@@ -15,3 +15,11 @@ pub mod handler;
 
 /// IRA business logic
 pub mod services;
+
+/// IRA Components
+pub mod components;
+
+/// IRA Domain types and structs
+pub mod domain;
+
+pub mod utils;

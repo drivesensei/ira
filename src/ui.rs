@@ -1,7 +1,6 @@
 use ratatui::{
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
-    text::Span,
     widgets::{Block, BorderType, Paragraph},
     Frame,
 };
@@ -16,6 +15,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     // - https://github.com/ratatui-org/ratatui/tree/master/examples
 
     let Rect { width, height, .. } = frame.size();
+
     let app_title_block = Block::bordered()
         .title("     IRA (Integrated Retro Archives)    ")
         .title_alignment(Alignment::Center)
@@ -33,53 +33,18 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     } else {
         let chunks = ratatui::layout::Layout::default()
             .direction(ratatui::layout::Direction::Vertical)
-            .margin(1)
-            .constraints(
-                [
-                    ratatui::layout::Constraint::Percentage(50),
-                    ratatui::layout::Constraint::Percentage(50),
-                ]
-                .as_ref(),
-            )
+            .constraints([
+                ratatui::layout::Constraint::Length(3),
+                ratatui::layout::Constraint::Length(3),
+                ratatui::layout::Constraint::Length(3),
+                ratatui::layout::Constraint::Min(2),
+            ])
             .split(frame.size());
 
-        if let Some(drives) = &app.drives {
-            let drive_spans: Vec<Span> = drives
-                .iter()
-                .map(|drive| Span::raw(format!(" {}", &drive.label)))
-                .collect();
+        crate::components::drives_ui::render(frame, app, chunks[0]);
+        crate::components::common_folders_ui::render(frame, app, chunks[1]);
+        crate::components::bookmarks_ui::render(frame, app, chunks[2]);
 
-            let drive_list = ratatui::widgets::List::new(drive_spans)
-                .block(
-                    Block::default()
-                        .title("  Drives  ")
-                        .borders(ratatui::widgets::Borders::ALL),
-                )
-                .style(Style::default().fg(Color::White).bg(Color::Black))
-                .highlight_style(Style::default().add_modifier(Modifier::BOLD));
-
-            frame.render_widget(drive_list, chunks[0]);
-        }
-
-        // list of files
-        if let Ok(files) = app.list_files_from_selected_folder() {
-            let label = &app.current_drive.as_ref().unwrap().label;
-
-            let file_spans: Vec<Span> = files
-                .iter()
-                .map(|file| Span::raw(format!(" {}", &file.label)))
-                .collect();
-
-            let file_list = ratatui::widgets::List::new(file_spans)
-                .block(
-                    Block::default()
-                        .title(format!("  Files  ({})", label))
-                        .borders(ratatui::widgets::Borders::ALL),
-                )
-                .style(Style::default().fg(Color::White).bg(Color::Black))
-                .highlight_style(Style::default().add_modifier(Modifier::BOLD));
-
-            frame.render_widget(file_list, chunks[1]);
-        }
+        crate::components::tab1_files_ui::render(frame, app, chunks[3]);
     }
 }

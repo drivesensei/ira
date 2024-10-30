@@ -1,3 +1,4 @@
+#[derive(Debug)]
 pub struct FEntry {
     pub path: String,
     pub label: String,
@@ -18,7 +19,7 @@ pub fn list_files(path: &str) -> Result<Vec<FEntry>, std::io::Error> {
                     });
                 }
             }
-            Err(e) => eprintln!("Error reading entry: {}", e),
+            Err(e) => println!("Error reading entry: {}", e),
         }
     }
 

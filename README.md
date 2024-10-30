@@ -1,6 +1,10 @@
+## IRA (Integrated Retro Archives)
+
+This is a terminal file manager built with Rust and Ratatui.
+
 ## Simple template
 
-The simple template will create the following project structure:
+The simple template have the following project structure:
 
 ```text
 src/
