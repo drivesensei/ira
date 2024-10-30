@@ -1,7 +1,6 @@
 use ratatui::{
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
     widgets::{Block, BorderType, Paragraph},
     Frame,
 };
@@ -46,29 +45,6 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         crate::components::common_folders_ui::render(frame, app, chunks[1]);
         crate::components::bookmarks_ui::render(frame, app, chunks[2]);
 
-        // list of files
-        // println!("{:?}", app.tab1_folder);
-        match app.list_files_from_selected_folder() {
-            Ok(files) => {
-                let label = &app.tab1_folder.as_ref().unwrap().label;
-
-                let file_spans: Vec<Span> = files
-                    .iter()
-                    .map(|file| Span::raw(format!(" {}", &file.label)))
-                    .collect();
-
-                let file_list = ratatui::widgets::List::new(file_spans)
-                    .block(
-                        Block::default()
-                            .title(format!("  Files  ({})", label))
-                            .borders(ratatui::widgets::Borders::ALL),
-                    )
-                    .style(Style::default().fg(Color::White).bg(Color::Black))
-                    .highlight_style(Style::default().add_modifier(Modifier::BOLD));
-
-                frame.render_widget(file_list, chunks[3]);
-            }
-            Err(e) => println!("{:?}", e),
-        }
+        crate::components::tab1_files_ui::render(frame, app, chunks[3]);
     }
 }

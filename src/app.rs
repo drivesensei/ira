@@ -1,13 +1,17 @@
 use std::error;
-use std::io::Result as IOResult;
+
+use open::that;
+use ratatui::widgets::ListState;
 
 use crate::{
     domain::data::Folder,
     services::{
+        bookmarks::list_bookmarks,
         drives::list_drives,
         folders::list_common_folders,
         list_files::{list_files, FEntry},
     },
+    utils::is_dir::{get_directory, get_parent_directory},
 };
 
 /// Application result type.
@@ -29,6 +33,10 @@ pub struct App {
 
     pub tab1_folder: Option<Folder>,
     pub tab2_folder: Option<Folder>,
+
+    pub tab1_state: ListState,
+
+    pub tab1_files: Vec<FEntry>,
 }
 
 impl Default for App {
@@ -40,7 +48,9 @@ impl Default for App {
             tab2_folder: None,
             drives: None,
             folders: Some(list_common_folders()),
-            bookmarks: None,
+            bookmarks: Some(list_bookmarks()),
+            tab1_state: ListState::default(),
+            tab1_files: Vec::new(),
         }
     }
 }
@@ -55,6 +65,7 @@ impl App {
             if count > 0 {
                 if let Some(first_drive) = app_drives.get(0) {
                     default.tab1_folder = Some(first_drive.clone());
+                    default.list_files_from_selected_folder();
                 }
             }
 
@@ -92,17 +103,12 @@ impl App {
         &self.drives
     }
 
-    pub fn list_files_from_selected_folder(&mut self) -> IOResult<Vec<FEntry>> {
+    pub fn list_files_from_selected_folder(&mut self) {
         if let Some(current) = &self.tab1_folder {
-            let mut files = list_files(&current.path)?;
-            // println!("t1f {:?} {}", self.tab1_folder, files.len());
-            files.sort_by(|a, b| a.label.cmp(&b.label));
-            Ok(files)
-        } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "No directory set",
-            ))
+            if let Ok(mut files) = list_files(&current.path) {
+                files.sort_by(|a, b| a.label.cmp(&b.label));
+                self.tab1_files = files;
+            }
         }
     }
 
@@ -133,6 +139,7 @@ impl App {
             if count > 0 {
                 if let Some(selected_drive) = app_drives.get(initial_shortcut) {
                     self.tab1_folder = Some(selected_drive.clone());
+                    self.list_files_from_selected_folder();
                 }
             }
 
@@ -147,10 +154,60 @@ impl App {
             if count > 0 {
                 if let Some(selected_common_folder) = app_folders.get(initial_shortcut) {
                     self.tab1_folder = Some(selected_common_folder.clone());
-                    // println!("count is {count}");
-                    // println!("scf {selected_common_folder:?}");
+                    self.list_files_from_selected_folder();
                 }
             }
         }
+    }
+
+    pub fn enter_folder(&mut self) {
+        if let Some(idx) = self.tab1_state.selected() {
+            if let Some(selected_folder) = self.tab1_files.get(idx) {
+                match get_directory(&selected_folder.path) {
+                    Ok(some_folder) => {
+                        if let Some(actual_folder) = some_folder {
+                            self.tab1_folder = Some(actual_folder);
+                            self.list_files_from_selected_folder();
+                        } else {
+                            // it's a file, just open it
+                            let _ = that(&selected_folder.path);
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+
+    pub fn out_of_folder(&mut self) {
+        if let Some(idx) = self.tab1_state.selected() {
+            if let Some(selected_folder) = self.tab1_files.get(idx) {
+                match get_parent_directory(&selected_folder.path) {
+                    Ok(some_folder) => {
+                        if let Some(actual_folder) = some_folder {
+                            self.tab1_folder = Some(actual_folder);
+                            self.list_files_from_selected_folder();
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+
+    pub fn tab1_next_item(&mut self) {
+        self.tab1_state.select_next();
+    }
+
+    pub fn tab1_prev_item(&mut self) {
+        self.tab1_state.select_previous();
+    }
+
+    pub fn tab1_goto_top(&mut self) {
+        self.tab1_state.select_first();
+    }
+
+    pub fn tab1_goto_bottom(&mut self) {
+        self.tab1_state.select_last();
     }
 }

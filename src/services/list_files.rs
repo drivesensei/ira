@@ -1,3 +1,4 @@
+#[derive(Debug)]
 pub struct FEntry {
     pub path: String,
     pub label: String,

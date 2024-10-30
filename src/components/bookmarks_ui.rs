@@ -5,32 +5,29 @@ use ratatui::{
     Frame,
 };
 
-use crate::{app::App, domain::data::Folder};
+use crate::app::App;
 
 pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
-    let folders = vec![
-        Folder::new(String::from("Projects"), String::from("~/projects"), 'y'),
-        Folder::new(String::from(".ssh"), String::from("~/.ssh"), 'u'),
-    ];
+    if let Some(bookmarks) = &app.bookmarks {
+        let folder_spans: Vec<Span> = bookmarks
+            .iter()
+            .enumerate()
+            .map(|(i, folder)| {
+                if i + 1 == bookmarks.len() {
+                    Span::raw(format!("[{}] {}", folder.shortcut, folder.label))
+                } else {
+                    Span::raw(format!("[{}] {} |", folder.shortcut, folder.label))
+                }
+            })
+            .collect();
 
-    let folder_spans: Vec<Span> = folders
-        .iter()
-        .enumerate()
-        .map(|(i, folder)| {
-            if i + 1 == folders.len() {
-                Span::raw(format!(" [{}] {}", folder.shortcut, folder.label))
-            } else {
-                Span::raw(format!(" [{}] {} |", folder.shortcut, folder.label))
-            }
-        })
-        .collect();
+        let text = Line::from(folder_spans);
+        let dlist = ratatui::widgets::Paragraph::new(text).block(
+            Block::default()
+                .title(" Bookmarks ")
+                .borders(ratatui::widgets::Borders::BOTTOM),
+        );
 
-    let text = Line::from(folder_spans);
-    let dlist = ratatui::widgets::Paragraph::new(text).block(
-        Block::default()
-            .title(" Bookmarks ")
-            .borders(ratatui::widgets::Borders::BOTTOM),
-    );
-
-    f.render_widget(dlist, area);
+        f.render_widget(dlist, area);
+    }
 }

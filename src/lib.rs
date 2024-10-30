@@ -21,3 +21,5 @@ pub mod components;
 
 /// IRA Domain types and structs
 pub mod domain;
+
+pub mod utils;
