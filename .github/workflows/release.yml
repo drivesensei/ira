@@ -49,22 +49,24 @@ jobs:
       - name: Build
         run: cargo build --release
 
-      - name: Archive binaries
+      - name: Archive binaries (Linux/macOS)
         if: matrix.platform == 'ubuntu-latest' || matrix.platform == 'macos-latest'
-        run: tar -czf ${GITHUB_RUN_NUMBER}_ira_${matrix.platform}.tar.gz -C target/release ira
+        env:
+          FILENAME: ira-${{ matrix.platform }}-${{ github.run_number }}.tar.gz
+        run: tar -czf $FILENAME -C target/release ira
 
       - name: Archive binary (Windows)
         if: matrix.platform == 'windows-latest'
+        env:
+          FILENAME: ira-windows-${{ github.run_number }}.zip
         run: |
-          Compress-Archive -Path target\release\ira.exe -DestinationPath ${GITHUB_RUN_NUMBER}_ira_windows.zip
+          Compress-Archive -Path target\release\ira.exe -DestinationPath $env:FILENAME
 
       - name: Upload Release Asset
         uses: actions/upload-artifact@v3
         with:
           name: ira-${{ matrix.platform }}
-          path: |
-            ${GITHUB_RUN_NUMBER}_ira_${{ matrix.platform }}.tar.gz
-            ${GITHUB_RUN_NUMBER}_ira_windows.zip
+          path: ${{ env.FILENAME }}
 
   create_release:
     needs: release
