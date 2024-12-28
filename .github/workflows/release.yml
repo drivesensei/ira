@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v*.*.*' # Triggers the workflow on versioned tags like v1.0.0
+      - 'v*.*.*' # Triggers the workflow on tags like v1.0.0
 
 jobs:
   build:
@@ -15,22 +15,19 @@ jobs:
           - os: ubuntu-latest
             platform: linux
             archive_ext: tar.gz
-            build_cmd: tar -czf ira-linux-${{ github.run_number }}.tar.gz -C target/release ira
-            artifact_name: ira-linux-${{ github.run_number }}.tar.gz
+            archive_filename: ira-linux-${{ github.run_number }}.tar.gz
           - os: macos-latest
             platform: macos
             archive_ext: tar.gz
-            build_cmd: tar -czf ira-macos-${{ github.run_number }}.tar.gz -C target/release ira
-            artifact_name: ira-macos-${{ github.run_number }}.tar.gz
+            archive_filename: ira-macos-${{ github.run_number }}.tar.gz
           - os: windows-latest
             platform: windows
             archive_ext: zip
-            build_cmd: Compress-Archive -Path target\release\ira.exe -DestinationPath ira-windows-${{ github.run_number }}.zip
-            artifact_name: ira-windows-${{ github.run_number }}.zip
+            archive_filename: ira-windows-${{ github.run_number }}.zip
 
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
 
       - name: Set up Rust
         uses: actions-rs/toolchain@v1
@@ -38,18 +35,24 @@ jobs:
           toolchain: stable
           profile: minimal
 
-      - name: Cache Cargo registry and index
-        uses: actions/cache@v2
+      - name: Cache Cargo registry
+        uses: actions/cache@v3
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/index
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache Cargo index
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/index
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-index-
 
       - name: Cache Cargo build
-        uses: actions/cache@v2
+        uses: actions/cache@v3
         with:
           path: target
           key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
@@ -59,40 +62,53 @@ jobs:
       - name: Build Release Binary
         run: cargo build --release
 
-      - name: Archive Binary
-        run: ${{ matrix.build_cmd }}
+      # Archive binary for Linux and macOS
+      - name: Archive Binary (Linux/macOS)
+        if: matrix.platform == 'linux' || matrix.platform == 'macos'
+        run: tar -czf ${{ matrix.archive_filename }} -C target/release ira
         shell: bash
+
+      # Archive binary for Windows
+      - name: Archive Binary (Windows)
+        if: matrix.platform == 'windows'
+        run: |
+          Compress-Archive -Path target\release\ira.exe -DestinationPath ${{ matrix.archive_filename }}
+        shell: pwsh # Corrected shell to pwsh
+
+      - name: Verify Archive Exists
+        run: |
+          if [ ! -f ${{ matrix.archive_filename }} ]; then
+            echo "Archive file not found: ${{ matrix.archive_filename }}"
+            exit 1
+          fi
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v3
         with:
           name: ira-${{ matrix.platform }}
-          path: ${{ matrix.artifact_name }}
+          path: ${{ matrix.archive_filename }}
 
   create_release:
     needs: build
     runs-on: ubuntu-latest
     steps:
       - name: Download Linux Artifact
-        if: matrix.platform == 'linux'
         uses: actions/download-artifact@v3
         with:
           name: ira-linux-${{ github.run_number }}.tar.gz
-          path: ./release_assets
+          path: release_assets/
 
       - name: Download macOS Artifact
-        if: matrix.platform == 'macos'
         uses: actions/download-artifact@v3
         with:
           name: ira-macos-${{ github.run_number }}.tar.gz
-          path: ./release_assets
+          path: release_assets/
 
       - name: Download Windows Artifact
-        if: matrix.platform == 'windows'
         uses: actions/download-artifact@v3
         with:
           name: ira-windows-${{ github.run_number }}.zip
-          path: ./release_assets
+          path: release_assets/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
