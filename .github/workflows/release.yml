@@ -73,14 +73,27 @@ jobs:
         if: matrix.platform == 'windows'
         run: |
           Compress-Archive -Path target\release\ira.exe -DestinationPath ${{ matrix.archive_filename }}
-        shell: pwsh # Corrected shell to pwsh
+        shell: pwsh # Use PowerShell Core
 
-      - name: Verify Archive Exists
+      # Verify Archive Exists (Linux/macOS)
+      - name: Verify Archive Exists (Linux/macOS)
+        if: matrix.platform == 'linux' || matrix.platform == 'macos'
         run: |
           if [ ! -f ${{ matrix.archive_filename }} ]; then
             echo "Archive file not found: ${{ matrix.archive_filename }}"
             exit 1
           fi
+        shell: bash
+
+      # Verify Archive Exists (Windows)
+      - name: Verify Archive Exists (Windows)
+        if: matrix.platform == 'windows'
+        run: |
+          if (!(Test-Path -Path ${{ matrix.archive_filename }})) {
+            Write-Error "Archive file not found: ${{ matrix.archive_filename }}"
+            exit 1
+          }
+        shell: pwsh
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v3
