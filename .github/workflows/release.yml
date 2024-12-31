@@ -35,29 +35,17 @@ jobs:
           toolchain: stable
           profile: minimal
 
-      - name: Cache Cargo registry
+      # Consolidated Cache for Cargo registry and index
+      - name: Cache Cargo dependencies
         uses: actions/cache@v3
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/index
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-registry-
-
-      - name: Cache Cargo index
-        uses: actions/cache@v3
-        with:
-          path: ~/.cargo/index
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-index-
-
-      - name: Cache Cargo build
-        uses: actions/cache@v3
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-build-
+            ${{ runner.os }}-cargo-
 
       - name: Build Release Binary
         run: cargo build --release
@@ -73,7 +61,7 @@ jobs:
         if: matrix.platform == 'windows'
         run: |
           Compress-Archive -Path target\release\ira.exe -DestinationPath ${{ matrix.archive_filename }}
-        shell: pwsh # Use PowerShell Core
+        shell: pwsh
 
       # Verify Archive Exists (Linux/macOS)
       - name: Verify Archive Exists (Linux/macOS)
@@ -124,7 +112,7 @@ jobs:
           path: release_assets/
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: ./release_assets/*
         env:
