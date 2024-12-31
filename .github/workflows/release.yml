@@ -15,15 +15,15 @@ jobs:
           - os: ubuntu-latest
             platform: linux
             archive_ext: tar.gz
-            archive_filename: ira-linux-${{ github.run_number }}.tar.gz
+            archive_filename: ira-linux.tar.gz
           - os: macos-latest
             platform: macos
             archive_ext: tar.gz
-            archive_filename: ira-macos-${{ github.run_number }}.tar.gz
+            archive_filename: ira-macos.tar.gz
           - os: windows-latest
             platform: windows
             archive_ext: zip
-            archive_filename: ira-windows-${{ github.run_number }}.zip
+            archive_filename: ira-windows.zip
 
     steps:
       - name: Check out the repository
@@ -108,19 +108,19 @@ jobs:
       - name: Download Linux Artifact
         uses: actions/download-artifact@v3
         with:
-          name: ira-linux-${{ github.run_number }}.tar.gz
+          name: ira-linux
           path: release_assets/
 
       - name: Download macOS Artifact
         uses: actions/download-artifact@v3
         with:
-          name: ira-macos-${{ github.run_number }}.tar.gz
+          name: ira-macos
           path: release_assets/
 
       - name: Download Windows Artifact
         uses: actions/download-artifact@v3
         with:
-          name: ira-windows-${{ github.run_number }}.zip
+          name: ira-windows
           path: release_assets/
 
       - name: Create GitHub Release
