@@ -5,8 +5,10 @@ use ira::tui::Tui;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io;
+use cli_log::*;
 
 fn main() -> AppResult<()> {
+    init_cli_log!();
     // Create an application.
     let mut app = App::new();
 

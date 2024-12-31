@@ -16,7 +16,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
                 if i + 1 == bookmarks.len() {
                     Span::raw(format!("[{}] {}", folder.shortcut, folder.label))
                 } else {
-                    Span::raw(format!("[{}] {} |", folder.shortcut, folder.label))
+                    Span::raw(format!("[{}] {} ", folder.shortcut, folder.label))
                 }
             })
             .collect();

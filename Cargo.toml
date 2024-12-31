@@ -1,14 +1,17 @@
 [package]
 name = "ira"
 version = "0.1.0"
-authors = ["vladimir.lopez"]
+authors = ["drivesensei"]
 license = "MIT"
 edition = "2021"
 
 [dependencies]
+cli-log = "2.1.0"
 dirs-next = "2.0.0"
 open = "5.3.0"
-ratatui = "0.27.0"
+ratatui = "0.29.0"
+serde = { version = "1.0.217", features = ["derive"] }
+serde_json = "1.0.134"
 winapi = { version = "0.3.9", features = [
     "fileapi",
     "winbase",

@@ -14,7 +14,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     // - https://docs.rs/ratatui/latest/ratatui/widgets/index.html
     // - https://github.com/ratatui-org/ratatui/tree/master/examples
 
-    let Rect { width, height, .. } = frame.size();
+    let Rect { width, height, .. } = frame.area();
 
     let app_title_block = Block::bordered()
         .title("     IRA (Integrated Retro Archives)    ")
@@ -28,7 +28,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
                 .block(app_title_block)
                 .style(Style::default().fg(Color::Cyan).bg(Color::Black))
                 .centered(),
-            frame.size(),
+            frame.area(),
         )
     } else {
         let chunks = ratatui::layout::Layout::default()
@@ -39,7 +39,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
                 ratatui::layout::Constraint::Length(3),
                 ratatui::layout::Constraint::Min(2),
             ])
-            .split(frame.size());
+            .split(frame.area());
 
         crate::components::drives_ui::render(frame, app, chunks[0]);
         crate::components::common_folders_ui::render(frame, app, chunks[1]);
