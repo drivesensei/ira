@@ -7,9 +7,9 @@ edition = "2021"
 
 [dependencies]
 dirs-next = "2.0.0"
-open = "5.3.0"
-parking_lot = "0.12.2"
-ratatui = "0.27.0"
+open = "5.4.3"
+parking_lot = "0.12.5"
+ratatui = "0.30.2"
 winapi = { version = "0.3.9", features = [
     "fileapi",
     "winbase",

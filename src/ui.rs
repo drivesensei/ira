@@ -10,7 +10,7 @@ use crate::app::App;
 
 /// Renders the user interface widgets.
 pub fn render(app: &mut App, frame: &mut Frame) {
-    let Rect { width, height, .. } = frame.size();
+    let Rect { width, height, .. } = frame.area();
 
     let app_title_block = Block::bordered()
         .title("     IRA (Integrated Retro Archives)    ")
@@ -24,7 +24,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
                 .block(app_title_block)
                 .style(Style::default().fg(Color::Cyan).bg(Color::Black))
                 .centered(),
-            frame.size(),
+            frame.area(),
         );
         return;
     }
@@ -37,7 +37,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
             Constraint::Length(3), // Bookmarks + Actions
             Constraint::Min(2),    // Files
         ])
-        .split(frame.size());
+        .split(frame.area());
 
     crate::components::drives_ui::render(frame, app, chunks[0]);
     crate::components::common_folders_ui::render(frame, app, chunks[1]);
@@ -80,7 +80,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         let block = Block::bordered().title(" Confirm ").style(style);
         frame.render_widget(
             Paragraph::new(prompt).block(block).alignment(Alignment::Center).style(style),
-            centered_rect(60, 3, frame.size()),
+            centered_rect(60, 3, frame.area()),
         );
     }
 
@@ -102,12 +102,12 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         let text_line = Line::from(spans);
         let hint = Line::raw("  [Enter] rename  [Esc] cancel  ");
         let lines: Vec<Line<'static>> = vec![text_line, Line::raw(""), hint];
-        let w = (prompt.text.len() as u16 + 12).max(34).min(frame.size().width.saturating_sub(4));
+        let w = (prompt.text.len() as u16 + 12).max(34).min(frame.area().width.saturating_sub(4));
         let h = lines.len() as u16 + 2;
         let style = Style::default().fg(Color::Black).bg(Color::White);
         frame.render_widget(
             Paragraph::new(lines).block(Block::bordered().title(" Rename ").style(style)).style(style),
-            centered_rect(w, h, frame.size()),
+            centered_rect(w, h, frame.area()),
         );
     }
 
@@ -118,12 +118,12 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         for l in &info.lines {
             max_w = max_w.max(l.chars().count() as u16);
         }
-        let w = (max_w + 4).min(frame.size().width.saturating_sub(4));
+        let w = (max_w + 4).min(frame.area().width.saturating_sub(4));
         let h = lines.len() as u16 + 2;
         let style = Style::default().fg(Color::Black).bg(Color::White);
         frame.render_widget(
             Paragraph::new(lines).block(Block::bordered().title(" Info ").style(style)).style(style),
-            centered_rect(w, h, frame.size()),
+            centered_rect(w, h, frame.area()),
         );
     }
 }
