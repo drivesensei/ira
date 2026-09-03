@@ -44,8 +44,12 @@ impl<B: Backend> Tui<B> {
             panic_hook(panic);
         }));
 
+        // NOTE: do NOT call `terminal.clear()` here. Since ratatui 0.30 it
+        // saves/restores the cursor position, which sends a blocking \x1b[6n
+        // query whose response races with the EventHandler thread - the
+        // resulting ~2 s stall was the entire "slow startup" regression. The
+        // alternate screen is already blank and the first draw paints it.
         self.terminal.hide_cursor()?;
-        self.terminal.clear()?;
         Ok(())
     }
 
