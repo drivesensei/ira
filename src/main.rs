@@ -29,6 +29,8 @@ fn main() -> AppResult<()> {
             Event::Resize(_, _) => {}
         }
     }
+    // Persist session state (split layout and pane folders) on exit.
+    app.persist_state();
 
     // Exit the user interface.
     tui.exit()?;

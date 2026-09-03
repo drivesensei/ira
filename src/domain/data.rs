@@ -3,6 +3,8 @@ pub struct Folder {
     pub label: String,
     pub path: String,
     pub shortcut: char,
+    /// Block device path (e.g. "/dev/sdb1") for drives; `None` for ordinary folders/bookmarks.
+    pub device: Option<String>,
 }
 
 impl Folder {
@@ -11,6 +13,7 @@ impl Folder {
             label,
             path,
             shortcut,
+            device: None,
         }
     }
 }

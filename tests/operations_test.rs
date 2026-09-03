@@ -1,0 +1,184 @@
+use std::time::{Duration, Instant};
+
+use ira::app::App;
+use ira::domain::data::Folder;
+use ira::services::list_files::FEntry;
+use ira::services::transfer::JobStatus;
+
+fn entry(path: &str) -> FEntry {
+    FEntry {
+        path: path.to_string(),
+        label: std::path::Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string()),
+        is_dir: false,
+    }
+}
+
+/// Polls the job channel (as the main loop's tick does) until all jobs settle.
+fn wait_for_jobs(app: &mut App) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        app.tick();
+        let pending = app.jobs.iter().any(|j| {
+            matches!(j.status, JobStatus::Running | JobStatus::Paused | JobStatus::Queued)
+        });
+        if !pending {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "transfer hung: {:?}",
+            app.jobs.iter().map(|j| j.status.clone()).collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn space_toggles_selection_and_moves_cursor() {
+    let mut app = App::default();
+    app.panes[0].files = vec![entry("/tmp/a.txt"), entry("/tmp/b.txt"), entry("/tmp/c.txt")];
+    app.panes[0].selected = vec![false, false, false];
+    app.panes[0].state.select(Some(0));
+
+    app.toggle_select_current(); // select a.txt, cursor -> 1
+    app.toggle_select_current(); // select b.txt, cursor -> 2
+    assert_eq!(app.panes[0].selected, vec![true, true, false]);
+    assert_eq!(app.panes[0].state.selected(), Some(2));
+
+    // Back to b.txt and toggle it off.
+    app.panes[0].state.select(Some(1));
+    app.toggle_select_current(); // deselect b.txt, cursor -> 2
+    assert_eq!(app.panes[0].selected, vec![true, false, false]);
+    assert_eq!(app.panes[0].state.selected(), Some(2));
+}
+
+#[test]
+fn select_all_and_invert() {
+    let mut app = App::default();
+    app.panes[0].files = vec![entry("/tmp/a.txt"), entry("/tmp/b.txt"), entry("/tmp/c.txt")];
+    app.panes[0].selected = vec![false, false, false];
+
+    // Super+A: nothing selected -> select all.
+    app.toggle_select_all();
+    assert_eq!(app.panes[0].selected, vec![true, true, true]);
+
+    // Super+A again: everything selected -> clear all.
+    app.toggle_select_all();
+    assert_eq!(app.panes[0].selected, vec![false, false, false]);
+
+    // Super+I: invert.
+    app.panes[0].selected = vec![true, false, true];
+    app.invert_selection();
+    assert_eq!(app.panes[0].selected, vec![false, true, false]);
+}
+
+#[test]
+fn list_files_marks_directories() {
+    let base = std::env::temp_dir().join(format!("ira_icons_{}", std::process::id()));
+    std::fs::create_dir_all(base.join("sub")).unwrap();
+    std::fs::write(base.join("file.txt"), "x").unwrap();
+
+    let entries = ira::services::list_files::list_files(base.to_str().unwrap()).unwrap();
+    let sub = entries.iter().find(|e| e.label == "sub").unwrap();
+    let file = entries.iter().find(|e| e.label == "file.txt").unwrap();
+    assert!(sub.is_dir, "directory entries must be marked is_dir");
+    assert!(!file.is_dir, "file entries must not be marked is_dir");
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn hidden_files_toggle() {
+    let base = std::env::temp_dir().join(format!("ira_hidden_{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join(".secret"), "s").unwrap();
+    std::fs::write(base.join("visible.txt"), "v").unwrap();
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new("t".into(), base.to_str().unwrap().into(), '#'));
+
+    // Default hides dotfiles.
+    app.list_files_from_selected_folder();
+    let labels: Vec<&str> = app.panes[0].files.iter().map(|f| f.label.as_str()).collect();
+    assert_eq!(labels, vec!["visible.txt"]);
+
+    // `.` toggles them on.
+    app.toggle_hidden();
+    let labels: Vec<&str> = app.panes[0].files.iter().map(|f| f.label.as_str()).collect();
+    assert_eq!(labels, vec![".secret", "visible.txt"]);
+
+    // And back off.
+    app.toggle_hidden();
+    assert_eq!(app.panes[0].files.len(), 1);
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn copy_uses_all_selected_entries_and_focuses_board() {
+    let base = std::env::temp_dir().join(format!("ira_sel_copy_{}", std::process::id()));
+    let src = base.join("src");
+    let dst = base.join("dst");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&dst).unwrap();
+    std::fs::write(src.join("a.txt"), "A").unwrap();
+    std::fs::write(src.join("b.txt"), "B").unwrap();
+    std::fs::write(src.join("c.txt"), "C").unwrap();
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new("src".into(), src.to_str().unwrap().into(), '#'));
+    app.panes[1].folder = Some(Folder::new("dst".into(), dst.to_str().unwrap().into(), '#'));
+    app.panes[0].files = vec![
+        entry(src.join("a.txt").to_str().unwrap()),
+        entry(src.join("b.txt").to_str().unwrap()),
+        entry(src.join("c.txt").to_str().unwrap()),
+    ];
+    app.panes[0].selected = vec![true, true, false]; // a.txt + b.txt
+    app.panes[0].state.select(Some(0));
+
+    app.copy_to_other_pane();
+    assert_eq!(app.jobs.len(), 2);
+    assert!(app.copy_board && app.board_has_focus());
+
+    wait_for_jobs(&mut app);
+
+    assert!(dst.join("a.txt").exists());
+    assert!(dst.join("b.txt").exists());
+    assert!(!dst.join("c.txt").exists());
+    assert!(matches!(app.jobs[0].status, JobStatus::Done));
+    assert!(matches!(app.jobs[1].status, JobStatus::Done));
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn delete_requires_confirmation_and_removes_on_confirm() {
+    let base = std::env::temp_dir().join(format!("ira_del_{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+    let victim = base.join("victim.txt");
+    std::fs::write(&victim, "data").unwrap();
+
+    let mut app = App::default();
+    app.panes[0].files = vec![entry(victim.to_str().unwrap())];
+    app.panes[0].selected = vec![false];
+    app.panes[0].state.select(Some(0));
+
+    // Cancel path: prompt shown, Esc/n cancels, file stays.
+    app.request_delete();
+    assert!(app.confirming.is_some());
+    app.cancel_confirm();
+    assert!(app.confirming.is_none());
+    assert!(victim.exists());
+
+    // Confirm path: y deletes the file.
+    app.request_delete();
+    assert_eq!(app.confirming.as_ref().unwrap().paths.len(), 1);
+    app.confirm_delete();
+    assert!(app.confirming.is_none());
+    assert!(!victim.exists());
+
+    let _ = std::fs::remove_dir_all(&base);
+}

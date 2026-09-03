@@ -5,71 +5,43 @@ pub fn list_common_folders() -> Vec<Folder> {
     let mut result: Vec<Folder> = Vec::new();
     if let Some(home) = dirs_next::home_dir() {
         if let Some(homestr) = home.to_str() {
-            result.push(Folder {
-                label: "Home".to_string(),
-                path: homestr.to_string(),
-                shortcut: 'w',
-            });
+            result.push(Folder::new("Home".to_string(), homestr.to_string(), 'w'));
         }
     }
 
     if let Some(desktop) = dirs_next::desktop_dir() {
         if let Some(desktopstr) = desktop.to_str() {
-            result.push(Folder {
-                label: "Desktop".to_string(),
-                path: desktopstr.to_string(),
-                shortcut: 'e',
-            });
+            result.push(Folder::new("Desktop".to_string(), desktopstr.to_string(), 'e'));
         }
     }
 
     if let Some(document) = dirs_next::document_dir() {
         if let Some(documentstr) = document.to_str() {
-            result.push(Folder {
-                label: "Documents".to_string(),
-                path: documentstr.to_string(),
-                shortcut: 'r',
-            });
+            result.push(Folder::new("Documents".to_string(), documentstr.to_string(), 'r'));
         }
     }
 
     if let Some(download) = dirs_next::download_dir() {
         if let Some(downloadstr) = download.to_str() {
-            result.push(Folder {
-                label: "Downloads".to_string(),
-                path: downloadstr.to_string(),
-                shortcut: 't',
-            });
+            result.push(Folder::new("Downloads".to_string(), downloadstr.to_string(), 't'));
         }
     }
 
     if let Some(music) = dirs_next::audio_dir() {
         if let Some(musicstr) = music.to_str() {
-            result.push(Folder {
-                label: "Music".to_string(),
-                path: musicstr.to_string(),
-                shortcut: 'y',
-            });
+            result.push(Folder::new("Music".to_string(), musicstr.to_string(), 'y'));
         }
     }
 
     if let Some(video) = dirs_next::video_dir() {
         if let Some(videostr) = video.to_str() {
-            result.push(Folder {
-                label: "Videos".to_string(),
-                path: videostr.to_string(),
-                shortcut: 'u',
-            });
+            result.push(Folder::new("Videos".to_string(), videostr.to_string(), 'u'));
         }
     }
 
     if let Some(public) = dirs_next::public_dir() {
         if let Some(publicstr) = public.to_str() {
-            result.push(Folder {
-                label: "Public".to_string(),
-                path: publicstr.to_string(),
-                shortcut: 'i',
-            });
+            result.push(Folder::new("Public".to_string(), publicstr.to_string(), 'i'));
         }
     }
 

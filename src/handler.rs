@@ -3,64 +3,155 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// Handles the key events and updates the state of [`App`].
 pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
-    match key_event.code {
-        // Exit application on `Ctrl-C` or q
-        KeyCode::Char(c) if c == 'q' => app.quit(),
-        KeyCode::Char('c') | KeyCode::Char('C') => {
-            if key_event.modifiers == KeyModifiers::CONTROL {
-                app.quit();
-            }
+    // Ctrl combos: Ctrl+C quits, Ctrl+A selects all / clears all. (Ctrl is the
+    // only modifier every terminal reports reliably.)
+    if key_event.modifiers == KeyModifiers::CONTROL {
+        match key_event.code {
+            KeyCode::Char('c') | KeyCode::Char('C') => app.quit(),
+            KeyCode::Char('a') | KeyCode::Char('A') => app.toggle_select_all(),
+            _ => {}
         }
+        return Ok(());
+    }
+
+    // Confirmation prompt (e.g. delete).
+    if app.confirming.is_some() {
+        match key_event.code {
+            KeyCode::Char('y') | KeyCode::Enter => app.confirm_delete(),
+            KeyCode::Char('n') | KeyCode::Esc => app.cancel_confirm(),
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    // Fuzzy search input.
+    if app.is_searching() {
+        match key_event.code {
+            KeyCode::Esc => app.cancel_search(),
+            KeyCode::Enter => app.confirm_search(),
+            KeyCode::Backspace => app.pop_search_char(),
+            KeyCode::Char(c) => app.push_search_char(c),
+            KeyCode::Right => app.enter_folder(),
+            KeyCode::Up => {
+                if key_event.modifiers == KeyModifiers::ALT {
+                    app.goto_top();
+                } else {
+                    app.prev_item();
+                }
+            }
+            KeyCode::Down => {
+                if key_event.modifiers == KeyModifiers::ALT {
+                    app.goto_bottom();
+                } else {
+                    app.next_item();
+                }
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    // Copy Board controls (contextual — only while the board has focus).
+    if app.board_has_focus() {
+        match key_event.code {
+            KeyCode::Esc | KeyCode::Char('`') => app.toggle_copy_board(),
+            KeyCode::Tab => app.switch_pane(),
+            KeyCode::Up => app.copy_board_prev(),
+            KeyCode::Down => app.copy_board_next(),
+            KeyCode::Char('p') | KeyCode::Char(' ') => app.toggle_selected_job_pause(),
+            KeyCode::Char('x') => app.cancel_selected_job(),
+            KeyCode::Char('q') => app.quit(),
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    match key_event.code {
+        // Exit application on `q`
+        KeyCode::Char(c) if c == 'q' => app.quit(),
 
         // Any digit represents a shortcut to a Drive path
         KeyCode::Char(c) if c.is_digit(10) => {
             let index = c.to_digit(10).unwrap() as usize;
             let shortcuts = app.get_drive_shortcuts();
             if index > 0 && index <= shortcuts.len() {
-                app.set_tab1_folder_from_drives(index - 1);
+                app.set_folder_from_drives(index - 1);
             }
         }
 
-        KeyCode::Char('z') => {
-            app.tab1_goto_top();
+        KeyCode::Char('z') => app.goto_top(),
+        KeyCode::Char('x') => app.goto_bottom(),
+
+        // `/` starts fuzzy search within the current folder.
+        KeyCode::Char('/') => app.start_search(),
+
+        // Toggle a bookmark for the current folder.
+        KeyCode::Char('b') => app.toggle_bookmark(),
+
+        // `+` toggles the vertical split of the files pane.
+        KeyCode::Char('+') => app.toggle_split(),
+
+        // Backtick toggles the Copy Board sidebar.
+        KeyCode::Char('`') => app.toggle_copy_board(),
+
+        // `c` copies the selected entry to the other pane; `m` moves it.
+        KeyCode::Char('c') => app.copy_to_other_pane(),
+        KeyCode::Char('m') => app.move_to_other_pane(),
+
+        // Tab cycles focus among panes and the Copy Board.
+        KeyCode::Tab => app.switch_pane(),
+
+        // Space multi-selects entries; Del deletes the selection (with
+        // confirmation).
+        KeyCode::Char(' ') => app.toggle_select_current(),
+        KeyCode::Delete => app.request_delete(),
+
+        // Select all / clear all and invert. Ctrl+A (above) and Alt+? are the
+        // reliable paths — terminals generally do not forward Super, so the
+        // Super variants only fire where the terminal happens to report it.
+        KeyCode::Char(c)
+            if key_event.modifiers.intersects(KeyModifiers::SUPER | KeyModifiers::ALT)
+                && matches!(c, 'a' | 'A') =>
+        {
+            app.toggle_select_all()
+        }
+        KeyCode::Char(c)
+            if key_event.modifiers.intersects(KeyModifiers::SUPER | KeyModifiers::ALT)
+                && matches!(c, 'i' | 'I') =>
+        {
+            app.invert_selection()
         }
 
-        KeyCode::Char('x') => {
-            app.tab1_goto_bottom();
-        }
+        // `.` toggles hidden files.
+        KeyCode::Char('.') => app.toggle_hidden(),
 
         KeyCode::Char(c) if !c.is_digit(10) => {
-            let shortcuts = app.get_common_folders_shortcuts();
-            if let Some(idx) = shortcuts.iter().position(|sc| *sc == c) {
-                app.set_tab1_folder_from_common_folders(idx);
+            let common = app.get_common_folders_shortcuts();
+            if let Some(idx) = common.iter().position(|sc| *sc == c) {
+                app.set_folder_from_common_folders(idx);
+            } else {
+                let bookmarks = app.get_bookmark_shortcuts();
+                if let Some(idx) = bookmarks.iter().position(|sc| *sc == c) {
+                    app.set_folder_from_bookmark(idx);
+                }
             }
         }
 
-        KeyCode::Char('b') => {
-            println!("placeholder add bookmark");
-        }
-
         // Files navigation handlers
-        KeyCode::Right => {
-            app.enter_folder();
-        }
+        KeyCode::Right => app.enter_folder(),
+        KeyCode::Left => app.out_of_folder(),
 
-        KeyCode::Left => {
-            app.out_of_folder();
-        }
-
-        // Files navigation handlers
         KeyCode::Up => {
             if key_event.modifiers == KeyModifiers::ALT {
-                app.tab1_goto_top();
+                app.goto_top();
             }
-            app.tab1_prev_item();
+            app.prev_item();
         }
         KeyCode::Down => {
             if key_event.modifiers == KeyModifiers::ALT {
-                app.tab1_goto_bottom();
+                app.goto_bottom();
             }
-            app.tab1_next_item();
+            app.next_item();
         }
 
         _ => {}

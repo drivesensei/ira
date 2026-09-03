@@ -12,7 +12,8 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     if let Some(ref drives) = app.drives {
         let drive_spans: Vec<Span> = drives
             .iter()
-            .map(|drive| Span::raw(format!(" {}", &drive.label)).style(Style::new().cyan()))
+            .enumerate()
+            .map(|(i, drive)| Span::raw(format!(" [{}] 🖥️ {}", i + 1, drive.label)).style(Style::new().cyan()))
             .collect();
 
         // let drive_list = ratatui::widgets::List::new(drive_spans)

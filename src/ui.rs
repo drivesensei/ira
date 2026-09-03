@@ -1,5 +1,5 @@
 use ratatui::{
-    layout::{Alignment, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     widgets::{Block, BorderType, Paragraph},
     Frame,
@@ -9,11 +9,6 @@ use crate::app::App;
 
 /// Renders the user interface widgets.
 pub fn render(app: &mut App, frame: &mut Frame) {
-    // This is where you add new widgets.
-    // See the following resources:
-    // - https://docs.rs/ratatui/latest/ratatui/widgets/index.html
-    // - https://github.com/ratatui-org/ratatui/tree/master/examples
-
     let Rect { width, height, .. } = frame.size();
 
     let app_title_block = Block::bordered()
@@ -24,27 +19,79 @@ pub fn render(app: &mut App, frame: &mut Frame) {
 
     if app.should_increase_size(width, height) {
         frame.render_widget(
-            Paragraph::new(format!("Please increase the terminal's size"))
+            Paragraph::new("Please increase the terminal's size")
                 .block(app_title_block)
                 .style(Style::default().fg(Color::Cyan).bg(Color::Black))
                 .centered(),
             frame.size(),
-        )
-    } else {
-        let chunks = ratatui::layout::Layout::default()
-            .direction(ratatui::layout::Direction::Vertical)
-            .constraints([
-                ratatui::layout::Constraint::Length(3),
-                ratatui::layout::Constraint::Length(3),
-                ratatui::layout::Constraint::Length(3),
-                ratatui::layout::Constraint::Min(2),
-            ])
-            .split(frame.size());
-
-        crate::components::drives_ui::render(frame, app, chunks[0]);
-        crate::components::common_folders_ui::render(frame, app, chunks[1]);
-        crate::components::bookmarks_ui::render(frame, app, chunks[2]);
-
-        crate::components::tab1_files_ui::render(frame, app, chunks[3]);
+        );
+        return;
     }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Drives
+            Constraint::Length(3), // Common folders
+            Constraint::Length(3), // Bookmarks + Actions
+            Constraint::Min(2),    // Files
+        ])
+        .split(frame.size());
+
+    crate::components::drives_ui::render(frame, app, chunks[0]);
+    crate::components::common_folders_ui::render(frame, app, chunks[1]);
+
+    // Bookmarks (left) and Actions (right) share the third row.
+    let bookmarks_row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(36)])
+        .split(chunks[2]);
+    crate::components::bookmarks_ui::render(frame, app, bookmarks_row[0]);
+    crate::components::actions_ui::render(frame, app, bookmarks_row[1]);
+
+    // Files area: optional Copy Board sidebar on the right, then the panes.
+    let mut files_area = chunks[3];
+    if app.copy_board {
+        let board = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(36)])
+            .split(chunks[3]);
+        crate::components::copy_board_ui::render(frame, app, board[1]);
+        files_area = board[0];
+    }
+
+    if app.split {
+        let files = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(files_area);
+        crate::components::tab1_files_ui::render(frame, app, files[0], 0, app.active_pane == 0);
+        crate::components::tab1_files_ui::render(frame, app, files[1], 1, app.active_pane == 1);
+    } else {
+        crate::components::tab1_files_ui::render(frame, app, files_area, 0, true);
+    }
+
+    // Confirmation prompt overlay (delete): solid light background so it is
+    // readable over the file list.
+    if let Some(confirm) = &app.confirming {
+        let prompt = format!(" Delete {}?  [y]es  [n]o ", confirm.label);
+        let style = Style::default().fg(Color::Black).bg(Color::White);
+        let block = Block::bordered().title(" Confirm ").style(style);
+        frame.render_widget(
+            Paragraph::new(prompt).block(block).alignment(Alignment::Center).style(style),
+            centered_rect(60, 3, frame.size()),
+        );
+    }
+}
+
+/// Returns a `width`x`height` rect centered within `area`.
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    Rect::new(
+        area.x + (area.width - w) / 2,
+        area.y + (area.height - h) / 2,
+        w,
+        h,
+    )
 }
