@@ -13,9 +13,15 @@ fn main() -> AppResult<()> {
     // Initialize the terminal user interface.
     let backend = CrosstermBackend::new(io::stderr());
     let terminal = Terminal::new(backend)?;
-    let events = EventHandler::new(2000);
+    // Short tick so async results (drive list, initial file listings) reach
+    // the UI promptly instead of straggling behind a 2 s cadence.
+    let events = EventHandler::new(500);
     let mut tui = Tui::new(terminal, events);
     tui.init()?;
+
+    // Draw immediately so the UI appears instantly instead of waiting up to
+    // the first tick (2000 ms).
+    tui.draw(&mut app)?;
 
     // Start the main loop.
     while app.running {

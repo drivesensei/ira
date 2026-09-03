@@ -114,7 +114,7 @@ Drives, common folders, and bookmarks all produce `Folder` values, which feed th
 
 ## Event loop
 
-`src/event.rs` spawns a background thread that polls crossterm and emits `Tick`, `Key`, `Mouse`, and `Resize` events over an mpsc channel. The main loop (`src/main.rs`) draws the UI, then blocks on the next event. The tick rate is 2000 ms. `Tick` and `Mouse` events are currently no-ops in `App`.
+`src/event.rs` spawns a background thread that polls crossterm and emits `Tick`, `Key`, `Mouse`, and `Resize` events over an mpsc channel. The main loop (`src/main.rs`) draws the UI, then blocks on the next event. The tick rate is 500 ms so async results (drive list, restored pane listings) appear promptly. `Tick` and `Mouse` events are handled by `App::tick` (drains jobs, drive cache, and pending file listings).
 
 ## Terminal lifecycle
 

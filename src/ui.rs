@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Paragraph},
+    widgets::{Block, BorderType, Clear, Paragraph},
     Frame,
 };
 
@@ -77,10 +77,12 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     if let Some(confirm) = &app.confirming {
         let prompt = format!(" Delete {}?  [y]es  [n]o ", confirm.label);
         let style = Style::default().fg(Color::Black).bg(Color::White);
+        let area = centered_rect(60, 3, frame.area());
+        paint_bg(frame, area, style);
         let block = Block::bordered().title(" Confirm ").style(style);
         frame.render_widget(
             Paragraph::new(prompt).block(block).alignment(Alignment::Center).style(style),
-            centered_rect(60, 3, frame.area()),
+            area,
         );
     }
 
@@ -105,9 +107,11 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         let w = (prompt.text.len() as u16 + 12).max(34).min(frame.area().width.saturating_sub(4));
         let h = lines.len() as u16 + 2;
         let style = Style::default().fg(Color::Black).bg(Color::White);
+        let area = centered_rect(w, h, frame.area());
+        paint_bg(frame, area, style);
         frame.render_widget(
             Paragraph::new(lines).block(Block::bordered().title(" Rename ").style(style)).style(style),
-            centered_rect(w, h, frame.area()),
+            area,
         );
     }
 
@@ -121,11 +125,21 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         let w = (max_w + 4).min(frame.area().width.saturating_sub(4));
         let h = lines.len() as u16 + 2;
         let style = Style::default().fg(Color::Black).bg(Color::White);
+        let area = centered_rect(w, h, frame.area());
+        paint_bg(frame, area, style);
         frame.render_widget(
             Paragraph::new(lines).block(Block::bordered().title(" Info ").style(style)).style(style),
-            centered_rect(w, h, frame.area()),
+            area,
         );
     }
+}
+
+/// Paints a solid background (blank cells, `style`) across `area`, so modal
+/// dialogs are opaque instead of letting the underlying file list show
+/// through in the unfilled padding around their text.
+fn paint_bg(frame: &mut Frame, area: Rect, style: Style) {
+    frame.render_widget(Clear, area);
+    frame.buffer_mut().set_style(area, style);
 }
 
 /// Returns a `width`x`height` rect centered within `area`.

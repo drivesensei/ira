@@ -1,6 +1,7 @@
 use std::error;
-use std::sync::mpsc;
-use std::time::Instant;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use open::that_detached;
 use ratatui::widgets::ListState;
@@ -105,11 +106,28 @@ pub struct App {
     job_tx: mpsc::Sender<JobEvent>,
     job_rx: mpsc::Receiver<JobEvent>,
     next_job_id: u64,
+
+    /// Latest drive list produced by the background poller.
+    drive_cache: Arc<Mutex<Vec<Folder>>>,
+    /// Monotonic counter bumped when the background poller publishes a new
+    /// drive list. `refresh_drives` only re-renders when this changes.
+    drive_generation: Arc<Mutex<u64>>,
+    /// Generation observed on the last `refresh_drives()` call.
+    seen_drive_generation: u64,
+    /// Whether a background drive poller is running for this app.
+    /// (Only the pool thread writes this; the UI thread reads it.)
+    drives_running: bool,
+
+    /// Startup file listings run on worker threads and are delivered here, so
+    /// a slow folder (e.g. a cold spin-up HDD) can't block `App::new()`.
+    file_list_tx: mpsc::Sender<(usize, Vec<FEntry>)>,
+    file_list_rx: mpsc::Receiver<(usize, Vec<FEntry>)>,
 }
 
 impl Default for App {
     fn default() -> Self {
         let (job_tx, job_rx) = mpsc::channel();
+        let (file_list_tx, file_list_rx) = mpsc::channel();
         Self {
             running: true,
             size: (1024, 768),
@@ -131,6 +149,12 @@ impl Default for App {
             job_tx,
             job_rx,
             next_job_id: 0,
+            drive_cache: Arc::new(Mutex::new(Vec::new())),
+            drive_generation: Arc::new(Mutex::new(0)),
+            seen_drive_generation: 0,
+            drives_running: false,
+            file_list_tx,
+            file_list_rx,
         }
     }
 }
@@ -145,20 +169,51 @@ impl App {
             // drives are left for the user to mount on demand.
             if let Some(first_mounted) = app_drives.iter().find(|d| !d.path.is_empty()) {
                 default.panes[0].folder = Some(first_mounted.clone());
-                default.list_files_from_selected_folder();
                 default.panes[0].state.select(None);
             }
             default.drives = Some(app_drives);
         }
         default.restore_state();
+        default.start_drive_poller();
+        // Load the initial file listings off the render thread so a cold
+        // (spin-up) drive can't delay the first frame; results arrive on tick.
+        default.request_pane_listing(0);
+        default.request_pane_listing(1);
 
         default
+    }
+
+    /// Spawns a background thread that re-scans attached drives every 2 s and
+    /// publishes the result (with a generation bump) through shared state, so
+    /// the render thread never blocks on `lsblk`. Works the same way on
+    /// Linux, Windows and macOS: `list_drives()` runs on this worker, not on
+    /// the render path.
+    fn start_drive_poller(&mut self) {
+        if self.drives_running {
+            return;
+        }
+        self.drives_running = true;
+
+        let cache = self.drive_cache.clone();
+        let generation = self.drive_generation.clone();
+
+        thread::spawn(move || loop {
+            if let Ok(drives) = list_drives() {
+                let mut guard = cache.lock().unwrap();
+                if *guard != drives {
+                    *guard = drives;
+                    *generation.lock().unwrap() += 1;
+                }
+            }
+            thread::sleep(Duration::from_secs(2));
+        });
     }
 
     /// Handles the tick event of the terminal.
     pub fn tick(&mut self) {
         self.drain_jobs();
         self.refresh_drives();
+        self.pick_up_pane_listings();
     }
 
     /// Set running to false to quit the application.
@@ -183,14 +238,17 @@ impl App {
         &mut self.panes[self.active_pane]
     }
 
-    /// Re-scans attached drives so newly connected devices appear without a
-    /// restart, like a file manager does. Polling on the tick keeps this
-    /// portable across Linux/Windows/macOS (event-driven detection would need
-    /// udev / WM_DEVICECHANGE / disk-arbitration plumbing).
+    /// Consumes the latest drive list from the background poller, but only
+    /// replaces the UI list when the poller reported a change. Never blocks
+    /// on `lsblk`; already runs on a worker thread.
     pub fn refresh_drives(&mut self) {
-        if let Ok(drives) = list_drives() {
-            self.drives = Some(drives);
+        let gen = *self.drive_generation.lock().unwrap();
+        if gen == self.seen_drive_generation {
+            return;
         }
+        self.seen_drive_generation = gen;
+        let drives = self.drive_cache.lock().unwrap().clone();
+        self.drives = Some(drives);
     }
 
     pub fn list_files_from_selected_folder(&mut self) {
@@ -210,6 +268,37 @@ impl App {
             let len = files.len();
             self.panes[pane_index].files = files;
             self.panes[pane_index].selected = vec![false; len];
+        }
+    }
+
+    /// Loads a pane's initial file list on a worker thread; the result is
+    /// delivered on `tick()` via [`App::pick_up_pane_listings`]. This keeps
+    /// slow directories (cold spin-up HDDs, network shares) off the render
+    /// path at startup.
+    fn request_pane_listing(&self, pane_index: usize) {
+        let Some(path) = self.panes[pane_index].folder.as_ref().map(|f| f.path.clone()) else {
+            return;
+        };
+        let show_hidden = self.show_hidden;
+        let tx = self.file_list_tx.clone();
+        thread::spawn(move || {
+            if let Ok(mut files) = list_files(&path) {
+                files.sort_by(|a, b| a.label.cmp(&b.label));
+                if !show_hidden {
+                    files.retain(|f| !f.label.starts_with('.'));
+                }
+                let _ = tx.send((pane_index, files));
+            }
+        });
+    }
+
+    fn pick_up_pane_listings(&mut self) {
+        while let Ok((pane_index, files)) = self.file_list_rx.try_recv() {
+            if pane_index < self.panes.len() {
+                let len = files.len();
+                self.panes[pane_index].files = files;
+                self.panes[pane_index].selected = vec![false; len];
+            }
         }
     }
 
@@ -989,8 +1078,8 @@ impl App {
         if let Some(right) = state.right {
             self.panes[1].folder = Some(right);
         }
-        self.list_files_for_pane(0);
-        self.list_files_for_pane(1);
+        // File lists are populated asynchronously from `App::new` via
+        // `request_pane_listing`, so a slow drive doesn't block startup.
     }
 
     /// Persists the current session state (split layout and pane folders).
