@@ -70,6 +70,8 @@ Shows the contents of the currently selected folder (`src/services/list_files.rs
 | `Alt+I` | Invert the selection |
 | `.` | Toggle hidden (dot) files |
 | `Del` | Delete the selection (with confirmation) |
+| `Enter` | Rename the selected entry |
+| `?` | Show metadata (size, type, dates) for the selected entry |
 | `` ` `` | Toggle the Copy Board sidebar (progress, pause, cancel) |
 | `→` | Enter selected folder / open selected file |
 | `←` | Go up one directory |
@@ -86,6 +88,10 @@ While searching, typed characters filter the file list by fuzzy subsequence matc
 **Copy / move (async):** `c` copies the selected entry(ies) to the other pane's folder, `m` moves them (rename when possible, otherwise copy + delete). `Space` multi-selects entries (marked `[*]`), so several can be copied/moved at once; with nothing selected, `c`/`m` act on the cursor entry. Copies run in background threads and never block the UI; progress and all active jobs are shown in the Copy Board (`` ` ``). With the board focused (`Tab` cycles focus), `↑`/`↓` select a job, `Space`/`p` pause/resume, `x` cancels (removes the partial destination), and `Esc` closes the board.
 
 **Delete:** `Del` deletes the selection (or the cursor entry when nothing is selected) after a confirmation prompt — `y`/`Enter` confirms, `n`/`Esc` cancels. Directories are removed recursively.
+
+**Rename:** `Enter` opens an in-place rename dialog with a visible cursor; type to edit, `←`/`→` move the cursor, `Backspace` deletes, `Enter` applies, `Esc` cancels. Rejects empty names and name collisions (won't overwrite).
+
+**Info:** `?` opens a metadata dialog showing name, full path, kind (folder, or a file type derived from the extension), hidden status, size (recursive for folders), and added/modified dates (UTC). Any key dismisses it.
 
 **Selection & visibility:** `Space` multi-selects (rows show `[*]`/`[ ]`); `Ctrl+A` selects or clears everything, `Alt+I` inverts the selection. (Super-based binds are not reliable in terminals, so `Ctrl`/`Alt` are used instead.) `.` toggles whether hidden (dot) files are listed. Rows carry a folder glyph (`□`) or file glyph (`·`), both single-width Unicode that render identically on Linux/macOS/Windows terminal fonts.
 

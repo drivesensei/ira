@@ -8,6 +8,7 @@ use ratatui::widgets::ListState;
 use crate::{
     domain::data::Folder,
     services::{
+        file_info::build_info,
         bookmarks::{next_free_shortcut, read_bookmarks, write_bookmarks},
         drives::{list_drives, mount_drive},
         folders::list_common_folders,
@@ -33,6 +34,23 @@ pub struct Pane {
     /// Parallel to `files`: `true` marks entries multi-selected with Space
     /// for batch copy/move/delete.
     pub selected: Vec<bool>,
+}
+
+/// An in-place rename being edited in a modal text box.
+pub struct RenamePrompt {
+    /// Index into the active pane's file list.
+    pub index: usize,
+    /// Original name (no-op / existence checks).
+    pub original: String,
+    /// Edited name as Unicode characters.
+    pub text: Vec<char>,
+    /// Cursor position (index into `text`).
+    pub cursor: usize,
+}
+
+/// Read-only metadata dialog for a file or folder.
+pub struct InfoDialog {
+    pub lines: Vec<String>,
 }
 
 /// A pending destructive action awaiting confirmation.
@@ -79,6 +97,10 @@ pub struct App {
 
     /// Pending destructive-action confirmation (delete).
     pub confirming: Option<Confirm>,
+    /// Active rename edit; `None` when not renaming.
+    pub renaming: Option<RenamePrompt>,
+    /// Open metadata dialog; `None` when closed.
+    pub info: Option<InfoDialog>,
 
     job_tx: mpsc::Sender<JobEvent>,
     job_rx: mpsc::Receiver<JobEvent>,
@@ -104,6 +126,8 @@ impl Default for App {
             board_focused: false,
             copy_board_state: ListState::default(),
             confirming: None,
+            renaming: None,
+            info: None,
             job_tx,
             job_rx,
             next_job_id: 0,
@@ -434,6 +458,125 @@ impl App {
         self.show_hidden = !self.show_hidden;
         self.list_files_for_pane(0);
         self.list_files_for_pane(1);
+    }
+
+    // ---- Rename (modal text editor) ----
+
+    /// Opens the rename dialog for the entry under the cursor. Bound to Enter.
+    pub fn start_rename(&mut self) {
+        if self.confirming.is_some() || self.info.is_some() {
+            return;
+        }
+        let Some(vis_idx) = self.pane().state.selected() else {
+            return;
+        };
+        let Some(file_idx) = self.visible_file_index(vis_idx) else {
+            return;
+        };
+        let Some(entry) = self.pane().files.get(file_idx) else {
+            return;
+        };
+        let label = entry.label.clone();
+        self.renaming = Some(RenamePrompt {
+            index: file_idx,
+            original: label.clone(),
+            text: label.chars().collect(),
+            cursor: label.chars().count(),
+        });
+    }
+
+    pub fn cancel_rename(&mut self) {
+        self.renaming = None;
+    }
+
+    /// Applies the edited name (if changed and valid) and closes the dialog.
+    pub fn commit_rename(&mut self) {
+        let Some(prompt) = self.renaming.take() else {
+            return;
+        };
+        let new_name = chars_to_string(&prompt.text);
+        if new_name.is_empty() || new_name == prompt.original {
+            return; // nothing changed
+        }
+        let Some(entry) = self.panes[self.active_pane].files.get(prompt.index) else {
+            return;
+        };
+        let src = entry.path.clone();
+        let Some(parent) = std::path::Path::new(&src).parent() else {
+            return;
+        };
+        let dst = parent.join(new_name);
+        if std::fs::metadata(&dst).is_ok() {
+            eprintln!("Cannot rename: '{}' already exists.", prompt.original);
+            return;
+        }
+        match std::fs::rename(&src, &dst) {
+            Ok(_) => {}
+            Err(e) => eprintln!("Failed to rename: {e}"),
+        }
+        // Drop the old selection; the list was rebuilt.
+        self.list_files_for_pane(self.active_pane);
+        self.pane_mut().state.select(None);
+    }
+
+    pub fn rename_insert(&mut self, c: char) {
+        if let Some(p) = &mut self.renaming {
+            let pos = p.cursor.min(p.text.len());
+            let mut next: Vec<char> = Vec::with_capacity(p.text.len() + 1);
+            for (i, ch) in p.text.iter().enumerate() {
+                if i == pos {
+                    next.push(c);
+                }
+                next.push(*ch);
+            }
+            if pos >= p.text.len() {
+                next.push(c);
+            }
+            p.text = next;
+            p.cursor = pos + 1;
+        }
+    }
+
+    pub fn rename_backspace(&mut self) {
+        if let Some(p) = &mut self.renaming {
+            if p.cursor > 0 {
+                p.text.remove(p.cursor - 1);
+                p.cursor -= 1;
+            }
+        }
+    }
+
+    pub fn rename_cursor_left(&mut self) {
+        if let Some(p) = &mut self.renaming {
+            p.cursor = p.cursor.saturating_sub(1);
+        }
+    }
+
+    pub fn rename_cursor_right(&mut self) {
+        if let Some(p) = &mut self.renaming {
+            p.cursor = (p.cursor + 1).min(p.text.len());
+        }
+    }
+
+    // ---- Info dialog ----
+
+    /// Opens the metadata dialog for the entry under the cursor. Bound to `?`.
+    pub fn show_info(&mut self) {
+        if self.confirming.is_some() || self.renaming.is_some() {
+            return;
+        }
+        let Some(vis_idx) = self.pane().state.selected() else {
+            return;
+        };
+        let Some(entry) = self.visible_entry(vis_idx) else {
+            return;
+        };
+        let lines = build_info(entry);
+        self.info = Some(InfoDialog { lines });
+    }
+
+    pub fn close_info(&mut self) {
+        self.info = None;
     }
 
     /// Full paths to operate on: all multi-selected entries, or the cursor
@@ -859,6 +1002,15 @@ impl App {
             right: self.panes[1].folder.clone(),
         });
     }
+}
+
+/// Joins Unicode characters into a `String`.
+fn chars_to_string(chars: &[char]) -> String {
+    let mut s = String::new();
+    for c in chars {
+        s.push(*c);
+    }
+    s
 }
 
 /// Opens a file with the system default application without blocking the TUI.

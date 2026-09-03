@@ -32,6 +32,8 @@ cargo build --release
 | `Alt+I` | Invert the selection |
 | `.` | Toggle hidden (dot) files |
 | `Del` | Delete the selection (with confirmation) |
+| `Enter` | Rename the selected entry |
+| `?` | Show metadata (size, type, dates) for the selected entry |
 | `` ` `` | Toggle the Copy Board sidebar (progress, pause, cancel) |
 | `→` | Enter the selected folder, or open the selected file |
 | `←` | Go up one directory |

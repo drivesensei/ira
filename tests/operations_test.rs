@@ -182,3 +182,101 @@ fn delete_requires_confirmation_and_removes_on_confirm() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn rename_file_in_place() {
+    let base = std::env::temp_dir().join(format!("ira_rename_{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+    let old = base.join("doc");
+    std::fs::write(&old, "data").unwrap();
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new("t".into(), base.to_str().unwrap().into(), '#'));
+    app.panes[0].files = vec![entry(old.to_str().unwrap())];
+    app.panes[0].selected = vec![false];
+    app.panes[0].state.select(Some(0));
+
+    app.start_rename();
+    assert!(app.renaming.is_some());
+    app.rename_insert('x'); // "doc" -> "docx"
+    app.commit_rename();
+
+    assert!(app.renaming.is_none());
+    assert!(!base.join("doc").exists());
+    assert!(base.join("docx").exists());
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn rename_cancel_keeps_original_name() {
+    let base = std::env::temp_dir().join(format!("ira_rename_cancel_{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+    let old = base.join("keep.txt");
+    std::fs::write(&old, "x").unwrap();
+
+    let mut app = App::default();
+    app.panes[0].files = vec![entry(old.to_str().unwrap())];
+    app.panes[0].selected = vec![false];
+    app.panes[0].state.select(Some(0));
+
+    app.start_rename();
+    app.rename_insert('y');
+    app.cancel_rename();
+    assert!(app.renaming.is_none());
+    assert!(base.join("keep.txt").exists());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn rename_supports_cursor_and_backspace() {
+    let mut app = App::default();
+    app.panes[0].files = vec![entry("/tmp/abc.txt")];
+    app.panes[0].selected = vec![false];
+    app.panes[0].state.select(Some(0));
+
+    app.start_rename(); // text "abc.txt" (7 chars), cursor at 7
+    app.rename_cursor_left(); // 6
+    app.rename_cursor_left(); // 5
+    app.rename_backspace(); // remove chars[4], cursor 4
+    app.rename_insert('T'); // insert at 4, cursor 5
+
+    let p = app.renaming.as_ref().unwrap();
+    assert_eq!(p.text.iter().collect::<String>(), "abc.Txt");
+    assert_eq!(p.cursor, 5);
+}
+
+#[test]
+fn info_dialog_shows_metadata() {
+    let base = std::env::temp_dir().join(format!("ira_info_{}", std::process::id()));
+    std::fs::create_dir_all(base.join("sub")).unwrap();
+    let f = base.join("photo.png");
+    std::fs::write(&f, "1234567890123").unwrap(); // 13 bytes
+
+    let mut app = App::default();
+    app.panes[0].files = vec![entry(f.to_str().unwrap())];
+    app.panes[0].selected = vec![false];
+    app.panes[0].state.select(Some(0));
+
+    app.show_info();
+    let lines = app.info.as_ref().unwrap().lines.clone();
+    assert!(lines.iter().any(|l| l.starts_with("Name: photo.png")));
+    assert!(lines.iter().any(|l| l.starts_with("Kind: Image")));
+    assert!(lines.iter().any(|l| l.contains("13 bytes")));
+    assert!(lines.iter().any(|l| l.starts_with("Added:") || l.starts_with("Modified:")));
+
+    app.close_info();
+    assert!(app.info.is_none());
+
+    // Folder entry shows folder kind and recursive size.
+    let mut dir_entry = entry(base.join("sub").to_str().unwrap());
+    dir_entry.is_dir = true;
+    app.panes[0].files = vec![dir_entry];
+    app.panes[0].state.select(Some(0));
+    app.show_info();
+    let lines = app.info.as_ref().unwrap().lines.clone();
+    assert!(lines.iter().any(|l| l.starts_with("Kind: Folder")));
+    assert!(lines.iter().any(|l| l.starts_with("Size:")));
+
+    let _ = std::fs::remove_dir_all(&base);
+}

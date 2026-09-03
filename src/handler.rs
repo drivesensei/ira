@@ -3,14 +3,43 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// Handles the key events and updates the state of [`App`].
 pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
-    // Ctrl combos: Ctrl+C quits, Ctrl+A selects all / clears all. (Ctrl is the
-    // only modifier every terminal reports reliably.)
+    // Ctrl combos: Ctrl+C quits in every mode; Ctrl+A selects all / clears all
+    // (except while editing a rename). Ctrl is the only modifier every
+    // terminal reports reliably.
     if key_event.modifiers == KeyModifiers::CONTROL {
         match key_event.code {
-            KeyCode::Char('c') | KeyCode::Char('C') => app.quit(),
-            KeyCode::Char('a') | KeyCode::Char('A') => app.toggle_select_all(),
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                app.quit();
+                return Ok(());
+            }
             _ => {}
         }
+        if app.renaming.is_none() {
+            match key_event.code {
+                KeyCode::Char('a') | KeyCode::Char('A') => app.toggle_select_all(),
+                _ => {}
+            }
+        }
+        return Ok(());
+    }
+
+    // Rename text editor.
+    if app.renaming.is_some() {
+        match key_event.code {
+            KeyCode::Esc => app.cancel_rename(),
+            KeyCode::Enter => app.commit_rename(),
+            KeyCode::Backspace => app.rename_backspace(),
+            KeyCode::Left => app.rename_cursor_left(),
+            KeyCode::Right => app.rename_cursor_right(),
+            KeyCode::Char(c) => app.rename_insert(c),
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    // Info dialog: any key dismisses it.
+    if app.info.is_some() {
+        app.close_info();
         return Ok(());
     }
 
@@ -125,6 +154,9 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         // `.` toggles hidden files.
         KeyCode::Char('.') => app.toggle_hidden(),
 
+        // `?` shows metadata for the selected entry.
+        KeyCode::Char('?') => app.show_info(),
+
         KeyCode::Char(c) if !c.is_digit(10) => {
             let common = app.get_common_folders_shortcuts();
             if let Some(idx) = common.iter().position(|sc| *sc == c) {
@@ -140,6 +172,9 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         // Files navigation handlers
         KeyCode::Right => app.enter_folder(),
         KeyCode::Left => app.out_of_folder(),
+
+        // Enter renames the selected entry (macOS-style).
+        KeyCode::Enter => app.start_rename(),
 
         KeyCode::Up => {
             if key_event.modifiers == KeyModifiers::ALT {
