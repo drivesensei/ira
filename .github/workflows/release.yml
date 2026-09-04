@@ -28,6 +28,9 @@ jobs:
             target: x86_64-unknown-linux-musl
           - os: ubuntu-22.04
             target: aarch64-unknown-linux-musl
+            # rustup's self-contained musl linking covers x86_64 but not aarch64:
+            # point the linker at the bundled rust-lld.
+            rustflags: "-C linker=rust-lld"
           - os: macos-14
             target: x86_64-apple-darwin
           - os: macos-14
@@ -45,9 +48,12 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # Pure-Rust crate: musl targets link with rust-lld, no cross toolchain needed.
+      # Pure-Rust crate: musl targets link statically; aarch64-musl links via
+      # the bundled rust-lld (see matrix rustflags).
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
 
       - name: Archive (unix)
         if: runner.os != 'Windows'

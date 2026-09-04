@@ -260,6 +260,16 @@ pub fn mount_drive(device: &str) -> IOResult<String> {
     })
 }
 
+/// On-demand mounting is Linux-only (udisks2); macOS and Windows volumes are
+/// always mounted, so this is never reachable there.
+#[cfg(not(target_os = "linux"))]
+pub fn mount_drive(_device: &str) -> IOResult<String> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "on-demand drive mounting is not supported on this platform",
+    ))
+}
+
 /// Unmounts (and spins down, when the device is a whole drive) a removable
 /// device via udisks2, mirroring the desktop file manager's eject.
 #[cfg(target_os = "linux")]
