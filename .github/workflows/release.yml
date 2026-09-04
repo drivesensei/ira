@@ -1,81 +1,356 @@
 name: Release
 
+# Tag-triggered release pipeline: one matrix job per OS target, then universal
+# macOS binary, .deb packages, checksums, GitHub Release, and channel publishes
+# (Homebrew tap, winget, AUR, crates.io — each skipped when its secret is absent).
+#
+# Rollout notes and owner prerequisites: docs/distribution-plan.md
 on:
   push:
     tags:
-      - 'v*.*.*' # Triggering the workflow on tags like v1.0.0
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        platform: [ubuntu-latest, macos-latest, windows-latest]
-
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-musl
+          - os: macos-14
+            target: x86_64-apple-darwin
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
     steps:
-      - name: Check out the code
-        uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
-      - name: Set up Rust
-        uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          profile: minimal
+          targets: ${{ matrix.target }}
 
-      - name: Cache Cargo registry
-        uses: actions/cache@v2
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry
-          restore-keys: |
-            ${{ runner.os }}-cargo-registry
+          key: ${{ matrix.target }}
 
-      - name: Cache Cargo index
-        uses: actions/cache@v2
-        with:
-          path: ~/.cargo/index
-          key: ${{ runner.os }}-cargo-index
-          restore-keys: |
-            ${{ runner.os }}-cargo-index
-
-      - name: Cache Cargo build
-        uses: actions/cache@v2
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-build
-          restore-keys: |
-            ${{ runner.os }}-cargo-build
-
+      # Pure-Rust crate: musl targets link with rust-lld, no cross toolchain needed.
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Archive binaries
-        if: matrix.platform == 'ubuntu-latest' || matrix.platform == 'macos-latest'
-        run: tar -czf ${GITHUB_RUN_NUMBER}_ira_${matrix.platform}.tar.gz -C target/release ira
-
-      - name: Archive binary (Windows)
-        if: matrix.platform == 'windows-latest'
+      - name: Archive (unix)
+        if: runner.os != 'Windows'
         run: |
-          Compress-Archive -Path target\release\ira.exe -DestinationPath ${GITHUB_RUN_NUMBER}_ira_windows.zip
+          VERSION="${GITHUB_REF_NAME#v}"
+          tar -cJf "ira-${VERSION}-${{ matrix.target }}.tar.xz" \
+            -C "target/${{ matrix.target }}/release" ira
 
-      - name: Upload Release Asset
-        uses: actions/upload-artifact@v3
+      - name: Archive (windows)
+        if: runner.os == 'Windows'
+        run: |
+          $v = $env:GITHUB_REF_NAME.TrimStart('v')
+          Compress-Archive -Path "target/x86_64-pc-windows-msvc/release/ira.exe" `
+            -DestinationPath "ira-$v-x86_64-pc-windows-msvc.zip"
+
+      - uses: actions/upload-artifact@v4
         with:
-          name: ira-${{ matrix.platform }}
+          name: dist-${{ matrix.target }}
           path: |
-            ${GITHUB_RUN_NUMBER}_ira_${{ matrix.platform }}.tar.gz
-            ${GITHUB_RUN_NUMBER}_ira_windows.zip
+            ira-*.tar.xz
+            ira-*.zip
+          if-no-files-found: error
 
-  create_release:
+  macos-universal:
+    name: macos universal
+    needs: build
+    runs-on: macos-14
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*-apple-darwin
+          merge-multiple: true
+          path: dist
+
+      - name: Combine with lipo
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir x64 arm64
+          tar -xJf "dist/ira-${VERSION}-x86_64-apple-darwin.tar.xz" -C x64
+          tar -xJf "dist/ira-${VERSION}-aarch64-apple-darwin.tar.xz" -C arm64
+          lipo -create -output ira x64/ira arm64/ira
+          tar -cJf "ira-${VERSION}-universal-apple-darwin.tar.xz" ira
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-universal-apple-darwin
+          path: ira-*.tar.xz
+          if-no-files-found: error
+
+  deb:
+    name: deb (${{ matrix.debarch }})
+    needs: build
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            debarch: amd64
+          - target: aarch64-unknown-linux-musl
+            debarch: arm64
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist
+
+      - name: Build package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          tar -xJf dist/*.tar.xz -C dist
+          mkdir -p pkg/DEBIAN pkg/usr/bin
+          install -m755 dist/ira pkg/usr/bin/ira
+          cat > pkg/DEBIAN/control <<EOF
+          Package: ira
+          Version: $VERSION
+          Section: utils
+          Priority: optional
+          Architecture: ${{ matrix.debarch }}
+          Maintainer: drivesensei <drivesensei@users.noreply.github.com>
+          Homepage: https://github.com/drivesensei/ira
+          Recommends: udisks2
+          Description: Terminal file manager built with Ratatui and crossterm
+           IRA is a dual-pane terminal file manager with drive mounting,
+           bookmarks, multi-select copy/move, and fuzzy search.
+          EOF
+          dpkg-deb --build --root-owner-group pkg "ira_${VERSION}_${{ matrix.debarch }}.deb"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.debarch }}
+          path: ira_*.deb
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    needs: [build, macos-universal, deb]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - name: Checksums
+        run: |
+          cd dist
+          find . -type f \( -name '*.tar.xz' -o -name '*.zip' -o -name '*.deb' \) \
+            | sort | xargs sha256sum --binary > SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+
+  homebrew-tap:
+    name: Publish Homebrew formula
     needs: release
     runs-on: ubuntu-latest
     steps:
-      - name: Create GitHub Release
-        id: create_release
-        uses: softprops/action-gh-release@v1
+      - uses: actions/download-artifact@v4
         with:
-          files: |
-            *.tar.gz
-            *.zip
+          name: dist-universal-apple-darwin
+          path: dist
+
+      - name: Check for HOMEBREW_TAP_TOKEN
+        id: guard
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "HOMEBREW_TAP_TOKEN not set; skipping tap update" >> "$GITHUB_STEP_SUMMARY"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push formula
+        if: steps.guard.outputs.enabled == 'true'
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          SHA="$(sha256sum "dist/ira-${VERSION}-universal-apple-darwin.tar.xz" | cut -d' ' -f1)"
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/drivesensei/homebrew-ira.git" tap
+          mkdir -p tap/Formula
+          cat > tap/Formula/ira.rb <<EOF
+          class Ira < Formula
+            desc "Terminal file manager built with Ratatui and crossterm"
+            homepage "https://github.com/drivesensei/ira"
+            url "https://github.com/drivesensei/ira/releases/download/v${VERSION}/ira-v${VERSION}-universal-apple-darwin.tar.xz"
+            sha256 "${SHA}"
+            license "MIT"
+
+            def install
+              bin.install "ira"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/ira --version")
+            end
+          end
+          EOF
+          cd tap
+          git config user.name "drivesensei"
+          git config user.email "drivesenseimx@gmail.com"
+          git add Formula/ira.rb
+          git commit -m "ira ${VERSION}"
+          git push
+
+  winget:
+    name: Update winget manifest
+    needs: release
+    runs-on: windows-latest
+    steps:
+      - name: Check for WINGET_PAT
+        id: guard
+        env:
+          TOKEN: ${{ secrets.WINGET_PAT }}
+        shell: pwsh
+        run: |
+          if ($env:TOKEN) {
+            "enabled=true" | Out-File -Append $env:GITHUB_OUTPUT
+          } else {
+            "WINGET_PAT not set; skipping manifest update" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+            "enabled=false" | Out-File -Append $env:GITHUB_OUTPUT
+          }
+
+      # Requires the package to exist: first submission is manual
+      # (`wingetcreate new <zip-url>` + PR to microsoft/winget-pkgs).
+      # wingetcreate is not preinstalled on hosted runners.
+      - name: Install wingetcreate
+        shell: pwsh
+        run: Invoke-WebRequest -Uri "https://aka.ms/wingetcreate/latest" -OutFile "wingetcreate.exe"
+      - name: Submit manifest update
+        if: steps.guard.outputs.enabled == 'true'
+        shell: pwsh
+        env:
+          WINGET_PAT: ${{ secrets.WINGET_PAT }}
+        run: |
+          $v = $env:GITHUB_REF_NAME.TrimStart('v')
+          $url = "https://github.com/drivesensei/ira/releases/download/$($env:GITHUB_REF_NAME)/ira-$v-x86_64-pc-windows-msvc.zip"
+          .\wingetcreate.exe update drivesensei.IRA --version $v --urls $url --submit-to-winget-pkgs --token $env:WINGET_PAT
+
+  aur:
+    name: Publish AUR package
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-x86_64-unknown-linux-musl
+          path: dist
+
+      - name: Check for AUR_SSH_KEY
+        id: guard
+        env:
+          KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          if [ -n "$KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "AUR_SSH_KEY not set; skipping AUR update" >> "$GITHUB_STEP_SUMMARY"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push PKGBUILD
+        if: steps.guard.outputs.enabled == 'true'
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          TAG="$GITHUB_REF_NAME"
+          SHA="$(sha256sum "dist/ira-${VERSION}-x86_64-unknown-linux-musl.tar.xz" | cut -d' ' -f1)"
+          mkdir -p ~/.ssh
+          echo "$AUR_SSH_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan -H aur.archlinux.org >> ~/.ssh/known_hosts
+          cd aur
+          cat > PKGBUILD <<EOF
+          pkgname=ira-bin
+          pkgver=${VERSION}
+          pkgrel=1
+          pkgdesc="Terminal file manager built with Ratatui and crossterm"
+          arch=('x86_64')
+          url="https://github.com/drivesensei/ira"
+          license=('MIT')
+          optdepends=('udisks2: drive mounting support')
+          provides=('ira')
+          conflicts=('ira')
+          source=("ira-\$pkgver.tar.xz::\$url/releases/download/v\$pkgver/ira-v\$pkgver-x86_64-unknown-linux-musl.tar.xz")
+          sha256sums=('${SHA}')
+          package() {
+            install -Dm755 "\$srcdir/ira" "\$pkgdir/usr/bin/ira"
+          }
+          EOF
+          cat > .SRCINFO <<EOF
+          pkgbase = ira-bin
+          	pkgdesc = Terminal file manager built with Ratatui and crossterm
+          	pkgver = ${VERSION}
+          	pkgrel = 1
+          	url = https://github.com/drivesensei/ira
+          	arch = x86_64
+          	license = MIT
+          	optdepends = udisks2: drive mounting support
+          	provides = ira
+          	conflicts = ira
+          	source = ira-${VERSION}.tar.xz::https://github.com/drivesensei/ira/releases/download/${TAG}/ira-${VERSION}-x86_64-unknown-linux-musl.tar.xz
+          	sha256sums = ${SHA}
+          pkgname = ira-bin
+          EOF
+          git config user.name "drivesensei"
+          git config user.email "drivesenseimx@gmail.com"
+          git add PKGBUILD .SRCINFO
+          git commit -m "ira-bin ${VERSION}"
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/aur" git push
+
+  crates-io:
+    name: Publish to crates.io
+    needs: build
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check for CARGO_REGISTRY_TOKEN
+        id: guard
+        env:
+          TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "CARGO_REGISTRY_TOKEN not set; skipping crates.io publish" >> "$GITHUB_STEP_SUMMARY"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish
+        if: steps.guard.outputs.enabled == 'true'
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

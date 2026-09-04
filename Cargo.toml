@@ -1,9 +1,13 @@
 [package]
 name = "ira"
 version = "0.1.0"
+description = "A terminal file manager built with Ratatui and crossterm"
+repository = "https://github.com/drivesensei/ira"
 authors = ["vladimir.lopez"]
 license = "MIT"
 edition = "2021"
+keywords = ["tui", "file-manager", "terminal"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 dirs-next = "2.0.0"

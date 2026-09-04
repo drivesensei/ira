@@ -7,6 +7,12 @@ use ratatui::Terminal;
 use std::io;
 
 fn main() -> AppResult<()> {
+    // Package-manager entry point: `--version` / `-V` prints and exits before
+    // the TUI initializes. Homebrew's `brew test` and other packagers rely on it.
+    if std::env::args().skip(1).any(|a| a == "--version" || a == "-V") {
+        println!("ira {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     // Create an application.
     let mut app = App::new();
 

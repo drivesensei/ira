@@ -9,6 +9,22 @@ A terminal file manager built with Rust, [Ratatui](https://ratatui.rs), and cros
 - **Bookmarks** — mark any folder with `b`; each gets a single-letter shortcut auto-assigned in QWERTY keyboard order, persisted to `~/.config/ira/bookmarks`.
 - **File browser** — alphabetically sorted listing, cursor navigation, opens files with the system default application.
 
+## Install
+
+Releases are published automatically for every version tag — see
+[GitHub Releases](https://github.com/drivesensei/ira/releases) for all assets and checksums.
+
+- **macOS** (Homebrew): `brew install drivesensei/ira/ira`
+- **Windows** (winget): `winget install drivesensei.IRA`
+- **Ubuntu/Debian**: download the `.deb` from a release and run
+  `sudo dpkg -i ira_<version>_amd64.deb` (or `apt install ./ira_...deb`)
+- **Arch Linux**: install the `ira-bin` package from the AUR
+- **Anywhere with Rust**: `cargo install ira`
+
+Linux drive-mounting support uses `udisks2` (installed automatically on most desktop
+distributions; listed as a recommended dependency in the `.deb`).
+
+
 ## Build
 
 Requires Rust (tested with 1.98).
