@@ -33,7 +33,11 @@ pub fn get_parent_directory(dir_path: &str) -> Result<Option<Folder>> {
         .unwrap_or_default()
         .to_string();
 
-    Ok(Some(Folder::new(label, parent_path.to_str().unwrap_or_default().to_string(), '#')))
+    Ok(Some(Folder::new(
+        label,
+        parent_path.to_str().unwrap_or_default().to_string(),
+        '#',
+    )))
 }
 
 #[cfg(test)]

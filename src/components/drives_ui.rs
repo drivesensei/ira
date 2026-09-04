@@ -13,7 +13,9 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
         let drive_spans: Vec<Span> = drives
             .iter()
             .enumerate()
-            .map(|(i, drive)| Span::raw(format!(" [{}] 🖥️ {}", i + 1, drive.label)).style(Style::new().cyan()))
+            .map(|(i, drive)| {
+                Span::raw(format!(" [{}] {}", i + 1, drive.label)).style(Style::new().cyan())
+            })
             .collect();
 
         // let drive_list = ratatui::widgets::List::new(drive_spans)
@@ -28,7 +30,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
         let text = Line::from(drive_spans);
         let dlist = ratatui::widgets::Paragraph::new(text).block(
             Block::default()
-                .title(" Drives ")
+                .title(" Drives  (press e to unmount the current drive) ")
                 .borders(ratatui::widgets::Borders::ALL),
         );
 

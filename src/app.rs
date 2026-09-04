@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::error;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use open::that_detached;
 use ratatui::widgets::ListState;
@@ -9,12 +11,15 @@ use ratatui::widgets::ListState;
 use crate::{
     domain::data::Folder,
     services::{
-        file_info::build_info,
         bookmarks::{next_free_shortcut, read_bookmarks, write_bookmarks},
-        drives::{list_drives, mount_drive},
+        drives::{eject_drive, list_drives, mount_drive},
+        file_info::{
+            build_info_fast, build_info_full, dir_size, size_line_final, InfoEvent, SizeInfo,
+            WalkHandle,
+        },
         folders::list_common_folders,
-        list_files::{list_files, FEntry},
-        state::{load_state, save_state, SessionState},
+        list_files::{list_files_bounded, list_files_chunked, FEntry, LISTING_CHUNK},
+        state::{load_state, save_state, save_state_to, SessionState, SizeEntry},
         transfer::{spawn_job, Job, JobControl, JobEvent, JobKind, JobStatus},
     },
     utils::{
@@ -35,6 +40,16 @@ pub struct Pane {
     /// Parallel to `files`: `true` marks entries multi-selected with Space
     /// for batch copy/move/delete.
     pub selected: Vec<bool>,
+    /// First row index of the visible render window (windowed rendering).
+    pub render_scroll: usize,
+    /// `false` while a chunked listing is still streaming; `true` once the
+    /// final sorted pass replaced the streamed prefix (or the listing
+    /// errored). Test/UI hook for "listing is complete".
+    pub listing_settled: bool,
+    /// Bumped on every listing request; results carrying an older
+    /// generation are dropped, so overlapping listings never interleave
+    /// (the "folder lists itself" bug).
+    pub listing_generation: u64,
 }
 
 /// An in-place rename being edited in a modal text box.
@@ -49,9 +64,33 @@ pub struct RenamePrompt {
     pub cursor: usize,
 }
 
-/// Read-only metadata dialog for a file or folder.
+/// A transient message shown in the bottom status bar. `is_error` styles it
+/// red; eject-busy and rename collisions are errors, "copied 3 items" is not.
+#[derive(Debug, Clone)]
+pub struct Status {
+    pub text: String,
+    /// `true` renders red; `false` renders as an ordinary notice.
+    pub is_error: bool,
+    /// When the message was raised; the bar clears itself after
+    /// [`STATUS_TTL`].
+    pub raised: Instant,
+}
+
+/// How long a status message stays visible.
+pub const STATUS_TTL: Duration = Duration::from_secs(8);
+
+/// Read-only metadata dialog for a file or folder. Opens instantly with the
+/// no-filesystem fast lines; the worker's `Meta` event replaces them with
+/// the stat lines, and the folder's Size line is injected/updated from the
+/// size cache while its background walk runs.
 pub struct InfoDialog {
     pub lines: Vec<String>,
+    /// Queried path; matches events arriving from background threads.
+    pub path: String,
+    /// `true` until the worker's `Meta` event arrives.
+    pub pending: bool,
+    /// When the dialog opened; drives the loading spinner animation.
+    pub started: Instant,
 }
 
 /// A pending destructive action awaiting confirmation.
@@ -60,6 +99,12 @@ pub struct Confirm {
     pub label: String,
     /// Full paths of the items the action would affect.
     pub paths: Vec<String>,
+}
+
+/// A running folder-size walk plus its start time (drives the spinner).
+struct WalkSlot {
+    handle: WalkHandle,
+    started: Instant,
 }
 
 /// Application.
@@ -103,8 +148,19 @@ pub struct App {
     /// Open metadata dialog; `None` when closed.
     pub info: Option<InfoDialog>,
 
+    /// Transient status/error message shown in the bottom bar until it
+    /// expires (or the next action replaces it).
+    pub status: Option<Status>,
+
     job_tx: mpsc::Sender<JobEvent>,
     job_rx: mpsc::Receiver<JobEvent>,
+    info_tx: mpsc::Sender<InfoEvent>,
+    info_rx: mpsc::Receiver<InfoEvent>,
+    /// Folder sizes measured this session (partial while walking), keyed by
+    /// path. Survives dialog dismissal; re-querying shows it instantly.
+    size_cache: HashMap<String, SizeInfo>,
+    /// Active background walks keyed by path (one per folder, cancellable).
+    size_walks: HashMap<String, WalkSlot>,
     next_job_id: u64,
 
     /// Latest drive list produced by the background poller.
@@ -120,14 +176,18 @@ pub struct App {
 
     /// Startup file listings run on worker threads and are delivered here, so
     /// a slow folder (e.g. a cold spin-up HDD) can't block `App::new()`.
-    file_list_tx: mpsc::Sender<(usize, Vec<FEntry>)>,
-    file_list_rx: mpsc::Receiver<(usize, Vec<FEntry>)>,
+    file_list_tx: mpsc::Sender<(usize, Vec<FEntry>, bool, u64)>,
+    file_list_rx: mpsc::Receiver<(usize, Vec<FEntry>, bool, u64)>,
+    /// State file location override; `None` = the real `~/.config/ira/state`.
+    /// Integration tests set this so their walks never touch user config.
+    pub state_path: Option<PathBuf>,
 }
 
 impl Default for App {
     fn default() -> Self {
         let (job_tx, job_rx) = mpsc::channel();
         let (file_list_tx, file_list_rx) = mpsc::channel();
+        let (info_tx, info_rx) = mpsc::channel();
         Self {
             running: true,
             size: (1024, 768),
@@ -135,10 +195,11 @@ impl Default for App {
             folders: Some(list_common_folders()),
             bookmarks: Some(Vec::new()),
             panes: [Pane::default(), Pane::default()],
+            state_path: None,
             active_pane: 0,
-            split: false,
             search_query: None,
             show_hidden: false,
+            split: false,
             jobs: Vec::new(),
             copy_board: false,
             board_focused: false,
@@ -146,8 +207,11 @@ impl Default for App {
             confirming: None,
             renaming: None,
             info: None,
+            status: None,
             job_tx,
             job_rx,
+            size_cache: HashMap::new(),
+            size_walks: HashMap::new(),
             next_job_id: 0,
             drive_cache: Arc::new(Mutex::new(Vec::new())),
             drive_generation: Arc::new(Mutex::new(0)),
@@ -155,8 +219,20 @@ impl Default for App {
             drives_running: false,
             file_list_tx,
             file_list_rx,
+            info_tx,
+            info_rx,
         }
     }
+}
+
+/// Finds the mounted removable drive whose mount point contains
+/// `folder_path` (longest mount-point prefix wins).
+fn matching_drive<'a>(drives: &'a [Folder], folder_path: &str) -> Option<&'a Folder> {
+    drives
+        .iter()
+        .filter(|d| d.device.is_some() && !d.path.is_empty())
+        .filter(|d| folder_path.starts_with(&d.path))
+        .max_by_key(|d| d.path.len())
 }
 
 impl App {
@@ -175,12 +251,45 @@ impl App {
         }
         default.restore_state();
         default.start_drive_poller();
-        // Load the initial file listings off the render thread so a cold
-        // (spin-up) drive can't delay the first frame; results arrive on tick.
+        // Startup pane listings run on the async chunked worker so a slow
+        // drive can't block the first frame.
         default.request_pane_listing(0);
         default.request_pane_listing(1);
-
         default
+    }
+
+    /// Handles the tick event of the terminal.
+    pub fn tick(&mut self) {
+        self.drain_jobs();
+        self.drain_info_results();
+        self.refresh_drives();
+        self.pick_up_pane_listings();
+        self.expire_status();
+    }
+
+    /// Raises a transient bottom-bar message (replaces any current one).
+    pub fn set_status(&mut self, text: impl Into<String>, is_error: bool) {
+        self.status = Some(Status {
+            text: text.into(),
+            is_error,
+            raised: Instant::now(),
+        });
+    }
+
+    /// Dismisses the error dialog immediately (any key while it is open).
+    pub fn clear_status(&mut self) {
+        self.status = None;
+    }
+
+    /// Drops the status message once its TTL has elapsed.
+    fn expire_status(&mut self) {
+        if self
+            .status
+            .as_ref()
+            .is_some_and(|s| s.raised.elapsed() >= STATUS_TTL)
+        {
+            self.status = None;
+        }
     }
 
     /// Spawns a background thread that re-scans attached drives every 2 s and
@@ -207,13 +316,6 @@ impl App {
             }
             thread::sleep(Duration::from_secs(2));
         });
-    }
-
-    /// Handles the tick event of the terminal.
-    pub fn tick(&mut self) {
-        self.drain_jobs();
-        self.refresh_drives();
-        self.pick_up_pane_listings();
     }
 
     /// Set running to false to quit the application.
@@ -255,49 +357,118 @@ impl App {
         self.list_files_for_pane(self.active_pane);
     }
 
+    /// Lists `pane_index`'s folder asynchronously (chunked streaming +
+    /// sorted final pass) so huge/slow folders never block the UI.
     fn list_files_for_pane(&mut self, pane_index: usize) {
-        let path = self.panes[pane_index].folder.as_ref().map(|f| f.path.clone());
-        let Some(path) = path else {
+        if pane_index >= self.panes.len() {
+            return;
+        }
+        let Some(path) = self.panes[pane_index]
+            .folder
+            .as_ref()
+            .map(|f| f.path.clone())
+        else {
             return;
         };
-        if let Ok(mut files) = list_files(&path) {
-            files.sort_by(|a, b| a.label.cmp(&b.label));
-            if !self.show_hidden {
-                files.retain(|f| !f.label.starts_with('.'));
+        // Fast path: a bounded readdir decides sync vs streaming. Small
+        // folders (the overwhelming majority) fill instantly, fully sorted,
+        // with no Loading flash; the bounded read costs only a few ms.
+        if let Ok((mut files, complete)) =
+            list_files_bounded(&path, LISTING_CHUNK, self.show_hidden)
+        {
+            if complete {
+                files.sort_by(|a, b| a.label.cmp(&b.label));
+                let len = files.len();
+                let pane = &mut self.panes[pane_index];
+                pane.files = files;
+                pane.selected = vec![false; len];
+                pane.render_scroll = 0;
+                pane.state.select(None);
+                pane.listing_settled = true;
+                return;
             }
-            let len = files.len();
-            self.panes[pane_index].files = files;
-            self.panes[pane_index].selected = vec![false; len];
         }
+        // Big folder: clear the pane and stream it in the background
+        // (Loading… shows until the first chunk lands).
+        self.request_pane_listing(pane_index);
+    }
+
+    /// `true` when pane `pane_index`'s current listing finished (sorted pass
+    /// applied) or errored out. Test/UI hook for the async listing flow.
+    pub fn file_list_settled(&self, pane_index: usize) -> bool {
+        self.panes
+            .get(pane_index)
+            .is_some_and(|p| p.listing_settled)
     }
 
     /// Loads a pane's initial file list on a worker thread; the result is
     /// delivered on `tick()` via [`App::pick_up_pane_listings`]. This keeps
     /// slow directories (cold spin-up HDDs, network shares) off the render
     /// path at startup.
-    fn request_pane_listing(&self, pane_index: usize) {
-        let Some(path) = self.panes[pane_index].folder.as_ref().map(|f| f.path.clone()) else {
+    fn request_pane_listing(&mut self, pane_index: usize) {
+        if pane_index >= self.panes.len() {
+            return;
+        }
+        let pane = &mut self.panes[pane_index];
+        pane.listing_settled = false;
+        pane.listing_generation = pane.listing_generation.wrapping_add(1);
+        // Clear the rows now: the pane shows "Loading…" until the first
+        // chunk of the NEW folder arrives (never stale mixed content).
+        pane.files.clear();
+        pane.selected.clear();
+        pane.render_scroll = 0;
+        pane.state.select(None);
+        let generation = pane.listing_generation;
+        let Some(path) = pane.folder.as_ref().map(|f| f.path.clone()) else {
             return;
         };
         let show_hidden = self.show_hidden;
         let tx = self.file_list_tx.clone();
         thread::spawn(move || {
-            if let Ok(mut files) = list_files(&path) {
-                files.sort_by(|a, b| a.label.cmp(&b.label));
+            // Phase 1: stream chunks as they are read so the first rows
+            // appear instantly on huge folders (readdir order, unsorted).
+            let mut streamed: Vec<FEntry> = Vec::new();
+            let listed = list_files_chunked(&path, LISTING_CHUNK, &mut |mut chunk| {
                 if !show_hidden {
-                    files.retain(|f| !f.label.starts_with('.'));
+                    chunk.retain(|f| !f.label.starts_with('.'));
                 }
-                let _ = tx.send((pane_index, files));
+                if chunk.is_empty() {
+                    return;
+                }
+                streamed.extend(chunk.iter().cloned());
+                let _ = tx.send((pane_index, chunk, false, generation));
+            });
+            if listed.is_err() && streamed.is_empty() {
+                let _ = tx.send((pane_index, Vec::new(), true, generation));
+                return;
             }
+            // Phase 2: authoritative fully-sorted list replaces the stream.
+            streamed.sort_by(|a, b| a.label.cmp(&b.label));
+            let _ = tx.send((pane_index, streamed, true, generation));
         });
     }
 
     fn pick_up_pane_listings(&mut self) {
-        while let Ok((pane_index, files)) = self.file_list_rx.try_recv() {
-            if pane_index < self.panes.len() {
-                let len = files.len();
-                self.panes[pane_index].files = files;
-                self.panes[pane_index].selected = vec![false; len];
+        while let Ok((pane_index, files, done, generation)) = self.file_list_rx.try_recv() {
+            if pane_index >= self.panes.len() {
+                continue;
+            }
+            // A newer listing was requested for this pane in the meantime:
+            // everything from the stale run is garbage, drop it.
+            if self.panes[pane_index].listing_generation != generation {
+                continue;
+            }
+            let pane = &mut self.panes[pane_index];
+            if done {
+                pane.files = files;
+                pane.selected = vec![false; pane.files.len()];
+                pane.render_scroll = 0;
+                pane.listing_settled = true;
+            } else {
+                pane.listing_settled = false;
+                pane.selected
+                    .extend(std::iter::repeat_n(false, files.len()));
+                pane.files.extend(files);
             }
         }
     }
@@ -335,7 +506,7 @@ impl App {
                     mp
                 }
                 Err(err) => {
-                    eprintln!("Failed to mount {device}: {err}");
+                    self.set_status(format!("Failed to mount {device}: {err}"), true);
                     return;
                 }
             }
@@ -353,6 +524,59 @@ impl App {
         self.search_query = None;
         self.list_files_from_selected_folder();
         self.pane_mut().state.select(None);
+    }
+
+    /// Ejects (`udisksctl unmount`) the removable drive that contains the
+    /// active pane's current folder, then points any pane that lived on that
+    /// mount at Home so it never shows a dead listing.
+    pub fn eject_active_drive(&mut self) {
+        let Some(folder_path) = self.pane().folder.as_ref().map(|f| f.path.clone()) else {
+            return;
+        };
+        let Some(drives) = &self.drives else {
+            return;
+        };
+        let Some(drive) = matching_drive(drives, &folder_path) else {
+            self.set_status(
+                format!("No removable drive is mounted at {folder_path}"),
+                true,
+            );
+            return;
+        };
+        let Some(device) = drive.device.as_deref() else {
+            return;
+        };
+        let mount_point = drive.path.clone();
+        if let Err(err) = eject_drive(device) {
+            // udisksctl errors like "GDBus.Error...target is busy" are the
+            // common case; trim the bus prefix for a human-readable line.
+            let reason = err.to_string();
+            let reason = reason
+                .rsplit("GDBus.Error:")
+                .next()
+                .unwrap_or(&reason)
+                .trim();
+            self.set_status(format!("Failed to eject {device}: {reason}"), true);
+            return;
+        }
+
+        // The mount point is gone; move every pane that lived there to Home
+        // (the drive bar updates itself within one poller tick).
+        let home = dirs_next::home_dir().map(|p| p.to_string_lossy().into_owned());
+        for pane in self.panes.iter_mut() {
+            let stale = pane
+                .folder
+                .as_ref()
+                .is_some_and(|f| f.path.starts_with(&mount_point));
+            if stale {
+                pane.folder = home
+                    .as_deref()
+                    .map(|h| Folder::new("Home".to_string(), h.to_string(), '#'));
+                pane.state.select(None);
+            }
+        }
+        self.search_query = None;
+        self.list_files_from_selected_folder();
     }
 
     pub fn set_folder_from_common_folders(&mut self, initial_shortcut: usize) {
@@ -400,7 +624,9 @@ impl App {
                     self.pane_mut().state.select(None);
                 } else {
                     // it's a file, just open it
-                    open_file(&path);
+                    if let Err(msg) = open_file(&path) {
+                        self.set_status(msg, true);
+                    }
                 }
             }
             Err(_) => {}
@@ -596,12 +822,15 @@ impl App {
         };
         let dst = parent.join(new_name);
         if std::fs::metadata(&dst).is_ok() {
-            eprintln!("Cannot rename: '{}' already exists.", prompt.original);
+            self.set_status(
+                format!("Cannot rename: '{}' already exists.", prompt.original),
+                true,
+            );
             return;
         }
         match std::fs::rename(&src, &dst) {
             Ok(_) => {}
-            Err(e) => eprintln!("Failed to rename: {e}"),
+            Err(e) => self.set_status(format!("Failed to rename: {e}"), true),
         }
         // Drop the old selection; the list was rebuilt.
         self.list_files_for_pane(self.active_pane);
@@ -641,15 +870,22 @@ impl App {
         }
     }
 
+    /// Opens the metadata dialog for the entry under the cursor. Bound to `?`.
+    /// The dialog renders instantly; the worker's `Meta` event (a stat) fills
+    /// in Added/Modified, and folder sizes stream in from the background
+    /// walk registered in `size_walks` — which keeps running after the
+    /// dialog is dismissed until done or cancelled with `x`.
     pub fn rename_cursor_right(&mut self) {
         if let Some(p) = &mut self.renaming {
             p.cursor = (p.cursor + 1).min(p.text.len());
         }
     }
 
-    // ---- Info dialog ----
-
     /// Opens the metadata dialog for the entry under the cursor. Bound to `?`.
+    /// The dialog renders instantly; the worker's `Meta` event (a stat) fills
+    /// in Added/Modified, and folder sizes stream in from the background
+    /// walk registered in `size_walks` — which keeps running after the
+    /// dialog is dismissed until done or cancelled with `x`.
     pub fn show_info(&mut self) {
         if self.confirming.is_some() || self.renaming.is_some() {
             return;
@@ -660,11 +896,160 @@ impl App {
         let Some(entry) = self.visible_entry(vis_idx) else {
             return;
         };
-        let lines = build_info(entry);
-        self.info = Some(InfoDialog { lines });
+        let entry = entry.clone();
+        self.info = Some(InfoDialog {
+            lines: build_info_fast(&entry),
+            path: entry.path.clone(),
+            pending: true,
+            started: Instant::now(),
+        });
+        if entry.is_dir {
+            self.ensure_size_walk(&entry.path);
+        }
+        // Metadata worker: one stat for Added/Modified (and a file's size).
+        let tx = self.info_tx.clone();
+        let path = entry.path.clone();
+        thread::spawn(move || {
+            let lines = build_info_full(&entry, None);
+            let _ = tx.send(InfoEvent::Meta { path, lines });
+        });
+    }
+
+    /// Ensures a background size walk is running for `path` (one per folder;
+    /// skipped when already measured or already running).
+    fn ensure_size_walk(&mut self, path: &str) {
+        if self.size_cache.get(path).is_some_and(|s| s.complete) {
+            return;
+        }
+        if self.size_walks.contains_key(path) {
+            return;
+        }
+        let handle = WalkHandle::new();
+        self.size_walks.insert(
+            path.to_string(),
+            WalkSlot {
+                handle: handle.clone(),
+                started: Instant::now(),
+            },
+        );
+        let tx = self.info_tx.clone();
+        let walk_path = path.to_string();
+        thread::spawn(move || {
+            let mut on_progress = |bytes: u64, items: u64, on_disk: u64| {
+                if !handle.cancelled() {
+                    let _ = tx.send(InfoEvent::Progress {
+                        path: walk_path.clone(),
+                        bytes,
+                        items,
+                        on_disk,
+                    });
+                }
+            };
+            let size = dir_size(Path::new(&walk_path), &handle, &mut on_progress);
+            if !handle.cancelled() {
+                let _ = tx.send(InfoEvent::Done {
+                    path: walk_path,
+                    size,
+                });
+            }
+        });
+    }
+
+    /// Applies queued events: walk progress/done update the size cache (and
+    /// the open dialog's Size line), the metadata worker fills the dialog.
+    fn drain_info_results(&mut self) {
+        while let Ok(event) = self.info_rx.try_recv() {
+            match event {
+                InfoEvent::Progress {
+                    path,
+                    bytes,
+                    items,
+                    on_disk,
+                } => {
+                    self.size_cache.insert(
+                        path.clone(),
+                        SizeInfo {
+                            bytes,
+                            items,
+                            on_disk,
+                            complete: false,
+                            updated: SystemTime::now(),
+                        },
+                    );
+                }
+                InfoEvent::Done { path, size } => {
+                    self.size_walks.remove(&path);
+                    self.size_cache.insert(
+                        path.clone(),
+                        SizeInfo {
+                            bytes: size.bytes,
+                            items: size.items,
+                            on_disk: size.on_disk,
+                            complete: true,
+                            updated: SystemTime::now(),
+                        },
+                    );
+                    // A completed measurement is worth keeping across
+                    // restarts; save immediately so a crash keeps it too.
+                    self.persist_state();
+                }
+                InfoEvent::Meta { path, lines } => {
+                    if let Some(dialog) = self.info.as_mut() {
+                        if dialog.pending && dialog.path == path {
+                            dialog.pending = false;
+                            dialog.lines = lines;
+                        }
+                    }
+                }
+            }
+        }
+        self.sync_dialog_size_line();
+    }
+
+    /// Keeps the open dialog's Size line in sync with the cache: inserts the
+    /// final line once the walk completes (the renderer draws the animated
+    /// partial line while the walk runs or after a cancellation).
+    fn sync_dialog_size_line(&mut self) {
+        let Some(dialog) = self.info.as_mut() else {
+            return;
+        };
+        if dialog.pending {
+            return;
+        }
+        let Some(si) = self.size_cache.get(&dialog.path) else {
+            return;
+        };
+        if si.complete && !dialog.lines.iter().any(|l| l.starts_with("Size:")) {
+            let line = size_line_final(si);
+            dialog.lines.insert(4.min(dialog.lines.len()), line);
+        }
+    }
+
+    /// Cancels the background walk for the open dialog's folder (`x`); the
+    /// partial measurement stays in the cache.
+    pub fn cancel_dialog_size_walk(&mut self) {
+        let Some(dialog) = self.info.as_ref() else {
+            return;
+        };
+        if let Some(slot) = self.size_walks.remove(&dialog.path) {
+            slot.handle.cancel();
+        }
+    }
+
+    /// Start time of the walk for `path`, if one is running (drives the
+    /// spinner icon in the file list).
+    pub fn size_walk_started(&self, path: &str) -> Option<Instant> {
+        self.size_walks.get(path).map(|s| s.started)
+    }
+
+    /// Cached measurement for `path`, if any (partial or complete).
+    pub fn size_info(&self, path: &str) -> Option<&SizeInfo> {
+        self.size_cache.get(path)
     }
 
     pub fn close_info(&mut self) {
+        // Deliberately does NOT cancel the walk: measurements continue in
+        // the background so sizes are ready whenever the user returns.
         self.info = None;
     }
 
@@ -693,7 +1078,7 @@ impl App {
     fn start_transfer(&mut self, kind: JobKind) {
         let other = 1 - self.active_pane;
         let Some(dest) = self.panes[other].folder.as_ref().map(|f| f.path.clone()) else {
-            eprintln!("The other pane has no folder to copy into.");
+            self.set_status("The other pane has no folder to copy into.", true);
             return;
         };
         let sources = self.collect_sources();
@@ -705,7 +1090,7 @@ impl App {
         for src in sources {
             let src_path = std::path::Path::new(&src);
             if dest_path.starts_with(src_path) {
-                eprintln!("Cannot copy/move a folder into itself.");
+                self.set_status("Cannot copy/move a folder into itself.", true);
                 continue;
             }
             let label = src_path
@@ -752,11 +1137,8 @@ impl App {
         self.copy_board = !self.copy_board;
         if self.copy_board {
             self.board_focused = true;
-            self.copy_board_state.select(if self.jobs.is_empty() {
-                None
-            } else {
-                Some(0)
-            });
+            self.copy_board_state
+                .select(if self.jobs.is_empty() { None } else { Some(0) });
         } else {
             self.board_focused = false;
         }
@@ -849,7 +1231,7 @@ impl App {
                 }
             });
             if let Some(Err(err)) = result {
-                eprintln!("Failed to delete '{path}': {err}");
+                self.set_status(format!("Failed to delete '{path}': {err}"), true);
             }
         }
         self.pane_mut().selected.fill(false);
@@ -869,7 +1251,11 @@ impl App {
                         j.total_bytes = total_bytes;
                     }
                 }
-                JobEvent::Progress { id, copied_bytes, current } => {
+                JobEvent::Progress {
+                    id,
+                    copied_bytes,
+                    current,
+                } => {
                     if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id) {
                         j.copied_bytes = copied_bytes;
                         j.current = current;
@@ -1058,7 +1444,7 @@ impl App {
                 bookmarks.remove(pos);
             } else {
                 let Some(shortcut) = next_free_shortcut(bookmarks) else {
-                    eprintln!("No available bookmark shortcut");
+                    self.set_status("No free bookmark shortcut available (a-p are taken)", true);
                     return;
                 };
                 bookmarks.push(Folder::new(label, path, shortcut));
@@ -1078,18 +1464,472 @@ impl App {
         if let Some(right) = state.right {
             self.panes[1].folder = Some(right);
         }
+        // Folder sizes measured in earlier sessions reappear instantly;
+        // re-querying one of these folders skips the walk.
+        self.restore_sizes(state.sizes);
         // File lists are populated asynchronously from `App::new` via
         // `request_pane_listing`, so a slow drive doesn't block startup.
     }
 
-    /// Persists the current session state (split layout and pane folders).
+    /// Restores persisted size entries into the cache (epoch -> `SystemTime`).
+    fn restore_sizes(&mut self, entries: Vec<SizeEntry>) {
+        for e in entries {
+            self.size_cache.insert(
+                e.path.clone(),
+                SizeInfo {
+                    bytes: e.bytes,
+                    items: e.items,
+                    on_disk: e.on_disk,
+                    complete: e.complete,
+                    updated: SystemTime::UNIX_EPOCH + Duration::from_secs(e.updated_epoch),
+                },
+            );
+        }
+    }
+
+    /// Maps the cache into persistable entries: complete measurements only —
+    /// partials are stale after a restart anyway.
+    fn size_entries(&self) -> Vec<SizeEntry> {
+        self.size_cache
+            .iter()
+            .filter(|(_, si)| si.complete)
+            .map(|(path, si)| SizeEntry {
+                path: path.clone(),
+                bytes: si.bytes,
+                items: si.items,
+                on_disk: si.on_disk,
+                complete: si.complete,
+                updated_epoch: si
+                    .updated
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            })
+            .collect()
+    }
+
+    /// Persists the current session state (split layout, pane folders and
+    /// folder sizes) as `key=value` lines.
     pub fn persist_state(&self) {
-        save_state(&SessionState {
+        let state = SessionState {
             split: self.split,
             active_pane: self.active_pane,
             left: self.panes[0].folder.clone(),
             right: self.panes[1].folder.clone(),
+            sizes: self.size_entries(),
+        };
+        match &self.state_path {
+            Some(p) => save_state_to(p, &state),
+            None => save_state(&state),
+        }
+    }
+    pub fn recalculate_dialog_size(&mut self) {
+        let Some(dialog) = self.info.as_ref() else {
+            return;
+        };
+        let path = dialog.path.clone();
+        self.size_cache.remove(&path);
+        if let Some(slot) = self.size_walks.remove(&path) {
+            slot.handle.cancel();
+        }
+        self.ensure_size_walk(&path);
+        let label = std::path::Path::new(&path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&path)
+            .to_string();
+        let entry = FEntry {
+            path: path.clone(),
+            label,
+            is_dir: true,
+        };
+        let lines = build_info_fast(&entry);
+        if let Some(dialog) = self.info.as_mut() {
+            dialog.pending = true;
+            dialog.lines = lines;
+        }
+        // Same metadata worker as `show_info`, so `pending` clears once stat
+        // lines arrive instead of sticking forever.
+        let tx = self.info_tx.clone();
+        thread::spawn(move || {
+            let lines = build_info_full(&entry, None);
+            let _ = tx.send(InfoEvent::Meta { path, lines });
         });
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::file_info::DirSize;
+
+    fn entry(path: &str) -> FEntry {
+        FEntry {
+            path: path.to_string(),
+            label: path.rsplit('/').next().unwrap_or(path).to_string(),
+            is_dir: false,
+        }
+    }
+    use crate::services::state::{load_state_from, save_state_to};
+
+    fn dialog_for(path: &str) -> InfoDialog {
+        InfoDialog {
+            lines: vec!["Name: x".to_string()],
+            path: path.to_string(),
+            pending: true,
+            started: Instant::now(),
+        }
+    }
+
+    fn partial(path: &str, bytes: u64, items: u64) -> (String, SizeInfo) {
+        (
+            path.to_string(),
+            SizeInfo {
+                bytes,
+                items,
+                on_disk: 0,
+                complete: false,
+                updated: SystemTime::now(),
+            },
+        )
+    }
+
+    #[test]
+    fn progress_updates_cache_and_done_finalizes() {
+        let mut app = App::default();
+        app.state_path =
+            Some(std::env::temp_dir().join(format!("ira-test-done-{}", std::process::id())));
+        app.info = Some(dialog_for("/big"));
+        let (p, si) = partial("/big", 512, 100);
+        app.size_cache.insert(p, si);
+        let handle = WalkHandle::new();
+        app.size_walks.insert(
+            "/big".to_string(),
+            WalkSlot {
+                handle,
+                started: Instant::now(),
+            },
+        );
+
+        app.info_tx
+            .send(InfoEvent::Progress {
+                path: "/big".into(),
+                bytes: 1024,
+                items: 200,
+                on_disk: 4096,
+            })
+            .unwrap();
+        app.tick();
+        let si = app.size_info("/big").unwrap();
+        assert!(!si.complete && si.bytes == 1024 && si.items == 200);
+        assert!(app.size_walk_started("/big").is_some());
+
+        app.info_tx
+            .send(InfoEvent::Done {
+                path: "/big".into(),
+                size: DirSize {
+                    bytes: 4096,
+                    items: 800,
+                    on_disk: 8192,
+                },
+            })
+            .unwrap();
+        app.tick();
+        let si = app.size_info("/big").unwrap();
+        assert!(si.complete && si.bytes == 4096 && si.items == 800);
+        assert!(app.size_walk_started("/big").is_none(), "walk slot removed");
+    }
+
+    #[test]
+    fn done_inserts_final_size_line_into_open_dialog() {
+        let mut app = App::default();
+        app.state_path =
+            Some(std::env::temp_dir().join(format!("ira-test-done2-{}", std::process::id())));
+        app.info = Some(dialog_for("/big"));
+        app.info_tx
+            .send(InfoEvent::Meta {
+                path: "/big".into(),
+                lines: vec!["Name: big".into(), "Added: x".into()],
+            })
+            .unwrap();
+        app.info_tx
+            .send(InfoEvent::Done {
+                path: "/big".into(),
+                size: DirSize {
+                    bytes: 4096,
+                    items: 800,
+                    on_disk: 8192,
+                },
+            })
+            .unwrap();
+        app.tick();
+        let d = app.info.as_ref().unwrap();
+        assert!(!d.pending);
+        let size_line = d.lines.iter().find(|l| l.starts_with("Size:")).unwrap();
+        assert!(
+            size_line.contains("800 items") && size_line.contains("4.0 KiB data / 8.0 KiB on disk"),
+            "{size_line:?}"
+        );
+    }
+
+    #[test]
+    fn meta_for_other_paths_is_ignored() {
+        let mut app = App::default();
+        app.info = Some(dialog_for("/big"));
+        app.info_tx
+            .send(InfoEvent::Meta {
+                path: "/other".into(),
+                lines: vec!["Name: other".into()],
+            })
+            .unwrap();
+        app.tick();
+        let d = app.info.as_ref().unwrap();
+        assert!(d.pending, "stale Meta must not fill the dialog");
+        assert_eq!(d.lines, vec!["Name: x".to_string()]);
+    }
+
+    #[test]
+    fn close_info_keeps_the_background_walk_running() {
+        let mut app = App::default();
+        app.info = Some(dialog_for("/big"));
+        let handle = WalkHandle::new();
+        app.size_walks.insert(
+            "/big".to_string(),
+            WalkSlot {
+                handle: handle.clone(),
+                started: Instant::now(),
+            },
+        );
+        app.close_info();
+        assert!(app.info.is_none());
+        assert!(!handle.cancelled(), "dismissal must NOT stop the walk");
+        assert!(app.size_walk_started("/big").is_some());
+    }
+
+    #[test]
+    fn cancel_dialog_size_walk_stops_measurement() {
+        let mut app = App::default();
+        app.info = Some(dialog_for("/big"));
+        let handle = WalkHandle::new();
+        app.size_walks.insert(
+            "/big".to_string(),
+            WalkSlot {
+                handle: handle.clone(),
+                started: Instant::now(),
+            },
+        );
+        app.cancel_dialog_size_walk();
+        assert!(handle.cancelled(), "x must stop the walk");
+        assert!(app.size_walk_started("/big").is_none());
+    }
+    #[test]
+    fn events_after_dialog_closed_are_dropped() {
+        let mut app = App::default();
+        app.info_tx
+            .send(InfoEvent::Meta {
+                path: "/big".into(),
+                lines: vec!["Name: big".into()],
+            })
+            .unwrap();
+        app.tick(); // no dialog open: must not panic nor reopen one
+        assert!(app.info.is_none());
+    }
+
+    #[test]
+    fn recalculate_dialog_size_drops_cache_and_restarts_walk() {
+        let mut app = App::default();
+        app.info = Some(dialog_for("/big"));
+        let (p, si) = partial("/big", 512, 100);
+        app.size_cache.insert(p, si);
+        let handle = WalkHandle::new();
+        app.size_walks.insert(
+            "/big".to_string(),
+            WalkSlot {
+                handle,
+                started: Instant::now(),
+            },
+        );
+
+        app.recalculate_dialog_size();
+
+        assert!(
+            app.size_info("/big").is_none(),
+            "cached measurement dropped"
+        );
+        assert!(
+            app.size_walk_started("/big").is_some(),
+            "fresh walk started"
+        );
+        let d = app.info.as_ref().unwrap();
+        assert!(d.pending, "dialog back to pending fast lines");
+        assert_eq!(d.lines[0], "Name: big");
+    }
+
+    #[test]
+    fn size_cache_survives_a_simulated_restart() {
+        let mut app = App::default();
+        app.size_cache.insert(
+            "/big".to_string(),
+            SizeInfo {
+                bytes: 4096,
+                items: 800,
+                on_disk: 8192,
+                complete: true,
+                updated: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            },
+        );
+        app.size_cache.insert(
+            "/wip".to_string(),
+            SizeInfo {
+                bytes: 1,
+                items: 1,
+                on_disk: 0,
+                complete: false,
+                updated: SystemTime::UNIX_EPOCH,
+            },
+        );
+
+        // "Save": complete measurements only go to disk.
+        let entries = app.size_entries();
+        assert_eq!(entries.len(), 1, "partials must not persist");
+        assert_eq!(entries[0].path, "/big");
+
+        // A fresh app restores them (simulated restart via restore_sizes,
+        // the same path App::new takes through restore_state).
+        let mut app2 = App::default();
+        app2.restore_sizes(entries.clone());
+        let si = app2.size_info("/big").unwrap();
+        assert!(si.complete && si.bytes == 4096 && si.items == 800 && si.on_disk == 8192);
+        assert_eq!(
+            si.updated,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+        );
+        assert!(app2.size_info("/wip").is_none());
+
+        // Full file roundtrip through an explicit path (no touching the
+        // real config file).
+        let file = std::env::temp_dir().join(format!("ira-test-state-{}", std::process::id()));
+        save_state_to(
+            &file,
+            &SessionState {
+                split: app.split,
+                active_pane: app.active_pane,
+                left: app.panes[0].folder.clone(),
+                right: app.panes[1].folder.clone(),
+                sizes: entries,
+            },
+        );
+        let loaded = load_state_from(&file);
+        let _ = std::fs::remove_file(&file);
+        let mut app3 = App::default();
+        app3.restore_sizes(loaded.sizes);
+        let si = app3.size_info("/big").unwrap();
+        assert!(si.complete && si.bytes == 4096 && si.items == 800);
+        assert_eq!(
+            si.updated,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+        );
+    }
+    #[test]
+    fn stale_listing_chunks_from_an_older_generation_are_dropped() {
+        let mut app = App::default();
+        // Simulate: pane starts listing gen 1, user navigates, gen 2 starts.
+        app.panes[0].listing_generation = 2;
+        app.panes[0].files.clear();
+
+        // A late chunk from gen 1 must be dropped entirely (this is the
+        // "folder lists itself" bug: interleaved chunks of two runs).
+        app.file_list_tx
+            .send((0, vec![entry("/stale/old")], false, 1))
+            .unwrap();
+        app.tick();
+        assert!(
+            app.panes[0].files.is_empty(),
+            "stale-generation chunks must not appear"
+        );
+
+        // A chunk from the current generation lands normally.
+        app.file_list_tx
+            .send((0, vec![entry("/new/a")], false, 2))
+            .unwrap();
+        app.tick();
+        assert_eq!(app.panes[0].files.len(), 1);
+
+        // A gen-2 done replaces the streamed prefix.
+        app.file_list_tx
+            .send((0, vec![entry("/new/a"), entry("/new/b")], true, 2))
+            .unwrap();
+        app.tick();
+        assert!(app.file_list_settled(0));
+        assert_eq!(app.panes[0].files.len(), 2);
+
+        // A late done from gen 1 is still dropped.
+        app.file_list_tx
+            .send((0, vec![entry("/stale/z")], true, 1))
+            .unwrap();
+        app.tick();
+        assert_eq!(app.panes[0].files.len(), 2);
+    }
+
+    #[test]
+    fn small_folders_list_synchronously_big_folders_stream() {
+        let base = std::env::temp_dir().join(format!("ira_sync_async_{}", std::process::id()));
+        let small = base.join("small");
+        let big = base.join("big");
+        std::fs::create_dir_all(&small).unwrap();
+        std::fs::create_dir_all(&big).unwrap();
+        std::fs::write(small.join("a.txt"), "x").unwrap();
+        std::fs::write(small.join("b.txt"), "x").unwrap();
+        for i in 0..LISTING_CHUNK + 5 {
+            std::fs::write(big.join(format!("f{i}")), "x").unwrap();
+        }
+
+        let folder_of = |p: &std::path::Path| {
+            Folder::new("t".to_string(), p.to_string_lossy().into_owned(), '#')
+        };
+
+        // Small folder: bounded sync read — settled immediately, sorted, no
+        // worker involved (listing_settled true right after the call).
+        let mut app = App::default();
+        app.panes[0].folder = Some(folder_of(&small));
+        app.list_files_from_selected_folder();
+        assert!(
+            app.file_list_settled(0),
+            "small folder must list synchronously"
+        );
+        let labels: Vec<String> = app.panes[0].files.iter().map(|f| f.label.clone()).collect();
+        assert_eq!(labels, vec!["a.txt", "b.txt"]);
+
+        // Big folder: pane is cleared for streaming, NOT settled, and the
+        // sorted list arrives only after ticks.
+        app.panes[0].folder = Some(folder_of(&big));
+        app.list_files_from_selected_folder();
+        assert!(
+            !app.file_list_settled(0),
+            "big folder must stream in background"
+        );
+        let mut got = false;
+        for _ in 0..250 {
+            app.tick();
+            if app.file_list_settled(0) {
+                got = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(got, "big folder must settle via the background worker");
+        assert_eq!(app.panes[0].files.len(), LISTING_CHUNK + 5);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+    #[test]
+    fn any_key_dismisses_the_error_dialog() {
+        let mut app = App::default();
+        app.set_status("Failed to eject /dev/sdd2: target is busy", true);
+        assert!(app.status.is_some());
+
+        // clear_status is what the handler calls on any key.
+        app.clear_status();
+        assert!(app.status.is_none());
     }
 }
 
@@ -1108,7 +1948,7 @@ fn chars_to_string(chars: &[char]) -> String {
 /// not honor `Terminal=true` desktop entries, so terminal-based editors (e.g.
 /// Neovim) launch without a controlling terminal and appear to do nothing.
 /// `gio open` handles terminal apps correctly.
-fn open_file(path: &str) {
+fn open_file(path: &str) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
         use std::process::{Command, Stdio};
@@ -1120,11 +1960,40 @@ fn open_file(path: &str) {
             .spawn()
             .is_ok();
         if launched {
-            return;
+            return Ok(());
         }
     }
 
-    if let Err(err) = that_detached(path) {
-        eprintln!("Failed to open '{path}': {err}");
-    }
+    that_detached(path).map_err(|err| format!("Failed to open '{path}': {err}"))
+}
+
+#[test]
+fn matching_drive_picks_longest_mount_prefix() {
+    let mut drives = vec![
+        Folder::new("root".to_string(), "/run/media/vlad".to_string(), '1'),
+        Folder::new(
+            "usb".to_string(),
+            "/run/media/vlad/USB STICK".to_string(),
+            '2',
+        ),
+        Folder::new("unmounted".to_string(), String::new(), '3'),
+    ];
+    // The drive with a device set and the longest matching mount point wins.
+    drives[0].device = Some("/dev/sda1".to_string());
+    drives[1].device = Some("/dev/sdb1".to_string());
+    drives[2].device = Some("/dev/sdz1".to_string());
+
+    let hit = matching_drive(&drives, "/run/media/vlad/USB STICK/photos").unwrap();
+    assert_eq!(hit.label, "usb");
+
+    // A folder outside every mount point has no drive.
+    assert!(matching_drive(&drives, "/home/vlad").is_none());
+    // An empty mount point never matches by prefix.
+    let none = vec![Folder {
+        path: String::new(),
+        label: "x".to_string(),
+        shortcut: '1',
+        device: Some("/dev/x".to_string()),
+    }];
+    assert!(matching_drive(&none, "/anything").is_none());
 }

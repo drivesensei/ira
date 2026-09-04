@@ -25,7 +25,11 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
         Style::default().fg(Color::DarkGray)
     };
     let list = List::new(rows)
-        .block(Block::bordered().title(" Copy Board ").border_style(border_style))
+        .block(
+            Block::bordered()
+                .title(" Copy Board ")
+                .border_style(border_style),
+        )
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
         .highlight_symbol("▸");
     if focused {
@@ -75,7 +79,9 @@ fn job_line(job: &Job) -> Line<'static> {
             let bytes = format!(
                 "{}/{}",
                 human(job.copied_bytes),
-                job.total_bytes.map(human).unwrap_or_else(|| "?".to_string())
+                job.total_bytes
+                    .map(human)
+                    .unwrap_or_else(|| "?".to_string())
             );
             // Keep the row within the fixed 36-column panel: no unicode bar,
             // tight padding, right-aligned byte counter.

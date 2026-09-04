@@ -11,19 +11,31 @@ pub fn list_common_folders() -> Vec<Folder> {
 
     if let Some(desktop) = dirs_next::desktop_dir() {
         if let Some(desktopstr) = desktop.to_str() {
-            result.push(Folder::new("Desktop".to_string(), desktopstr.to_string(), 'e'));
+            result.push(Folder::new(
+                "Desktop".to_string(),
+                desktopstr.to_string(),
+                'e',
+            ));
         }
     }
 
     if let Some(document) = dirs_next::document_dir() {
         if let Some(documentstr) = document.to_str() {
-            result.push(Folder::new("Documents".to_string(), documentstr.to_string(), 'r'));
+            result.push(Folder::new(
+                "Documents".to_string(),
+                documentstr.to_string(),
+                'r',
+            ));
         }
     }
 
     if let Some(download) = dirs_next::download_dir() {
         if let Some(downloadstr) = download.to_str() {
-            result.push(Folder::new("Downloads".to_string(), downloadstr.to_string(), 't'));
+            result.push(Folder::new(
+                "Downloads".to_string(),
+                downloadstr.to_string(),
+                't',
+            ));
         }
     }
 
@@ -41,7 +53,11 @@ pub fn list_common_folders() -> Vec<Folder> {
 
     if let Some(public) = dirs_next::public_dir() {
         if let Some(publicstr) = public.to_str() {
-            result.push(Folder::new("Public".to_string(), publicstr.to_string(), 'i'));
+            result.push(Folder::new(
+                "Public".to_string(),
+                publicstr.to_string(),
+                'i',
+            ));
         }
     }
 

@@ -37,8 +37,29 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         return Ok(());
     }
 
-    // Info dialog: any key dismisses it.
+    // Error dialog: any key dismisses it. Checked before the info dialog so
+    // an eject failure's error box never swallows the next action.
+    if app.status.is_some() {
+        app.clear_status();
+        return Ok(());
+    }
+
+    // Info dialog: `x` cancels the folder's background size walk (keeping
+    // the dialog open with the partial size), `r` restarts the measurement
+    // from scratch; any other key dismisses it and leaves the walk running.
     if app.info.is_some() {
+        if let KeyCode::Char('x') = key_event.code {
+            if key_event.modifiers.is_empty() {
+                app.cancel_dialog_size_walk();
+                return Ok(());
+            }
+        }
+        if let KeyCode::Char('r') = key_event.code {
+            if key_event.modifiers.is_empty() {
+                app.recalculate_dialog_size();
+                return Ok(());
+            }
+        }
         app.close_info();
         return Ok(());
     }
@@ -111,11 +132,13 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         KeyCode::Char('z') => app.goto_top(),
         KeyCode::Char('x') => app.goto_bottom(),
 
-        // `/` starts fuzzy search within the current folder.
-        KeyCode::Char('/') => app.start_search(),
+        // `e` ejects (unmounts) the removable drive of the active pane.
+        KeyCode::Char('e') => app.eject_active_drive(),
 
         // Toggle a bookmark for the current folder.
         KeyCode::Char('b') => app.toggle_bookmark(),
+        // `/` starts fuzzy search within the current folder.
+        KeyCode::Char('/') => app.start_search(),
 
         // `+` toggles the vertical split of the files pane.
         KeyCode::Char('+') => app.toggle_split(),
@@ -139,13 +162,17 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         // reliable paths — terminals generally do not forward Super, so the
         // Super variants only fire where the terminal happens to report it.
         KeyCode::Char(c)
-            if key_event.modifiers.intersects(KeyModifiers::SUPER | KeyModifiers::ALT)
+            if key_event
+                .modifiers
+                .intersects(KeyModifiers::SUPER | KeyModifiers::ALT)
                 && matches!(c, 'a' | 'A') =>
         {
             app.toggle_select_all()
         }
         KeyCode::Char(c)
-            if key_event.modifiers.intersects(KeyModifiers::SUPER | KeyModifiers::ALT)
+            if key_event
+                .modifiers
+                .intersects(KeyModifiers::SUPER | KeyModifiers::ALT)
                 && matches!(c, 'i' | 'I') =>
         {
             app.invert_selection()

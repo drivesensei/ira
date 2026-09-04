@@ -35,11 +35,25 @@ pub enum JobStatus {
 /// Events the worker emits on the job channel.
 #[derive(Debug)]
 pub enum JobEvent {
-    Started { id: u64, total_bytes: Option<u64> },
-    Progress { id: u64, copied_bytes: u64, current: String },
-    Done { id: u64 },
-    Cancelled { id: u64 },
-    Failed { id: u64, error: String },
+    Started {
+        id: u64,
+        total_bytes: Option<u64>,
+    },
+    Progress {
+        id: u64,
+        copied_bytes: u64,
+        current: String,
+    },
+    Done {
+        id: u64,
+    },
+    Cancelled {
+        id: u64,
+    },
+    Failed {
+        id: u64,
+        error: String,
+    },
 }
 
 /// Shared cancellation + pause state between the UI and the worker thread.
@@ -155,7 +169,10 @@ fn run(
     } else {
         None
     };
-    let _ = tx.send(JobEvent::Started { id, total_bytes: total });
+    let _ = tx.send(JobEvent::Started {
+        id,
+        total_bytes: total,
+    });
 
     let mut bytes = 0u64;
     match kind {
@@ -190,7 +207,14 @@ fn copy_entry(
         });
         for entry in fs::read_dir(src)? {
             let entry = entry?;
-            copy_entry(&entry.path(), &dst.join(entry.file_name()), control, id, tx, bytes)?;
+            copy_entry(
+                &entry.path(),
+                &dst.join(entry.file_name()),
+                control,
+                id,
+                tx,
+                bytes,
+            )?;
         }
         Ok(())
     } else {

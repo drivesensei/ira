@@ -22,7 +22,10 @@ fn wait_for_jobs(app: &mut App) {
     loop {
         app.tick();
         let pending = app.jobs.iter().any(|j| {
-            matches!(j.status, JobStatus::Running | JobStatus::Paused | JobStatus::Queued)
+            matches!(
+                j.status,
+                JobStatus::Running | JobStatus::Paused | JobStatus::Queued
+            )
         });
         if !pending {
             return;
@@ -30,7 +33,10 @@ fn wait_for_jobs(app: &mut App) {
         assert!(
             Instant::now() < deadline,
             "transfer hung: {:?}",
-            app.jobs.iter().map(|j| j.status.clone()).collect::<Vec<_>>()
+            app.jobs
+                .iter()
+                .map(|j| j.status.clone())
+                .collect::<Vec<_>>()
         );
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -39,7 +45,11 @@ fn wait_for_jobs(app: &mut App) {
 #[test]
 fn space_toggles_selection_and_moves_cursor() {
     let mut app = App::default();
-    app.panes[0].files = vec![entry("/tmp/a.txt"), entry("/tmp/b.txt"), entry("/tmp/c.txt")];
+    app.panes[0].files = vec![
+        entry("/tmp/a.txt"),
+        entry("/tmp/b.txt"),
+        entry("/tmp/c.txt"),
+    ];
     app.panes[0].selected = vec![false, false, false];
     app.panes[0].state.select(Some(0));
 
@@ -58,7 +68,11 @@ fn space_toggles_selection_and_moves_cursor() {
 #[test]
 fn select_all_and_invert() {
     let mut app = App::default();
-    app.panes[0].files = vec![entry("/tmp/a.txt"), entry("/tmp/b.txt"), entry("/tmp/c.txt")];
+    app.panes[0].files = vec![
+        entry("/tmp/a.txt"),
+        entry("/tmp/b.txt"),
+        entry("/tmp/c.txt"),
+    ];
     app.panes[0].selected = vec![false, false, false];
 
     // Super+A: nothing selected -> select all.
@@ -100,18 +114,34 @@ fn hidden_files_toggle() {
     let mut app = App::default();
     app.panes[0].folder = Some(Folder::new("t".into(), base.to_str().unwrap().into(), '#'));
 
+    // Listing is now async (chunked streaming + sorted final pass); wait
+    // until the pane's settled (sorted) listing arrives before asserting.
+    let mut wait_settled = |app: &mut App| {
+        for _ in 0..250 {
+            app.tick();
+            if app.file_list_settled(0) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    };
+    let labels =
+        |app: &App| -> Vec<String> { app.panes[0].files.iter().map(|f| f.label.clone()).collect() };
+
     // Default hides dotfiles.
     app.list_files_from_selected_folder();
-    let labels: Vec<&str> = app.panes[0].files.iter().map(|f| f.label.as_str()).collect();
-    assert_eq!(labels, vec!["visible.txt"]);
+    assert!(wait_settled(&mut app), "listing should arrive");
+    assert_eq!(labels(&app), vec!["visible.txt"]);
 
     // `.` toggles them on.
     app.toggle_hidden();
-    let labels: Vec<&str> = app.panes[0].files.iter().map(|f| f.label.as_str()).collect();
-    assert_eq!(labels, vec![".secret", "visible.txt"]);
+    assert!(wait_settled(&mut app), "re-listing should arrive");
+    assert_eq!(labels(&app), vec![".secret", "visible.txt"]);
 
     // And back off.
     app.toggle_hidden();
+    assert!(wait_settled(&mut app));
     assert_eq!(app.panes[0].files.len(), 1);
 
     let _ = std::fs::remove_dir_all(&base);
@@ -254,21 +284,41 @@ fn info_dialog_shows_metadata() {
     std::fs::write(&f, "1234567890123").unwrap(); // 13 bytes
 
     let mut app = App::default();
+    // Never touch the real user config from tests.
+    app.state_path =
+        Some(std::env::temp_dir().join(format!("ira_state_test_{}", std::process::id())));
     app.panes[0].files = vec![entry(f.to_str().unwrap())];
     app.panes[0].selected = vec![false];
     app.panes[0].state.select(Some(0));
 
     app.show_info();
-    let lines = app.info.as_ref().unwrap().lines.clone();
-    assert!(lines.iter().any(|l| l.starts_with("Name: photo.png")));
-    assert!(lines.iter().any(|l| l.starts_with("Kind: Image")));
-    assert!(lines.iter().any(|l| l.contains("13 bytes")));
-    assert!(lines.iter().any(|l| l.starts_with("Added:") || l.starts_with("Modified:")));
+    // The dialog opens instantly with the no-filesystem fast lines; the
+    // worker's `Ready` event replaces them with the full set.
+    assert!(app.info.as_ref().unwrap().pending);
+    let fast = app.info.as_ref().unwrap().lines.clone();
+    assert!(fast.iter().any(|l| l.starts_with("Name: photo.png")));
+    assert!(fast.iter().any(|l| l.starts_with("Kind: Image")));
+    assert!(
+        !fast.iter().any(|l| l.starts_with("Size:")),
+        "no fs lines yet"
+    );
+    let mut ready = false;
+    for _ in 0..250 {
+        app.tick();
+        if !app.info.as_ref().unwrap().pending {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 
     app.close_info();
     assert!(app.info.is_none());
 
-    // Folder entry shows folder kind and recursive size.
+    // Folder entry shows folder kind and a size measured by a background
+    // walk that keeps running after the dialog is dismissed. The dialog
+    // opens instantly with fast lines; `tick()` applies the worker's Meta
+    // event and then the walk's final size line.
     let mut dir_entry = entry(base.join("sub").to_str().unwrap());
     dir_entry.is_dir = true;
     app.panes[0].files = vec![dir_entry];
@@ -276,7 +326,44 @@ fn info_dialog_shows_metadata() {
     app.show_info();
     let lines = app.info.as_ref().unwrap().lines.clone();
     assert!(lines.iter().any(|l| l.starts_with("Kind: Folder")));
-    assert!(lines.iter().any(|l| l.starts_with("Size:")));
+    assert!(
+        !lines.iter().any(|l| l.starts_with("Size:")),
+        "no static Size line while walking"
+    );
+    let mut measured = false;
+    for _ in 0..500 {
+        app.tick();
+        let d = app.info.as_ref().unwrap();
+        if !d.pending && d.lines.iter().any(|l| l.starts_with("Size:")) {
+            measured = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(measured, "background folder-size walk should report back");
+    let lines = app.info.as_ref().unwrap().lines.clone();
+    let size_line = lines.iter().find(|l| l.starts_with("Size:")).unwrap();
+    assert!(
+        size_line.contains("0 B") && size_line.contains("0 items"),
+        "empty folder measures to 0 bytes: {size_line:?}"
+    );
+    // The completed measurement is cached and annotates the file list.
+    let si = app.size_info(base.join("sub").to_str().unwrap()).unwrap();
+    assert!(si.complete && si.bytes == 0 && si.items == 0);
 
-    let _ = std::fs::remove_dir_all(&base);
+    // Dismissing the dialog and re-querying shows the cached size again
+    // (no new walk for a completed folder).
+    app.close_info();
+    app.show_info();
+    let mut ready = false;
+    for _ in 0..250 {
+        app.tick();
+        let d = app.info.as_ref().unwrap();
+        if !d.pending && d.lines.iter().any(|l| l.starts_with("Size:")) {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(ready, "cached size should reappear after re-query");
 }

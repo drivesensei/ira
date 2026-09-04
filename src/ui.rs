@@ -7,6 +7,9 @@ use ratatui::{
 };
 
 use crate::app::App;
+use crate::services::file_info::{
+    size_line_cancelled, size_line_partial, size_line_started, spinner_char,
+};
 
 /// Renders the user interface widgets.
 pub fn render(app: &mut App, frame: &mut Frame) {
@@ -29,7 +32,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         return;
     }
 
-    let chunks = Layout::default()
+    let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // Drives
@@ -39,24 +42,24 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         ])
         .split(frame.area());
 
-    crate::components::drives_ui::render(frame, app, chunks[0]);
-    crate::components::common_folders_ui::render(frame, app, chunks[1]);
+    crate::components::drives_ui::render(frame, app, rows[0]);
+    crate::components::common_folders_ui::render(frame, app, rows[1]);
 
     // Bookmarks (left) and Actions (right) share the third row.
     let bookmarks_row = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(0), Constraint::Length(36)])
-        .split(chunks[2]);
+        .split(rows[2]);
     crate::components::bookmarks_ui::render(frame, app, bookmarks_row[0]);
     crate::components::actions_ui::render(frame, app, bookmarks_row[1]);
 
     // Files area: optional Copy Board sidebar on the right, then the panes.
-    let mut files_area = chunks[3];
+    let mut files_area = rows[3];
     if app.copy_board {
         let board = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(0), Constraint::Length(36)])
-            .split(chunks[3]);
+            .split(rows[3]);
         crate::components::copy_board_ui::render(frame, app, board[1]);
         files_area = board[0];
     }
@@ -81,7 +84,10 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         paint_bg(frame, area, style);
         let block = Block::bordered().title(" Confirm ").style(style);
         frame.render_widget(
-            Paragraph::new(prompt).block(block).alignment(Alignment::Center).style(style),
+            Paragraph::new(prompt)
+                .block(block)
+                .alignment(Alignment::Center)
+                .style(style),
             area,
         );
     }
@@ -104,23 +110,59 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         let text_line = Line::from(spans);
         let hint = Line::raw("  [Enter] rename  [Esc] cancel  ");
         let lines: Vec<Line<'static>> = vec![text_line, Line::raw(""), hint];
-        let w = (prompt.text.len() as u16 + 12).max(34).min(frame.area().width.saturating_sub(4));
+        let w = (prompt.text.len() as u16 + 12)
+            .max(34)
+            .min(frame.area().width.saturating_sub(4));
         let h = lines.len() as u16 + 2;
         let style = Style::default().fg(Color::Black).bg(Color::White);
         let area = centered_rect(w, h, frame.area());
         paint_bg(frame, area, style);
         frame.render_widget(
-            Paragraph::new(lines).block(Block::bordered().title(" Rename ").style(style)).style(style),
+            Paragraph::new(lines)
+                .block(Block::bordered().title(" Rename ").style(style))
+                .style(style),
             area,
         );
     }
 
-    // Info dialog: read-only metadata for the selected entry.
+    // Info dialog: read-only metadata for the selected entry. The Size line
+    // is dynamic: animated partial size while the background walk runs, an
+    // honest lower bound after `x`, and the final line once done (drain
+    // inserts it into `lines`; the renderer only fills the gap).
     if let Some(info) = &app.info {
-        let lines: Vec<Line<'static>> = info.lines.iter().map(|l| Line::raw(l.clone())).collect();
+        let mut lines: Vec<Line<'static>> =
+            info.lines.iter().map(|l| Line::raw(l.clone())).collect();
+        if !lines.iter().any(|l| {
+            l.spans
+                .first()
+                .is_some_and(|s| s.content.starts_with("Size:"))
+        }) {
+            let line = match (app.size_walk_started(&info.path), app.size_info(&info.path)) {
+                (Some(started), Some(si)) => {
+                    Line::raw(size_line_partial(si, spinner_char(started)))
+                }
+                (Some(started), None) => Line::raw(size_line_started(spinner_char(started))),
+                // Walk cancelled with `x`: show the partial lower bound.
+                (None, Some(si)) => Line::raw(size_line_cancelled(si)),
+                // Brief window before the walk's first progress tick (or a
+                // file's pending metadata stat).
+                (None, None) => Line::raw(size_line_started(spinner_char(info.started))),
+            };
+            lines.insert(4.min(lines.len()), line);
+        }
+        // Folder queries get a hint line (walk running or a cached
+        // measurement exists); plain files need none of these keys.
+        let is_folder =
+            app.size_walk_started(&info.path).is_some() || app.size_info(&info.path).is_some();
+        if is_folder {
+            lines.push(Line::raw(""));
+            lines.push(Line::raw(
+                "  [x] cancel size walk   [r] recalculate   [Esc] close  ",
+            ));
+        }
         let mut max_w: u16 = 10;
-        for l in &info.lines {
-            max_w = max_w.max(l.chars().count() as u16);
+        for l in &lines {
+            max_w = max_w.max(l.width() as u16);
         }
         let w = (max_w + 4).min(frame.area().width.saturating_sub(4));
         let h = lines.len() as u16 + 2;
@@ -128,9 +170,186 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         let area = centered_rect(w, h, frame.area());
         paint_bg(frame, area, style);
         frame.render_widget(
-            Paragraph::new(lines).block(Block::bordered().title(" Info ").style(style)).style(style),
+            Paragraph::new(lines)
+                .block(Block::bordered().title(" Info ").style(style))
+                .style(style),
             area,
         );
+    }
+
+    // Error dialog: dismissable modal for action failures (eject busy,
+    // rename collision, delete IO error...). Red theme; any key closes it
+    // (handler.rs treats every key as dismiss while it is open).
+    if let Some(status) = &app.status {
+        let text: Vec<Line<'static>> = vec![
+            Line::styled(
+                status.text.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Line::raw(""),
+            Line::raw("  [any key] dismiss  "),
+        ];
+        // Cap the width at 80% of the screen and word-wrap long messages.
+        // `Paragraph` wraps on word boundaries when the text exceeds the
+        // widget width; the height must count every wrapped line.
+        let max_allowed = (frame.area().width * 4 / 5).max(30);
+        let content_w = text
+            .iter()
+            .map(|l| l.width() as u16)
+            .max()
+            .unwrap_or(20)
+            .max(30)
+            .min(max_allowed.saturating_sub(4));
+        let w = (content_w + 4).min(frame.area().width.saturating_sub(4));
+        let inner_w = w.saturating_sub(2) as usize; // minus borders
+        let wrapped: usize = text
+            .iter()
+            .map(|l| {
+                let lw = l.width();
+                if lw == 0 {
+                    1
+                } else {
+                    lw.div_ceil(inner_w.max(1))
+                }
+            })
+            .sum();
+        let h = (wrapped as u16 + 2).min(frame.area().height.saturating_sub(2));
+        let style = Style::default().fg(Color::White).bg(Color::Red);
+        let area = centered_rect(w, h, frame.area());
+        paint_bg(frame, area, style);
+        frame.render_widget(
+            Paragraph::new(text)
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .block(Block::bordered().title(" Error ").style(style))
+                .style(style),
+            area,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::list_files::FEntry;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    /// Renders on a 100x30 TestBackend and returns the whole screen text.
+    fn rendered(app: &mut App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| render(app, f)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    /// Opens the info dialog for a single entry via the real `show_info`
+    /// path (the only public way to start a walk / create a dialog).
+    fn dialog_app(name: &str, is_dir: bool, dir: &std::path::Path) -> App {
+        let mut app = App::default();
+        app.panes[0].files = vec![FEntry {
+            path: dir.join(name).to_string_lossy().into_owned(),
+            label: name.to_string(),
+            is_dir,
+        }];
+        app.panes[0].state.select(Some(0));
+        app.show_info();
+        app
+    }
+
+    #[test]
+    fn long_error_messages_wrap_instead_of_cutting() {
+        // 120 chars on a 100-wide backend: wider than the dialog, so the
+        // Paragraph must word-wrap; every character must survive in the
+        // buffer (nothing truncated).
+        let long = format!("Failed to eject /dev/sdd2: {}", "x".repeat(100));
+        let mut app = App::default();
+        app.set_status(long, true);
+
+        let text = rendered(&mut app);
+        let tail = "x".repeat(10);
+        assert!(
+            text.contains(&tail),
+            "the message tail must survive wrapping; buffer tail: {:?}",
+            text.chars().rev().take(300).collect::<String>()
+        );
+        assert!(text.contains("Failed to eject"), "{text}");
+    }
+    #[test]
+    fn eject_error_renders_as_dismissable_dialog_not_inline() {
+        let mut app = App::default();
+        app.set_status("Failed to eject /dev/sdd2: target is busy", true);
+
+        let text = rendered(&mut app);
+        // The dialog frame is present and the full human-readable line fits
+        // on one line (nothing truncated into the files pane).
+        assert!(text.contains(" Error "), "{text}");
+        assert!(
+            text.contains("Failed to eject /dev/sdd2: target is busy"),
+            "{text}"
+        );
+        assert!(text.contains("[any key] dismiss"), "{text}");
+
+        // A non-error notice renders with the same dialog shape.
+        let mut app = App::default();
+        app.set_status("Copied 2 items", false);
+        let text = rendered(&mut app);
+        assert!(text.contains("Copied 2 items"), "{text}");
+
+        // No status -> nothing rendered.
+        let mut app = App::default();
+        let text = rendered(&mut app);
+        assert!(!text.contains(" Error "), "{text}");
+    }
+    #[test]
+    fn folder_dialog_shows_hint_and_file_dialog_does_not() {
+        let dir = std::env::temp_dir().join(format!("ira-ui-hint-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A folder query starts a walk (or shows a cached size): hint shows.
+        let mut app = dialog_app("folder", true, &dir);
+        let text = rendered(&mut app);
+        assert!(text.contains("[r] recalculate"), "{text}");
+        assert!(text.contains("[x] cancel size walk"));
+        assert!(text.contains("[Esc] close"));
+
+        // A plain file gets no walk and no cache entry: no hint keys.
+        let mut app = dialog_app("file.txt", false, &dir);
+        let text = rendered(&mut app);
+        assert!(!text.contains("recalculate"), "{text}");
+        assert!(!text.contains("cancel size walk"), "{text}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hint_line_fits_inside_the_dialog() {
+        let dir = std::env::temp_dir().join(format!("ira-ui-width-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = dialog_app("f", true, &dir);
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| render(&mut app, f)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        // If the dialog were too narrow the Paragraph would truncate/wrap the
+        // hint and the full string could not appear contiguously.
+        assert!(
+            text.contains("[x] cancel size walk   [r] recalculate   [Esc] close"),
+            "{text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

@@ -206,7 +206,12 @@ fn drives_from_lsblk(output: &str) -> Vec<Folder> {
 #[cfg(target_os = "linux")]
 pub fn list_drives() -> IOResult<Vec<Folder>> {
     let output = std::process::Command::new("lsblk")
-        .args(["-P", "-n", "-o", "KNAME,TYPE,FSTYPE,LABEL,PARTTYPE,MOUNTPOINT"])
+        .args([
+            "-P",
+            "-n",
+            "-o",
+            "KNAME,TYPE,FSTYPE,LABEL,PARTTYPE,MOUNTPOINT",
+        ])
         .output()?;
 
     if !output.status.success() {
@@ -255,13 +260,32 @@ pub fn mount_drive(device: &str) -> IOResult<String> {
     })
 }
 
-/// Drive mounting is Linux-only; on other platforms every detected drive is
-/// already mounted, so this is never reached.
+/// Unmounts (and spins down, when the device is a whole drive) a removable
+/// device via udisks2, mirroring the desktop file manager's eject.
+#[cfg(target_os = "linux")]
+pub fn eject_drive(device: &str) -> IOResult<()> {
+    let output = std::process::Command::new("udisksctl")
+        .args(["unmount", "-b", device])
+        .output()?;
+
+    if !output.status.success() {
+        let msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(std::io::Error::other(if msg.is_empty() {
+            "udisksctl unmount failed".to_string()
+        } else {
+            msg
+        }));
+    }
+    Ok(())
+}
+
+/// Drive ejecting is Linux-only; on other platforms drives are ejected via
+/// the desktop environment or OS tray instead.
 #[cfg(not(target_os = "linux"))]
-pub fn mount_drive(_device: &str) -> IOResult<String> {
+pub fn eject_drive(_device: &str) -> IOResult<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
-        "drive mounting is not supported on this platform",
+        "drive ejecting is not supported on this platform",
     ))
 }
 
@@ -284,7 +308,10 @@ KNAME="sdc1" TYPE="part" FSTYPE="exfat" LABEL="USB STICK" PARTTYPE="0x7" MOUNTPO
     #[test]
     fn detects_mounted_and_unmounted_drives() {
         let drives = drives_from_lsblk(FIXTURE);
-        let devices: Vec<&str> = drives.iter().map(|d| d.device.as_deref().unwrap()).collect();
+        let devices: Vec<&str> = drives
+            .iter()
+            .map(|d| d.device.as_deref().unwrap())
+            .collect();
         assert_eq!(devices, vec!["/dev/sdb1", "/dev/nvme0n1p3", "/dev/sdc1"]);
         let paths: Vec<&str> = drives.iter().map(|d| d.path.as_str()).collect();
         assert_eq!(paths, vec!["", "", "/run/media/vlad/USB STICK"]);
