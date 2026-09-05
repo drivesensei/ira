@@ -1145,3 +1145,135 @@ fn filter_reapplies_after_hidden_toggle() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn new_entry_extension_decides_kind() {
+    use ira::app::App;
+    use ira::domain::data::Folder;
+    use ira::handler::handle_key_events;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let base = std::env::temp_dir().join(format!("ira_new_{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new("t".into(), base.to_str().unwrap().into(), '#'));
+    let key = |code| KeyEvent::new(code, KeyModifiers::empty());
+    let type_text = |app: &mut App, text: &str| {
+        for ch in text.chars() {
+            app.new_entry_insert(ch);
+        }
+    };
+
+    // Folder: no extension.
+    app.start_new_entry();
+    type_text(&mut app, "newfolder");
+    app.confirm_new_entry();
+    assert!(app.new_entry.is_none(), "dialog closes on success");
+    assert!(base.join("newfolder").is_dir());
+
+    // File: extension present.
+    app.start_new_entry();
+    type_text(&mut app, "notes.txt");
+    app.confirm_new_entry();
+    assert!(base.join("notes.txt").is_file());
+    let content = std::fs::read(base.join("notes.txt")).unwrap();
+    assert!(content.is_empty(), "new file starts empty");
+
+    // Multi-dot name is a file.
+    app.start_new_entry();
+    type_text(&mut app, "data.v2.json");
+    app.confirm_new_entry();
+    assert!(base.join("data.v2.json").is_file());
+
+    // Leading-dot name is a folder (no visible extension).
+    app.start_new_entry();
+    type_text(&mut app, ".config");
+    app.confirm_new_entry();
+    assert!(base.join(".config").is_dir());
+
+    // Trailing dot is a folder (empty suffix).
+    app.start_new_entry();
+    type_text(&mut app, "backup.");
+    app.confirm_new_entry();
+    assert!(base.join("backup.").is_dir());
+
+    // Existing name is rejected with an error status and nothing changes.
+    app.start_new_entry();
+    type_text(&mut app, "notes.txt");
+    app.confirm_new_entry();
+    let st = app.status.as_ref().expect("existing name must error");
+    assert!(st.is_error && st.text.contains("already exists"));
+
+    // Path separators are rejected.
+    app.start_new_entry();
+    type_text(&mut app, "a/b");
+    app.confirm_new_entry();
+    assert!(app.status.as_ref().unwrap().is_error);
+    assert!(!base.join("a").exists());
+
+    // Empty name is ignored (dialog stays open).
+    app.cancel_new_entry();
+    app.start_new_entry();
+    app.confirm_new_entry();
+    assert!(app.new_entry.is_some(), "empty name keeps the dialog open");
+    app.cancel_new_entry();
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn new_entry_selects_created_item_and_works_via_handler() {
+    use ira::app::App;
+    use ira::domain::data::Folder;
+    use ira::handler::handle_key_events;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let base = std::env::temp_dir().join(format!("ira_new2_{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new("t".into(), base.to_str().unwrap().into(), '#'));
+    app.list_files_from_selected_folder();
+    let key = |code| KeyEvent::new(code, KeyModifiers::empty());
+
+    // `n` opens the dialog (normal mode routing).
+    handle_key_events(key(KeyCode::Char('n')), &mut app).unwrap();
+    assert!(app.new_entry.is_some(), "n must open the create dialog");
+
+    // Esc cancels.
+    handle_key_events(key(KeyCode::Esc), &mut app).unwrap();
+    assert!(app.new_entry.is_none());
+
+    // Create a file and wait for the (async) refresh to select it.
+    handle_key_events(key(KeyCode::Char('n')), &mut app).unwrap();
+    for ch in "created.txt".chars() {
+        handle_key_events(key(KeyCode::Char(ch)), &mut app).unwrap();
+    }
+    handle_key_events(key(KeyCode::Enter), &mut app).unwrap();
+
+    let mut selected_path = None;
+    for _ in 0..100 {
+        app.tick();
+        let idx = app.panes[0].state.selected();
+        if let (Some(i), true) = (idx, app.file_list_settled(0)) {
+            selected_path = app.panes[0].files.get(i).map(|f| f.path.clone());
+            if selected_path
+                .as_deref()
+                .is_some_and(|p| p.ends_with("created.txt"))
+            {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let p = selected_path.expect("created file must be selected after refresh");
+    assert!(p.ends_with("created.txt"), "got {p:?}");
+
+    // Rename must still work (Backspace in rename editor unaffected).
+    handle_key_events(key(KeyCode::Enter), &mut app).unwrap();
+    assert!(app.renaming.is_some(), "Enter on the entry opens rename");
+    handle_key_events(key(KeyCode::Esc), &mut app).unwrap();
+
+    let _ = std::fs::remove_dir_all(&base);
+}

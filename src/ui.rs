@@ -174,6 +174,50 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         );
     }
 
+    // Create-new dialog: live kind preview (folder vs file by extension).
+    if let Some(p) = &app.new_entry {
+        let name: String = p.text.iter().collect();
+        let kind = match name.rsplit_once('.') {
+            Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() => {
+                format!("file (.{ext})")
+            }
+            _ => "folder".to_string(),
+        };
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let chars = p.text.clone();
+        if chars.is_empty() {
+            spans.push(Span::raw(" ").style(Style::default().add_modifier(Modifier::REVERSED)));
+        }
+        for (i, c) in chars.iter().enumerate() {
+            let s = Span::raw(format!("{c}"));
+            spans.push(if i == p.cursor {
+                s.style(Style::default().add_modifier(Modifier::REVERSED))
+            } else {
+                s
+            });
+        }
+        if p.cursor >= chars.len() {
+            spans.push(Span::raw(" ").style(Style::default().add_modifier(Modifier::REVERSED)));
+        }
+        let text_line = Line::from(spans);
+        let kind_line = Line::raw(format!("  new {kind}  "));
+        let hint = Line::raw("  [Enter] create  [Esc] cancel  ");
+        let lines: Vec<Line<'static>> = vec![text_line, kind_line, hint];
+        let w = (name.len() as u16 + 16)
+            .max(34)
+            .min(frame.area().width.saturating_sub(4));
+        let h = lines.len() as u16 + 2;
+        let style = Style::default().fg(Color::Black).bg(Color::White);
+        let area = centered_rect(w, h, frame.area());
+        paint_bg(frame, area, style);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(Block::bordered().title(" New ").style(style))
+                .style(style),
+            area,
+        );
+    }
+
     // Info dialog: read-only metadata for the selected entry. The Size line
     // is dynamic: animated partial size while the background walk runs, an
     // honest lower bound after `x`, and the final line once done (drain

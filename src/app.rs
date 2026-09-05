@@ -53,6 +53,8 @@ pub struct Pane {
     pub filter_query: Option<String>,
     /// Visible file indices for the active filter (into `files`).
     pub filter_indices: Vec<usize>,
+    /// Path to select on the next listing settle (e.g. a just-created entry).
+    pub pending_select: Option<String>,
     /// Bumped on every listing request; results carrying an older
     /// generation are dropped, so overlapping listings never interleave
     /// (the "folder lists itself" bug).
@@ -117,6 +119,13 @@ pub struct InfoDialog {
     pub pending: bool,
     /// When the dialog opened; drives the loading spinner animation.
     pub started: Instant,
+}
+
+/// In-place input for creating a new entry. Extension decides the kind:
+/// "notes" → folder, "notes.txt" → file.
+pub struct NewEntryPrompt {
+    pub text: Vec<char>,
+    pub cursor: usize,
 }
 
 /// A pending destructive action awaiting confirmation.
@@ -185,6 +194,8 @@ pub struct App {
     pub renaming: Option<RenamePrompt>,
     /// Open metadata dialog; `None` when closed.
     pub info: Option<InfoDialog>,
+    /// "Create new" dialog (`n`); `None` when closed.
+    pub new_entry: Option<NewEntryPrompt>,
 
     /// Transient status/error message shown in the bottom bar until it
     /// expires (or the next action replaces it).
@@ -267,6 +278,7 @@ impl Default for App {
             copy_board_state: ListState::default(),
             confirming: None,
             renaming: None,
+            new_entry: None,
             info: None,
             status: None,
             deletion: None,
@@ -469,8 +481,13 @@ impl App {
                 pane.files = files;
                 pane.selected = vec![false; len];
                 pane.render_scroll = 0;
-                pane.state.select(None);
                 pane.listing_settled = true;
+                // A just-created entry gets the cursor.
+                if let Some(sel) = pane.pending_select.take() {
+                    if let Some(i) = pane.files.iter().position(|f| f.path == sel) {
+                        pane.state.select(Some(i));
+                    }
+                }
                 // Same-folder refresh: keep the confirmed filter applied.
                 let query = pane.filter_query.clone();
                 if let Some(q) = query {
@@ -556,6 +573,11 @@ impl App {
                 pane.selected = vec![false; pane.files.len()];
                 pane.render_scroll = 0;
                 pane.listing_settled = true;
+                if let Some(sel) = pane.pending_select.take() {
+                    if let Some(i) = pane.files.iter().position(|f| f.path == sel) {
+                        pane.state.select(Some(i));
+                    }
+                }
                 let query = pane.filter_query.clone();
                 if let Some(q) = query {
                     let labels: Vec<String> = pane.files.iter().map(|f| f.label.clone()).collect();
@@ -724,6 +746,7 @@ impl App {
                     let pane = self.pane_mut();
                     pane.filter_query = None;
                     pane.filter_indices.clear();
+                    pane.pending_select = None;
                     pane.folder = Some(actual_folder);
                     self.search_query = None;
                     self.list_files_from_selected_folder();
@@ -749,6 +772,7 @@ impl App {
                 let pane = self.pane_mut();
                 pane.filter_query = None;
                 pane.filter_indices.clear();
+                pane.pending_select = None;
                 pane.folder = Some(folder);
                 self.search_query = None;
                 self.list_files_from_selected_folder();
@@ -1016,6 +1040,106 @@ impl App {
             return;
         };
         self.spawn_transfer_jobs(kind, confirm.paths, dest);
+    }
+
+    // ---- Create new folder / file (`n`) ----
+
+    /// Opens the create dialog for the active pane's folder. The entry kind
+    /// is decided by the typed name: an extension makes it a file.
+    pub fn start_new_entry(&mut self) {
+        if self.confirming.is_some() || self.info.is_some() || self.renaming.is_some() {
+            return;
+        }
+        if self.pane().folder.is_none() {
+            return;
+        }
+        self.new_entry = Some(NewEntryPrompt {
+            text: Vec::new(),
+            cursor: 0,
+        });
+    }
+
+    pub fn new_entry_insert(&mut self, c: char) {
+        if let Some(p) = self.new_entry.as_mut() {
+            p.text.insert(p.cursor, c);
+            p.cursor += 1;
+        }
+    }
+
+    pub fn new_entry_backspace(&mut self) {
+        if let Some(p) = self.new_entry.as_mut() {
+            if p.cursor > 0 {
+                p.cursor -= 1;
+                p.text.remove(p.cursor);
+            }
+        }
+    }
+
+    pub fn new_entry_left(&mut self) {
+        if let Some(p) = self.new_entry.as_mut() {
+            p.cursor = p.cursor.saturating_sub(1);
+        }
+    }
+
+    pub fn new_entry_right(&mut self) {
+        if let Some(p) = self.new_entry.as_mut() {
+            p.cursor = (p.cursor + 1).min(p.text.len());
+        }
+    }
+
+    pub fn cancel_new_entry(&mut self) {
+        self.new_entry = None;
+    }
+
+    /// Creates the entry and refreshes the listing, selecting it. Kind rule:
+    /// a name whose last dot is not leading and has a non-empty suffix is a
+    /// file ("notes.txt", "data.v2.json"); otherwise a folder ("notes",
+    /// ".config", "backup.").
+    pub fn confirm_new_entry(&mut self) {
+        // Validation failures keep the dialog open so the name can be fixed.
+        let (name, is_file) = {
+            let Some(prompt) = self.new_entry.as_ref() else {
+                return;
+            };
+            let raw: String = prompt.text.iter().collect();
+            let name = raw.trim().to_string();
+            if name.is_empty() {
+                self.set_status("Enter a name first.", true);
+                return;
+            }
+            if name.contains('/') || name.contains('\\') {
+                self.set_status("Name cannot contain path separators.", true);
+                return;
+            }
+            let is_file = match name.rsplit_once('.') {
+                Some((stem, ext)) => !stem.is_empty() && !ext.is_empty(),
+                None => false,
+            };
+            (name, is_file)
+        };
+
+        let pane = self.pane_mut();
+        let Some(parent) = pane.folder.as_ref().map(|f| f.path.clone()) else {
+            return;
+        };
+        let target = std::path::Path::new(&parent).join(&name);
+        if target.exists() {
+            self.set_status(format!("'{name}' already exists."), true);
+            return;
+        }
+        let result = if is_file {
+            std::fs::write(&target, "")
+        } else {
+            std::fs::create_dir_all(&target)
+        };
+        if let Err(err) = result {
+            self.set_status(format!("Failed to create '{name}': {err}"), true);
+            return;
+        }
+        // Select the new entry once the (async) listing refresh settles.
+        pane.pending_select = Some(target.to_string_lossy().into_owned());
+        self.new_entry = None;
+        self.list_files_from_selected_folder();
     }
 
     /// Single entry point for whichever confirmation is pending (`y`/Enter).

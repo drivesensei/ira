@@ -63,6 +63,20 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         return Ok(());
     }
 
+    // Create-new dialog: typing builds the name; Enter creates.
+    if app.new_entry.is_some() {
+        match key_event.code {
+            KeyCode::Esc => app.cancel_new_entry(),
+            KeyCode::Enter => app.confirm_new_entry(),
+            KeyCode::Backspace => app.new_entry_backspace(),
+            KeyCode::Left => app.new_entry_left(),
+            KeyCode::Right => app.new_entry_right(),
+            KeyCode::Char(c) => app.new_entry_insert(c),
+            _ => {}
+        }
+        return Ok(());
+    }
+
     // Command panel focused: typing goes to the panel input.
     if app.panel_has_focus() {
         match key_event.code {
@@ -198,6 +212,9 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
 
         KeyCode::Char('z') => app.goto_top(),
         KeyCode::Char('x') => app.goto_bottom(),
+
+        // `n` opens the create-new dialog (folder or file by extension).
+        KeyCode::Char('n') => app.start_new_entry(),
 
         // `-` ejects (unmounts) the removable drive of the active pane.
         // (`e` belongs to the Desktop common-folder shortcut on macOS.)
