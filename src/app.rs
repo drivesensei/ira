@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
@@ -19,8 +19,9 @@ use crate::{
         },
         folders::list_common_folders,
         list_files::{list_files_bounded, list_files_chunked, FEntry, LISTING_CHUNK},
+        process_panel::{spawn_command, CommandRun, RunState},
         state::{load_state, save_state, save_state_to, SessionState, SizeEntry},
-        transfer::{spawn_job, Job, JobControl, JobEvent, JobKind, JobStatus},
+        transfer::{spawn_delete_job, spawn_job, Job, JobControl, JobEvent, JobKind, JobStatus},
     },
     utils::{
         fuzzy::fuzzy_score,
@@ -79,6 +80,25 @@ pub struct Status {
 /// How long a status message stays visible.
 pub const STATUS_TTL: Duration = Duration::from_secs(8);
 
+/// Gap between navigation keys under which they count as "held down"
+/// (OS key-repeat fires at ~30 Hz; anything slower is a fresh press).
+pub const SCROLL_REPEAT_WINDOW: Duration = Duration::from_millis(200);
+/// Held-key repeats needed for each step-size increase (1,1,1,1,1,1 → 2 …).
+pub const SCROLL_RAMP_EVERY: u32 = 6;
+/// Maximum rows moved per key repeat once fully ramped.
+pub const SCROLL_MAX_STEP: usize = 6;
+
+/// Live state of the background batch deletion.
+#[derive(Debug)]
+pub struct DeletionState {
+    pub total: usize,
+    pub done: usize,
+    /// Path currently being removed (spinner target).
+    pub current: Option<String>,
+    pub started: Instant,
+    pub control: Arc<JobControl>,
+}
+
 /// Read-only metadata dialog for a file or folder. Opens instantly with the
 /// no-filesystem fast lines; the worker's `Meta` event replaces them with
 /// the stat lines, and the folder's Size line is injected/updated from the
@@ -95,10 +115,22 @@ pub struct InfoDialog {
 
 /// A pending destructive action awaiting confirmation.
 pub struct Confirm {
+    /// Which operation `y` confirms.
+    pub action: ConfirmAction,
     /// Prompt label, e.g. `'report.pdf'` or `3 items`.
     pub label: String,
     /// Full paths of the items the action would affect.
     pub paths: Vec<String>,
+    /// Destination folder for copy/move; `None` for delete.
+    pub dest_dir: Option<String>,
+}
+
+/// The operation a confirmation dialog refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmAction {
+    Delete,
+    Copy,
+    Move,
 }
 
 /// A running folder-size walk plus its start time (drives the spinner).
@@ -151,6 +183,29 @@ pub struct App {
     /// Transient status/error message shown in the bottom bar until it
     /// expires (or the next action replaces it).
     pub status: Option<Status>,
+
+    /// In-progress batch deletion (background worker); `None` when idle.
+    pub deletion: Option<DeletionState>,
+    /// The deletion progress dialog was dismissed with a key; stays hidden
+    /// until the deletion finishes.
+    pub deletion_box_hidden: bool,
+    /// Paths queued for/being deleted (drives the file-list spinners).
+    deleting_paths: HashSet<String>,
+    /// Embedded command panel (`0`): running process + its buffered output.
+    /// The command keeps running while the panel is hidden.
+    pub process_panel: Option<Arc<CommandRun>>,
+    /// Whether the panel is visible.
+    pub panel_open: bool,
+    /// Whether the panel has keyboard focus (typing goes to the process).
+    pub panel_focused: bool,
+    /// Panel input line being typed.
+    pub panel_input: String,
+    /// Scroll acceleration state: direction (+1 down / -1 up / 0 idle),
+    /// consecutive repeats within [`SCROLL_REPEAT_WINDOW`], and the time of
+    /// the last move.
+    scroll_dir: i8,
+    scroll_repeat: u32,
+    last_scroll: Option<Instant>,
 
     job_tx: mpsc::Sender<JobEvent>,
     job_rx: mpsc::Receiver<JobEvent>,
@@ -208,6 +263,16 @@ impl Default for App {
             renaming: None,
             info: None,
             status: None,
+            deletion: None,
+            deletion_box_hidden: false,
+            deleting_paths: HashSet::new(),
+            process_panel: None,
+            panel_open: false,
+            panel_focused: false,
+            panel_input: String::new(),
+            scroll_dir: 0,
+            scroll_repeat: 0,
+            last_scroll: None,
             job_tx,
             job_rx,
             size_cache: HashMap::new(),
@@ -656,8 +721,9 @@ impl App {
             self.pane_mut().state.select(None);
             return;
         }
+        let step = self.scroll_step(1);
         let next = match self.pane().state.selected() {
-            Some(i) => Some((i + 1).min(count - 1)),
+            Some(i) => Some((i + step).min(count - 1)),
             None => Some(0),
         };
         self.pane_mut().state.select(next);
@@ -665,7 +731,10 @@ impl App {
 
     pub fn prev_item(&mut self) {
         match self.pane().state.selected() {
-            Some(i) if i > 0 => self.pane_mut().state.select(Some(i - 1)),
+            Some(i) if i > 0 => {
+                let step = self.scroll_step(-1);
+                self.pane_mut().state.select(Some(i.saturating_sub(step)));
+            }
             Some(_) => {}
             None => {
                 if self.visible_count() > 0 {
@@ -675,7 +744,30 @@ impl App {
         }
     }
 
+    /// Clears the held-key ramp (jump navigation starts from step 1).
+    fn reset_scroll_ramp(&mut self) {
+        self.scroll_dir = 0;
+        self.scroll_repeat = 0;
+        self.last_scroll = None;
+    }
+
+    /// Rows to move for this navigation key: 1 for a fresh press, ramping
+    /// to [`SCROLL_MAX_STEP`] while the key is held (repeats within
+    /// [`SCROLL_REPEAT_WINDOW`]). Direction change or pause resets the ramp.
+    fn scroll_step(&mut self, dir: i8) -> usize {
+        let now = Instant::now();
+        let held = self.scroll_dir == dir
+            && self
+                .last_scroll
+                .is_some_and(|t| now.duration_since(t) <= SCROLL_REPEAT_WINDOW);
+        self.scroll_dir = dir;
+        self.last_scroll = Some(now);
+        self.scroll_repeat = if held { self.scroll_repeat + 1 } else { 0 };
+        (1 + (self.scroll_repeat / SCROLL_RAMP_EVERY) as usize).min(SCROLL_MAX_STEP)
+    }
+
     pub fn goto_top(&mut self) {
+        self.reset_scroll_ramp();
         if self.visible_count() > 0 {
             self.pane_mut().state.select(Some(0));
         } else {
@@ -684,6 +776,7 @@ impl App {
     }
 
     pub fn goto_bottom(&mut self) {
+        self.reset_scroll_ramp();
         let count = self.visible_count();
         if count > 0 {
             self.pane_mut().state.select(Some(count - 1));
@@ -714,6 +807,15 @@ impl App {
     /// (when open) -> pane 0.
     pub fn switch_pane(&mut self) {
         self.search_query = None;
+        if self.panel_open && !self.panel_focused && !self.copy_board {
+            // Pane -> panel.
+            self.panel_focused = true;
+            return;
+        }
+        if self.panel_has_focus() {
+            self.panel_focused = false;
+            return;
+        }
         if self.copy_board {
             if self.board_focused {
                 self.board_focused = false;
@@ -728,14 +830,160 @@ impl App {
         }
     }
 
-    // ---- Copy / move between panes (async, via the Copy Board) ----
-
-    pub fn copy_to_other_pane(&mut self) {
-        self.start_transfer(JobKind::Copy);
+    /// Toggles the command panel (`0`). First open offers an empty input
+    /// line; the panel can be hidden/shown freely while a command runs.
+    pub fn toggle_process_panel(&mut self) {
+        if self.panel_open {
+            // Hide the panel; any running command keeps going.
+            self.panel_open = false;
+            self.panel_focused = false;
+            self.panel_input.clear();
+            return;
+        }
+        self.panel_open = true;
+        // Auto-focus: `0` is an explicit "I want the terminal" action.
+        self.panel_focused = true;
+        self.board_focused = false;
     }
 
-    pub fn move_to_other_pane(&mut self) {
-        self.start_transfer(JobKind::Move);
+    /// Spawns the typed command in the active pane's folder. The panel stays
+    /// open and streams output; the process keeps running when hidden.
+    pub fn run_panel_command(&mut self) {
+        let cmd = self.panel_input.trim().to_string();
+        self.panel_input.clear();
+        if cmd.is_empty() {
+            return;
+        }
+        if self
+            .process_panel
+            .as_ref()
+            .is_some_and(|p| p.state() == RunState::Running)
+        {
+            self.set_status(
+                "A command is already running — stop it first (Ctrl+C).",
+                true,
+            );
+            return;
+        }
+        let Some(folder) = self.pane().folder.as_ref().map(|f| f.path.clone()) else {
+            self.set_status("No folder open to run the command in.", true);
+            return;
+        };
+        let (program, args) = parse_command_line(&cmd);
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        match spawn_command(&program, &arg_refs, &folder) {
+            Ok(run) => self.process_panel = Some(run),
+            Err(msg) => self.set_status(msg, true),
+        }
+    }
+
+    /// Ctrl+C in the panel: interrupt the running process (SIGINT on Unix,
+    /// taskkill on Windows); its output keeps flowing into the buffer.
+    pub fn stop_panel_command(&mut self) {
+        if let Some(panel) = &self.process_panel {
+            if panel.state() == RunState::Running {
+                panel.stop();
+            }
+        }
+    }
+
+    /// Sends one input line to the running process's stdin.
+    pub fn panel_send_line(&mut self) {
+        let line = self.panel_input.trim().to_string();
+        self.panel_input.clear();
+        if let Some(panel) = &self.process_panel {
+            panel.send_line(&line);
+        }
+    }
+
+    /// True when the bottom command panel is open.
+    pub fn panel_open(&self) -> bool {
+        self.panel_open
+    }
+
+    /// True when the panel is open, has a live process, and focus is on it.
+    pub fn panel_has_focus(&self) -> bool {
+        self.panel_open && self.panel_focused
+    }
+
+    /// Focuses the panel for typing (called by the Tab/focus machinery).
+    pub fn focus_process_panel(&mut self) {
+        self.panel_open = true;
+        self.panel_focused = true;
+        self.board_focused = false;
+    }
+
+    // ---- Copy / move between panes (async, via the Copy Board) ----
+
+    pub fn request_copy(&mut self) {
+        self.request_transfer(JobKind::Copy);
+    }
+
+    pub fn request_move(&mut self) {
+        self.request_transfer(JobKind::Move);
+    }
+
+    /// Pre-validates and stages a copy/move confirmation dialog: pressing
+    /// `c`/`m` never starts a transfer by itself.
+    fn request_transfer(&mut self, kind: JobKind) {
+        let other = 1 - self.active_pane;
+        let Some(dest) = self.panes[other].folder.as_ref().map(|f| f.path.clone()) else {
+            self.set_status("The other pane has no folder to copy into.", true);
+            return;
+        };
+        let sources = self.collect_sources();
+        if sources.is_empty() {
+            return;
+        }
+        let dest_path = std::path::Path::new(&dest);
+        if sources
+            .iter()
+            .any(|src| dest_path.starts_with(std::path::Path::new(src)))
+        {
+            self.set_status("Cannot copy/move a folder into itself.", true);
+            return;
+        }
+        let label = if sources.len() == 1 {
+            let name = std::path::Path::new(&sources[0])
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| sources[0].clone());
+            format!("'{name}'")
+        } else {
+            format!("{} items", sources.len())
+        };
+        self.confirming = Some(Confirm {
+            action: match kind {
+                JobKind::Copy => ConfirmAction::Copy,
+                JobKind::Move => ConfirmAction::Move,
+            },
+            label,
+            paths: sources,
+            dest_dir: Some(dest),
+        });
+    }
+
+    /// Applies the pending copy/move confirmation: spawns the jobs.
+    pub fn confirm_transfer(&mut self, kind: JobKind) {
+        let Some(confirm) = self.confirming.take() else {
+            return;
+        };
+        let Some(dest) = confirm.dest_dir else {
+            return;
+        };
+        self.spawn_transfer_jobs(kind, confirm.paths, dest);
+    }
+
+    /// Single entry point for whichever confirmation is pending (`y`/Enter).
+    pub fn confirm_pending(&mut self) {
+        let Some(action) = self.confirming.as_ref().map(|c| c.action) else {
+            return;
+        };
+        match action {
+            ConfirmAction::Delete => self.confirm_delete(),
+            ConfirmAction::Copy => self.confirm_transfer(JobKind::Copy),
+            ConfirmAction::Move => self.confirm_transfer(JobKind::Move),
+        }
     }
 
     /// Toggles multi-selection on the entry under the cursor, then moves the
@@ -1075,16 +1323,7 @@ impl App {
             .unwrap_or_default()
     }
 
-    fn start_transfer(&mut self, kind: JobKind) {
-        let other = 1 - self.active_pane;
-        let Some(dest) = self.panes[other].folder.as_ref().map(|f| f.path.clone()) else {
-            self.set_status("The other pane has no folder to copy into.", true);
-            return;
-        };
-        let sources = self.collect_sources();
-        if sources.is_empty() {
-            return;
-        }
+    fn spawn_transfer_jobs(&mut self, kind: JobKind, sources: Vec<String>, dest: String) {
         let dest_path = std::path::Path::new(&dest);
         let mut spawned = false;
         for src in sources {
@@ -1214,28 +1453,48 @@ impl App {
         } else {
             format!("{} items", paths.len())
         };
-        self.confirming = Some(Confirm { label, paths });
+        self.confirming = Some(Confirm {
+            action: ConfirmAction::Delete,
+            label,
+            paths,
+            dest_dir: None,
+        });
     }
 
-    /// Confirms the pending deletion and removes the files/directories.
+    /// Confirms the pending deletion: spawns the background delete worker
+    /// and returns immediately. Progress arrives on the job channel and is
+    /// shown in the (dismissable) progress dialog plus file-list spinners.
     pub fn confirm_delete(&mut self) {
         let Some(confirm) = self.confirming.take() else {
             return;
         };
-        for path in &confirm.paths {
-            let result = std::fs::symlink_metadata(path).ok().map(|meta| {
-                if meta.is_dir() {
-                    std::fs::remove_dir_all(path)
-                } else {
-                    std::fs::remove_file(path)
-                }
-            });
-            if let Some(Err(err)) = result {
-                self.set_status(format!("Failed to delete '{path}': {err}"), true);
-            }
+        if confirm.paths.is_empty() {
+            return;
         }
-        self.pane_mut().selected.fill(false);
-        self.refresh_after_job();
+        self.deleting_paths = confirm.paths.iter().cloned().collect();
+        let tx = self.job_tx.clone();
+        let control = spawn_delete_job(confirm.paths.clone(), tx);
+        self.deletion = Some(DeletionState {
+            total: confirm.paths.len(),
+            done: 0,
+            current: None,
+            started: Instant::now(),
+            control,
+        });
+        self.deletion_box_hidden = false;
+    }
+
+    /// `Some(started)` when `path` is queued/being deleted (file-list spinner).
+    pub fn deleting_started(&self, path: &str) -> Option<Instant> {
+        self.deleting_paths
+            .contains(path)
+            .then_some(())
+            .and(self.deletion.as_ref().map(|d| d.started))
+    }
+
+    /// A batch deletion is running and its progress dialog is visible.
+    pub fn deletion_box_visible(&self) -> bool {
+        self.deletion.is_some() && !self.deletion_box_hidden
     }
 
     /// Cancels the pending confirmation.
@@ -1277,7 +1536,39 @@ impl App {
                     if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id) {
                         j.status = JobStatus::Failed(error);
                     }
-                    self.refresh_after_job();
+                }
+                JobEvent::DeleteProgress {
+                    done,
+                    total,
+                    current,
+                } => {
+                    if let Some(d) = self.deletion.as_mut() {
+                        d.done = done;
+                        d.total = total;
+                        d.current = Some(current.clone());
+                    }
+                    self.deleting_paths.remove(&current);
+                }
+                JobEvent::DeleteDone { cancelled, failed } => {
+                    self.deletion = None;
+                    self.deleting_paths.clear();
+                    self.deletion_box_hidden = false;
+                    if !cancelled {
+                        self.pane_mut().selected.fill(false);
+                        self.refresh_after_job();
+                    }
+                    if failed.is_empty() {
+                        // Success is visible in the listing itself — no
+                        // dialog for a normal completion.
+                    } else {
+                        let (path, err) = &failed[0];
+                        let more = if failed.len() > 1 {
+                            format!(" (+{} more)", failed.len() - 1)
+                        } else {
+                            String::new()
+                        };
+                        self.set_status(format!("Failed to delete '{path}': {err}{more}"), true);
+                    }
                 }
             }
         }
@@ -1931,6 +2222,14 @@ mod tests {
         app.clear_status();
         assert!(app.status.is_none());
     }
+}
+
+/// Splits a command line into program + args on whitespace (no shell
+/// quoting yet; good enough for `npm run dev`, `node server.js`, `du -sh *`
+/// style usage — globbing/vars are the shell's job and are not expanded).
+fn parse_command_line(cmd: &str) -> (String, Vec<String>) {
+    let mut parts = cmd.split_whitespace().map(str::to_string);
+    (parts.next().unwrap_or_default(), parts.collect())
 }
 
 /// Joins Unicode characters into a `String`.

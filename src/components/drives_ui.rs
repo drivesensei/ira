@@ -30,7 +30,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
         let text = Line::from(drive_spans);
         let dlist = ratatui::widgets::Paragraph::new(text).block(
             Block::default()
-                .title(" Drives  (press e to unmount the current drive) ")
+                .title(" Drives  (press minus (-) to unmount the current drive) ")
                 .borders(ratatui::widgets::Borders::ALL),
         );
 

@@ -48,18 +48,27 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     // Bookmarks (left) and Actions (right) share the third row.
     let bookmarks_row = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(36)])
+        .constraints([Constraint::Min(0), Constraint::Length(48)])
         .split(rows[2]);
     crate::components::bookmarks_ui::render(frame, app, bookmarks_row[0]);
     crate::components::actions_ui::render(frame, app, bookmarks_row[1]);
 
-    // Files area: optional Copy Board sidebar on the right, then the panes.
+    // Files area: optional Copy Board sidebar on the right, optional
+    // command panel at the bottom, then the panes.
     let mut files_area = rows[3];
+    if app.panel_open() {
+        let vert = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(4), Constraint::Length(10)])
+            .split(files_area);
+        files_area = vert[0];
+        crate::components::process_panel_ui::render(frame, app, vert[1]);
+    }
     if app.copy_board {
         let board = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(0), Constraint::Length(36)])
-            .split(rows[3]);
+            .constraints([Constraint::Min(0), Constraint::Length(48)])
+            .split(files_area);
         crate::components::copy_board_ui::render(frame, app, board[1]);
         files_area = board[0];
     }
@@ -75,10 +84,50 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         crate::components::tab1_files_ui::render(frame, app, files_area, 0, true);
     }
 
+    // Deletion progress dialog: shown while the background delete worker
+    // runs (unless dismissed with a key). Dismissing never cancels the job.
+    if let Some(del) = &app.deletion {
+        if !app.deletion_box_hidden {
+            let current = del
+                .current
+                .as_deref()
+                .and_then(|p| p.rsplit('/').next())
+                .unwrap_or("");
+            let line = format!(" Deleting {}/{} — {} ", del.done, del.total, current);
+            let style = Style::default().fg(Color::Black).bg(Color::LightYellow);
+            let area = centered_rect(60, 3, frame.area());
+            paint_bg(frame, area, style);
+            let block = Block::bordered().title(" Deleting ").style(style);
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::raw(line),
+                    Line::raw("  [any key] hide (deletion continues)  "),
+                ])
+                .block(block)
+                .style(style),
+                area,
+            );
+        }
+    }
+
     // Confirmation prompt overlay (delete): solid light background so it is
     // readable over the file list.
     if let Some(confirm) = &app.confirming {
-        let prompt = format!(" Delete {}?  [y]es  [n]o ", confirm.label);
+        let verb = match confirm.action {
+            crate::app::ConfirmAction::Delete => "Delete",
+            crate::app::ConfirmAction::Copy => "Copy",
+            crate::app::ConfirmAction::Move => "Move",
+        };
+        let prompt = match &confirm.dest_dir {
+            Some(dest) => {
+                let dest_name = std::path::Path::new(dest)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| dest.clone());
+                format!(" {verb} {} → {dest_name}?  [y]es  [n]o ", confirm.label)
+            }
+            None => format!(" {verb} {}?  [y]es  [n]o ", confirm.label),
+        };
         let style = Style::default().fg(Color::Black).bg(Color::White);
         let area = centered_rect(60, 3, frame.area());
         paint_bg(frame, area, style);

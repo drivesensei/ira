@@ -39,6 +39,10 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, activ
         let size_note = |f: &crate::services::list_files::FEntry| {
             app.size_info(&f.path).filter(|s| s.complete && f.is_dir)
         };
+        // Folders queued for background deletion show the spinner too.
+        let deleting_started = |f: &crate::services::list_files::FEntry| {
+            app.deleting_started(&f.path).filter(|_| f.is_dir)
+        };
 
         // Build spans ONLY for the visible window: with 200k+ entries, one
         // Span allocation per row per frame is what makes the UI feel stuck.
@@ -62,6 +66,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, activ
                         f,
                         walk_started(f),
                         size_note(f),
+                        deleting_started(f),
                     )
                 })
                 .collect();
@@ -78,6 +83,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, activ
                         f,
                         walk_started(f),
                         size_note(f),
+                        deleting_started(f),
                     )
                 })
                 .collect();
@@ -146,11 +152,13 @@ fn row_span(
     file: &crate::services::list_files::FEntry,
     walking: Option<Instant>,
     note: Option<&SizeInfo>,
+    deleting: Option<Instant>,
 ) -> Span<'static> {
     let mark = if selected { "[*]" } else { "[ ]" };
-    let icon = match walking {
-        Some(started) => spinner_char(started).to_string(),
-        None => icon_for(file.is_dir).to_string(),
+    let icon = match (deleting, walking) {
+        (Some(started), _) => spinner_char(started).to_string(),
+        (None, Some(started)) => spinner_char(started).to_string(),
+        (None, None) => icon_for(file.is_dir).to_string(),
     };
     let label = match note {
         Some(si) => format!("{} ({})", file.label, list_note(si)),
@@ -190,8 +198,8 @@ mod tests {
             is_dir: false,
         };
 
-        let d = row_span(false, &dir, None, None).content.to_string();
-        let f = row_span(false, &file, None, None).content.to_string();
+        let d = row_span(false, &dir, None, None, None).content.to_string();
+        let f = row_span(false, &file, None, None, None).content.to_string();
         assert!(
             d.contains('□'),
             "folder row should carry the folder square: {d:?}"
@@ -216,7 +224,9 @@ mod tests {
             complete: true,
             updated: SystemTime::now(),
         };
-        let row = row_span(false, &dir, None, Some(&si)).content.to_string();
+        let row = row_span(false, &dir, None, Some(&si), None)
+            .content
+            .to_string();
         assert!(
             row.starts_with(" [ ] □ cybertouch ("),
             "folder row keeps mark and icon: {row:?}"
@@ -237,8 +247,8 @@ mod tests {
             label: "src".to_string(),
             is_dir: true,
         };
-        let plain = row_span(false, &dir, None, None).content.to_string();
-        let walking = row_span(false, &dir, Some(Instant::now()), None)
+        let plain = row_span(false, &dir, None, None, None).content.to_string();
+        let walking = row_span(false, &dir, Some(Instant::now()), None, None)
             .content
             .to_string();
         assert_ne!(plain, walking, "walking folder swaps its icon");

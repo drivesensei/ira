@@ -1,4 +1,5 @@
 use crate::app::{App, AppResult};
+use crate::services::process_panel::RunState;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// Handles the key events and updates the state of [`App`].
@@ -7,6 +8,18 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
     // (except while editing a rename). Ctrl is the only modifier every
     // terminal reports reliably.
     if key_event.modifiers == KeyModifiers::CONTROL {
+        // Ctrl+C with a running process in the focused panel = stop the
+        // process, never quit the app.
+        if matches!(key_event.code, KeyCode::Char('c') | KeyCode::Char('C'))
+            && app.panel_has_focus()
+            && app
+                .process_panel
+                .as_ref()
+                .is_some_and(|p| p.state() == RunState::Running)
+        {
+            app.stop_panel_command();
+            return Ok(());
+        }
         match key_event.code {
             KeyCode::Char('c') | KeyCode::Char('C') => {
                 app.quit();
@@ -37,10 +50,47 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         return Ok(());
     }
 
+    // Command panel focused: typing goes to the panel input.
+    if app.panel_has_focus() {
+        match key_event.code {
+            // Esc/Tab unfocus; `0` is just a character here (commands may
+            // contain digits, e.g. "sleep 60"). Closing = Esc then `0`.
+            KeyCode::Esc | KeyCode::Tab => {
+                app.panel_focused = false;
+            }
+            KeyCode::Enter => {
+                if key_event.modifiers.contains(KeyModifiers::CONTROL) {
+                    app.stop_panel_command();
+                } else if app
+                    .process_panel
+                    .as_ref()
+                    .is_some_and(|p| p.state() == RunState::Running)
+                {
+                    app.panel_send_line();
+                } else {
+                    app.run_panel_command();
+                }
+            }
+            KeyCode::Backspace => {
+                app.panel_input.pop();
+            }
+            KeyCode::Char(c) => app.panel_input.push(c),
+            _ => {}
+        }
+        return Ok(());
+    }
+
     // Error dialog: any key dismisses it. Checked before the info dialog so
     // an eject failure's error box never swallows the next action.
     if app.status.is_some() {
         app.clear_status();
+        return Ok(());
+    }
+
+    // Deletion progress dialog: any key hides it; the background deletion
+    // keeps running.
+    if app.deletion_box_visible() {
+        app.deletion_box_hidden = true;
         return Ok(());
     }
 
@@ -64,10 +114,10 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         return Ok(());
     }
 
-    // Confirmation prompt (e.g. delete).
+    // Confirmation prompt (delete / copy / move).
     if app.confirming.is_some() {
         match key_event.code {
-            KeyCode::Char('y') | KeyCode::Enter => app.confirm_delete(),
+            KeyCode::Char('y') | KeyCode::Enter => app.confirm_pending(),
             KeyCode::Char('n') | KeyCode::Esc => app.cancel_confirm(),
             _ => {}
         }
@@ -120,6 +170,10 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         // Exit application on `q`
         KeyCode::Char(c) if c == 'q' => app.quit(),
 
+        // `0` toggles the command panel (drives shortcuts start at 1, so
+        // 0 is free).
+        KeyCode::Char('0') => app.toggle_process_panel(),
+
         // Any digit represents a shortcut to a Drive path
         KeyCode::Char(c) if c.is_digit(10) => {
             let index = c.to_digit(10).unwrap() as usize;
@@ -132,8 +186,9 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         KeyCode::Char('z') => app.goto_top(),
         KeyCode::Char('x') => app.goto_bottom(),
 
-        // `e` ejects (unmounts) the removable drive of the active pane.
-        KeyCode::Char('e') => app.eject_active_drive(),
+        // `-` ejects (unmounts) the removable drive of the active pane.
+        // (`e` belongs to the Desktop common-folder shortcut on macOS.)
+        KeyCode::Char('-') => app.eject_active_drive(),
 
         // Toggle a bookmark for the current folder.
         KeyCode::Char('b') => app.toggle_bookmark(),
@@ -147,8 +202,8 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         KeyCode::Char('`') => app.toggle_copy_board(),
 
         // `c` copies the selected entry to the other pane; `m` moves it.
-        KeyCode::Char('c') => app.copy_to_other_pane(),
-        KeyCode::Char('m') => app.move_to_other_pane(),
+        KeyCode::Char('c') => app.request_copy(),
+        KeyCode::Char('m') => app.request_move(),
 
         // Tab cycles focus among panes and the Copy Board.
         KeyCode::Tab => app.switch_pane(),
