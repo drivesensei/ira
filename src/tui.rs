@@ -75,6 +75,18 @@ impl<B: Backend> Tui<B> {
         Ok(())
     }
 
+    /// Clears the ratatui buffer state so the next draw repaints every
+    /// cell. Only call while the EventHandler is paused: ratatui 0.30's
+    /// clear() sends a blocking cursor-position query whose response can
+    /// be eaten by the event thread (the startup-stall regression).
+    pub fn clear(&mut self) -> AppResult<()>
+    where
+        <B as Backend>::Error: 'static,
+    {
+        self.terminal.clear()?;
+        Ok(())
+    }
+
     /// Exits the terminal interface.
     ///
     /// It disables the raw mode and reverts back the terminal properties.
