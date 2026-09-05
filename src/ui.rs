@@ -39,11 +39,32 @@ pub fn render(app: &mut App, frame: &mut Frame) {
             Constraint::Length(3), // Common folders
             Constraint::Length(3), // Bookmarks + Actions
             Constraint::Min(2),    // Files
+            Constraint::Length(1), // Status bar
         ])
         .split(frame.area());
 
     crate::components::drives_ui::render(frame, app, rows[0]);
     crate::components::common_folders_ui::render(frame, app, rows[1]);
+
+    // Bottom status bar: non-error notices (errors use the modal dialog).
+    if let Some(status) = &app.status {
+        if !status.is_error {
+            let bar = Rect {
+                x: frame.area().x,
+                y: frame.area().y + frame.area().height - 1,
+                width: frame.area().width,
+                height: 1,
+            };
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    format!(" {} ", status.text),
+                    Style::default().fg(Color::Black).bg(Color::LightYellow),
+                ))
+                .style(Style::default().fg(Color::Black).bg(Color::LightYellow)),
+                bar,
+            );
+        }
+    }
 
     // Bookmarks (left) and Actions (right) share the third row.
     let bookmarks_row = Layout::default()
@@ -342,6 +363,9 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     // rename collision, delete IO error...). Red theme; any key closes it
     // (handler.rs treats every key as dismiss while it is open).
     if let Some(status) = &app.status {
+        if !status.is_error {
+            return; // notices render in the bottom bar; only errors modal here
+        }
         let text: Vec<Line<'static>> = vec![
             Line::styled(
                 status.text.clone(),

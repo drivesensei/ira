@@ -196,6 +196,9 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         // `[` opens the go-to-path dialog (paste or type a path).
         KeyCode::Char('[') => app.start_goto(),
 
+        // `]` copies the active pane's current folder path to the clipboard.
+        KeyCode::Char(']') => app.copy_folder_path(),
+
         // `-` ejects (unmounts) the removable drive of the active pane.
         // (`e` belongs to the Desktop common-folder shortcut on macOS.)
         KeyCode::Char('-') => app.eject_active_drive(),

@@ -970,10 +970,7 @@ impl App {
                 .stderr(Stdio::null())
                 .current_dir(&dir);
             match cmd.spawn() {
-                Ok(_) => {
-                    self.set_status(format!("Opened {program}"), false);
-                    return;
-                }
+                Ok(_) => return, // success is visible: the window opened
                 Err(_) => continue,
             }
         }
@@ -1162,6 +1159,18 @@ impl App {
         }
         self.search_query = None;
         self.list_files_from_selected_folder();
+    }
+
+    /// Copies the active pane's current folder path to the clipboard (`]`).
+    pub fn copy_folder_path(&mut self) {
+        let Some(folder) = self.pane().folder.as_ref().map(|f| f.path.clone()) else {
+            return;
+        };
+        if crate::services::clipboard::copy_text(&folder) {
+            self.set_status("Folder path copied to clipboard", false);
+        } else {
+            self.set_status("Failed to copy the folder path to the clipboard.", true);
+        }
     }
 
     /// Single entry point for whichever confirmation is pending (`y`/Enter).

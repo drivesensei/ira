@@ -1,4 +1,5 @@
 pub mod bookmarks;
+pub mod clipboard;
 pub mod drives;
 pub mod file_info;
 pub mod folders;
