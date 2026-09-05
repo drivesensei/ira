@@ -47,6 +47,18 @@ pub enum JobEvent {
     Done {
         id: u64,
     },
+    /// Delete worker progress: `done`/`total` are path counts, `current` is
+    /// the path just removed.
+    DeleteProgress {
+        done: usize,
+        total: usize,
+        current: String,
+    },
+    /// Delete worker finished. `failed` carries (path, error) pairs.
+    DeleteDone {
+        cancelled: bool,
+        failed: Vec<(String, String)>,
+    },
     Cancelled {
         id: u64,
     },
@@ -57,6 +69,7 @@ pub enum JobEvent {
 }
 
 /// Shared cancellation + pause state between the UI and the worker thread.
+#[derive(Debug)]
 pub struct JobControl {
     cancel: AtomicBool,
     pause: Mutex<bool>,
@@ -303,4 +316,46 @@ fn remove_tree(path: &Path) -> Result<(), JobError> {
         fs::remove_file(path)?;
     }
     Ok(())
+}
+
+/// Spawns a worker that deletes `paths` one by one (dirs recursively),
+/// reporting progress on `tx`. Returns the control handle; `gate()` honours
+/// cancel/pause between paths (a single huge `remove_dir_all` is atomic, so
+/// granularity is per path).
+pub fn spawn_delete_job(paths: Vec<String>, tx: mpsc::Sender<JobEvent>) -> Arc<JobControl> {
+    let control = JobControl::new();
+    let c = control.clone();
+    thread::spawn(move || {
+        let total = paths.len();
+        let mut failed: Vec<(String, String)> = Vec::new();
+        for (i, path) in paths.iter().enumerate() {
+            if c.gate().is_err() {
+                let _ = tx.send(JobEvent::DeleteDone {
+                    cancelled: true,
+                    failed,
+                });
+                return;
+            }
+            let result = std::fs::symlink_metadata(path).ok().map(|meta| {
+                if meta.is_dir() {
+                    std::fs::remove_dir_all(path)
+                } else {
+                    std::fs::remove_file(path)
+                }
+            });
+            if let Some(Err(e)) = result {
+                failed.push((path.clone(), e.to_string()));
+            }
+            let _ = tx.send(JobEvent::DeleteProgress {
+                done: i + 1,
+                total,
+                current: path.clone(),
+            });
+        }
+        let _ = tx.send(JobEvent::DeleteDone {
+            cancelled: false,
+            failed,
+        });
+    });
+    control
 }
