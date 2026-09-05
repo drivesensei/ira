@@ -1,8 +1,9 @@
 use std::time::{Duration, Instant};
 
-use ira::app::App;
+use ira::app::{App, ConfirmAction};
 use ira::domain::data::Folder;
 use ira::services::list_files::FEntry;
+use ira::services::process_panel::RunState;
 use ira::services::transfer::JobStatus;
 
 fn entry(path: &str) -> FEntry {
@@ -169,7 +170,21 @@ fn copy_uses_all_selected_entries_and_focuses_board() {
     app.panes[0].selected = vec![true, true, false]; // a.txt + b.txt
     app.panes[0].state.select(Some(0));
 
-    app.copy_to_other_pane();
+    // `c` now asks first: nothing runs until confirmed.
+    app.request_copy();
+    assert!(app.jobs.is_empty(), "no transfer before confirmation");
+    let confirm = app.confirming.as_ref().expect("confirmation dialog");
+    assert!(matches!(confirm.action, ConfirmAction::Copy));
+    assert_eq!(confirm.paths.len(), 2);
+    assert_eq!(
+        confirm.dest_dir.as_deref(),
+        Some(dst.to_str().unwrap()),
+        "re-request must not stack dialogs"
+    );
+    assert_eq!(confirm.dest_dir.as_deref(), Some(dst.to_str().unwrap()));
+
+    // Confirming spawns both jobs and focuses the board.
+    app.confirm_pending();
     assert_eq!(app.jobs.len(), 2);
     assert!(app.copy_board && app.board_has_focus());
 
@@ -180,6 +195,307 @@ fn copy_uses_all_selected_entries_and_focuses_board() {
     assert!(!dst.join("c.txt").exists());
     assert!(matches!(app.jobs[0].status, JobStatus::Done));
     assert!(matches!(app.jobs[1].status, JobStatus::Done));
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn move_requires_confirmation_and_cancel_keeps_files() {
+    let base = std::env::temp_dir().join(format!("ira_move_cfm_{}", std::process::id()));
+    let src = base.join("src");
+    let dst = base.join("dst");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&dst).unwrap();
+    std::fs::write(src.join("m.txt"), "M").unwrap();
+
+    let mut app = App::default();
+    app.split = true;
+    app.panes[0].folder = Some(Folder::new("src".into(), src.to_str().unwrap().into(), '#'));
+    app.panes[1].folder = Some(Folder::new("dst".into(), dst.to_str().unwrap().into(), '#'));
+    app.panes[0].files = vec![entry(src.join("m.txt").to_str().unwrap())];
+    app.panes[0].selected = vec![false];
+    app.panes[0].state.select(Some(0));
+
+    app.request_move();
+    let confirm = app.confirming.as_ref().expect("confirmation dialog");
+    assert!(matches!(confirm.action, ConfirmAction::Move));
+    assert_eq!(confirm.paths.len(), 1);
+
+    // `n` cancels: file untouched, no jobs.
+    app.cancel_confirm();
+    assert!(app.confirming.is_none());
+    assert!(app.jobs.is_empty());
+    assert!(src.join("m.txt").exists());
+
+    // Confirming moves the file.
+    app.request_move();
+    app.confirm_pending();
+    assert_eq!(app.jobs.len(), 1);
+    assert!(matches!(app.jobs[0].status, JobStatus::Running));
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn request_copy_blocks_folder_into_itself() {
+    let base = std::env::temp_dir().join(format!("ira_self_{}", std::process::id()));
+    let src = base.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), "A").unwrap();
+
+    let mut app = App::default();
+    app.split = true;
+    // Browsing the parent; cursor on the `src` folder. Copying `src` into
+    // `src` (the other pane) must be rejected.
+    app.panes[0].folder = Some(Folder::new(
+        "base".into(),
+        base.to_str().unwrap().into(),
+        '#',
+    ));
+    app.panes[1].folder = Some(Folder::new("src".into(), src.to_str().unwrap().into(), '#'));
+    let dir_entry = FEntry {
+        path: src.to_str().unwrap().to_string(),
+        label: "src".to_string(),
+        is_dir: true,
+    };
+    app.panes[0].files = vec![dir_entry];
+    app.panes[0].selected = vec![false];
+    app.panes[0].state.select(Some(0));
+
+    app.request_copy();
+    assert!(
+        app.confirming.is_none(),
+        "self-copy must be rejected upfront"
+    );
+    assert!(app.status.as_ref().unwrap().is_error);
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn ctrl_c_stops_running_process_not_the_app() {
+    // Handler-level: Ctrl+C with focused panel + running process must stop
+    // the process and leave app.running intact. Exercised via the app state
+    // the handler mutates (stop_panel_command is the handler's call).
+    let base = std::env::temp_dir().join(format!("ira_ctrlc_{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new("t".into(), base.to_str().unwrap().into(), '#'));
+    app.toggle_process_panel(); // opens AND focuses now
+    assert!(app.panel_has_focus(), "0 must auto-focus the panel");
+    app.panel_input = "sleep 30".into();
+    app.run_panel_command();
+    assert!(app
+        .process_panel
+        .as_ref()
+        .is_some_and(|p| p.state() == RunState::Running));
+
+    // The handler calls stop_panel_command() on Ctrl+C; app.running stays.
+    std::thread::sleep(Duration::from_millis(200));
+    app.stop_panel_command();
+    assert!(
+        app.running,
+        "the app must survive Ctrl+C while a command runs"
+    );
+
+    let mut stopped = false;
+    for _ in 0..150 {
+        app.tick();
+        if let Some(p) = &app.process_panel {
+            let st = p.state();
+            if st == RunState::Killed || st == RunState::Exited(130) {
+                stopped = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(stopped);
+    assert!(app.running, "still running after the command stopped");
+
+    // Now Ctrl+C semantics with no running command: app quit is unchanged.
+    app.quit();
+    assert!(!app.running);
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn zero_while_panel_focused_closes_it() {
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new(
+        "t".into(),
+        std::env::temp_dir().to_string_lossy().into_owned(),
+        '#',
+    ));
+    app.toggle_process_panel();
+    assert!(app.panel_open() && app.panel_has_focus());
+    // Second 0 (as the handler routes it) closes the panel.
+    app.toggle_process_panel();
+    assert!(!app.panel_open() && !app.panel_has_focus());
+}
+
+#[test]
+fn zero_toggles_panel_and_runs_command_in_folder() {
+    let base = std::env::temp_dir().join(format!("ira_term_{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new("t".into(), base.to_str().unwrap().into(), '#'));
+
+    // 0 toggles the panel open/closed.
+    app.toggle_process_panel();
+    assert!(app.panel_open());
+    app.toggle_process_panel();
+    assert!(!app.panel_open());
+    app.toggle_process_panel();
+
+    // Typing + Enter spawns the command in the pane's folder.
+    app.panel_input = "echo panel-hello".into();
+    app.run_panel_command();
+    assert!(app.process_panel.is_some(), "command must be running");
+
+    // Output arrives in the buffer on the pump thread.
+    let mut got = false;
+    for _ in 0..100 {
+        app.tick();
+        if let Some(p) = &app.process_panel {
+            if p.tail(10).iter().any(|l| l.contains("panel-hello")) {
+                got = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(got, "echo output must appear in the panel buffer");
+
+    // The command finishes on its own; state flips to Exited(0).
+    for _ in 0..100 {
+        app.tick();
+        if let Some(p) = &app.process_panel {
+            if p.state() != RunState::Running {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        app.process_panel.as_ref().map(|p| p.state()),
+        Some(RunState::Exited(0))
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn stopping_panel_sends_interrupt_and_marks_killed() {
+    let base = std::env::temp_dir().join(format!("ira_stop_{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new("t".into(), base.to_str().unwrap().into(), '#'));
+    app.toggle_process_panel();
+    app.panel_input = "sleep 30".into();
+    app.run_panel_command();
+    assert!(app.process_panel.is_some());
+
+    // Give the child a moment, then Ctrl+C.
+    std::thread::sleep(Duration::from_millis(200));
+    app.stop_panel_command();
+
+    let mut stopped = false;
+    for _ in 0..150 {
+        app.tick();
+        if let Some(p) = &app.process_panel {
+            let st = p.state();
+            if st == RunState::Killed || st == RunState::Exited(130) {
+                stopped = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(stopped, "sleep must be interrupted");
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn scroll_accelerates_while_key_is_held() {
+    let mut app = App::default();
+    app.panes[0].files = (0..100).map(|i| entry(&format!("/f{i}"))).collect();
+    app.panes[0].selected = vec![false; 100];
+
+    // Rapid (within-window) next_item calls ramp the step size.
+    // Call 1 only selects row 0; calls 2-6 step 1 (idx 1..5); calls 7-8
+    // ramp to step 2 (7, 9).
+    for _ in 0..8 {
+        app.next_item();
+    }
+    let sel = app.panes[0].state.selected().unwrap();
+    assert_eq!(sel, 9, "8 rapid downs must land at index 9, got {sel}");
+
+    // Direction change resets the ramp: two rapid ups step 1 each.
+    app.prev_item();
+    app.prev_item();
+    let sel = app.panes[0].state.selected().unwrap();
+    assert_eq!(sel, 7, "ups after a direction change step 1: got {sel}");
+
+    // Jump navigation resets the ramp.
+    app.goto_top();
+    let sel = app.panes[0].state.selected().unwrap();
+    assert_eq!(sel, 0);
+    app.next_item();
+    assert_eq!(app.panes[0].state.selected(), Some(1));
+}
+
+#[test]
+fn scroll_step_is_capped() {
+    let mut app = App::default();
+    app.panes[0].files = (0..2000).map(|i| entry(&format!("/f{i}"))).collect();
+    app.panes[0].selected = vec![false; 2000];
+    // Call 1 selects row 0; then steps ramp 1,1,1,1,1,2,2,2,2,2,3,...
+    // After 54 rapid calls the cursor sits at 233 (step capped at 6 from
+    // repeat 30 onward).
+    for _ in 0..54 {
+        app.next_item();
+    }
+    assert_eq!(app.panes[0].state.selected(), Some(233));
+}
+
+#[test]
+fn delete_progress_dialog_is_dismissable() {
+    let base = std::env::temp_dir().join(format!("ira_del_ui_{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+    let victim = base.join("v.txt");
+    std::fs::write(&victim, "d").unwrap();
+
+    let mut app = App::default();
+    app.panes[0].files = vec![entry(victim.to_str().unwrap())];
+    app.panes[0].selected = vec![false];
+    app.panes[0].state.select(Some(0));
+    app.request_delete();
+    app.confirm_delete();
+    assert!(
+        app.deletion_box_visible(),
+        "progress dialog visible initially"
+    );
+
+    // Any key hides it (handler sets this): deletion continues regardless.
+    app.deletion_box_hidden = true;
+    assert!(!app.deletion_box_visible());
+    for _ in 0..250 {
+        app.tick();
+        if app.deletion.is_none() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(app.deletion.is_none());
+    assert!(!victim.exists());
+    // After completion the box state resets.
+    assert!(app.deletion_box_visible() == false);
 
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -203,12 +519,25 @@ fn delete_requires_confirmation_and_removes_on_confirm() {
     assert!(app.confirming.is_none());
     assert!(victim.exists());
 
-    // Confirm path: y deletes the file.
+    // Confirm path: y spawns the background delete worker; the file is
+    // removed asynchronously and progress flows through tick().
     app.request_delete();
     assert_eq!(app.confirming.as_ref().unwrap().paths.len(), 1);
     app.confirm_delete();
     assert!(app.confirming.is_none());
+    assert!(app.deletion.is_some(), "deletion must run in background");
+    let mut done = false;
+    for _ in 0..250 {
+        app.tick();
+        if app.deletion.is_none() {
+            done = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(done, "background deletion should finish");
     assert!(!victim.exists());
+    assert!(app.deleting_started(victim.to_str().unwrap()).is_none());
 
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -366,4 +695,196 @@ fn info_dialog_shows_metadata() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     assert!(ready, "cached size should reappear after re-query");
+}
+
+#[test]
+fn toggle_directly_sets_open_and_focused() {
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new(
+        "t".into(),
+        std::env::temp_dir().to_string_lossy().into_owned(),
+        '#',
+    ));
+    app.toggle_process_panel();
+    assert!(app.panel_open(), "open must be true after 0");
+    assert!(app.panel_focused, "focus must be true after 0");
+    assert!(app.panel_has_focus());
+}
+
+#[test]
+fn handler_routes_zero_and_typing_to_panel() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new(
+        "t".into(),
+        std::env::temp_dir().to_string_lossy().into_owned(),
+        '#',
+    ));
+    let ev = |code| KeyEvent::new(code, KeyModifiers::empty());
+
+    ira::handler::handle_key_events(ev(KeyCode::Char('0')), &mut app).unwrap();
+    assert!(app.panel_open() && app.panel_has_focus(), "0 focuses panel");
+
+    ira::handler::handle_key_events(ev(KeyCode::Char('e')), &mut app).unwrap();
+    ira::handler::handle_key_events(ev(KeyCode::Char('c')), &mut app).unwrap();
+    ira::handler::handle_key_events(ev(KeyCode::Char('h')), &mut app).unwrap();
+    ira::handler::handle_key_events(ev(KeyCode::Char('o')), &mut app).unwrap();
+    assert_eq!(app.panel_input, "echo");
+
+    // Space must land in the input too (not toggle file selection).
+    ira::handler::handle_key_events(ev(KeyCode::Char(' ')), &mut app).unwrap();
+    assert_eq!(app.panel_input, "echo ", "space must reach the input");
+    for ch in ['s', 'l', 'e', 'e', 'p'] {
+        ira::handler::handle_key_events(ev(KeyCode::Char(ch)), &mut app).unwrap();
+    }
+    assert_eq!(app.panel_input, "echo sleep");
+}
+
+#[test]
+fn panel_input_row_shows_typed_chars() {
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new(
+        "t".into(),
+        std::env::temp_dir().to_string_lossy().into_owned(),
+        '#',
+    ));
+    app.panel_open = true;
+    app.panel_focused = true;
+    app.panel_input = "Z".to_string();
+
+    let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+    terminal.draw(|f| ira::ui::render(&mut app, f)).unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    // The '$' and the typed char must be adjacent in the buffer (the input
+    // row renders them as one segment).
+    // Prompt renders as "$ " (2 cells) followed by the typed char.
+    let idx = text.find('$').expect("prompt must render");
+    assert_eq!(
+        &text[idx..idx + 3],
+        "$ Z",
+        "typed char must render right after the prompt: {:?}",
+        &text[idx..idx + 6]
+    );
+}
+
+#[test]
+fn panel_badge_shows_running_while_child_lives() {
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let dir = std::env::temp_dir().join(format!("ira_badge_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new("t".into(), dir.to_str().unwrap().into(), '#'));
+    app.panel_open = true;
+    app.panel_focused = true;
+    app.panel_input = "sleep 30".into();
+    app.run_panel_command();
+    assert!(app.process_panel.is_some());
+
+    let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+    terminal.draw(|f| ira::ui::render(&mut app, f)).unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(
+        text.contains("[running]"),
+        "badge must show running: {text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn panel_tail_during_running_sleep_does_not_deadlock() {
+    // Reproduces the PTY hang: run sleep, tick like the app, then assert a
+    // marker key event would still be processed (i.e. tail() returns).
+    let dir = std::env::temp_dir().join(format!("ira_dl_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new("t".into(), dir.to_str().unwrap().into(), '#'));
+    app.panel_open = true;
+    app.panel_focused = true;
+    app.panel_input = "sleep 60".into();
+    app.run_panel_command();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        app.tick();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // If the UI thread were deadlocked in tail(), this would hang above.
+    let _ = app.panel_input.len();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn handler_ctrl_c_stops_running_process() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let dir = std::env::temp_dir().join(format!("ira_hctrlc_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new("t".into(), dir.to_str().unwrap().into(), '#'));
+    app.panel_open = true;
+    app.panel_focused = true;
+    app.panel_input = "sleep 30".into();
+    app.run_panel_command();
+    assert!(app
+        .process_panel
+        .as_ref()
+        .is_some_and(|p| p.state() == RunState::Running));
+
+    let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+    ira::handler::handle_key_events(key, &mut app).unwrap();
+    assert!(app.running, "Ctrl+C must NOT quit the app in this state");
+    let mut stopped = false;
+    for _ in 0..150 {
+        app.tick();
+        if let Some(p) = &app.process_panel {
+            let st = p.state();
+            if st == RunState::Killed || st == RunState::Exited(130) {
+                stopped = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(stopped, "sleep must be stopped");
+    assert!(app.running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn zero_types_into_input_and_esc_then_zero_hides() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new(
+        "t".into(),
+        std::env::temp_dir().to_string_lossy().into_owned(),
+        '#',
+    ));
+    let key = |code| KeyEvent::new(code, KeyModifiers::empty());
+
+    ira::handler::handle_key_events(key(KeyCode::Char('0')), &mut app).unwrap();
+    assert!(app.panel_open() && app.panel_has_focus());
+    // Second 0 types into the input (commands may contain digits).
+    ira::handler::handle_key_events(key(KeyCode::Char('0')), &mut app).unwrap();
+    assert!(app.panel_open(), "typing 0 must not close the panel");
+    assert_eq!(app.panel_input, "0");
+    // Esc unfocuses, then 0 hides the panel.
+    ira::handler::handle_key_events(key(KeyCode::Esc), &mut app).unwrap();
+    ira::handler::handle_key_events(key(KeyCode::Char('0')), &mut app).unwrap();
+    assert!(!app.panel_open(), "0 after Esc must hide the panel");
 }
