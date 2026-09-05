@@ -991,9 +991,7 @@ impl App {
             .as_deref()
             .and_then(|p| pane.files.iter().position(|f| f.path == p));
         let cursor = match new_file_index {
-            Some(fi) if filter_query.is_some() => {
-                pane.filter_indices.iter().position(|&i| i == fi)
-            }
+            Some(fi) if filter_query.is_some() => pane.filter_indices.iter().position(|&i| i == fi),
             Some(fi) if search_active => {
                 let labels: Vec<String> = pane.files.iter().map(|f| f.label.clone()).collect();
                 fuzzy_indices(&labels, &search_query)
@@ -2724,7 +2722,6 @@ mod tests {
                 left: app.panes[0].folder.clone(),
                 right: app.panes[1].folder.clone(),
                 sizes: entries,
-                show_hidden: app.show_hidden,
             },
         );
         let loaded = load_state_from(&file);

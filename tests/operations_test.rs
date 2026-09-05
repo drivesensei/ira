@@ -13,6 +13,8 @@ fn entry(path: &str) -> FEntry {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string()),
         is_dir: false,
+        size: 0,
+        modified: None,
     }
 }
 
@@ -257,6 +259,8 @@ fn request_copy_blocks_folder_into_itself() {
         path: src.to_str().unwrap().to_string(),
         label: "src".to_string(),
         is_dir: true,
+        size: 0,
+        modified: None,
     };
     app.panes[0].files = vec![dir_entry];
     app.panes[0].selected = vec![false];
@@ -584,6 +588,8 @@ fn backspace_opens_delete_confirmation_on_macos() {
         path: victim.to_str().unwrap().to_string(),
         label: "victim.txt".to_string(),
         is_dir: false,
+        size: 0,
+        modified: None,
     }];
     app.panes[0].selected = vec![false];
     app.panes[0].state.select(Some(0));
@@ -1012,11 +1018,15 @@ fn multi_selection_shows_aggregate_and_sums_walks() {
         path: d1.to_str().unwrap().to_string(),
         label: "dir1".to_string(),
         is_dir: true,
+        size: 0,
+        modified: None,
     };
     let dir2_entry = FEntry {
         path: d2.to_str().unwrap().to_string(),
         label: "dir2".to_string(),
         is_dir: true,
+        size: 0,
+        modified: None,
     };
     app.panes[0].files = vec![
         dir1_entry,
@@ -1593,8 +1603,7 @@ fn out_of_folder_selects_the_folder_you_came_from() {
         base.to_str().unwrap(),
         "Left navigates to the parent"
     );
-    let sel = app
-        .panes[0]
+    let sel = app.panes[0]
         .state
         .selected()
         .expect("cursor must land on the folder we came from");
@@ -1636,8 +1645,7 @@ fn out_of_folder_selects_origin_in_streamed_listing() {
         std::thread::sleep(Duration::from_millis(5));
     }
 
-    let sel = app
-        .panes[0]
+    let sel = app.panes[0]
         .state
         .selected()
         .expect("cursor must land on the folder we came from after settle");

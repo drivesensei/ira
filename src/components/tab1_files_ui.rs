@@ -30,10 +30,9 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, activ
                 (Some(q), _) => {
                     format!("  {}  {}  /{}", folder.label, folder.path, q)
                 }
-                (None, Some(q)) => format!(
-                    "  {}  {}  /{}  (Esc clears)",
-                    folder.label, folder.path, q
-                ),
+                (None, Some(q)) => {
+                    format!("  {}  {}  /{}  (Esc clears)", folder.label, folder.path, q)
+                }
                 _ => format!("  {}  {}  ", folder.label, folder.path),
             }
         } else {

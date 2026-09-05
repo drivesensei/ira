@@ -79,7 +79,11 @@ fn cursor_path(app: &App) -> String {
 }
 
 fn status_text(app: &App) -> &str {
-    app.status.as_ref().expect("a notice must be showing").text.as_str()
+    app.status
+        .as_ref()
+        .expect("a notice must be showing")
+        .text
+        .as_str()
 }
 
 /// Creates the shared cycle fixture: three files of distinct sizes/mtimes
