@@ -25,9 +25,19 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, activ
             return;
         };
 
-        let title = match (active, app.search_query.as_deref()) {
-            (true, Some(q)) => format!("  Files  {}  {}  /{}", folder.label, folder.path, q),
-            _ => format!("  Files  {}  {}", folder.label, folder.path),
+        let title = if active {
+            match (&app.search_query, &pane.filter_query) {
+                (Some(q), _) => {
+                    format!("  Files  {}  {}  /{}", folder.label, folder.path, q)
+                }
+                (None, Some(q)) => format!(
+                    "  Files  {}  {}  /{}  (Esc clears)",
+                    folder.label, folder.path, q
+                ),
+                _ => format!("  Files  {}  {}", folder.label, folder.path),
+            }
+        } else {
+            format!("  Files  {}  {}", folder.label, folder.path)
         };
 
         // Folders being measured show an animated spinner as their icon;
@@ -53,10 +63,11 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, activ
         // unsorted view.
         let selected = pane.state.selected();
         let loading = !pane.listing_settled && pane.files.is_empty();
+        let filtered = pane.filter_query.is_some() && !pane.filter_indices.is_empty();
         let (start, file_spans) = if loading {
             (0, vec![Span::raw(" Loading…").style(Style::new().dim())])
-        } else if active && app.is_searching() {
-            let rows = app.visible_rows();
+        } else if filtered || (active && app.is_searching()) {
+            let rows = app.pane_visible_rows(pane_index);
             let (start, end) = visible_window(rows.len(), selected, pane.render_scroll, height);
             let spans: Vec<Span> = rows[start..end]
                 .iter()

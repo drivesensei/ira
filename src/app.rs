@@ -47,6 +47,12 @@ pub struct Pane {
     /// final sorted pass replaced the streamed prefix (or the listing
     /// errored). Test/UI hook for "listing is complete".
     pub listing_settled: bool,
+    /// Confirmed search: while set, the pane shows only the matching files
+    /// (`filter_indices`, best match first) and all actions operate on that
+    /// view. Cleared with Esc.
+    pub filter_query: Option<String>,
+    /// Visible file indices for the active filter (into `files`).
+    pub filter_indices: Vec<usize>,
     /// Bumped on every listing request; results carrying an older
     /// generation are dropped, so overlapping listings never interleave
     /// (the "folder lists itself" bug).
@@ -290,6 +296,21 @@ impl Default for App {
     }
 }
 
+/// Indices into `labels` matching `query` (fuzzy), best match first.
+/// Empty query matches everything in order.
+fn fuzzy_indices(labels: &[String], query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return (0..labels.len()).collect();
+    }
+    let mut scored: Vec<(u32, usize)> = labels
+        .iter()
+        .enumerate()
+        .filter_map(|(i, label)| fuzzy_score(query, label).map(|s| (s, i)))
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored.into_iter().map(|(_, i)| i).collect()
+}
+
 /// Finds the mounted removable drive whose mount point contains
 /// `folder_path` (longest mount-point prefix wins).
 fn matching_drive<'a>(drives: &'a [Folder], folder_path: &str) -> Option<&'a Folder> {
@@ -450,6 +471,12 @@ impl App {
                 pane.render_scroll = 0;
                 pane.state.select(None);
                 pane.listing_settled = true;
+                // Same-folder refresh: keep the confirmed filter applied.
+                let query = pane.filter_query.clone();
+                if let Some(q) = query {
+                    let labels: Vec<String> = pane.files.iter().map(|f| f.label.clone()).collect();
+                    pane.filter_indices = fuzzy_indices(&labels, &q);
+                }
                 return;
             }
         }
@@ -529,6 +556,11 @@ impl App {
                 pane.selected = vec![false; pane.files.len()];
                 pane.render_scroll = 0;
                 pane.listing_settled = true;
+                let query = pane.filter_query.clone();
+                if let Some(q) = query {
+                    let labels: Vec<String> = pane.files.iter().map(|f| f.label.clone()).collect();
+                    pane.filter_indices = fuzzy_indices(&labels, &q);
+                }
             } else {
                 pane.listing_settled = false;
                 pane.selected
@@ -580,7 +612,10 @@ impl App {
         };
 
         self.drives = Some(drives);
-        self.pane_mut().folder = Some(Folder {
+        let pane = self.pane_mut();
+        pane.filter_query = None;
+        pane.filter_indices.clear();
+        pane.folder = Some(Folder {
             label: drive.label,
             path: mount_point,
             shortcut: '#',
@@ -652,7 +687,10 @@ impl App {
         else {
             return;
         };
-        self.pane_mut().folder = Some(selected);
+        let pane = self.pane_mut();
+        pane.filter_query = None;
+        pane.filter_indices.clear();
+        pane.folder = Some(selected);
         self.search_query = None;
         self.list_files_from_selected_folder();
         self.pane_mut().state.select(None);
@@ -683,7 +721,10 @@ impl App {
         match get_directory(&path) {
             Ok(some_folder) => {
                 if let Some(actual_folder) = some_folder {
-                    self.pane_mut().folder = Some(actual_folder);
+                    let pane = self.pane_mut();
+                    pane.filter_query = None;
+                    pane.filter_indices.clear();
+                    pane.folder = Some(actual_folder);
                     self.search_query = None;
                     self.list_files_from_selected_folder();
                     self.pane_mut().state.select(None);
@@ -705,7 +746,10 @@ impl App {
 
         match get_parent_directory(&current_path) {
             Ok(Some(folder)) => {
-                self.pane_mut().folder = Some(folder);
+                let pane = self.pane_mut();
+                pane.filter_query = None;
+                pane.filter_indices.clear();
+                pane.folder = Some(folder);
                 self.search_query = None;
                 self.list_files_from_selected_folder();
                 self.pane_mut().state.select(None);
@@ -1002,17 +1046,26 @@ impl App {
     }
 
     /// Selects every entry when any is unselected; otherwise clears all.
+    /// Operates on the visible set (filtered view when a filter is active).
     /// Bound to Super+A.
     pub fn toggle_select_all(&mut self) {
-        let pane = self.pane_mut();
-        let all_selected = !pane.selected.is_empty() && pane.selected.iter().all(|&s| s);
-        pane.selected.fill(!all_selected);
+        let indices = self.visible_indices();
+        if indices.is_empty() {
+            return;
+        }
+        let any_unselected = indices.iter().any(|&i| !self.pane().selected[i]);
+        for &i in &indices {
+            self.pane_mut().selected[i] = any_unselected;
+        }
     }
 
-    /// Inverts the multi-selection. Bound to Super+I.
+    /// Inverts the multi-selection within the visible set.
+    /// Bound to Super+I.
     pub fn invert_selection(&mut self) {
-        for s in &mut self.pane_mut().selected {
-            *s = !*s;
+        for i in self.visible_indices() {
+            if let Some(s) = self.pane_mut().selected.get_mut(i) {
+                *s = !*s;
+            }
         }
     }
 
@@ -1588,61 +1641,83 @@ impl App {
     /// Indices into the active pane's files matching the current query, best match first.
     fn search_matches(&self) -> Vec<usize> {
         let query = self.search_query.as_deref().unwrap_or("");
-        let files = &self.pane().files;
-        if query.is_empty() {
-            return (0..files.len()).collect();
+        let labels: Vec<String> = self.pane().files.iter().map(|f| f.label.clone()).collect();
+        fuzzy_indices(&labels, query)
+    }
+
+    /// Clears the pane's confirmed filter, keeping the cursor on the entry
+    /// that was selected in the filtered view.
+    pub fn clear_filter(&mut self) {
+        let file_idx = self
+            .pane()
+            .state
+            .selected()
+            .and_then(|vis| self.pane().filter_indices.get(vis).copied());
+        let pane = self.pane_mut();
+        pane.filter_query = None;
+        pane.filter_indices.clear();
+        match file_idx {
+            Some(i) => pane.state.select(Some(i)),
+            None => {
+                if pane.files.is_empty() {
+                    pane.state.select(None);
+                } else {
+                    pane.state.select(Some(0));
+                }
+            }
         }
-        let mut scored: Vec<(u32, usize)> = files
-            .iter()
-            .enumerate()
-            .filter_map(|(i, f)| fuzzy_score(query, &f.label).map(|s| (s, i)))
-            .collect();
-        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        scored.into_iter().map(|(_, i)| i).collect()
     }
 
     /// The currently visible entries of the active pane (filtered by search),
     /// as `(file_index, entry)` pairs so callers can map rows back to the
     /// source file list (e.g. for multi-select).
     pub fn visible_rows(&self) -> Vec<(usize, &FEntry)> {
-        let files = &self.pane().files;
+        self.pane_visible_rows(self.active_pane)
+    }
+
+    /// Visible rows of any pane (live search while typing, confirmed filter,
+    /// or the full listing).
+    pub fn pane_visible_rows(&self, pane_index: usize) -> Vec<(usize, &FEntry)> {
+        let pane = &self.panes[pane_index];
+        let indices: Vec<usize> = if self.is_searching() && pane_index == self.active_pane {
+            self.search_matches()
+        } else if let Some(_q) = &pane.filter_query {
+            pane.filter_indices.clone()
+        } else {
+            (0..pane.files.len()).collect()
+        };
+        indices
+            .into_iter()
+            .filter_map(|i| pane.files.get(i).map(|f| (i, f)))
+            .collect()
+    }
+
+    /// Indices into `files` of the active pane's visible rows.
+    fn visible_indices(&self) -> Vec<usize> {
         if self.is_searching() {
             self.search_matches()
-                .into_iter()
-                .filter_map(|i| files.get(i).map(|f| (i, f)))
-                .collect()
+        } else if let Some(_q) = &self.pane().filter_query {
+            self.pane().filter_indices.clone()
         } else {
-            files.iter().enumerate().collect()
+            (0..self.pane().files.len()).collect()
         }
     }
 
     /// Maps a visible-list index to the underlying `files` index.
     fn visible_file_index(&self, visible_idx: usize) -> Option<usize> {
-        if self.is_searching() {
-            self.search_matches().get(visible_idx).copied()
-        } else {
-            (visible_idx < self.pane().files.len()).then_some(visible_idx)
-        }
+        self.visible_indices().get(visible_idx).copied()
     }
 
-    fn visible_count(&self) -> usize {
-        if self.is_searching() {
-            self.search_matches().len()
-        } else {
-            self.pane().files.len()
-        }
+    pub fn visible_count(&self) -> usize {
+        self.visible_indices().len()
     }
 
     /// Maps a visible-list index to the underlying file entry.
     fn visible_entry(&self, visible_idx: usize) -> Option<&FEntry> {
         let files = &self.pane().files;
-        if self.is_searching() {
-            self.search_matches()
-                .get(visible_idx)
-                .and_then(|&i| files.get(i))
-        } else {
-            files.get(visible_idx)
-        }
+        self.visible_indices()
+            .get(visible_idx)
+            .and_then(|&i| files.get(i))
     }
 
     pub fn start_search(&mut self) {
@@ -1662,16 +1737,21 @@ impl App {
     }
 
     pub fn confirm_search(&mut self) {
-        // Keep the selected match highlighted after leaving search mode by
-        // mapping the visible index back to the full list.
-        let full_index = self
-            .pane()
-            .state
-            .selected()
-            .and_then(|visible_idx| self.search_matches().get(visible_idx).copied());
-        self.search_query = None;
-        if let Some(i) = full_index {
-            self.pane_mut().state.select(Some(i));
+        // Promote the query to a sticky filter: the pane keeps showing only
+        // the matches, and every action operates on that view. Empty query
+        // just exits typing (shows everything).
+        let query = self.search_query.take();
+        let pane = self.pane_mut();
+        match query {
+            Some(q) if !q.trim().is_empty() => {
+                let labels: Vec<String> = pane.files.iter().map(|f| f.label.clone()).collect();
+                pane.filter_indices = fuzzy_indices(&labels, &q);
+                pane.filter_query = Some(q);
+            }
+            _ => {
+                pane.filter_query = None;
+                pane.filter_indices.clear();
+            }
         }
     }
 

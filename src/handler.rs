@@ -2,6 +2,19 @@ use crate::app::{App, AppResult};
 use crate::services::process_panel::RunState;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+/// Keys that trigger the delete flow in normal mode. Windows/Linux have a
+/// dedicated Del key; on macOS the key labeled "delete" is Backspace (Del
+/// is fn+Backspace), so Backspace joins the delete keys there — matching
+/// Finder's convention. Either way the y/n confirmation guards it.
+pub fn is_delete_key(code: KeyCode) -> bool {
+    match code {
+        KeyCode::Delete => true,
+        #[cfg(target_os = "macos")]
+        KeyCode::Backspace => true,
+        _ => false,
+    }
+}
+
 /// Handles the key events and updates the state of [`App`].
 pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
     // Ctrl combos: Ctrl+C quits in every mode; Ctrl+A selects all / clears all
@@ -190,6 +203,9 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         // (`e` belongs to the Desktop common-folder shortcut on macOS.)
         KeyCode::Char('-') => app.eject_active_drive(),
 
+        // Esc clears the confirmed search filter (all files visible again).
+        KeyCode::Esc => app.clear_filter(),
+
         // Toggle a bookmark for the current folder.
         KeyCode::Char('b') => app.toggle_bookmark(),
         // `/` starts fuzzy search within the current folder.
@@ -211,7 +227,9 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         // Space multi-selects entries; Del deletes the selection (with
         // confirmation).
         KeyCode::Char(' ') => app.toggle_select_current(),
-        KeyCode::Delete => app.request_delete(),
+        KeyCode::Delete | KeyCode::Backspace if is_delete_key(key_event.code) => {
+            app.request_delete()
+        }
 
         // Select all / clear all and invert. Ctrl+A (above) and Alt+? are the
         // reliable paths — terminals generally do not forward Super, so the

@@ -888,3 +888,260 @@ fn zero_types_into_input_and_esc_then_zero_hides() {
     ira::handler::handle_key_events(key(KeyCode::Char('0')), &mut app).unwrap();
     assert!(!app.panel_open(), "0 after Esc must hide the panel");
 }
+
+#[test]
+fn delete_keys_depend_on_platform() {
+    use ira::handler::is_delete_key;
+    use ratatui::crossterm::event::KeyCode;
+
+    // Del triggers the delete flow everywhere.
+    assert!(is_delete_key(KeyCode::Delete));
+
+    // Backspace joins it only on macOS (the key labeled "delete" there).
+    #[cfg(target_os = "macos")]
+    assert!(is_delete_key(KeyCode::Backspace));
+
+    #[cfg(not(target_os = "macos"))]
+    assert!(
+        !is_delete_key(KeyCode::Backspace),
+        "on Win/Linux backspace stays free"
+    );
+}
+
+#[test]
+fn backspace_opens_delete_confirmation_on_macos() {
+    use ira::app::App;
+    use ira::domain::data::Folder;
+    use ira::handler::handle_key_events;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let base = std::env::temp_dir().join(format!("ira_bksp_del_{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+    let victim = base.join("victim.txt");
+    std::fs::write(&victim, "d").unwrap();
+
+    let mut app = App::default();
+    app.panes[0].files = vec![FEntry {
+        path: victim.to_str().unwrap().to_string(),
+        label: "victim.txt".to_string(),
+        is_dir: false,
+    }];
+    app.panes[0].selected = vec![false];
+    app.panes[0].state.select(Some(0));
+
+    handle_key_events(
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()),
+        &mut app,
+    )
+    .unwrap();
+
+    #[cfg(target_os = "macos")]
+    assert!(
+        app.confirming.is_some(),
+        "macOS: backspace opens the delete confirmation"
+    );
+    #[cfg(not(target_os = "macos"))]
+    assert!(
+        app.confirming.is_none(),
+        "other platforms: backspace stays free"
+    );
+    assert!(victim.exists(), "nothing deleted without confirmation");
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn confirmed_search_becomes_sticky_filter() {
+    use ira::handler::handle_key_events;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let base = std::env::temp_dir().join(format!("ira_filter_{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("alpha.txt"), "a").unwrap();
+    std::fs::write(base.join("beta.txt"), "b").unwrap();
+    std::fs::write(base.join("gamma.txt"), "g").unwrap();
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new("t".into(), base.to_str().unwrap().into(), '#'));
+    app.panes[0].files = vec![
+        entry(base.join("alpha.txt").to_str().unwrap()),
+        entry(base.join("beta.txt").to_str().unwrap()),
+        entry(base.join("gamma.txt").to_str().unwrap()),
+    ];
+    app.panes[0].selected = vec![false, false, false];
+    app.panes[0].state.select(Some(0));
+    let key = |code| KeyEvent::new(code, KeyModifiers::empty());
+
+    // `/` + "beta" + Enter: the filter becomes the pane's working view.
+    handle_key_events(key(KeyCode::Char('/')), &mut app).unwrap();
+    for ch in "beta".chars() {
+        handle_key_events(key(KeyCode::Char(ch)), &mut app).unwrap();
+    }
+    handle_key_events(key(KeyCode::Enter), &mut app).unwrap();
+
+    assert!(!app.is_searching(), "typing mode ends on Enter");
+    assert_eq!(app.visible_count(), 1, "only beta matches 'beta'");
+    assert_eq!(app.panes[0].filter_query.as_deref(), Some("beta"));
+
+    // Actions operate on the filtered view: space selects beta (underlying
+    // files index 1), copy sources = beta only.
+    handle_key_events(key(KeyCode::Char(' ')), &mut app).unwrap();
+    assert_eq!(app.panes[0].selected, vec![false, true, false]);
+
+    // Esc clears the filter: everything visible again, cursor parked on the
+    // previously filtered entry (beta, underlying index 1).
+    handle_key_events(key(KeyCode::Esc), &mut app).unwrap();
+    assert!(app.panes[0].filter_query.is_none());
+    assert_eq!(app.visible_count(), 3);
+    assert_eq!(app.panes[0].state.selected(), Some(1));
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn esc_while_typing_returns_to_confirmed_filter() {
+    use ira::handler::handle_key_events;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let base = std::env::temp_dir().join(format!("ira_filter2_{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+    for name in ["alpha.txt", "beta.txt", "gamma.txt"] {
+        std::fs::write(base.join(name), "x").unwrap();
+    }
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new("t".into(), base.to_str().unwrap().into(), '#'));
+    app.panes[0].files = vec![
+        entry(base.join("alpha.txt").to_str().unwrap()),
+        entry(base.join("beta.txt").to_str().unwrap()),
+        entry(base.join("gamma.txt").to_str().unwrap()),
+    ];
+    app.panes[0].selected = vec![false, false, false];
+    app.panes[0].state.select(Some(0));
+    let key = |code| KeyEvent::new(code, KeyModifiers::empty());
+
+    // Confirm "beta" as the filter...
+    handle_key_events(key(KeyCode::Char('/')), &mut app).unwrap();
+    for ch in "beta".chars() {
+        handle_key_events(key(KeyCode::Char(ch)), &mut app).unwrap();
+    }
+    handle_key_events(key(KeyCode::Enter), &mut app).unwrap();
+    assert_eq!(app.visible_count(), 1);
+
+    // ...then `/` starts a NEW search over the full folder; Esc while
+    // typing returns to the previously confirmed filter.
+    handle_key_events(key(KeyCode::Char('/')), &mut app).unwrap();
+    assert_eq!(app.visible_count(), 3, "typing searches the full folder");
+    handle_key_events(key(KeyCode::Esc), &mut app).unwrap();
+    assert!(!app.is_searching());
+    assert_eq!(app.panes[0].filter_query.as_deref(), Some("beta"));
+    assert_eq!(app.visible_count(), 1);
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn filter_reapplies_after_listing_refresh_and_survives_deletion() {
+    use ira::handler::handle_key_events;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let base = std::env::temp_dir().join(format!("ira_filter3_{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("beta.txt"), "b").unwrap();
+    std::fs::write(base.join("beta2.txt"), "b").unwrap();
+    std::fs::write(base.join("gamma.txt"), "g").unwrap();
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new("t".into(), base.to_str().unwrap().into(), '#'));
+    app.panes[0].files = vec![
+        entry(base.join("beta.txt").to_str().unwrap()),
+        entry(base.join("beta2.txt").to_str().unwrap()),
+        entry(base.join("gamma.txt").to_str().unwrap()),
+    ];
+    app.panes[0].selected = vec![false, false, false];
+    app.panes[0].state.select(Some(0));
+    let key = |code| KeyEvent::new(code, KeyModifiers::empty());
+
+    // Filter "beta" -> two matches.
+    handle_key_events(key(KeyCode::Char('/')), &mut app).unwrap();
+    for ch in "beta".chars() {
+        handle_key_events(key(KeyCode::Char(ch)), &mut app).unwrap();
+    }
+    handle_key_events(key(KeyCode::Enter), &mut app).unwrap();
+    assert_eq!(app.visible_count(), 2);
+
+    // Select both matches and confirm deletion; the background job deletes
+    // them and the refresh re-applies the filter to the new listing.
+    app.toggle_select_all();
+    assert_eq!(
+        app.panes[0].selected,
+        vec![true, true, false],
+        "select-all must operate on the filtered set"
+    );
+    app.request_delete();
+    let paths = app.confirming.as_ref().unwrap().paths.clone();
+    app.confirm_delete();
+    for _ in 0..250 {
+        app.tick();
+        if app.deletion.is_none() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!base.join("beta.txt").exists());
+    assert!(!base.join("beta2.txt").exists());
+    assert!(base.join("gamma.txt").exists());
+    assert_eq!(app.panes[0].filter_query.as_deref(), Some("beta"));
+    assert_eq!(app.visible_count(), 0, "no beta files remain");
+
+    // Esc: full folder again.
+    handle_key_events(key(KeyCode::Esc), &mut app).unwrap();
+    assert_eq!(app.visible_count(), 1);
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn filter_reapplies_after_hidden_toggle() {
+    use ira::handler::handle_key_events;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let base = std::env::temp_dir().join(format!("ira_filter4_{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("beta.txt"), "b").unwrap();
+    std::fs::write(base.join(".beta-hidden"), "h").unwrap();
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new("t".into(), base.to_str().unwrap().into(), '#'));
+    // Seed only the visible file (hidden files are excluded by default).
+    app.panes[0].files = vec![entry(base.join("beta.txt").to_str().unwrap())];
+    app.panes[0].selected = vec![false];
+    app.panes[0].state.select(Some(0));
+    let key = |code| KeyEvent::new(code, KeyModifiers::empty());
+
+    handle_key_events(key(KeyCode::Char('/')), &mut app).unwrap();
+    for ch in "beta".chars() {
+        handle_key_events(key(KeyCode::Char(ch)), &mut app).unwrap();
+    }
+    handle_key_events(key(KeyCode::Enter), &mut app).unwrap();
+    assert_eq!(app.visible_count(), 1);
+
+    // `.` re-lists with hidden files; the filter re-applies to the new list
+    // and the hidden beta file joins the filtered view.
+    handle_key_events(key(KeyCode::Char('.')), &mut app).unwrap();
+    for _ in 0..100 {
+        app.tick();
+        if app.file_list_settled(0) && app.visible_count() == 2 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(app.visible_count(), 2, "hidden beta file joins the filter");
+    assert_eq!(
+        app.panes[0].filter_query.as_deref(),
+        Some("beta"),
+        "filter must survive the refresh"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
