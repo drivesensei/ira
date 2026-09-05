@@ -1538,3 +1538,33 @@ fn n_dialog_existing_nested_path_errors() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn hidden_toggle_persists_across_restart() {
+    use ira::domain::data::Folder;
+
+    let base = std::env::temp_dir().join(format!("ira_hidden_persist_{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("visible.txt"), "v").unwrap();
+    std::fs::write(base.join(".hidden"), "h").unwrap();
+    let state_file = base.join("state");
+
+    let mut app = App::default();
+    app.state_path = Some(state_file.clone());
+    app.panes[0].folder = Some(Folder::new("t".into(), base.to_str().unwrap().into(), '#'));
+    app.list_files_from_selected_folder();
+
+    // Toggle hidden on and persist (toggle_hidden persists immediately).
+    app.toggle_hidden();
+    assert!(app.show_hidden);
+    assert!(state_file.exists(), "state must be written on toggle");
+
+    // Simulate restart: fresh app restores from the same state file.
+    let mut app2 = App::default();
+    app2.state_path = Some(state_file.clone());
+    app2.panes[0].folder = Some(Folder::new("t".into(), base.to_str().unwrap().into(), '#'));
+    app2.restore_state_for_test();
+    assert!(app2.show_hidden, "hidden setting must survive restart");
+
+    let _ = std::fs::remove_dir_all(&base);
+}

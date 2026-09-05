@@ -21,6 +21,8 @@ pub struct SizeEntry {
 pub struct SessionState {
     pub split: bool,
     pub active_pane: usize,
+    /// Whether hidden entries (dotfiles) are listed.
+    pub show_hidden: bool,
     pub left: Option<Folder>,
     pub right: Option<Folder>,
     pub sizes: Vec<SizeEntry>,
@@ -70,6 +72,7 @@ fn serialize_state(state: &SessionState) -> String {
     let mut content = String::new();
     content.push_str(&format!("split={}\n", state.split as u8));
     content.push_str(&format!("active={}\n", state.active_pane));
+    content.push_str(&format!("hidden={}\n", state.show_hidden as u8));
     for (key, folder) in [("left", &state.left), ("right", &state.right)] {
         match folder {
             Some(f) => content.push_str(&format!("{}={}\t{}\n", key, f.label, f.path)),
@@ -99,6 +102,7 @@ fn parse_state(contents: &str) -> SessionState {
         match key {
             "split" => state.split = value == "1",
             "active" => state.active_pane = value.parse::<usize>().unwrap_or(0).min(1),
+            "hidden" => state.show_hidden = value == "1",
             "left" => state.left = parse_folder(value),
             "right" => state.right = parse_folder(value),
             "size" => {
@@ -216,6 +220,7 @@ mod tests {
             ],
         };
         assert_eq!(parse_state(&serialize_state(&state)), state);
+        assert!(state.show_hidden, "hidden flag must roundtrip");
     }
 
     #[test]

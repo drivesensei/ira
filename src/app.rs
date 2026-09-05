@@ -20,7 +20,7 @@ use crate::{
         },
         folders::list_common_folders,
         list_files::{list_files_bounded, list_files_chunked, FEntry, LISTING_CHUNK},
-        state::{load_state, save_state, save_state_to, SessionState, SizeEntry},
+        state::{load_state, load_state_from, save_state, save_state_to, SessionState, SizeEntry},
         transfer::{spawn_delete_job, spawn_job, Job, JobControl, JobEvent, JobKind, JobStatus},
     },
     utils::{
@@ -1355,6 +1355,7 @@ impl App {
         self.show_hidden = !self.show_hidden;
         self.list_files_for_pane(0);
         self.list_files_for_pane(1);
+        self.persist_state();
     }
 
     // ---- Rename (modal text editor) ----
@@ -2202,9 +2203,13 @@ impl App {
 
     /// Restores the persisted session state (split layout and pane folders).
     fn restore_state(&mut self) {
-        let state = load_state();
+        let state = match &self.state_path {
+            Some(p) => load_state_from(p),
+            None => load_state(),
+        };
         self.split = state.split;
         self.active_pane = state.active_pane.min(1);
+        self.show_hidden = state.show_hidden;
         if let Some(left) = state.left {
             self.panes[0].folder = Some(left);
         }
@@ -2261,6 +2266,7 @@ impl App {
         let state = SessionState {
             split: self.split,
             active_pane: self.active_pane,
+            show_hidden: self.show_hidden,
             left: self.panes[0].folder.clone(),
             right: self.panes[1].folder.clone(),
             sizes: self.size_entries(),
