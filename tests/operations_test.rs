@@ -1206,12 +1206,12 @@ fn new_entry_extension_decides_kind() {
     let st = app.status.as_ref().expect("existing name must error");
     assert!(st.is_error && st.text.contains("already exists"));
 
-    // Path separators are rejected.
+    // Nested path under a plain name: parent folders are created.
     app.start_new_entry();
     type_text(&mut app, "a/b");
     app.confirm_new_entry();
-    assert!(app.status.as_ref().unwrap().is_error);
-    assert!(!base.join("a").exists());
+    assert!(base.join("a").is_dir());
+    assert!(base.join("a/b").is_dir());
 
     // Empty name is ignored (dialog stays open).
     app.cancel_new_entry();
@@ -1652,4 +1652,71 @@ fn paste_routes_to_goto_prompt() {
             .is_some_and(|p| p.starts_with("/some/pasted/pathmore")),
         "paste appends"
     );
+}
+
+#[test]
+fn new_entry_supports_nested_paths() {
+    use ira::domain::data::Folder;
+    use ira::handler::handle_key_events;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let base = std::env::temp_dir().join(format!("ira_new_nested_{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new("t".into(), base.to_str().unwrap().into(), '#'));
+
+    // Nested file: 2 folders + 1 file.
+    app.start_new_entry();
+    for ch in "xdg-desktop-portal/hyprland/portals.conf".chars() {
+        app.new_entry_insert(ch);
+    }
+    app.confirm_new_entry();
+    let created = base.join("xdg-desktop-portal/hyprland/portals.conf");
+    assert!(created.is_file(), "nested file must be created");
+    assert!(created.parent().unwrap().is_dir());
+
+    // Listing refresh selects the created file and shows its parent folder
+    // contents.
+    for _ in 0..100 {
+        app.tick();
+        if app.file_list_settled(0) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(app.panes[0].files.iter().any(|f| f.label == "portals.conf"));
+
+    // After the nested create the pane navigated into the deepest folder;
+    // subsequent relative creates anchor there.
+    app.start_new_entry();
+    for ch in "a/b/c".chars() {
+        app.new_entry_insert(ch);
+    }
+    app.confirm_new_entry();
+    assert!(base.join("xdg-desktop-portal/hyprland/a/b/c").is_dir());
+
+    // The nested create left the pane inside a/b/c. Two Lefts go to a/;
+    // a new folder created there lands beside the nested chain.
+    handle_key_events(
+        KeyEvent::new(KeyCode::Left, KeyModifiers::empty()),
+        &mut app,
+    )
+    .unwrap();
+    handle_key_events(
+        KeyEvent::new(KeyCode::Left, KeyModifiers::empty()),
+        &mut app,
+    )
+    .unwrap();
+    app.start_new_entry();
+    for ch in "new-gate".chars() {
+        app.new_entry_insert(ch);
+    }
+    app.confirm_new_entry();
+    assert!(
+        base.join("xdg-desktop-portal/hyprland/a/new-gate").is_dir(),
+        "new-gate must be created in the pane's current folder"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
 }

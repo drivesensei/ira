@@ -1282,6 +1282,7 @@ impl App {
     /// ".config", "backup.").
     pub fn confirm_new_entry(&mut self) {
         // Validation failures keep the dialog open so the name can be fixed.
+        // Nested paths are supported: missing parent folders are created.
         let (name, is_file) = {
             let Some(prompt) = self.new_entry.as_ref() else {
                 return;
@@ -1292,22 +1293,27 @@ impl App {
                 self.set_status("Enter a name first.", true);
                 return;
             }
-            if name.contains('/') || name.contains('\\') {
-                self.set_status("Name cannot contain path separators.", true);
-                return;
-            }
             let is_file = path_is_file_kind(std::path::Path::new(&name));
             (name, is_file)
         };
 
-        let pane = self.pane_mut();
-        let Some(parent) = pane.folder.as_ref().map(|f| f.path.clone()) else {
+        let Some(parent) = self.pane().folder.as_ref().map(|f| f.path.clone()) else {
             return;
         };
         let target = std::path::Path::new(&parent).join(&name);
         if target.exists() {
             self.set_status(format!("'{name}' already exists."), true);
             return;
+        }
+        // Nested path: create any missing parent folders first.
+        if let Some(parent_dirs) = target.parent() {
+            if let Err(err) = std::fs::create_dir_all(parent_dirs) {
+                self.set_status(
+                    format!("Failed to create '{}': {err}", parent_dirs.display()),
+                    true,
+                );
+                return;
+            }
         }
         let result = if is_file {
             std::fs::write(&target, "")
@@ -1318,9 +1324,17 @@ impl App {
             self.set_status(format!("Failed to create '{name}': {err}"), true);
             return;
         }
-        // Select the new entry once the (async) listing refresh settles.
-        pane.pending_select = Some(target.to_string_lossy().into_owned());
         self.new_entry = None;
+        if name.contains('/') {
+            // Nested path: open the deepest created folder (or the file's
+            // parent) so the user lands next to what they created.
+            self.goto_navigate(&target);
+            return;
+        }
+        // Simple name: stay in the current folder, select the new entry
+        // once the (async) listing refresh settles.
+        let pane = self.pane_mut();
+        pane.pending_select = Some(target.to_string_lossy().into_owned());
         self.list_files_from_selected_folder();
     }
 

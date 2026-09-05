@@ -209,9 +209,10 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     if let Some(p) = &app.new_entry {
         let name: String = p.text.iter().collect();
         let kind = match name.rsplit_once('.') {
-            Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() => {
+            Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() && !name.contains('/') => {
                 format!("file (.{ext})")
             }
+            _ if name.contains('/') => "nested folder(s) + file".to_string(),
             _ => "folder".to_string(),
         };
         let mut spans: Vec<Span<'static>> = Vec::new();
