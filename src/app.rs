@@ -1502,46 +1502,51 @@ impl App {
 
     fn spawn_transfer_jobs(&mut self, kind: JobKind, sources: Vec<String>, dest: String) {
         let dest_path = std::path::Path::new(&dest);
-        let mut spawned = false;
+        // One batch job for the whole selection: a single worker thread
+        // processes the paths sequentially — never one thread per file.
+        let mut paths = Vec::new();
         for src in sources {
-            let src_path = std::path::Path::new(&src);
-            if dest_path.starts_with(src_path) {
+            if dest_path.starts_with(std::path::Path::new(&src)) {
                 self.set_status("Cannot copy/move a folder into itself.", true);
                 continue;
             }
-            let label = src_path
+            paths.push(src);
+        }
+        if paths.is_empty() {
+            return;
+        }
+        let label = if paths.len() == 1 {
+            std::path::Path::new(&paths[0])
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "item".to_string());
+                .unwrap_or_else(|| "item".to_string())
+        } else {
+            format!("{} items", paths.len())
+        };
 
-            let id = self.next_job_id;
-            self.next_job_id += 1;
-            let control = JobControl::new();
-            self.jobs.push(Job {
-                id,
-                kind,
-                source: src,
-                dest_dir: dest.clone(),
-                label,
-                total_bytes: None,
-                copied_bytes: 0,
-                current: String::new(),
-                status: JobStatus::Running,
-                started_at: Instant::now(),
-                control: control.clone(),
-            });
-            let job = self.jobs.last().unwrap();
-            spawn_job(job, self.job_tx.clone());
-            spawned = true;
-        }
-        if spawned {
-            // The selected entries are now handled; drop the selection and
-            // focus the Copy Board on the newest job.
-            self.pane_mut().selected.fill(false);
-            self.copy_board = true;
-            self.board_focused = true;
-            self.copy_board_state.select(Some(self.jobs.len() - 1));
-        }
+        let id = self.next_job_id;
+        self.next_job_id += 1;
+        self.jobs.push(Job {
+            id,
+            kind,
+            paths,
+            dest_dir: dest.clone(),
+            label,
+            total_bytes: None,
+            copied_bytes: 0,
+            current: String::new(),
+            status: JobStatus::Running,
+            started_at: Instant::now(),
+            control: JobControl::new(),
+        });
+        let job = self.jobs.last().unwrap();
+        spawn_job(job, self.job_tx.clone());
+
+        // The selection is handled; drop it and focus the Copy Board.
+        self.pane_mut().selected.fill(false);
+        self.copy_board = true;
+        self.board_focused = true;
+        self.copy_board_state.select(Some(self.jobs.len() - 1));
     }
 
     /// Whether keyboard focus is on the Copy Board.

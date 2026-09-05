@@ -6,7 +6,7 @@
 
 use std::fs::{self, File};
 use std::io::{ErrorKind, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -33,7 +33,7 @@ pub enum JobStatus {
 }
 
 /// Events the worker emits on the job channel.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum JobEvent {
     Started {
         id: u64,
@@ -133,7 +133,8 @@ impl From<std::io::Error> for JobError {
 pub struct Job {
     pub id: u64,
     pub kind: JobKind,
-    pub source: String,
+    /// All paths to copy/move, processed sequentially by the worker.
+    pub paths: Vec<String>,
     pub dest_dir: String,
     pub label: String,
     pub total_bytes: Option<u64>,
@@ -148,18 +149,17 @@ const CHUNK: usize = 256 * 1024;
 const REPORT_EVERY: u64 = 4 * 1024 * 1024; // progress event every ~4 MiB
 const MAX_ENTRIES: u64 = 200_000; // pre-scan cap; above this show indeterminate
 
-/// Spawns a worker thread for `job`; the thread runs to completion and reports
-/// its outcome on `tx`. The cloned values are owned by the thread, so this
-/// returns immediately.
+/// Spawns ONE worker thread for the whole batch; it processes `job.paths`
+/// sequentially and reports progress on `tx`. Returns immediately.
 pub fn spawn_job(job: &Job, tx: mpsc::Sender<JobEvent>) {
     let id = job.id;
     let kind = job.kind;
     let control = job.control.clone();
-    let src = PathBuf::from(&job.source);
-    let dst = Path::new(&job.dest_dir).join(&job.label).to_path_buf();
+    let paths = job.paths.clone();
+    let dest_dir = job.dest_dir.clone();
 
     thread::spawn(move || {
-        let result = run(id, kind, &src, &dst, &control, &tx);
+        let result = run_batch(id, kind, &paths, Path::new(&dest_dir), &control, &tx);
         let event = match result {
             Ok(()) => JobEvent::Done { id },
             Err(JobError::Cancelled) => JobEvent::Cancelled { id },
@@ -169,36 +169,77 @@ pub fn spawn_job(job: &Job, tx: mpsc::Sender<JobEvent>) {
     });
 }
 
-fn run(
+/// Runs the batch: pre-scans total bytes, then copies/moves each path in
+/// order with one shared byte counter. Per-item I/O failures are counted
+/// and skipped (the rest still transfers); the job ends Failed with a
+/// summary if any item failed.
+fn run_batch(
     id: u64,
     kind: JobKind,
-    src: &Path,
-    dst: &Path,
+    paths: &[String],
+    dest_dir: &Path,
     control: &JobControl,
     tx: &mpsc::Sender<JobEvent>,
 ) -> Result<(), JobError> {
-    let total = if kind == JobKind::Copy {
-        total_bytes(src)
-    } else {
-        None
-    };
+    // Pre-scan totals (capped): any oversized/unreadable tree -> indeterminate.
+    let mut total = 0u64;
+    let mut capped = false;
+    for p in paths {
+        match total_bytes(Path::new(p)) {
+            Some(b) => total += b,
+            None => capped = true,
+        }
+    }
     let _ = tx.send(JobEvent::Started {
         id,
-        total_bytes: total,
+        total_bytes: (!capped).then_some(total),
     });
 
     let mut bytes = 0u64;
-    match kind {
-        JobKind::Copy => copy_entry(src, dst, control, id, tx, &mut bytes),
-        JobKind::Move => match fs::rename(src, dst) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == ErrorKind::CrossesDevices => {
-                copy_entry(src, dst, control, id, tx, &mut bytes)?;
-                remove_tree(src)
+    let mut failed = 0usize;
+    for p in paths {
+        control.gate()?;
+        let src = Path::new(p);
+        let dst = dest_dir.join(src.file_name().unwrap_or_default());
+        let result = match kind {
+            JobKind::Copy => copy_entry(src, &dst, control, id, tx, &mut bytes),
+            JobKind::Move => match fs::rename(src, &dst) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == ErrorKind::CrossesDevices => {
+                    copy_entry(src, &dst, control, id, tx, &mut bytes)?;
+                    remove_tree(src)
+                }
+                Err(e) => Err(JobError::Io(e.to_string())),
+            },
+        };
+        match result {
+            Ok(()) => {}
+            Err(JobError::Cancelled) => return Err(JobError::Cancelled),
+            Err(JobError::Io(_msg)) => {
+                failed += 1;
+                let _ = tx.send(JobEvent::Progress {
+                    id,
+                    copied_bytes: bytes,
+                    current: format!("FAILED: {}", p),
+                });
+                continue;
             }
-            Err(e) => Err(JobError::Io(e.to_string())),
-        },
+        }
+        let _ = tx.send(JobEvent::Progress {
+            id,
+            copied_bytes: bytes,
+            current: p.clone(),
+        });
     }
+
+    if failed > 0 {
+        return Err(JobError::Io(format!(
+            "{} of {} items failed",
+            failed,
+            paths.len()
+        )));
+    }
+    Ok(())
 }
 
 fn copy_entry(
@@ -358,4 +399,154 @@ pub fn spawn_delete_job(paths: Vec<String>, tx: mpsc::Sender<JobEvent>) -> Arc<J
         });
     });
     control
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn wait_done(rx: &mpsc::Receiver<JobEvent>) -> (Option<JobEvent>, Vec<JobEvent>) {
+        let mut last = None;
+        let mut all = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            while let Ok(ev) = rx.try_recv() {
+                let is_final = matches!(
+                    ev,
+                    JobEvent::Done { .. } | JobEvent::Failed { .. } | JobEvent::Cancelled { .. }
+                );
+                all.push(ev);
+                if is_final {
+                    last = Some(all.last().unwrap().clone());
+                }
+            }
+            if last.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        (last, all)
+    }
+
+    fn make_job(paths: Vec<String>, dest: &str) -> Job {
+        Job {
+            id: 1,
+            kind: JobKind::Copy,
+            paths,
+            dest_dir: dest.to_string(),
+            label: "batch".to_string(),
+            total_bytes: None,
+            copied_bytes: 0,
+            current: String::new(),
+            status: JobStatus::Running,
+            started_at: std::time::Instant::now(),
+            control: JobControl::new(),
+        }
+    }
+
+    #[test]
+    fn batch_copies_all_files_with_one_worker() {
+        let base = std::env::temp_dir().join(format!("ira_batch_{}", std::process::id()));
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::create_dir_all(base.join("dst")).unwrap();
+        let mut paths = Vec::new();
+        for i in 0..30 {
+            let p = base.join("src").join(format!("f{i}.txt"));
+            std::fs::write(&p, vec![b'x'; 100]);
+            paths.push(p.to_string_lossy().into_owned());
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let job = make_job(paths, base.join("dst").to_str().unwrap());
+        spawn_job(&job, tx);
+        let (last, _) = wait_done(&rx);
+
+        assert!(matches!(last, Some(JobEvent::Done { .. })));
+        assert_eq!(std::fs::read_dir(base.join("dst")).unwrap().count(), 30);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn batch_continues_after_io_failure_and_reports_summary() {
+        let base = std::env::temp_dir().join(format!("ira_batchfail_{}", std::process::id()));
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::create_dir_all(base.join("dst")).unwrap();
+        std::fs::write(base.join("src").join("good1"), "a").unwrap();
+        std::fs::write(base.join("src").join("good2"), "b").unwrap();
+
+        let paths = vec![
+            base.join("src")
+                .join("good1")
+                .to_string_lossy()
+                .into_owned(),
+            "/nonexistent/missing-file".to_string(),
+            base.join("src")
+                .join("good2")
+                .to_string_lossy()
+                .into_owned(),
+        ];
+
+        let (tx, rx) = mpsc::channel();
+        let job = make_job(paths, base.join("dst").to_str().unwrap());
+        spawn_job(&job, tx);
+        let (last, all) = wait_done(&rx);
+
+        assert!(
+            matches!(&last, Some(JobEvent::Failed { error, .. }) if error.contains("1 of 3 items failed")),
+            "failure summary expected: {last:?}"
+        );
+        // Good items still transferred despite the middle failure.
+        assert!(base.join("dst").join("good1").exists());
+        assert!(base.join("dst").join("good2").exists());
+        // A FAILED progress event was reported for the bad path.
+        assert!(all.iter().any(
+            |ev| matches!(ev, JobEvent::Progress { current, .. } if current.starts_with("FAILED:"))
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn batch_move_removes_sources() {
+        let base = std::env::temp_dir().join(format!("ira_batchmove_{}", std::process::id()));
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::create_dir_all(base.join("dst")).unwrap();
+        let mut paths = Vec::new();
+        for i in 0..5 {
+            let p = base.join("src").join(format!("m{i}"));
+            std::fs::write(&p, "data");
+            paths.push(p.to_string_lossy().into_owned());
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let mut job = make_job(paths, base.join("dst").to_str().unwrap());
+        job.kind = JobKind::Move;
+        spawn_job(&job, tx);
+        let (last, _) = wait_done(&rx);
+
+        assert!(matches!(last, Some(JobEvent::Done { .. })));
+        assert_eq!(std::fs::read_dir(base.join("dst")).unwrap().count(), 5);
+        assert_eq!(std::fs::read_dir(base.join("src")).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn batch_cancelled_before_start_copies_nothing() {
+        let base = std::env::temp_dir().join(format!("ira_batchcancel_{}", std::process::id()));
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::create_dir_all(base.join("dst")).unwrap();
+        std::fs::write(base.join("src").join("a"), "a").unwrap();
+
+        let paths = vec![base.join("src").join("a").to_string_lossy().into_owned()];
+        let (tx, rx) = mpsc::channel();
+        let job = make_job(paths, base.join("dst").to_str().unwrap());
+        // Cancel before spawn: the first gate() sees the cancel flag.
+        job.control.request_cancel();
+        spawn_job(&job, tx);
+        let (last, _) = wait_done(&rx);
+
+        assert!(matches!(last, Some(JobEvent::Cancelled { .. })));
+        assert!(!base.join("dst").join("a").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

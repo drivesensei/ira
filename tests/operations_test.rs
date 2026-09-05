@@ -183,9 +183,11 @@ fn copy_uses_all_selected_entries_and_focuses_board() {
     );
     assert_eq!(confirm.dest_dir.as_deref(), Some(dst.to_str().unwrap()));
 
-    // Confirming spawns both jobs and focuses the board.
+    // Confirming spawns ONE batch job for the whole selection and focuses
+    // the board.
     app.confirm_pending();
-    assert_eq!(app.jobs.len(), 2);
+    assert_eq!(app.jobs.len(), 1, "one batch job, not one per file");
+    assert_eq!(app.jobs[0].paths.len(), 2);
     assert!(app.copy_board && app.board_has_focus());
 
     wait_for_jobs(&mut app);
@@ -194,7 +196,6 @@ fn copy_uses_all_selected_entries_and_focuses_board() {
     assert!(dst.join("b.txt").exists());
     assert!(!dst.join("c.txt").exists());
     assert!(matches!(app.jobs[0].status, JobStatus::Done));
-    assert!(matches!(app.jobs[1].status, JobStatus::Done));
 
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -1274,6 +1275,59 @@ fn new_entry_selects_created_item_and_works_via_handler() {
     handle_key_events(key(KeyCode::Enter), &mut app).unwrap();
     assert!(app.renaming.is_some(), "Enter on the entry opens rename");
     handle_key_events(key(KeyCode::Esc), &mut app).unwrap();
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn batch_copy_of_thousands_stays_responsive() {
+    let base = std::env::temp_dir().join(format!("ira_stress_{}", std::process::id()));
+    let src = base.join("src");
+    let dst = base.join("dst");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&dst).unwrap();
+    for i in 0..8000 {
+        std::fs::write(src.join(format!("f{i:05}.txt")), "x".repeat(50)).unwrap();
+    }
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new("src".into(), src.to_str().unwrap().into(), '#'));
+    app.panes[1].folder = Some(Folder::new("dst".into(), dst.to_str().unwrap().into(), '#'));
+    app.panes[0].files = (0..8000)
+        .map(|i| entry(src.join(format!("f{i:05}.txt")).to_str().unwrap()))
+        .collect();
+    app.panes[0].selected = vec![true; 8000];
+
+    app.request_copy();
+    app.confirm_pending();
+
+    // THE fix: one batch job instead of one job per file.
+    assert_eq!(app.jobs.len(), 1, "8000 files must be one batch job");
+    assert_eq!(app.jobs[0].paths.len(), 8000);
+
+    // The UI thread must stay responsive while the copy runs: tick() (which
+    // drains progress events) must never take anywhere near a freeze.
+    let mut max_tick_us = 0u128;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        let t0 = std::time::Instant::now();
+        app.tick();
+        let dt = t0.elapsed().as_micros();
+        max_tick_us = max_tick_us.max(dt);
+        if matches!(app.jobs[0].status, JobStatus::Done | JobStatus::Failed(_)) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        max_tick_us < 50_000,
+        "tick must stay responsive: {max_tick_us}µs"
+    );
+    assert!(
+        matches!(app.jobs[0].status, JobStatus::Done),
+        "batch must complete"
+    );
+    assert_eq!(std::fs::read_dir(&dst).unwrap().count(), 8000);
 
     let _ = std::fs::remove_dir_all(&base);
 }
