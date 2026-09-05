@@ -1102,29 +1102,16 @@ impl App {
             }
         }
         let result = if is_file {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .map(|_| ())
+            std::fs::write(&path, "")
         } else {
             std::fs::create_dir_all(&path)
         };
-        match result {
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                // The entry appeared between the existence check and the
-                // create: never overwrite it — navigate to it instead.
-                self.goto_navigate(&path);
-                return;
-            }
-            Err(err) => {
-                self.set_status(
-                    format!("Failed to create '{}': {err}", path.display()),
-                    true,
-                );
-                return;
-            }
-            Ok(()) => {}
+        if let Err(err) = result {
+            self.set_status(
+                format!("Failed to create '{}': {err}", path.display()),
+                true,
+            );
+            return;
         }
         self.goto_navigate(&path);
     }
@@ -1236,7 +1223,7 @@ impl App {
         let Some(parent) = self.pane().folder.as_ref().map(|f| f.path.clone()) else {
             return;
         };
-        let target = expand_path(&name, Some(parent.clone()));
+        let target = std::path::Path::new(&parent).join(&name);
         if target.exists() {
             self.set_status(format!("'{name}' already exists."), true);
             return;
@@ -1252,28 +1239,12 @@ impl App {
             }
         }
         let result = if is_file {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&target)
-                .map(|_| ())
+            std::fs::write(&target, "")
         } else {
             std::fs::create_dir_all(&target)
         };
         if let Err(err) = result {
-            // create_new/create_dir_all never touch an existing entry, so
-            // an AlreadyExists failure here is a race with the existence
-            // check above — report it instead of clobbering anything.
-            let status = if err.kind() == std::io::ErrorKind::AlreadyExists {
-                if is_file {
-                    format!("'{name}' already exists.")
-                } else {
-                    format!("'{name}' already exists and is not a folder.")
-                }
-            } else {
-                format!("Failed to create '{name}': {err}")
-            };
-            self.set_status(status, true);
+            self.set_status(format!("Failed to create '{name}': {err}"), true);
             return;
         }
         self.new_entry = None;
