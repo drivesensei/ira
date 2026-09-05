@@ -202,11 +202,15 @@ mod tests {
             path: "/x/src".to_string(),
             label: "src".to_string(),
             is_dir: true,
+            size: 0,
+            modified: None,
         };
         let file = FEntry {
             path: "/x/r.txt".to_string(),
             label: "r.txt".to_string(),
             is_dir: false,
+            size: 0,
+            modified: None,
         };
 
         let d = row_span(false, &dir, None, None, None).content.to_string();
@@ -227,6 +231,8 @@ mod tests {
             path: "/x/cybertouch".to_string(),
             label: "cybertouch".to_string(),
             is_dir: true,
+            size: 0,
+            modified: None,
         };
         let si = SizeInfo {
             bytes: 322_000_000_000,
@@ -257,6 +263,8 @@ mod tests {
             path: "/x/src".to_string(),
             label: "src".to_string(),
             is_dir: true,
+            size: 0,
+            modified: None,
         };
         let plain = row_span(false, &dir, None, None, None).content.to_string();
         let walking = row_span(false, &dir, Some(Instant::now()), None, None)

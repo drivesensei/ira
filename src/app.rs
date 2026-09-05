@@ -59,6 +59,9 @@ pub struct Pane {
     /// generation are dropped, so overlapping listings never interleave
     /// (the "folder lists itself" bug).
     pub listing_generation: u64,
+    /// Active sort mode of the listing, cycled with `,`
+    /// (0=Name, 1=Size, 2=Modified, 3=Kind).
+    pub sort_mode: usize,
 }
 
 /// An in-place rename being edited in a modal text box.
@@ -888,6 +891,127 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Cycles the active pane's sort mode (Name → Size → Modified → Kind),
+    /// re-sorting its files in place while carrying the multi-select flags
+    /// along and keeping the cursor on the same file. With a confirmed
+    /// filter active, the filtered view is recomputed over the new order.
+    pub fn cycle_sort(&mut self) {
+        const SORT_MODES: usize = 4;
+        let pane_index = self.active_pane;
+        let (mode, selected_path) = {
+            // While searching (live query) the visible rows come from
+            // `search_matches`; with a confirmed filter they come from
+            // `filter_indices`. Either way `state.selected()` is a visible
+            // row that must be mapped to a `files` index first.
+            let visible_to_file: Option<Vec<usize>> =
+                if self.is_searching() && pane_index == self.active_pane {
+                    Some(self.search_matches())
+                } else if self.panes[pane_index].filter_query.is_some() {
+                    Some(self.panes[pane_index].filter_indices.clone())
+                } else {
+                    None
+                };
+            let pane = &mut self.panes[pane_index];
+            pane.sort_mode = (pane.sort_mode + 1) % SORT_MODES;
+            // Note the file under the cursor as a path, so the cursor can be
+            // restored once the new order is known.
+            let path = pane
+                .state
+                .selected()
+                .and_then(|vis| match &visible_to_file {
+                    Some(indices) => indices.get(vis).copied(),
+                    None => Some(vis),
+                })
+                .and_then(|i| pane.files.get(i))
+                .map(|f| f.path.clone());
+            (pane.sort_mode, path)
+        };
+
+        let search_active = self.is_searching() && pane_index == self.active_pane;
+        let search_query = if search_active {
+            self.search_query.clone().unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        let pane = &mut self.panes[pane_index];
+        // Stable sort of indices, then one permutation applied to both the
+        // entries and the parallel `selected` flags.
+        let mut order: Vec<usize> = (0..pane.files.len()).collect();
+        let files = &pane.files;
+        order.sort_by(|&a, &b| {
+            let (x, y) = (&files[a], &files[b]);
+            match mode {
+                1 => {
+                    // Size: files largest first; directories (size 0) group
+                    // last, alphabetical within each group.
+                    match (x.is_dir, y.is_dir) {
+                        (true, true) => x.label.cmp(&y.label),
+                        (true, false) => std::cmp::Ordering::Greater,
+                        (false, true) => std::cmp::Ordering::Less,
+                        (false, false) => y.size.cmp(&x.size).then(x.label.cmp(&y.label)),
+                    }
+                }
+                2 => {
+                    // Modified: newest first; unknown timestamps last.
+                    match (&x.modified, &y.modified) {
+                        (Some(a), Some(b)) => b.cmp(a).then(x.label.cmp(&y.label)),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => x.label.cmp(&y.label),
+                    }
+                }
+                3 => {
+                    // Kind: directories first, then files, alphabetical.
+                    y.is_dir.cmp(&x.is_dir).then(x.label.cmp(&y.label))
+                }
+                _ => x.label.cmp(&y.label),
+            }
+        });
+        pane.files = order.iter().map(|&i| files[i].clone()).collect();
+        pane.selected = order
+            .iter()
+            .map(|&i| pane.selected.get(i).copied().unwrap_or(false))
+            .collect();
+
+        // Recompute the confirmed filter over the new label order so the
+        // filtered rows keep pointing at the same files.
+        let filter_query = pane.filter_query.clone();
+        if let Some(q) = &filter_query {
+            let labels: Vec<String> = pane.files.iter().map(|f| f.label.clone()).collect();
+            pane.filter_indices = fuzzy_indices(&labels, q);
+        }
+
+        // Keep the cursor on the same file at its new position. Under a
+        // filter or live search the cursor is a visible row, so map the
+        // file's new index back through the (recomputed) visible list.
+        let new_file_index = selected_path
+            .as_deref()
+            .and_then(|p| pane.files.iter().position(|f| f.path == p));
+        let cursor = match new_file_index {
+            Some(fi) if filter_query.is_some() => {
+                pane.filter_indices.iter().position(|&i| i == fi)
+            }
+            Some(fi) if search_active => {
+                let labels: Vec<String> = pane.files.iter().map(|f| f.label.clone()).collect();
+                fuzzy_indices(&labels, &search_query)
+                    .iter()
+                    .position(|&i| i == fi)
+            }
+            other => other,
+        };
+        pane.render_scroll = 0;
+        pane.state.select(cursor);
+
+        let notice = match mode {
+            1 => "Sorted by size (largest first)",
+            2 => "Sorted by last modified (newest first)",
+            3 => "Sorted by kind",
+            _ => "Sorted by name",
+        };
+        self.set_status(notice, false);
     }
 
     /// Clears the held-key ramp (jump navigation starts from step 1).
@@ -2321,6 +2445,8 @@ impl App {
             path: path.clone(),
             label,
             is_dir: true,
+            size: 0,
+            modified: None,
         };
         let lines = build_info_fast(&entry);
         if let Some(dialog) = self.info.as_mut() {
@@ -2346,6 +2472,8 @@ mod tests {
             path: path.to_string(),
             label: path.rsplit('/').next().unwrap_or(path).to_string(),
             is_dir: false,
+            size: 0,
+            modified: None,
         }
     }
     use crate::services::state::{load_state_from, save_state_to};
@@ -2596,6 +2724,7 @@ mod tests {
                 left: app.panes[0].folder.clone(),
                 right: app.panes[1].folder.clone(),
                 sizes: entries,
+                show_hidden: app.show_hidden,
             },
         );
         let loaded = load_state_from(&file);

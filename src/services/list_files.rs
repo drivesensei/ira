@@ -4,6 +4,35 @@ pub struct FEntry {
     pub label: String,
     /// Whether this entry is a directory (drives the folder/file icon).
     pub is_dir: bool,
+    /// File size in bytes; `0` for directories (they group last in size sort).
+    pub size: u64,
+    /// Last-modified time as epoch seconds; `None` when unavailable
+    /// (stat failed or clock before the Unix epoch).
+    pub modified: Option<i64>,
+}
+
+/// Stat helper shared by every listing path: sorting by size/modified needs
+/// per-entry metadata, so we pay one extra stat per entry here (background
+/// and bounded paths only — this runs off the UI thread or on small folders).
+fn entry_with_meta(path: &std::path::Path, label: &str, is_dir: bool) -> FEntry {
+    let (size, modified) = match std::fs::metadata(path) {
+        Ok(md) => {
+            let modified = md
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64);
+            (if is_dir { 0 } else { md.len() }, modified)
+        }
+        Err(_) => (0, None),
+    };
+    FEntry {
+        path: path.to_string_lossy().into_owned(),
+        label: label.to_string(),
+        is_dir,
+        size,
+        modified,
+    }
 }
 
 pub fn list_files(path: &str) -> Result<Vec<FEntry>, std::io::Error> {
@@ -18,11 +47,7 @@ pub fn list_files(path: &str) -> Result<Vec<FEntry>, std::io::Error> {
                     // DirEntry::file_type() on Linux uses the readdir d_type,
                     // so this is cheap (no extra stat syscall for most entries).
                     let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                    drives.push(FEntry {
-                        path: path.to_string_lossy().into_owned(),
-                        label: label.to_string(),
-                        is_dir,
-                    });
+                    drives.push(entry_with_meta(&path, label, is_dir));
                 }
             }
             Err(e) => println!("Error reading entry: {}", e),
@@ -57,13 +82,11 @@ pub fn list_files_bounded(
                     if !show_hidden && label.starts_with('.') {
                         continue;
                     }
-                    // file_type() is free (d_type); no stat per entry.
+                    // file_type() is free (d_type); the metadata stat is the
+                    // one extra syscall per entry sorting needs.
                     let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                    files.push(FEntry {
-                        path: entry.path().to_string_lossy().into_owned(),
-                        label: label.to_string(),
-                        is_dir,
-                    });
+                    let path = entry.path();
+                    files.push(entry_with_meta(&path, label, is_dir));
                     if files.len() >= max_entries {
                         // Peek one more: None = we actually hit EOF, so
                         // the folder fits the cap exactly and is complete.
@@ -97,11 +120,8 @@ pub fn list_files_chunked(
                     // DirEntry::file_type() on Linux uses the readdir d_type,
                     // so this is cheap (no extra stat syscall for most entries).
                     let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                    batch.push(FEntry {
-                        path: entry.path().to_string_lossy().into_owned(),
-                        label: label.to_string(),
-                        is_dir,
-                    });
+                    let path = entry.path();
+                    batch.push(entry_with_meta(&path, label, is_dir));
                     if batch.len() >= chunk_size {
                         on_chunk(std::mem::take(&mut batch));
                     }

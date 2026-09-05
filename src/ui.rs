@@ -440,6 +440,8 @@ mod tests {
             path: dir.join(name).to_string_lossy().into_owned(),
             label: name.to_string(),
             is_dir,
+            size: 0,
+            modified: None,
         }];
         app.panes[0].state.select(Some(0));
         app.show_info();
