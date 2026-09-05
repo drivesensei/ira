@@ -1,5 +1,4 @@
 use crate::app::{App, AppResult};
-use crate::services::process_panel::RunState;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// Keys that trigger the delete flow in normal mode. Windows/Linux have a
@@ -21,18 +20,6 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
     // (except while editing a rename). Ctrl is the only modifier every
     // terminal reports reliably.
     if key_event.modifiers == KeyModifiers::CONTROL {
-        // Ctrl+C with a running process in the focused panel = stop the
-        // process, never quit the app.
-        if matches!(key_event.code, KeyCode::Char('c') | KeyCode::Char('C'))
-            && app.panel_has_focus()
-            && app
-                .process_panel
-                .as_ref()
-                .is_some_and(|p| p.state() == RunState::Running)
-        {
-            app.stop_panel_command();
-            return Ok(());
-        }
         match key_event.code {
             KeyCode::Char('c') | KeyCode::Char('C') => {
                 app.quit();
@@ -85,36 +72,6 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
             KeyCode::Left => app.new_entry_left(),
             KeyCode::Right => app.new_entry_right(),
             KeyCode::Char(c) => app.new_entry_insert(c),
-            _ => {}
-        }
-        return Ok(());
-    }
-
-    // Command panel focused: typing goes to the panel input.
-    if app.panel_has_focus() {
-        match key_event.code {
-            // Esc/Tab unfocus; `0` is just a character here (commands may
-            // contain digits, e.g. "sleep 60"). Closing = Esc then `0`.
-            KeyCode::Esc | KeyCode::Tab => {
-                app.panel_focused = false;
-            }
-            KeyCode::Enter => {
-                if key_event.modifiers.contains(KeyModifiers::CONTROL) {
-                    app.stop_panel_command();
-                } else if app
-                    .process_panel
-                    .as_ref()
-                    .is_some_and(|p| p.state() == RunState::Running)
-                {
-                    app.panel_send_line();
-                } else {
-                    app.run_panel_command();
-                }
-            }
-            KeyCode::Backspace => {
-                app.panel_input.pop();
-            }
-            KeyCode::Char(c) => app.panel_input.push(c),
             _ => {}
         }
         return Ok(());
@@ -217,9 +174,9 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         // Exit application on `q`
         KeyCode::Char(c) if c == 'q' => app.quit(),
 
-        // `0` toggles the command panel (drives shortcuts start at 1, so
-        // 0 is free).
-        KeyCode::Char('0') => app.toggle_process_panel(),
+        // `0` spawns the user's terminal emulator in the active pane's
+        // folder (drives shortcuts start at 1, so 0 is free).
+        KeyCode::Char('0') => app.spawn_native_terminal(),
 
         // Any digit represents a shortcut to a Drive path
         KeyCode::Char(c) if c.is_digit(10) => {

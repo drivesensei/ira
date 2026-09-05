@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::error;
+use std::process::Stdio;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -19,7 +20,6 @@ use crate::{
         },
         folders::list_common_folders,
         list_files::{list_files_bounded, list_files_chunked, FEntry, LISTING_CHUNK},
-        process_panel::{spawn_command, CommandRun, RunState},
         state::{load_state, save_state, save_state_to, SessionState, SizeEntry},
         transfer::{spawn_delete_job, spawn_job, Job, JobControl, JobEvent, JobKind, JobStatus},
     },
@@ -224,15 +224,6 @@ pub struct App {
     pub deletion_box_hidden: bool,
     /// Paths queued for/being deleted (drives the file-list spinners).
     deleting_paths: HashSet<String>,
-    /// Embedded command panel (`0`): running process + its buffered output.
-    /// The command keeps running while the panel is hidden.
-    pub process_panel: Option<Arc<CommandRun>>,
-    /// Whether the panel is visible.
-    pub panel_open: bool,
-    /// Whether the panel has keyboard focus (typing goes to the process).
-    pub panel_focused: bool,
-    /// Panel input line being typed.
-    pub panel_input: String,
     /// Scroll acceleration state: direction (+1 down / -1 up / 0 idle),
     /// consecutive repeats within [`SCROLL_REPEAT_WINDOW`], and the time of
     /// the last move.
@@ -302,10 +293,6 @@ impl Default for App {
             deletion: None,
             deletion_box_hidden: false,
             deleting_paths: HashSet::new(),
-            process_panel: None,
-            panel_open: false,
-            panel_focused: false,
-            panel_input: String::new(),
             scroll_dir: 0,
             scroll_repeat: 0,
             last_scroll: None,
@@ -452,8 +439,6 @@ impl App {
                 q.push_str(cleaned);
             }
             self.pane_mut().state.select(Some(0));
-        } else if self.panel_has_focus() {
-            self.panel_input.push_str(cleaned);
         }
     }
 
@@ -953,15 +938,6 @@ impl App {
     /// (when open) -> pane 0.
     pub fn switch_pane(&mut self) {
         self.search_query = None;
-        if self.panel_open && !self.panel_focused && !self.copy_board {
-            // Pane -> panel.
-            self.panel_focused = true;
-            return;
-        }
-        if self.panel_has_focus() {
-            self.panel_focused = false;
-            return;
-        }
         if self.copy_board {
             if self.board_focused {
                 self.board_focused = false;
@@ -976,87 +952,35 @@ impl App {
         }
     }
 
-    /// Toggles the command panel (`0`). First open offers an empty input
-    /// line; the panel can be hidden/shown freely while a command runs.
-    pub fn toggle_process_panel(&mut self) {
-        if self.panel_open {
-            // Hide the panel; any running command keeps going.
-            self.panel_open = false;
-            self.panel_focused = false;
-            self.panel_input.clear();
-            return;
-        }
-        self.panel_open = true;
-        // Auto-focus: `0` is an explicit "I want the terminal" action.
-        self.panel_focused = true;
-        self.board_focused = false;
-    }
-
-    /// Spawns the typed command in the active pane's folder. The panel stays
-    /// open and streams output; the process keeps running when hidden.
-    pub fn run_panel_command(&mut self) {
-        let cmd = self.panel_input.trim().to_string();
-        self.panel_input.clear();
-        if cmd.is_empty() {
-            return;
-        }
-        if self
-            .process_panel
-            .as_ref()
-            .is_some_and(|p| p.state() == RunState::Running)
-        {
-            self.set_status(
-                "A command is already running — stop it first (Ctrl+C).",
-                true,
-            );
-            return;
-        }
-        let Some(folder) = self.pane().folder.as_ref().map(|f| f.path.clone()) else {
-            self.set_status("No folder open to run the command in.", true);
+    /// Spawns the user's terminal emulator in the active pane's folder
+    /// without suspending ira.
+    pub fn spawn_native_terminal(&mut self) {
+        let Some(dir) = self.pane().folder.as_ref().map(|f| f.path.clone()) else {
+            self.set_status("No folder open to start a terminal in.", true);
             return;
         };
-        let (program, args) = parse_command_line(&cmd);
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        match spawn_command(&program, &arg_refs, &folder) {
-            Ok(run) => self.process_panel = Some(run),
-            Err(msg) => self.set_status(msg, true),
-        }
-    }
-
-    /// Ctrl+C in the panel: interrupt the running process (SIGINT on Unix,
-    /// taskkill on Windows); its output keeps flowing into the buffer.
-    pub fn stop_panel_command(&mut self) {
-        if let Some(panel) = &self.process_panel {
-            if panel.state() == RunState::Running {
-                panel.stop();
+        for (program, args) in terminal_candidates(&dir) {
+            if !which(&program) {
+                continue;
+            }
+            let mut cmd = std::process::Command::new(&program);
+            cmd.args(&args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .current_dir(&dir);
+            match cmd.spawn() {
+                Ok(_) => {
+                    self.set_status(format!("Opened {program}"), false);
+                    return;
+                }
+                Err(_) => continue,
             }
         }
-    }
-
-    /// Sends one input line to the running process's stdin.
-    pub fn panel_send_line(&mut self) {
-        let line = self.panel_input.trim().to_string();
-        self.panel_input.clear();
-        if let Some(panel) = &self.process_panel {
-            panel.send_line(&line);
-        }
-    }
-
-    /// True when the bottom command panel is open.
-    pub fn panel_open(&self) -> bool {
-        self.panel_open
-    }
-
-    /// True when the panel is open, has a live process, and focus is on it.
-    pub fn panel_has_focus(&self) -> bool {
-        self.panel_open && self.panel_focused
-    }
-
-    /// Focuses the panel for typing (called by the Tab/focus machinery).
-    pub fn focus_process_panel(&mut self) {
-        self.panel_open = true;
-        self.panel_focused = true;
-        self.board_focused = false;
+        self.set_status(
+            "No terminal emulator found (tried foot, alacritty, kitty, gnome-terminal, konsole, xfce4-terminal, xterm).",
+            true,
+        );
     }
 
     // ---- Copy / move between panes (async, via the Copy Board) ----
@@ -1129,7 +1053,6 @@ impl App {
         self.new_entry = None;
         self.renaming = None;
         self.search_query = None;
-        self.panel_focused = false;
         self.goto_prompt = Some(String::new());
     }
 
@@ -1179,16 +1102,29 @@ impl App {
             }
         }
         let result = if is_file {
-            std::fs::write(&path, "")
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map(|_| ())
         } else {
             std::fs::create_dir_all(&path)
         };
-        if let Err(err) = result {
-            self.set_status(
-                format!("Failed to create '{}': {err}", path.display()),
-                true,
-            );
-            return;
+        match result {
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                // The entry appeared between the existence check and the
+                // create: never overwrite it — navigate to it instead.
+                self.goto_navigate(&path);
+                return;
+            }
+            Err(err) => {
+                self.set_status(
+                    format!("Failed to create '{}': {err}", path.display()),
+                    true,
+                );
+                return;
+            }
+            Ok(()) => {}
         }
         self.goto_navigate(&path);
     }
@@ -1300,7 +1236,7 @@ impl App {
         let Some(parent) = self.pane().folder.as_ref().map(|f| f.path.clone()) else {
             return;
         };
-        let target = std::path::Path::new(&parent).join(&name);
+        let target = expand_path(&name, Some(parent.clone()));
         if target.exists() {
             self.set_status(format!("'{name}' already exists."), true);
             return;
@@ -1316,12 +1252,28 @@ impl App {
             }
         }
         let result = if is_file {
-            std::fs::write(&target, "")
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)
+                .map(|_| ())
         } else {
             std::fs::create_dir_all(&target)
         };
         if let Err(err) = result {
-            self.set_status(format!("Failed to create '{name}': {err}"), true);
+            // create_new/create_dir_all never touch an existing entry, so
+            // an AlreadyExists failure here is a race with the existence
+            // check above — report it instead of clobbering anything.
+            let status = if err.kind() == std::io::ErrorKind::AlreadyExists {
+                if is_file {
+                    format!("'{name}' already exists.")
+                } else {
+                    format!("'{name}' already exists and is not a folder.")
+                }
+            } else {
+                format!("Failed to create '{name}': {err}")
+            };
+            self.set_status(status, true);
             return;
         }
         self.new_entry = None;
@@ -2719,12 +2671,30 @@ mod tests {
     }
 }
 
-/// Splits a command line into program + args on whitespace (no shell
-/// quoting yet; good enough for `npm run dev`, `node server.js`, `du -sh *`
-/// style usage — globbing/vars are the shell's job and are not expanded).
-fn parse_command_line(cmd: &str) -> (String, Vec<String>) {
-    let mut parts = cmd.split_whitespace().map(str::to_string);
-    (parts.next().unwrap_or_default(), parts.collect())
+/// Terminal emulators to try for `0`, in preference order, with the args
+/// that make them open in `dir`. Pure so tests can inspect the table.
+pub fn terminal_candidates(dir: &str) -> Vec<(String, Vec<String>)> {
+    vec![
+        ("foot".into(), vec!["--working-directory".into(), dir.into()]),
+        ("alacritty".into(), vec!["--working-directory".into(), dir.into()]),
+        ("kitty".into(), vec!["--directory".into(), dir.into()]),
+        ("gnome-terminal".into(), vec![format!("--working-directory={dir}")]),
+        ("konsole".into(), vec!["--workdir".into(), dir.into()]),
+        ("xfce4-terminal".into(), vec!["--working-directory".into(), dir.into()]),
+        ("xterm".into(), vec![]),
+    ]
+}
+
+/// True when `program` is an executable file found on `PATH`
+/// (existence on the path is treated as sufficient).
+fn which(program: &str) -> bool {
+    let Ok(path_var) = std::env::var("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path_var).any(|dir| {
+        let candidate = dir.join(program);
+        candidate.is_file()
+    })
 }
 
 /// Joins Unicode characters into a `String`.

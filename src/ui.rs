@@ -53,17 +53,8 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     crate::components::bookmarks_ui::render(frame, app, bookmarks_row[0]);
     crate::components::actions_ui::render(frame, app, bookmarks_row[1]);
 
-    // Files area: optional Copy Board sidebar on the right, optional
-    // command panel at the bottom, then the panes.
+    // Files area: optional Copy Board sidebar on the right, then the panes.
     let mut files_area = rows[3];
-    if app.panel_open() {
-        let vert = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(4), Constraint::Length(10)])
-            .split(files_area);
-        files_area = vert[0];
-        crate::components::process_panel_ui::render(frame, app, vert[1]);
-    }
     if app.copy_board {
         let board = Layout::default()
             .direction(Direction::Horizontal)
