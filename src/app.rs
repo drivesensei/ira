@@ -14,8 +14,8 @@ use crate::{
         bookmarks::{next_free_shortcut, read_bookmarks, write_bookmarks},
         drives::{eject_drive, list_drives, mount_drive},
         file_info::{
-            build_info_fast, build_info_full, dir_size, size_line_final, InfoEvent, SizeInfo,
-            WalkHandle,
+            build_info_fast, build_info_full, dir_size, on_disk_bytes, size_line_final, DirSize,
+            InfoEvent, SizeInfo, WalkHandle,
         },
         folders::list_common_folders,
         list_files::{list_files_bounded, list_files_chunked, FEntry, LISTING_CHUNK},
@@ -95,6 +95,17 @@ pub const SCROLL_REPEAT_WINDOW: Duration = Duration::from_millis(200);
 pub const SCROLL_RAMP_EVERY: u32 = 6;
 /// Maximum rows moved per key repeat once fully ramped.
 pub const SCROLL_MAX_STEP: usize = 6;
+
+/// Aggregate info dialog for a multi-selection: sums the sizes of all
+/// selected folders (via their background walks) and files (via stat).
+#[derive(Debug)]
+pub struct MultiInfoState {
+    /// Selected paths (folders get walks, files get stat'd).
+    pub paths: Vec<String>,
+    pub folders: usize,
+    pub files: usize,
+    pub started: Instant,
+}
 
 /// Live state of the background batch deletion.
 #[derive(Debug)]
@@ -194,6 +205,8 @@ pub struct App {
     pub renaming: Option<RenamePrompt>,
     /// Open metadata dialog; `None` when closed.
     pub info: Option<InfoDialog>,
+    /// Aggregate info dialog for a multi-selection; `None` when closed.
+    pub multi_info: Option<MultiInfoState>,
     /// "Create new" dialog (`n`); `None` when closed.
     pub new_entry: Option<NewEntryPrompt>,
 
@@ -280,6 +293,7 @@ impl Default for App {
             renaming: None,
             new_entry: None,
             info: None,
+            multi_info: None,
             status: None,
             deletion: None,
             deletion_box_hidden: false,
@@ -740,25 +754,20 @@ impl App {
             return;
         };
 
-        match get_directory(&path) {
-            Ok(some_folder) => {
-                if let Some(actual_folder) = some_folder {
-                    let pane = self.pane_mut();
-                    pane.filter_query = None;
-                    pane.filter_indices.clear();
-                    pane.pending_select = None;
-                    pane.folder = Some(actual_folder);
-                    self.search_query = None;
-                    self.list_files_from_selected_folder();
-                    self.pane_mut().state.select(None);
-                } else {
-                    // it's a file, just open it
-                    if let Err(msg) = open_file(&path) {
-                        self.set_status(msg, true);
-                    }
-                }
+        if let Ok(Some(actual_folder)) = get_directory(&path) {
+            let pane = self.pane_mut();
+            pane.filter_query = None;
+            pane.filter_indices.clear();
+            pane.pending_select = None;
+            pane.folder = Some(actual_folder);
+            self.search_query = None;
+            self.list_files_from_selected_folder();
+            self.pane_mut().state.select(None);
+        } else if self.visible_entry(idx).map(|f| f.is_dir) == Some(false) {
+            // it's a file, just open it
+            if let Err(msg) = open_file(&path) {
+                self.set_status(msg, true);
             }
-            Err(_) => {}
         }
     }
 
@@ -1315,6 +1324,14 @@ impl App {
         if self.confirming.is_some() || self.renaming.is_some() {
             return;
         }
+        self.multi_info = None;
+        // Multi-selection: aggregate info dialog (sizes summed across all
+        // selected folders/files).
+        let sources = self.collect_sources();
+        if sources.len() > 1 {
+            self.show_multi_info(sources);
+            return;
+        }
         let Some(vis_idx) = self.pane().state.selected() else {
             return;
         };
@@ -1338,6 +1355,88 @@ impl App {
             let lines = build_info_full(&entry, None);
             let _ = tx.send(InfoEvent::Meta { path, lines });
         });
+    }
+
+    /// Opens the aggregate info dialog for a multi-selection: spawns size
+    /// walks for selected folders and stats the selected files; the dialog
+    /// sums everything live from the size cache. Any key dismisses it (the
+    /// walks keep running and stay cached).
+    fn show_multi_info(&mut self, paths: Vec<String>) {
+        let pane = self.pane();
+        let mut folders = 0usize;
+        let mut files = 0usize;
+        let mut dir_paths = Vec::new();
+        let mut file_paths = Vec::new();
+        for p in &paths {
+            let is_dir = pane
+                .files
+                .iter()
+                .find(|f| f.path == *p)
+                .map(|f| f.is_dir)
+                .unwrap_or(false);
+            if is_dir {
+                folders += 1;
+                dir_paths.push(p.clone());
+            } else {
+                files += 1;
+                file_paths.push(p.clone());
+            }
+        }
+        self.info = None;
+        self.multi_info = Some(MultiInfoState {
+            paths: paths.clone(),
+            folders,
+            files,
+            started: Instant::now(),
+        });
+        for p in dir_paths {
+            self.ensure_size_walk(&p);
+        }
+        // Selected files: one worker stats them (len + allocated size) and
+        // reports each as a Done size-cache entry.
+        if !file_paths.is_empty() {
+            let tx = self.info_tx.clone();
+            thread::spawn(move || {
+                for p in file_paths {
+                    if let Ok(meta) = std::fs::symlink_metadata(&p) {
+                        let _ = tx.send(InfoEvent::Done {
+                            path: p,
+                            size: DirSize {
+                                bytes: meta.len(),
+                                items: 1,
+                                on_disk: on_disk_bytes(&meta),
+                            },
+                        });
+                    }
+                }
+            });
+        }
+    }
+
+    /// Aggregate sums for the open multi-selection dialog:
+    /// (complete, data bytes, on-disk bytes, items).
+    pub fn multi_info_aggregate(&self) -> (bool, u64, u64, u64) {
+        let Some(m) = &self.multi_info else {
+            return (true, 0, 0, 0);
+        };
+        let mut complete = true;
+        let mut bytes = 0u64;
+        let mut items = 0u64;
+        let mut on_disk = 0u64;
+        for p in &m.paths {
+            match self.size_cache.get(p) {
+                Some(si) => {
+                    bytes += si.bytes;
+                    items += si.items;
+                    on_disk += si.on_disk;
+                    if !si.complete {
+                        complete = false;
+                    }
+                }
+                None => complete = false,
+            }
+        }
+        (complete, bytes, items, on_disk)
     }
 
     /// Ensures a background size walk is running for `path` (one per folder;

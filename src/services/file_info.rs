@@ -46,6 +46,11 @@ fn on_disk_of(_meta: &fs::Metadata) -> u64 {
     0
 }
 
+/// Public wrapper for callers outside this module (multi-selection worker).
+pub fn on_disk_bytes(meta: &fs::Metadata) -> u64 {
+    on_disk_of(meta)
+}
+
 /// `"{data} data / {on-disk} on disk"` — the on-disk half only appears when
 /// allocation meaningfully exceeds the data (cluster slack, e.g. exFAT).
 fn size_with_on_disk(bytes: u64, on_disk: u64) -> String {
@@ -400,7 +405,7 @@ fn walk(
     }
 }
 
-fn human(bytes: u64) -> String {
+pub fn human(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
     let mut v = bytes as f64;
     let mut unit = 0;

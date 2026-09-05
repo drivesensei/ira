@@ -121,6 +121,13 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         return Ok(());
     }
 
+    // Multi-selection info dialog: any key closes it; the walks keep
+    // running in the background (sizes stay cached).
+    if app.multi_info.is_some() {
+        app.multi_info = None;
+        return Ok(());
+    }
+
     // Info dialog: `x` cancels the folder's background size walk (keeping
     // the dialog open with the partial size), `r` restarts the measurement
     // from scratch; any other key dismisses it and leaves the walk running.

@@ -8,7 +8,7 @@ use ratatui::{
 
 use crate::app::App;
 use crate::services::file_info::{
-    size_line_cancelled, size_line_partial, size_line_started, spinner_char,
+    human, size_line_cancelled, size_line_partial, size_line_started, spinner_char,
 };
 
 /// Renders the user interface widgets.
@@ -213,6 +213,51 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         frame.render_widget(
             Paragraph::new(lines)
                 .block(Block::bordered().title(" New ").style(style))
+                .style(style),
+            area,
+        );
+    }
+
+    // Multi-selection info dialog: aggregate sizes summed live from the
+    // size cache while the per-folder walks run.
+    if let Some(m) = &app.multi_info {
+        let (complete, data, items, on_disk) = app.multi_info_aggregate();
+        let selection = match (m.folders, m.files) {
+            (f, 0) => format!("{f} folders selected"),
+            (0, fl) => format!("{fl} files selected"),
+            (f, fl) => format!("{f} folders / {fl} files selected"),
+        };
+        let size_line = if complete {
+            format!("Size: {data} data / {on_disk} on disk ({items} items)")
+        } else {
+            format!(
+                "Size: {} {} data / {} on disk — calculating…",
+                spinner_char(m.started),
+                human(data),
+                human(on_disk)
+            )
+        };
+        let lines: Vec<Line<'static>> = vec![
+            Line::styled(selection, Style::default().add_modifier(Modifier::BOLD)),
+            Line::raw(size_line),
+            Line::raw(""),
+            Line::raw("  [any key] close  "),
+        ];
+        let max_w = lines
+            .iter()
+            .map(|l| l.width() as u16)
+            .max()
+            .unwrap_or(30)
+            .max(34);
+        let w = (max_w + 4).min(frame.area().width.saturating_sub(4));
+        let h = lines.len() as u16 + 2;
+        let style = Style::default().fg(Color::Black).bg(Color::White);
+        let area = centered_rect(w, h, frame.area());
+        paint_bg(frame, area, style);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .block(Block::bordered().title(" Info ").style(style))
                 .style(style),
             area,
         );

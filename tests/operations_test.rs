@@ -1331,3 +1331,142 @@ fn batch_copy_of_thousands_stays_responsive() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn multi_selection_shows_aggregate_and_sums_walks() {
+    use ira::handler::handle_key_events;
+    use ira::services::process_panel::RunState;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let base = std::env::temp_dir().join(format!("ira_multi_{}", std::process::id()));
+    let d1 = base.join("dir1");
+    let d2 = base.join("dir2");
+    std::fs::create_dir_all(&d1).unwrap();
+    std::fs::create_dir_all(&d2).unwrap();
+    std::fs::write(d1.join("f"), "x".repeat(100)).unwrap();
+    std::fs::write(d2.join("f"), "x".repeat(50)).unwrap();
+    std::fs::write(base.join("file1.txt"), "x".repeat(10)).unwrap();
+    std::fs::write(base.join("file2.txt"), "x".repeat(5)).unwrap();
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new("t".into(), base.to_str().unwrap().into(), '#'));
+    let dir1_entry = FEntry {
+        path: d1.to_str().unwrap().to_string(),
+        label: "dir1".to_string(),
+        is_dir: true,
+    };
+    let dir2_entry = FEntry {
+        path: d2.to_str().unwrap().to_string(),
+        label: "dir2".to_string(),
+        is_dir: true,
+    };
+    app.panes[0].files = vec![
+        dir1_entry,
+        dir2_entry,
+        entry(base.join("file1.txt").to_str().unwrap()),
+        entry(base.join("file2.txt").to_str().unwrap()),
+    ];
+    app.panes[0].selected = vec![true, true, true, true];
+    app.panes[0].state.select(Some(0));
+    let key = |code| KeyEvent::new(code, KeyModifiers::empty());
+
+    app.show_info();
+
+    // Multi dialog: composition of the selection.
+    let m = app.multi_info.as_ref().expect("multi dialog must open");
+    eprintln!(
+        "folders={} files={} paths={:?}",
+        m.folders, m.files, m.paths
+    );
+    assert_eq!(m.folders, 2);
+    assert_eq!(m.files, 2);
+
+    // Walks spawned for both folders.
+    assert!(app.size_walk_started(d1.to_str().unwrap()).is_some());
+    assert!(app.size_walk_started(d2.to_str().unwrap()).is_some());
+
+    // Render: selection line present while calculating.
+    let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+    terminal.draw(|f| ira::ui::render(&mut app, f)).unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(text.contains("2 folders / 2 files selected"), "{text}");
+    assert!(text.contains("calculating"), "{text}");
+
+    // Wait for all walks + file stats to complete, then the aggregate sums.
+    let mut complete = false;
+    for _ in 0..250 {
+        app.tick();
+        let (c, bytes, _, _) = app.multi_info_aggregate();
+        if c {
+            complete = true;
+            assert_eq!(bytes, 100 + 50 + 10 + 5);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(complete, "aggregate must complete");
+
+    // Final render: summed sizes, no calculating.
+    terminal.draw(|f| ira::ui::render(&mut app, f)).unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    eprintln!(
+        "DBG2 has Info: {} | has selected: {}",
+        text.contains("Info"),
+        text.contains("selected")
+    );
+    if let Some(i) = text.find("Info") {
+        eprintln!("DBG2 region: {:?}", &text[i..i + 480]);
+    }
+    assert!(text.contains("165 data"), "{text}");
+    assert!(text.contains("(4 items)"), "{text}");
+    assert!(!text.contains("calculating"), "{text}");
+
+    // Any key closes the dialog; walks stay cached.
+    handle_key_events(key(KeyCode::Esc), &mut app).unwrap();
+    assert!(app.multi_info.is_none());
+    let cached: u64 = [
+        d1.as_path(),
+        d2.as_path(),
+        base.join("file1.txt").as_path(),
+        base.join("file2.txt").as_path(),
+    ]
+    .iter()
+    .filter_map(|p| app.size_info(p.to_str().unwrap()))
+    .map(|si| si.bytes)
+    .sum();
+    assert_eq!(cached, 165, "cache keeps the sums");
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn single_selection_still_uses_single_info_dialog() {
+    let base = std::env::temp_dir().join(format!("ira_single_{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("only.txt"), "x").unwrap();
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new("t".into(), base.to_str().unwrap().into(), '#'));
+    app.panes[0].files = vec![entry(base.join("only.txt").to_str().unwrap())];
+    app.panes[0].selected = vec![false];
+    app.panes[0].state.select(Some(0));
+
+    app.show_info();
+    assert!(app.multi_info.is_none(), "single selection = single dialog");
+    assert!(app.info.is_some());
+
+    let _ = std::fs::remove_dir_all(&base);
+}
