@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::error;
-use std::process::Stdio;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -2675,12 +2675,24 @@ mod tests {
 /// that make them open in `dir`. Pure so tests can inspect the table.
 pub fn terminal_candidates(dir: &str) -> Vec<(String, Vec<String>)> {
     vec![
-        ("foot".into(), vec!["--working-directory".into(), dir.into()]),
-        ("alacritty".into(), vec!["--working-directory".into(), dir.into()]),
+        (
+            "foot".into(),
+            vec!["--working-directory".into(), dir.into()],
+        ),
+        (
+            "alacritty".into(),
+            vec!["--working-directory".into(), dir.into()],
+        ),
         ("kitty".into(), vec!["--directory".into(), dir.into()]),
-        ("gnome-terminal".into(), vec![format!("--working-directory={dir}")]),
+        (
+            "gnome-terminal".into(),
+            vec![format!("--working-directory={dir}")],
+        ),
         ("konsole".into(), vec!["--workdir".into(), dir.into()]),
-        ("xfce4-terminal".into(), vec!["--working-directory".into(), dir.into()]),
+        (
+            "xfce4-terminal".into(),
+            vec!["--working-directory".into(), dir.into()],
+        ),
         ("xterm".into(), vec![]),
     ]
 }

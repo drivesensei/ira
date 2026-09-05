@@ -1528,7 +1528,10 @@ fn n_dialog_existing_nested_path_errors() {
     }
     app.confirm_new_entry();
 
-    let st = app.status.as_ref().expect("existing nested path must error");
+    let st = app
+        .status
+        .as_ref()
+        .expect("existing nested path must error");
     assert!(st.is_error && st.text.contains("already exists"));
     let kept = std::fs::read_to_string(base.join("x/y")).unwrap();
     assert_eq!(kept, "precious", "the existing file must be untouched");
