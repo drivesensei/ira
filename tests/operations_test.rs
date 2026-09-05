@@ -1720,3 +1720,161 @@ fn new_entry_supports_nested_paths() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn create_never_truncates_existing_sibling() {
+    use ira::app::App;
+    use ira::domain::data::Folder;
+
+    let base = std::env::temp_dir().join(format!("ira_nosibling_{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+    let sibling = base.join("hyprland-portals.conf");
+    std::fs::write(&sibling, "important").unwrap();
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new("t".into(), base.to_str().unwrap().into(), '#'));
+
+    app.start_new_entry();
+    for ch in "hyprland-portals.config".chars() {
+        app.new_entry_insert(ch);
+    }
+    app.confirm_new_entry();
+
+    let created = base.join("hyprland-portals.config");
+    assert!(created.is_file(), "the new file must be created");
+    let created_content = std::fs::read(&created).unwrap();
+    assert!(created_content.is_empty(), "the new file must be empty");
+    let kept = std::fs::read_to_string(&sibling).unwrap();
+    assert_eq!(kept, "important", "the pre-existing sibling must survive");
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn goto_never_truncates_existing_file() {
+    use ira::app::App;
+    use ira::domain::data::Folder;
+
+    let base = std::env::temp_dir().join(format!("ira_gotonotrim_{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+    let conf = base.join("conf");
+    std::fs::write(&conf, "keep").unwrap();
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new("t".into(), base.to_str().unwrap().into(), '#'));
+
+    // The exact existing path: must navigate, never truncate.
+    app.goto_prompt = Some(conf.to_string_lossy().into_owned());
+    app.confirm_goto();
+
+    assert_eq!(
+        app.panes[0].folder.as_ref().unwrap().path,
+        base.to_str().unwrap(),
+        "pane must navigate to the file's folder"
+    );
+    let sel = app.panes[0].state.selected();
+    assert!(sel.is_some(), "the file must be selected after navigation");
+    assert_eq!(
+        app.panes[0].files.get(sel.unwrap()).unwrap().label,
+        "conf",
+        "the existing file must be the selected entry"
+    );
+    let kept = std::fs::read_to_string(&conf).unwrap();
+    assert_eq!(kept, "keep", "the existing file must survive untouched");
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn goto_never_truncates_on_race() {
+    use ira::app::App;
+    use ira::domain::data::Folder;
+    let base = std::env::temp_dir().join(format!("ira_gotorace_{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+    let conf = base.join("conf");
+    std::fs::write(&conf, "keep").unwrap();
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new("t".into(), base.to_str().unwrap().into(), '#'));
+
+    // Two confirmations for the same existing path (the second simulates
+    // the entry appearing between the existence check and the create):
+    // both must navigate and neither may truncate.
+    app.goto_prompt = Some(conf.to_string_lossy().into_owned());
+    app.confirm_goto();
+    app.goto_prompt = Some(conf.to_string_lossy().into_owned());
+    app.confirm_goto();
+
+    assert_eq!(
+        app.panes[0].folder.as_ref().unwrap().path,
+        base.to_str().unwrap()
+    );
+    let kept = std::fs::read_to_string(&conf).unwrap();
+    assert_eq!(kept, "keep", "the existing file must survive both passes");
+    let entries: Vec<_> = std::fs::read_dir(&base)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(entries, vec!["conf".to_string()], "no second file created");
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn n_dialog_expands_tilde() {
+    use ira::app::App;
+    use ira::domain::data::Folder;
+
+    let base = std::env::temp_dir().join(format!("ira_ntilde_base_{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+    let home = dirs_next::home_dir().expect("home dir must resolve");
+    let target = home.join(format!("ira-tilde-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&target); // start clean
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new("t".into(), base.to_str().unwrap().into(), '#'));
+
+    app.start_new_entry();
+    for ch in format!("~/ira-tilde-test-{}", std::process::id()).chars() {
+        app.new_entry_insert(ch);
+    }
+    app.confirm_new_entry();
+
+    assert!(
+        target.is_dir(),
+        "the tilde name must expand to the real home, not a literal '~' folder"
+    );
+    assert!(
+        !base.join("~").exists(),
+        "no literal '~' folder may be created inside the pane"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&target);
+}
+
+#[test]
+
+fn n_dialog_existing_nested_path_errors() {
+    use ira::app::App;
+    use ira::domain::data::Folder;
+    let base = std::env::temp_dir().join(format!("ira_nnested_{}", std::process::id()));
+    std::fs::create_dir_all(base.join("x")).unwrap();
+    std::fs::write(base.join("x/y"), "precious").unwrap();
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new("t".into(), base.to_str().unwrap().into(), '#'));
+
+    app.start_new_entry();
+    for ch in "x/y".chars() {
+        app.new_entry_insert(ch);
+    }
+    app.confirm_new_entry();
+
+    let st = app.status.as_ref().expect("existing nested path must error");
+    assert!(st.is_error && st.text.contains("already exists"));
+    let kept = std::fs::read_to_string(base.join("x/y")).unwrap();
+    assert_eq!(kept, "precious", "the existing file must be untouched");
+
+    let _ = std::fs::remove_dir_all(&base);
+}
