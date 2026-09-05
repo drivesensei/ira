@@ -20,7 +20,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, activ
     let (title, file_spans, window_start, cursor) = {
         let pane = &app.panes[pane_index];
         let Some(folder) = &pane.folder else {
-            let block = Block::bordered().title("  Files  ");
+            let block = Block::bordered().title("  ");
             f.render_widget(Paragraph::new("").block(block), area);
             return;
         };
@@ -28,16 +28,16 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, activ
         let title = if active {
             match (&app.search_query, &pane.filter_query) {
                 (Some(q), _) => {
-                    format!("  Files  {}  {}  /{}", folder.label, folder.path, q)
+                    format!("  {}  {}  /{}", folder.label, folder.path, q)
                 }
                 (None, Some(q)) => format!(
-                    "  Files  {}  {}  /{}  (Esc clears)",
+                    "  {}  {}  /{}  (Esc clears)",
                     folder.label, folder.path, q
                 ),
-                _ => format!("  Files  {}  {}", folder.label, folder.path),
+                _ => format!("  {}  {}  ", folder.label, folder.path),
             }
         } else {
-            format!("  Files  {}  {}", folder.label, folder.path)
+            format!("  {}  {}  ", folder.label, folder.path)
         };
 
         // Folders being measured show an animated spinner as their icon;

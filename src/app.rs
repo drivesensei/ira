@@ -523,6 +523,20 @@ impl App {
         self.list_files_for_pane(self.active_pane);
     }
 
+    /// Refreshes the inactive pane when it is showing `folder`, so content
+    /// created from the active pane (new entry, go-to create) appears in
+    /// both listings.
+    fn refresh_other_pane_if_same_folder(&mut self, folder: &str) {
+        let other = 1 - self.active_pane;
+        if self.panes[other]
+            .folder
+            .as_ref()
+            .is_some_and(|f| f.path == folder)
+        {
+            self.list_files_for_pane(other);
+        }
+    }
+
     /// Lists `pane_index`'s folder asynchronously (chunked streaming +
     /// sorted final pass) so huge/slow folders never block the UI.
     fn list_files_for_pane(&mut self, pane_index: usize) {
@@ -835,11 +849,12 @@ impl App {
                 let pane = self.pane_mut();
                 pane.filter_query = None;
                 pane.filter_indices.clear();
-                pane.pending_select = None;
+                // Remember the folder we are leaving: once the parent's
+                // listing settles, the cursor lands on it.
+                pane.pending_select = Some(current_path);
                 pane.folder = Some(folder);
                 self.search_query = None;
                 self.list_files_from_selected_folder();
-                self.pane_mut().state.select(None);
             }
             Ok(None) => {}
             Err(_) => {}
@@ -1123,6 +1138,11 @@ impl App {
             }
             Ok(()) => {}
         }
+        // The parent folder just gained content: keep the other pane in
+        // sync when it is showing the same folder.
+        if let Some(created_in) = path.parent() {
+            self.refresh_other_pane_if_same_folder(&created_in.to_string_lossy());
+        }
         self.goto_navigate(&path);
     }
 
@@ -1290,6 +1310,11 @@ impl App {
             // Nested path: open the deepest created folder (or the file's
             // parent) so the user lands next to what they created.
             self.goto_navigate(&target);
+            // The parent folder just gained content: keep the other pane in
+            // sync when it is showing the same folder.
+            if let Some(created_in) = target.parent() {
+                self.refresh_other_pane_if_same_folder(&created_in.to_string_lossy());
+            }
             return;
         }
         // Simple name: stay in the current folder, select the new entry
@@ -1297,6 +1322,7 @@ impl App {
         let pane = self.pane_mut();
         pane.pending_select = Some(target.to_string_lossy().into_owned());
         self.list_files_from_selected_folder();
+        self.refresh_other_pane_if_same_folder(&parent);
     }
 
     /// Single entry point for whichever confirmation is pending (`y`/Enter).
@@ -2202,7 +2228,7 @@ impl App {
     }
 
     /// Restores the persisted session state (split layout and pane folders).
-    fn restore_state(&mut self) {
+    pub fn restore_state(&mut self) {
         let state = match &self.state_path {
             Some(p) => load_state_from(p),
             None => load_state(),
@@ -2566,6 +2592,7 @@ mod tests {
             &SessionState {
                 split: app.split,
                 active_pane: app.active_pane,
+                show_hidden: app.show_hidden,
                 left: app.panes[0].folder.clone(),
                 right: app.panes[1].folder.clone(),
                 sizes: entries,

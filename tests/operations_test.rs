@@ -1563,8 +1563,156 @@ fn hidden_toggle_persists_across_restart() {
     let mut app2 = App::default();
     app2.state_path = Some(state_file.clone());
     app2.panes[0].folder = Some(Folder::new("t".into(), base.to_str().unwrap().into(), '#'));
-    app2.restore_state_for_test();
+    app2.restore_state();
     assert!(app2.show_hidden, "hidden setting must survive restart");
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn out_of_folder_selects_the_folder_you_came_from() {
+    use ira::domain::data::Folder;
+
+    // Small folder: the sync fast path applies the listing immediately.
+    let base = std::env::temp_dir().join(format!("ira_outof_{}", std::process::id()));
+    std::fs::create_dir_all(base.join("child")).unwrap();
+    std::fs::write(base.join("sibling.txt"), "s").unwrap();
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new(
+        "child".into(),
+        base.join("child").to_str().unwrap().into(),
+        '#',
+    ));
+    app.list_files_from_selected_folder();
+
+    app.out_of_folder();
+
+    assert_eq!(
+        app.panes[0].folder.as_ref().unwrap().path,
+        base.to_str().unwrap(),
+        "Left navigates to the parent"
+    );
+    let sel = app
+        .panes[0]
+        .state
+        .selected()
+        .expect("cursor must land on the folder we came from");
+    assert_eq!(
+        app.panes[0].files[sel].path,
+        base.join("child").to_str().unwrap()
+    );
+    assert!(app.panes[0].files[sel].is_dir);
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn out_of_folder_selects_origin_in_streamed_listing() {
+    use ira::domain::data::Folder;
+
+    // Big folder (> LISTING_CHUNK entries): Left must stream the parent in
+    // the background and still land the cursor on the child we came from.
+    let base = std::env::temp_dir().join(format!("ira_outof_big_{}", std::process::id()));
+    std::fs::create_dir_all(base.join("child")).unwrap();
+    for i in 0..600 {
+        std::fs::write(base.join(format!("f{i:03}.txt")), "x").unwrap();
+    }
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new(
+        "child".into(),
+        base.join("child").to_str().unwrap().into(),
+        '#',
+    ));
+    app.list_files_from_selected_folder();
+
+    app.out_of_folder();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !app.file_list_settled(0) {
+        assert!(Instant::now() < deadline, "streamed listing never settled");
+        app.tick();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let sel = app
+        .panes[0]
+        .state
+        .selected()
+        .expect("cursor must land on the folder we came from after settle");
+    assert_eq!(
+        app.panes[0].files[sel].path,
+        base.join("child").to_str().unwrap()
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn creating_entry_refreshes_other_pane_showing_same_folder() {
+    use ira::domain::data::Folder;
+
+    let base = std::env::temp_dir().join(format!("ira_sync2_{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+
+    let folder = || {
+        Some(Folder::new(
+            "same".into(),
+            base.to_str().unwrap().into(),
+            '#',
+        ))
+    };
+    let mut app = App::default();
+    app.panes[0].folder = folder();
+    app.panes[1].folder = folder();
+
+    // `n` create in the active pane; the other pane shows the same folder.
+    app.start_new_entry();
+    for ch in "fresh.txt".chars() {
+        app.new_entry_insert(ch);
+    }
+    app.confirm_new_entry();
+    assert!(base.join("fresh.txt").is_file());
+    assert!(
+        app.panes[0].files.iter().any(|f| f.label == "fresh.txt"),
+        "active pane must list the new file"
+    );
+    assert!(
+        app.panes[1].files.iter().any(|f| f.label == "fresh.txt"),
+        "other pane on the same folder must refresh too"
+    );
+
+    // `[` go-to creation navigates the active pane; same sync applies.
+    app.start_goto();
+    for ch in "goto_made.md".chars() {
+        app.goto_push(&ch.to_string());
+    }
+    app.confirm_goto();
+    assert!(base.join("goto_made.md").is_file());
+    assert!(
+        app.panes[1].files.iter().any(|f| f.label == "goto_made.md"),
+        "other pane on the same folder must refresh after a go-to create"
+    );
+
+    // A different folder in the other pane is left alone (no refresh).
+    let other_dir = base.join("elsewhere");
+    std::fs::create_dir_all(&other_dir).unwrap();
+    app.panes[1].folder = Some(Folder::new(
+        "elsewhere".into(),
+        other_dir.to_str().unwrap().into(),
+        '#',
+    ));
+    app.start_new_entry();
+    for ch in "quiet.txt".chars() {
+        app.new_entry_insert(ch);
+    }
+    app.confirm_new_entry();
+    assert!(base.join("quiet.txt").is_file());
+    assert!(
+        !app.panes[1].files.iter().any(|f| f.label == "quiet.txt"),
+        "other pane on a different folder must not change"
+    );
 
     let _ = std::fs::remove_dir_all(&base);
 }
