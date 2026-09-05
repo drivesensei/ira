@@ -190,6 +190,7 @@ mod tests {
         let state = SessionState {
             split: true,
             active_pane: 1,
+            show_hidden: true,
             left: Some(Folder::new(
                 "Home".to_string(),
                 "/home/vlad".to_string(),

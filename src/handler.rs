@@ -257,6 +257,9 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         // `?` shows metadata for the selected entry.
         KeyCode::Char('?') => app.show_info(),
 
+        // `,` cycles the active pane's sort mode: Name → Size → Modified → Kind.
+        KeyCode::Char(',') => app.cycle_sort(),
+
         KeyCode::Char(c) if !c.is_digit(10) => {
             let common = app.get_common_folders_shortcuts();
             if let Some(idx) = common.iter().position(|sc| *sc == c) {
