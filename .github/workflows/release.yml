@@ -206,7 +206,7 @@ jobs:
           class Ira < Formula
             desc "Terminal file manager built with Ratatui and crossterm"
             homepage "https://github.com/drivesensei/ira"
-            url "https://github.com/drivesensei/ira/releases/download/v${VERSION}/ira-v${VERSION}-universal-apple-darwin.tar.xz"
+            url "https://github.com/drivesensei/ira/releases/download/v${VERSION}/ira-${VERSION}-universal-apple-darwin.tar.xz"
             sha256 "${SHA}"
             license "MIT"
 
@@ -306,7 +306,7 @@ jobs:
           optdepends=('udisks2: drive mounting support')
           provides=('ira')
           conflicts=('ira')
-          source=("ira-\$pkgver.tar.xz::\$url/releases/download/v\$pkgver/ira-v\$pkgver-x86_64-unknown-linux-musl.tar.xz")
+          source=("ira-\$pkgver.tar.xz::\$url/releases/download/v\$pkgver/ira-\$pkgver-x86_64-unknown-linux-musl.tar.xz")
           sha256sums=('${SHA}')
           package() {
             install -Dm755 "\$srcdir/ira" "\$pkgdir/usr/bin/ira"
