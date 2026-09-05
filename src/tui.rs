@@ -2,7 +2,9 @@ use crate::app::{App, AppResult};
 use crate::event::EventHandler;
 use crate::ui;
 use ratatui::backend::Backend;
-use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use ratatui::crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use ratatui::crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::Terminal;
 use std::io;
@@ -34,7 +36,12 @@ impl<B: Backend> Tui<B> {
         <B as Backend>::Error: 'static,
     {
         terminal::enable_raw_mode()?;
-        ratatui::crossterm::execute!(io::stderr(), EnterAlternateScreen, EnableMouseCapture)?;
+        ratatui::crossterm::execute!(
+            io::stderr(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        )?;
 
         // Define a custom panic hook to reset the terminal properties.
         // This way, you won't have your terminal messed up if an unexpected error happens.
@@ -71,7 +78,12 @@ impl<B: Backend> Tui<B> {
     /// the terminal properties if unexpected errors occur.
     fn reset() -> AppResult<()> {
         terminal::disable_raw_mode()?;
-        ratatui::crossterm::execute!(io::stderr(), LeaveAlternateScreen, DisableMouseCapture)?;
+        ratatui::crossterm::execute!(
+            io::stderr(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            DisableBracketedPaste
+        )?;
         Ok(())
     }
 

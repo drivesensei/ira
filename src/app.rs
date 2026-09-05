@@ -209,6 +209,9 @@ pub struct App {
     pub multi_info: Option<MultiInfoState>,
     /// "Create new" dialog (`n`); `None` when closed.
     pub new_entry: Option<NewEntryPrompt>,
+    /// "Go to path" dialog (`[`); `None` when closed. Existing paths are
+    /// navigated to; missing ones are created (nested, kind by extension).
+    pub goto_prompt: Option<String>,
 
     /// Transient status/error message shown in the bottom bar until it
     /// expires (or the next action replaces it).
@@ -292,6 +295,7 @@ impl Default for App {
             confirming: None,
             renaming: None,
             new_entry: None,
+            goto_prompt: None,
             info: None,
             multi_info: None,
             status: None,
@@ -319,6 +323,42 @@ impl Default for App {
             info_tx,
             info_rx,
         }
+    }
+}
+
+/// Expands a user-typed path: `~`/`~/...` to the home dir; relative paths
+/// anchor at `base` (the active pane's folder) when provided.
+fn expand_path(raw: &str, base: Option<String>) -> std::path::PathBuf {
+    let trimmed = raw.trim();
+    if trimmed == "~" || trimmed.starts_with("~/") {
+        if let Some(home) = dirs_next::home_dir() {
+            let rest = trimmed.trim_start_matches('~').trim_start_matches('/');
+            let joined = home.join(rest);
+            let s = joined.to_string_lossy();
+            // Drop the trailing separator home.join("") leaves behind.
+            return std::path::PathBuf::from(s.trim_end_matches('/'));
+        }
+    }
+    let p = std::path::Path::new(trimmed);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else if let Some(b) = base {
+        std::path::Path::new(&b).join(p)
+    } else {
+        p.to_path_buf()
+    }
+}
+
+/// Kind rule shared by the create dialogs: a name whose last dot is not
+/// leading and has a non-empty suffix is a file ("notes.txt"); otherwise a
+/// folder ("notes", ".config", "backup.").
+fn path_is_file_kind(path: &std::path::Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    match name.rsplit_once('.') {
+        Some((stem, ext)) => !stem.is_empty() && !ext.is_empty(),
+        None => false,
     }
 }
 
@@ -386,6 +426,35 @@ impl App {
             is_error,
             raised: Instant::now(),
         });
+    }
+
+    /// Routes pasted text to whichever input dialog is active.
+    pub fn handle_paste(&mut self, text: &str) {
+        let cleaned = text.strip_suffix('\n').unwrap_or(text);
+        let cleaned = cleaned.strip_suffix('\r').unwrap_or(cleaned);
+        if cleaned.is_empty() {
+            return;
+        }
+        if self.goto_prompt.is_some() {
+            self.goto_push(cleaned);
+        } else if let Some(p) = self.new_entry.as_mut() {
+            for c in cleaned.chars() {
+                p.text.insert(p.cursor, c);
+                p.cursor += 1;
+            }
+        } else if let Some(r) = self.renaming.as_mut() {
+            for c in cleaned.chars() {
+                r.text.insert(r.cursor, c);
+                r.cursor += 1;
+            }
+        } else if self.is_searching() {
+            if let Some(q) = &mut self.search_query {
+                q.push_str(cleaned);
+            }
+            self.pane_mut().state.select(Some(0));
+        } else if self.panel_has_focus() {
+            self.panel_input.push_str(cleaned);
+        }
     }
 
     /// Dismisses the error dialog immediately (any key while it is open).
@@ -1051,8 +1120,115 @@ impl App {
         self.spawn_transfer_jobs(kind, confirm.paths, dest);
     }
 
-    // ---- Create new folder / file (`n`) ----
+    // ---- Go to path (`[`) ----
 
+    /// Opens the go-to-path dialog: paste (Ctrl+V) or type a path.
+    /// Existing paths are navigated to; missing ones are created (nested).
+    pub fn start_goto(&mut self) {
+        // One input dialog at a time.
+        self.new_entry = None;
+        self.renaming = None;
+        self.search_query = None;
+        self.panel_focused = false;
+        self.goto_prompt = Some(String::new());
+    }
+
+    pub fn goto_push(&mut self, text: &str) {
+        if let Some(p) = self.goto_prompt.as_mut() {
+            p.push_str(text);
+        }
+    }
+
+    pub fn goto_pop(&mut self) {
+        if let Some(p) = self.goto_prompt.as_mut() {
+            p.pop();
+        }
+    }
+
+    pub fn cancel_goto(&mut self) {
+        self.goto_prompt = None;
+    }
+
+    /// Resolves the goto prompt: navigate to existing paths (files select
+    /// their containing folder + the file), create missing ones (nested
+    /// dirs, kind by extension), then navigate there.
+    pub fn confirm_goto(&mut self) {
+        let Some(raw) = self.goto_prompt.take() else {
+            return;
+        };
+        let path = expand_path(&raw, self.pane().folder.as_ref().map(|f| f.path.clone()));
+        if path.as_os_str().is_empty() {
+            return;
+        }
+        let is_file = path_is_file_kind(&path);
+
+        if path.exists() {
+            self.goto_navigate(&path);
+            return;
+        }
+
+        // Missing: create the whole chain. The parent must exist or be
+        // creatable; the final entry kind follows the extension rule.
+        if let Some(parent) = path.parent() {
+            if let Err(err) = std::fs::create_dir_all(parent) {
+                self.set_status(
+                    format!("Failed to create '{}': {err}", parent.display()),
+                    true,
+                );
+                return;
+            }
+        }
+        let result = if is_file {
+            std::fs::write(&path, "")
+        } else {
+            std::fs::create_dir_all(&path)
+        };
+        if let Err(err) = result {
+            self.set_status(
+                format!("Failed to create '{}': {err}", path.display()),
+                true,
+            );
+            return;
+        }
+        self.goto_navigate(&path);
+    }
+
+    /// Navigates a pane to `path`: a folder becomes the pane folder; a file
+    /// opens its parent folder with the file selected after the refresh.
+    fn goto_navigate(&mut self, path: &std::path::Path) {
+        let meta = std::fs::symlink_metadata(path);
+        let is_file = meta.as_ref().map(|m| !m.is_dir()).unwrap_or(false);
+        let target_folder = if is_file {
+            path.parent().map(|p| p.to_path_buf())
+        } else {
+            Some(path.to_path_buf())
+        };
+        let Some(folder) = target_folder else {
+            return;
+        };
+        {
+            let pane = self.pane_mut();
+            pane.filter_query = None;
+            pane.filter_indices.clear();
+            pane.folder = Some(Folder::new(
+                folder
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| folder.to_string_lossy().into_owned()),
+                folder.to_string_lossy().into_owned(),
+                '#',
+            ));
+            if is_file {
+                pane.pending_select = Some(path.to_string_lossy().into_owned());
+            } else {
+                pane.state.select(None);
+            }
+        }
+        self.search_query = None;
+        self.list_files_from_selected_folder();
+    }
+
+    /// Single entry point for whichever confirmation is pending (`y`/Enter).
     /// Opens the create dialog for the active pane's folder. The entry kind
     /// is decided by the typed name: an extension makes it a file.
     pub fn start_new_entry(&mut self) {
@@ -1120,10 +1296,7 @@ impl App {
                 self.set_status("Name cannot contain path separators.", true);
                 return;
             }
-            let is_file = match name.rsplit_once('.') {
-                Some((stem, ext)) => !stem.is_empty() && !ext.is_empty(),
-                None => false,
-            };
+            let is_file = path_is_file_kind(std::path::Path::new(&name));
             (name, is_file)
         };
 

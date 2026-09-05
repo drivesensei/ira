@@ -1470,3 +1470,186 @@ fn single_selection_still_uses_single_info_dialog() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn goto_navigates_to_existing_folder_and_selects_existing_file() {
+    use ira::handler::handle_key_events;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let base = std::env::temp_dir().join(format!("ira_goto_{}", std::process::id()));
+    let sub = base.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(sub.join("target.txt"), "x").unwrap();
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new(
+        "t".into(),
+        std::env::temp_dir().to_string_lossy().into_owned(),
+        '#',
+    ));
+    let key = |code| KeyEvent::new(code, KeyModifiers::empty());
+
+    // `[` opens the dialog; typing accumulates.
+    handle_key_events(key(KeyCode::Char('[')), &mut app).unwrap();
+    assert!(app.goto_prompt.is_some());
+    for ch in sub.to_str().unwrap().chars() {
+        handle_key_events(key(KeyCode::Char(ch)), &mut app).unwrap();
+    }
+    handle_key_events(key(KeyCode::Enter), &mut app).unwrap();
+
+    assert!(app.goto_prompt.is_none(), "dialog closes on success");
+    assert_eq!(
+        app.panes[0].folder.as_ref().unwrap().path,
+        sub.to_str().unwrap()
+    );
+
+    // File path: navigates to the containing folder and selects the file.
+    let file_path = sub.join("target.txt");
+    handle_key_events(key(KeyCode::Char('[')), &mut app).unwrap();
+    for ch in file_path.to_str().unwrap().chars() {
+        handle_key_events(key(KeyCode::Char(ch)), &mut app).unwrap();
+    }
+    handle_key_events(key(KeyCode::Enter), &mut app).unwrap();
+    assert_eq!(
+        app.panes[0].folder.as_ref().unwrap().path,
+        sub.to_str().unwrap()
+    );
+    for _ in 0..100 {
+        app.tick();
+        if let Some(i) = app.panes[0].state.selected() {
+            if app.panes[0]
+                .files
+                .get(i)
+                .is_some_and(|f| f.label == "target.txt")
+            {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let sel = app.panes[0].state.selected().unwrap();
+    assert_eq!(
+        app.panes[0].files.get(sel).unwrap().label,
+        "target.txt",
+        "the file must be selected after navigation"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn goto_creates_missing_nested_file_and_folder() {
+    use ira::handler::handle_key_events;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let base = std::env::temp_dir().join(format!("ira_goto_create_{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new(
+        "t".into(),
+        base.to_str().unwrap().to_string(),
+        '#',
+    ));
+    let key = |code| KeyEvent::new(code, KeyModifiers::empty());
+
+    // Missing nested file path: creates 2 folders + the file, navigates to
+    // the containing folder and selects the file.
+    let target = base.join("a/b/hyprland.conf");
+    handle_key_events(key(KeyCode::Char('[')), &mut app).unwrap();
+    for ch in target.to_str().unwrap().chars() {
+        handle_key_events(key(KeyCode::Char(ch)), &mut app).unwrap();
+    }
+    handle_key_events(key(KeyCode::Enter), &mut app).unwrap();
+
+    assert!(target.is_file(), "nested file must be created");
+    assert!(target.parent().unwrap().is_dir());
+    assert_eq!(
+        app.panes[0].folder.as_ref().unwrap().path,
+        target.parent().unwrap().to_string_lossy()
+    );
+
+    // Missing nested folder path (no extension): folder created, pane opens
+    // inside it.
+    let folder = base.join("x/y/z");
+    handle_key_events(key(KeyCode::Char('[')), &mut app).unwrap();
+    for ch in folder.to_str().unwrap().chars() {
+        handle_key_events(key(KeyCode::Char(ch)), &mut app).unwrap();
+    }
+    handle_key_events(key(KeyCode::Enter), &mut app).unwrap();
+    assert!(folder.is_dir());
+    assert_eq!(
+        app.panes[0].folder.as_ref().unwrap().path,
+        folder.to_string_lossy()
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn goto_expands_home_and_relative_paths() {
+    use ira::handler::handle_key_events;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let base = std::env::temp_dir().join(format!("ira_goto_rel_{}", std::process::id()));
+    let sub = base.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new("t".into(), base.to_str().unwrap().into(), '#'));
+    let key = |code| KeyEvent::new(code, KeyModifiers::empty());
+
+    // Relative path resolves against the pane's folder.
+    handle_key_events(key(KeyCode::Char('[')), &mut app).unwrap();
+    for ch in "sub".chars() {
+        handle_key_events(key(KeyCode::Char(ch)), &mut app).unwrap();
+    }
+    handle_key_events(key(KeyCode::Enter), &mut app).unwrap();
+    assert_eq!(
+        app.panes[0].folder.as_ref().unwrap().path,
+        sub.to_str().unwrap()
+    );
+
+    // Tilde expansion.
+    handle_key_events(key(KeyCode::Char('[')), &mut app).unwrap();
+    for ch in "~/".chars() {
+        handle_key_events(key(KeyCode::Char(ch)), &mut app).unwrap();
+    }
+    app.confirm_goto();
+    let home = dirs_next::home_dir().unwrap();
+    assert_eq!(
+        app.panes[0].folder.as_ref().unwrap().path,
+        home.to_string_lossy()
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn paste_routes_to_goto_prompt() {
+    use ira::handler::handle_key_events;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new(
+        "t".into(),
+        std::env::temp_dir().to_string_lossy().into_owned(),
+        '#',
+    ));
+
+    handle_key_events(
+        KeyEvent::new(KeyCode::Char('['), KeyModifiers::empty()),
+        &mut app,
+    )
+    .unwrap();
+    app.handle_paste("/some/pasted/path");
+    assert_eq!(app.goto_prompt.as_deref(), Some("/some/pasted/path"));
+    // Multi-line paste keeps its content (dialog trims on confirm).
+    app.handle_paste("more\nnoise");
+    assert!(
+        app.goto_prompt
+            .as_deref()
+            .is_some_and(|p| p.starts_with("/some/pasted/pathmore")),
+        "paste appends"
+    );
+}

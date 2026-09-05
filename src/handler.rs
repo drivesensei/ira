@@ -63,6 +63,19 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         return Ok(());
     }
 
+    // Go-to-path dialog: typing/pasting builds the path; Enter navigates
+    // or creates.
+    if app.goto_prompt.is_some() {
+        match key_event.code {
+            KeyCode::Esc => app.cancel_goto(),
+            KeyCode::Enter => app.confirm_goto(),
+            KeyCode::Backspace => app.goto_pop(),
+            KeyCode::Char(c) => app.goto_push(&c.to_string()),
+            _ => {}
+        }
+        return Ok(());
+    }
+
     // Create-new dialog: typing builds the name; Enter creates.
     if app.new_entry.is_some() {
         match key_event.code {
@@ -222,6 +235,9 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
 
         // `n` opens the create-new dialog (folder or file by extension).
         KeyCode::Char('n') => app.start_new_entry(),
+
+        // `[` opens the go-to-path dialog (paste or type a path).
+        KeyCode::Char('[') => app.start_goto(),
 
         // `-` ejects (unmounts) the removable drive of the active pane.
         // (`e` belongs to the Desktop common-folder shortcut on macOS.)

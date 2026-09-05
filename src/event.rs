@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 /// Terminal events.
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub enum Event {
     /// Terminal tick.
     Tick,
@@ -18,6 +18,8 @@ pub enum Event {
     Mouse(MouseEvent),
     /// Terminal resize.
     Resize(u16, u16),
+    /// Bracketed-paste text (Ctrl+V in supporting terminals).
+    Paste(String),
 }
 
 /// Terminal event handler.
@@ -73,7 +75,7 @@ impl EventHandler {
                             CrosstermEvent::Resize(w, h) => sender.send(Event::Resize(w, h)),
                             CrosstermEvent::FocusGained => Ok(()),
                             CrosstermEvent::FocusLost => Ok(()),
-                            CrosstermEvent::Paste(_) => unimplemented!(),
+                            CrosstermEvent::Paste(s) => sender.send(Event::Paste(s)),
                         }
                         .expect("failed to send terminal event")
                     }

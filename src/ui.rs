@@ -174,6 +174,37 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         );
     }
 
+    // Go-to-path dialog: paste (Ctrl+V) or type a path; Enter navigates to
+    // it or creates the missing chain.
+    if let Some(p) = &app.goto_prompt {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        if p.is_empty() {
+            spans.push(Span::raw(" ").style(Style::default().add_modifier(Modifier::REVERSED)));
+        }
+        for c in p.chars() {
+            spans.push(Span::raw(format!("{c}")));
+        }
+        if !p.is_empty() {
+            spans.push(Span::raw(" ").style(Style::default().add_modifier(Modifier::REVERSED)));
+        }
+        let text_line = Line::from(spans);
+        let hint = Line::raw("  [Enter] go / create  [Esc] cancel  ");
+        let lines: Vec<Line<'static>> = vec![text_line, hint];
+        let w = (p.chars().count() as u16 + 20)
+            .max(52)
+            .min(frame.area().width.saturating_sub(4));
+        let h = lines.len() as u16 + 2;
+        let style = Style::default().fg(Color::Black).bg(Color::White);
+        let area = centered_rect(w, h, frame.area());
+        paint_bg(frame, area, style);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(Block::bordered().title(" Go to path ").style(style))
+                .style(style),
+            area,
+        );
+    }
+
     // Create-new dialog: live kind preview (folder vs file by extension).
     if let Some(p) = &app.new_entry {
         let name: String = p.text.iter().collect();
