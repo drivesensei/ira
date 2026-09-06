@@ -201,6 +201,16 @@ pub struct InfoDialog {
     pub started: Instant,
 }
 
+/// Head of a text file for the preview column.
+#[derive(Debug, Clone)]
+pub struct TextPreview {
+    pub content: String,
+    /// NUL byte found in the head — treat as binary, don't render text.
+    pub binary: bool,
+    /// The file was larger than the read cap.
+    pub truncated: bool,
+}
+
 /// In-place input for creating a new entry. Extension decides the kind:
 /// "notes" → folder, "notes.txt" → file.
 pub struct NewEntryPrompt {
@@ -361,6 +371,11 @@ pub struct App {
     /// Whether the optional `ffmpeg` runtime dependency is usable (probed
     /// once in the background); gates video and HEIC previews.
     ffmpeg_available: Arc<AtomicBool>,
+    /// Whether the optional `pdftoppm` (poppler) runtime dependency is
+    /// usable; gates PDF previews.
+    pdftoppm_available: Arc<AtomicBool>,
+    /// Text-file heads keyed by [`ThumbRequest::mem_key`] (cols/rows are 0).
+    text_cache: HashMap<String, TextPreview>,
     /// Decode workers started (once, on the first picker install).
     thumb_workers_started: bool,
     /// State file location override; `None` = the real `~/.config/ira/state`.
@@ -433,6 +448,8 @@ impl Default for App {
             thumb_failed: HashSet::new(),
             info_rx,
             ffmpeg_available: Arc::new(AtomicBool::new(false)),
+            pdftoppm_available: Arc::new(AtomicBool::new(false)),
+            text_cache: HashMap::new(),
         }
     }
 }
@@ -860,19 +877,60 @@ impl App {
             self.thumb_tx.clone(),
         );
         std::thread::spawn(prune_cache);
-        // Probe for the optional runtime dependency once (background: the
-        // spawn costs a few ms). While unknown, videos/HEIC show glyphs.
-        let flag = Arc::clone(&self.ffmpeg_available);
+        // Probe for the optional runtime dependencies once (background:
+        // the spawns cost a few ms). While unknown, videos/HEIC/PDF show
+        // glyphs and the preview column explains what is missing.
+        let ffmpeg = Arc::clone(&self.ffmpeg_available);
+        let pdftoppm = Arc::clone(&self.pdftoppm_available);
         std::thread::spawn(move || {
-            let ok = std::process::Command::new("ffmpeg")
-                .arg("-version")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success());
-            flag.store(ok, std::sync::atomic::Ordering::Relaxed);
+            let probe = |bin: &str| {
+                std::process::Command::new(bin)
+                    .arg("-version")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|s| s.success())
+            };
+            ffmpeg.store(probe("ffmpeg"), std::sync::atomic::Ordering::Relaxed);
+            pdftoppm.store(probe("pdftoppm"), std::sync::atomic::Ordering::Relaxed);
         });
+    }
+
+    /// Renders the head of the active pane's selected TEXT file natively in
+    /// the preview column (no protocol, no thumbnail). `None` = loading or
+    /// not applicable; the UI shows a placeholder until a later frame.
+    pub fn text_preview(&mut self, pane_index: usize) -> Option<&TextPreview> {
+        self.pick_up_thumbnails();
+        let pane = &self.panes[pane_index];
+        if pane.preview_mode != PreviewMode::Column {
+            return None;
+        }
+        let entry = self.selected_visible_entry_for(pane_index)?;
+        if entry.is_dir || preview_kind(&entry.path) != Some(PreviewKind::Text) {
+            return None;
+        }
+        let req = ThumbRequest {
+            path: entry.path.clone(),
+            mtime: entry.modified,
+            size: entry.size,
+            cols: 0,
+            rows: 0,
+        };
+        let key = req.mem_key();
+        if let Some(preview) = self.text_cache.get(&key) {
+            return Some(preview);
+        }
+        if self.picker.is_none()
+            || self.thumb_failed.contains(&key)
+            || self.thumb_pending.contains(&key)
+        {
+            return None;
+        }
+        if self.thumb_jobs_hi.try_send(req).is_ok() {
+            self.thumb_pending.insert(key);
+        }
+        None
     }
 
     /// Enqueues a prefetch request on the low-priority queue (deduped by
@@ -910,10 +968,11 @@ impl App {
     pub fn preview_supported(&self, path: &str) -> bool {
         use std::sync::atomic::Ordering;
         match preview_kind(path) {
-            Some(PreviewKind::Image) => true,
+            Some(PreviewKind::Image | PreviewKind::Text) => true,
             Some(PreviewKind::Video | PreviewKind::Heic) => {
                 self.ffmpeg_available.load(Ordering::Relaxed)
             }
+            Some(PreviewKind::Pdf) => self.pdftoppm_available.load(Ordering::Relaxed),
             None => false,
         }
     }
@@ -975,6 +1034,9 @@ impl App {
         for entry in &candidates {
             if !self.preview_supported(&entry.path) {
                 continue;
+            }
+            if preview_kind(&entry.path) == Some(PreviewKind::Text) {
+                continue; // cell-native, no thumbnail job
             }
             let req = ThumbRequest {
                 path: entry.path.clone(),
@@ -1054,7 +1116,10 @@ impl App {
             return None;
         }
         let entry = self.selected_visible_entry_for(pane_index)?;
-        if entry.is_dir || !self.preview_supported(&entry.path) {
+        if entry.is_dir
+            || !self.preview_supported(&entry.path)
+            || preview_kind(&entry.path) == Some(PreviewKind::Text)
+        {
             return None;
         }
         Some(ThumbRequest {
@@ -1105,6 +1170,22 @@ impl App {
                 ThumbEvent::Failed(req) => {
                     self.thumb_pending.remove(&req.mem_key());
                     self.thumb_failed.insert(req.mem_key());
+                }
+                ThumbEvent::Text {
+                    req,
+                    content,
+                    binary,
+                    truncated,
+                } => {
+                    self.thumb_pending.remove(&req.mem_key());
+                    self.text_cache.insert(
+                        req.mem_key(),
+                        TextPreview {
+                            content,
+                            binary,
+                            truncated,
+                        },
+                    );
                 }
             }
         }
@@ -3647,9 +3728,13 @@ mod preview_tests {
         assert!(app.preview_supported("/tmp/clip.mp4"));
         assert!(app.preview_request().is_some());
 
-        // Images never depend on the probe.
-        assert!(!app.preview_supported("/tmp/x.txt"));
+        // Images and text never depend on the probe.
         assert!(app.preview_supported("/tmp/x.png"));
+        assert!(app.preview_supported("/tmp/x.txt"));
+        // PDF is gated by its own probe (pdftoppm), independent of ffmpeg.
+        assert!(!app.preview_supported("/tmp/notes.pdf"));
+        app.pdftoppm_available = Arc::new(AtomicBool::new(true));
+        assert!(app.preview_supported("/tmp/notes.pdf"));
     }
     #[test]
     fn preview_request_resolves_the_visible_row_not_files_index() {
@@ -3775,6 +3860,43 @@ mod preview_tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(done, reqs.len(), "queued requests did not all resolve");
+    }
+
+    #[test]
+    fn text_preview_roundtrips_through_the_pool() {
+        use std::fs;
+        let dir = std::env::temp_dir().join("ira_preview_tests");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("note.txt");
+        fs::write(&path, "first line\nsecond line\n").unwrap();
+
+        let mut app = App::default();
+        app.set_picker(ratatui_image::picker::Picker::halfblocks());
+        app.panes[0].preview_mode = PreviewMode::Column;
+        app.panes[0].preview_area = (38, 10);
+        app.panes[0].files = vec![FEntry {
+            path: path.to_string_lossy().into_owned(),
+            label: "note.txt".into(),
+            is_dir: false,
+            size: fs::metadata(&path).unwrap().len(),
+            modified: None,
+        }];
+        app.panes[0].state.select(Some(0));
+
+        // Text has no protocol request; the cell-native path fetches it.
+        assert!(app.preview_request_for(0).is_none());
+        let mut ready = false;
+        for _ in 0..500 {
+            if app.text_preview(0).is_some() {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready, "text preview never became ready");
+        let preview = app.text_preview(0).unwrap();
+        assert!(preview.content.starts_with("first line"));
+        assert!(!preview.binary && !preview.truncated);
     }
 
     #[test]

@@ -235,7 +235,14 @@ fn render_grid(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, acti
         let dim = Style::default().fg(Color::DarkGray);
 
         // Image area: thumbnail, or a kind glyph for folders/unsupported.
-        if !entry.is_dir && app.preview_supported(&entry.path) {
+        // Text files stay glyphs in the grid (cells can't show text) — the
+        // column mode renders them natively.
+        if !entry.is_dir
+            && crate::services::thumbnails::preview_kind(&entry.path)
+                == Some(crate::services::thumbnails::PreviewKind::Text)
+        {
+            f.render_widget(Paragraph::new(Span::styled("≡", dim)).centered(), img_area);
+        } else if !entry.is_dir && app.preview_supported(&entry.path) {
             let req = crate::services::thumbnails::ThumbRequest {
                 path: entry.path.clone(),
                 mtime: entry.modified,

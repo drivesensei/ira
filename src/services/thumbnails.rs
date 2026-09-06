@@ -72,6 +72,13 @@ pub enum PreviewKind {
     /// HEIC/HEIF photo — needs HEVC; attempted via `ffmpeg` when available
     /// (many builds decode it, some don't).
     Heic,
+    /// First page rasterized by the external `pdftoppm` binary (poppler,
+    /// optional runtime dependency). There is no viable pure-Rust PDF
+    /// rasterizer (pdfium/mupdf are C bindings; mupdf is AGPL).
+    Pdf,
+    /// Plain-text/code file — rendered natively as cells in the preview
+    /// column (no protocol, no thumbnail).
+    Text,
 }
 
 /// Classifies a path by extension. `None` = no preview at all.
@@ -84,6 +91,14 @@ pub fn preview_kind(path: &str) -> Option<PreviewKind> {
         Some("png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp") => Some(PreviewKind::Image),
         Some("mp4" | "mov" | "m4v" | "webm" | "mkv" | "avi") => Some(PreviewKind::Video),
         Some("heic" | "heif") => Some(PreviewKind::Heic),
+        Some("pdf") => Some(PreviewKind::Pdf),
+        Some(
+            "txt" | "md" | "markdown" | "rst" | "log" | "csv" | "tsv" | "json" | "toml" | "yaml"
+            | "yml" | "xml" | "ini" | "conf" | "cfg" | "properties" | "env" | "sh" | "bash" | "zsh"
+            | "fish" | "ps1" | "bat" | "py" | "rb" | "pl" | "js" | "ts" | "jsx" | "tsx" | "rs"
+            | "go" | "c" | "h" | "cpp" | "hpp" | "cc" | "java" | "kt" | "swift" | "sql" | "html"
+            | "htm" | "css" | "scss" | "less" | "lua" | "vim" | "service" | "desktop",
+        ) => Some(PreviewKind::Text),
         _ => None,
     }
 }
@@ -174,6 +189,10 @@ pub fn load_thumbnail(
     let img = match preview_kind(path) {
         Some(PreviewKind::Image) | None => decode_source(path)?,
         Some(PreviewKind::Video) | Some(PreviewKind::Heic) => decode_video_frame(path)?,
+        Some(PreviewKind::Pdf) => decode_pdf_first_page(path)?,
+        Some(PreviewKind::Text) => {
+            return Err(std::io::Error::other("text previews are cell-native").into())
+        }
     };
     // The ffmpeg path already returns ≤512 px frames; don't upscale those.
     let thumb = if img.width() <= THUMB_MAX_PX && img.height() <= THUMB_MAX_PX {
@@ -254,6 +273,93 @@ fn decode_video_frame(path: &str) -> Result<DynamicImage, image::ImageError> {
         .decode()
 }
 
+/// Rasterizes page 1 of a PDF with the system `pdftoppm` (poppler) into a
+/// temp PNG, then decodes it. Same optional-runtime-dependency tier as the
+/// ffmpeg path; a watchdog bounds hung processes.
+fn decode_pdf_first_page(path: &str) -> Result<DynamicImage, image::ImageError> {
+    use std::io::{Cursor, Read};
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::AtomicU64;
+
+    /// Unique temp-file root per extraction: PDF workers run concurrently.
+    static PDF_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let root = std::env::temp_dir().join(format!(
+        "ira_pdf_{}_{}",
+        std::process::id(),
+        PDF_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut child = Command::new("pdftoppm")
+        .args([
+            "-png",
+            "-f",
+            "1",
+            "-l",
+            "1",
+            "-scale-to",
+            "512",
+            "-singlefile",
+            path,
+        ])
+        .arg(&root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(image::ImageError::IoError)?;
+
+    let shared: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(Some(child)));
+    let watchdog = shared.clone();
+    std::thread::spawn(move || {
+        for _ in 0..(FFMPEG_TIMEOUT.as_millis() / 200) {
+            std::thread::sleep(Duration::from_millis(200));
+            if watchdog.lock().expect("watchdog poisoned").is_none() {
+                return;
+            }
+        }
+        if let Some(mut c) = watchdog.lock().expect("watchdog poisoned").take() {
+            let _ = c.kill();
+        }
+    });
+
+    let png = root.with_extension("png");
+    let result = (|| -> Result<DynamicImage, image::ImageError> {
+        if let Some(mut c) = shared.lock().expect("pdf child poisoned").take() {
+            let status = c.wait();
+            if !status.map(|s| s.success()).unwrap_or(false) {
+                return Err(std::io::Error::other("pdftoppm failed").into());
+            }
+        }
+        let mut bytes = Vec::new();
+        std::fs::File::open(&png)?.read_to_end(&mut bytes)?;
+        if bytes.is_empty() {
+            return Err(std::io::Error::other("pdftoppm produced no output").into());
+        }
+        ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()?
+            .decode()
+    })();
+    let _ = std::fs::remove_file(&png);
+    result
+}
+
+/// Reads the head of a text file for the column preview: capped, NUL-sniffed
+/// (binary → `binary`), lossy UTF-8. Returns `(content, binary, truncated)`.
+pub fn read_text_preview(path: &str) -> Result<(String, bool, bool), std::io::Error> {
+    use std::io::Read;
+
+    const CAP: u64 = 256 * 1024;
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let cap = CAP.min(len) as usize;
+    let mut buf = vec![0u8; cap];
+    file.read_exact(&mut buf)?;
+    let truncated = len > cap as u64;
+    let binary = buf.contains(&0);
+    let content = String::from_utf8_lossy(&buf).into_owned();
+    Ok((content, binary, truncated))
+}
+
 /// Decodes a source image with content sniffing (extension can lie) and EXIF
 fn decode_source(path: &str) -> Result<DynamicImage, image::ImageError> {
     let mut limits = image::Limits::default();
@@ -316,12 +422,25 @@ pub fn spawn_workers(picker: Picker, queues: WorkerQueues, tx: Sender<ThumbEvent
             let Some(req) = next else {
                 continue;
             };
-            let event = match load_thumbnail(&req.path, req.mtime, req.size)
-                .ok()
-                .and_then(|img| build_protocol(&picker, img, req.cols, req.rows).ok())
-            {
-                Some(protocol) => ThumbEvent::Ready(req.clone(), protocol),
-                None => ThumbEvent::Failed(req.clone()),
+            let event = match preview_kind(&req.path) {
+                Some(PreviewKind::Text) => match read_text_preview(&req.path) {
+                    Ok((content, binary, truncated)) => ThumbEvent::Text {
+                        req: req.clone(),
+                        content,
+                        binary,
+                        truncated,
+                    },
+                    Err(_) => ThumbEvent::Failed(req.clone()),
+                },
+                _ => {
+                    match load_thumbnail(&req.path, req.mtime, req.size)
+                        .ok()
+                        .and_then(|img| build_protocol(&picker, img, req.cols, req.rows).ok())
+                    {
+                        Some(protocol) => ThumbEvent::Ready(req.clone(), protocol),
+                        None => ThumbEvent::Failed(req.clone()),
+                    }
+                }
             };
             let _ = tx.send(event);
         });
@@ -385,6 +504,13 @@ pub enum ThumbEvent {
     Ready(ThumbRequest, Protocol),
     /// Undecodable/unreadable file — the UI shows a placeholder.
     Failed(ThumbRequest),
+    /// Head of a text file (`read_text_preview`), rendered natively as cells.
+    Text {
+        req: ThumbRequest,
+        content: String,
+        binary: bool,
+        truncated: bool,
+    },
 }
 
 /// Builds the terminal-protocol representation for a preview area of
@@ -450,9 +576,73 @@ mod tests {
         for name in ["a.heic", "a.heif"] {
             assert_eq!(preview_kind(name), Some(PreviewKind::Heic), "{name}");
         }
-        for name in ["a.txt", "a.tar.gz", "a", "a.rs", "a.PDF"] {
+        assert_eq!(preview_kind("a.pdf"), Some(PreviewKind::Pdf));
+        for name in [
+            "a.txt", "a.md", "a.json", "a.toml", "a.rs", "a.py", "a.sh", "a.csv", "a.yaml",
+        ] {
+            assert_eq!(preview_kind(name), Some(PreviewKind::Text), "{name}");
+        }
+        for name in ["a.tar.gz", "a", "a.pdfx"] {
             assert_eq!(preview_kind(name), None, "{name} must not preview");
         }
+    }
+
+    #[test]
+    fn text_head_is_capped_and_sniffed() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("ira_thumb_tests");
+        fs::create_dir_all(&dir).unwrap();
+
+        let text = dir.join("sample.txt");
+        fs::write(&text, "hello\nworld\n").unwrap();
+        let (content, binary, truncated) = read_text_preview(text.to_str().unwrap()).unwrap();
+        assert_eq!(content, "hello\nworld\n");
+        assert!(!binary && !truncated);
+
+        let big = dir.join("big.txt");
+        let mut f = fs::File::create(&big).unwrap();
+        let line = "x".repeat(100);
+        for _ in 0..4000 {
+            f.write_all(line.as_bytes()).unwrap();
+            f.write_all(b"\n").unwrap();
+        }
+        drop(f);
+        let (content, binary, truncated) = read_text_preview(big.to_str().unwrap()).unwrap();
+        assert!(truncated && !binary);
+        assert_eq!(content.len(), 256 * 1024);
+
+        let bin = dir.join("blob.dat.txt");
+        let mut f = fs::File::create(&bin).unwrap();
+        f.write_all(b"ok\0binary").unwrap();
+        drop(f);
+        let (_, binary, _) = read_text_preview(bin.to_str().unwrap()).unwrap();
+        assert!(binary, "NUL byte must mark the file binary");
+    }
+
+    #[test]
+    fn pdf_first_page_rasterizes_through_poppler() {
+        use std::process::{Command, Stdio};
+        if Command::new("pdftoppm")
+            .arg("-v")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_err()
+        {
+            eprintln!("skipping: pdftoppm not on PATH");
+            return;
+        }
+        use_test_cache();
+        let dir = std::env::temp_dir().join("ira_thumb_tests");
+        let pdf = dir.join("sample.pdf");
+        // Minimal one-page PDF with visible text; hand-written is fine.
+        let pdf_body = "%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 100]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj\n4 0 obj<</Length 60>>stream\nBT /F1 24 Tf 20 50 Td (IRA pdf preview) Tj ET\nendstream endobj\n5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\ntrailer<</Root 1 0 R/Size 6>>\n%%EOF\n";
+        fs::write(&pdf, pdf_body).unwrap();
+        let size = fs::metadata(&pdf).unwrap().len();
+
+        let thumb = load_thumbnail(pdf.to_str().unwrap(), Some(1), size).unwrap();
+        assert!(thumb.width() <= THUMB_MAX_PX && thumb.height() <= THUMB_MAX_PX);
+        assert!(thumb.width() > 0 && thumb.height() > 0);
     }
 
     #[test]

@@ -39,6 +39,46 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect, pane_index: usize) {
         return;
     }
 
+    // Text files render natively as cells — no protocol, no thumbnail.
+    let is_text = app.selected_visible_entry_for(pane_index).is_some_and(|e| {
+        !e.is_dir
+            && crate::services::thumbnails::preview_kind(&e.path)
+                == Some(crate::services::thumbnails::PreviewKind::Text)
+    });
+    if is_text {
+        match app.text_preview(pane_index) {
+            Some(preview) if preview.binary => frame.render_widget(
+                Paragraph::new(Line::raw(" binary file "))
+                    .style(Style::default().fg(Color::DarkGray)),
+                inner,
+            ),
+            Some(preview) if preview.content.is_empty() => frame.render_widget(
+                Paragraph::new(Line::raw(" (empty file) "))
+                    .style(Style::default().fg(Color::DarkGray)),
+                inner,
+            ),
+            Some(preview) => {
+                let mut lines: Vec<Line> = preview
+                    .content
+                    .lines()
+                    .map(|l| Line::raw(l.replace('\t', "    ")))
+                    .collect();
+                if preview.truncated {
+                    lines.push(
+                        Line::raw(" … truncated").style(Style::default().fg(Color::DarkGray)),
+                    );
+                }
+                lines.truncate(inner.height as usize);
+                frame.render_widget(Paragraph::new(lines), inner);
+            }
+            None => frame.render_widget(
+                Paragraph::new(Line::raw(" loading… ")).style(Style::default().fg(Color::DarkGray)),
+                inner,
+            ),
+        }
+        return;
+    }
+
     match app.preview_request_for(pane_index) {
         Some(req) => {
             if let Some(protocol) = app.preview_protocol(&req) {
@@ -68,7 +108,10 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect, pane_index: usize) {
                     Some(crate::services::thumbnails::PreviewKind::Heic) => {
                         " install ffmpeg for HEIC previews "
                     }
-                    _ => " format not supported (png/jpg/gif/bmp/webp/mp4/mov/heic) ",
+                    Some(crate::services::thumbnails::PreviewKind::Pdf) => {
+                        " install poppler (pdftoppm) for PDF previews "
+                    }
+                    _ => " format not supported (png/jpg/gif/bmp/webp/mp4/mov/heic/pdf) ",
                 },
             };
             frame.render_widget(
