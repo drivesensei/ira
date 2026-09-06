@@ -33,3 +33,4 @@ winapi = { version = "0.3.9", features = [
     "errhandlingapi",
     "handleapi",
 ] }
+ratatui-textarea = "0.9.2"

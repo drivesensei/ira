@@ -18,9 +18,45 @@ pub const PREVIEW_COLS: u16 = 40;
 /// Also prefetches the next images in the pane's visible order so scrolling
 /// shows already-decoded thumbnails.
 pub fn render(frame: &mut Frame, app: &mut App, area: Rect, pane_index: usize) {
-    let block = Block::bordered().title(" Preview (v) ");
+    // Editing takes over the column while this pane's editor is focused.
+    let editing = app.edit_focus
+        && app
+            .edit
+            .as_ref()
+            .is_some_and(|e| e.pane_index == pane_index && !e.read_only);
+    let editing_ro = app
+        .edit
+        .as_ref()
+        .is_some_and(|e| e.pane_index == pane_index && e.read_only);
+    let title = if editing {
+        let dirty = app.edit.as_ref().is_some_and(|e| e.dirty);
+        if dirty {
+            " * Editing — s save · Esc exit ".to_string()
+        } else {
+            " Editing — s save · Esc exit ".to_string()
+        }
+    } else if editing_ro {
+        " Preview (read-only) ".to_string()
+    } else {
+        " Preview (v) ".to_string()
+    };
+    let block = Block::bordered().title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    if editing {
+        let edit = app.edit.as_ref().expect("checked above");
+        frame.render_widget(edit.textarea.widget(), inner);
+        return;
+    }
+    if editing_ro {
+        frame.render_widget(
+            Paragraph::new(Line::raw(" read-only file "))
+                .style(Style::default().fg(Color::DarkGray)),
+            inner,
+        );
+        return;
+    }
 
     // Report the drawable area back so the app requests protocols that fit
     // exactly (protocol encoding is area-dependent).

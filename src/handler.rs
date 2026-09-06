@@ -36,6 +36,35 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         return Ok(());
     }
 
+    // Preview text editor (Tab-focused): the buffer captures every key —
+    // chars insert (including `q`), `s` saves without inserting, `Esc`
+    // exits back to pane focus, `Tab` moves focus on (discarding edits).
+    // Ctrl+C above still hard-quits.
+    if app.edit_focus {
+        match key_event.code {
+            KeyCode::Char('s')
+                if key_event.modifiers.is_empty()
+                    || key_event.modifiers == KeyModifiers::CONTROL =>
+            {
+                app.save_edit();
+                return Ok(());
+            }
+            KeyCode::Esc => {
+                app.close_edit();
+                app.edit_focus = false;
+                return Ok(());
+            }
+            KeyCode::Tab => {
+                app.switch_pane();
+                return Ok(());
+            }
+            _ => {
+                app.edit_input(key_event);
+                return Ok(());
+            }
+        }
+    }
+
     // Rename text editor.
     if app.renaming.is_some() {
         match key_event.code {
