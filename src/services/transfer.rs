@@ -4,8 +4,10 @@
 //! channel; the caller (the TUI) drains events and stays responsive. Jobs can
 //! be paused and cancelled through a shared [`JobControl`].
 
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{symlink as create_symlink, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -201,6 +203,17 @@ fn run_batch(
         control.gate()?;
         let src = Path::new(p);
         let dst = dest_dir.join(src.file_name().unwrap_or_default());
+        // Overwrite policy: an existing destination is never touched. The
+        // item counts as failed and the batch continues.
+        if fs::symlink_metadata(&dst).is_ok() {
+            failed += 1;
+            let _ = tx.send(JobEvent::Progress {
+                id,
+                copied_bytes: bytes,
+                current: format!("SKIPPED (already exists): {}", dst.to_string_lossy()),
+            });
+            continue;
+        }
         let result = match kind {
             JobKind::Copy => copy_entry(src, &dst, control, id, tx, &mut bytes),
             JobKind::Move => match fs::rename(src, &dst) {
@@ -214,13 +227,22 @@ fn run_batch(
         };
         match result {
             Ok(()) => {}
-            Err(JobError::Cancelled) => return Err(JobError::Cancelled),
-            Err(JobError::Io(_msg)) => {
+            Err(JobError::Cancelled) => {
+                // Cancelled mid-item: remove the partial destination we
+                // created so neither a truncated copy nor a half-moved tree
+                // is left behind. The source is untouched.
+                let _ = remove_tree(&dst);
+                return Err(JobError::Cancelled);
+            }
+            Err(JobError::Io(msg)) => {
                 failed += 1;
+                // Item failed: remove our partial destination (never the
+                // source) so no truncated file is mistaken for a copy.
+                let _ = remove_tree(&dst);
                 let _ = tx.send(JobEvent::Progress {
                     id,
                     copied_bytes: bytes,
-                    current: format!("FAILED: {}", p),
+                    current: format!("FAILED ({}): {}", msg, p),
                 });
                 continue;
             }
@@ -251,9 +273,30 @@ fn copy_entry(
     bytes: &mut u64,
 ) -> Result<(), JobError> {
     control.gate()?;
-    let meta = fs::metadata(src)?;
+    // symlink_metadata does NOT follow symlinks: links are preserved as
+    // links (never dereferenced, so cyclic symlinks cannot recurse).
+    let meta = fs::symlink_metadata(src)?;
+    if meta.file_type().is_symlink() {
+        #[cfg(unix)]
+        {
+            let target = fs::read_link(src)?;
+            create_symlink(&target, dst)?;
+            let _ = tx.send(JobEvent::Progress {
+                id,
+                copied_bytes: *bytes,
+                current: src.to_string_lossy().into_owned(),
+            });
+            return Ok(());
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows: creating symlinks needs privileges; fall back to
+            // following the link (previous behavior).
+            return copy_file_follow(src, dst, control, id, tx, bytes);
+        }
+    }
     if meta.is_dir() {
-        fs::create_dir_all(dst)?;
+        fs::create_dir(dst)?;
         let _ = tx.send(JobEvent::Progress {
             id,
             copied_bytes: *bytes,
@@ -270,9 +313,12 @@ fn copy_entry(
                 bytes,
             )?;
         }
+        // Directory permissions are applied AFTER the children (a read-only
+        // source dir would otherwise block writing into the copy).
+        fs::set_permissions(dst, meta.permissions())?;
         Ok(())
     } else {
-        copy_file(src, dst, control, id, tx, bytes)
+        copy_file(src, dst, control, id, tx, bytes, &meta)
     }
 }
 
@@ -283,35 +329,67 @@ fn copy_file(
     id: u64,
     tx: &mpsc::Sender<JobEvent>,
     bytes: &mut u64,
+    meta: &fs::Metadata,
 ) -> Result<(), JobError> {
     let mut input = File::open(src)?;
-    let mut output = File::create(dst)?;
-    let mut buf = vec![0u8; CHUNK];
-    let mut since_report = 0u64;
-    loop {
-        control.gate()?;
-        let n = input.read(&mut buf)?;
-        if n == 0 {
-            break;
+    // create_new is atomic: an existing destination can never be truncated
+    // (the batch-level exists-check already routed those away; this closes
+    // the race and any symlink-follow surprise).
+    let mut output = open_dest_file(dst, meta)?;
+    let result = (|| {
+        let mut buf = vec![0u8; CHUNK];
+        let mut since_report = 0u64;
+        loop {
+            control.gate()?;
+            let n = input.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            output.write_all(&buf[..n])?;
+            *bytes += n as u64;
+            since_report += n as u64;
+            if since_report >= REPORT_EVERY {
+                since_report = 0;
+                let _ = tx.send(JobEvent::Progress {
+                    id,
+                    copied_bytes: *bytes,
+                    current: src.to_string_lossy().into_owned(),
+                });
+            }
         }
-        output.write_all(&buf[..n])?;
-        *bytes += n as u64;
-        since_report += n as u64;
-        if since_report >= REPORT_EVERY {
-            since_report = 0;
-            let _ = tx.send(JobEvent::Progress {
-                id,
-                copied_bytes: *bytes,
-                current: src.to_string_lossy().into_owned(),
-            });
+        let _ = tx.send(JobEvent::Progress {
+            id,
+            copied_bytes: *bytes,
+            current: src.to_string_lossy().into_owned(),
+        });
+        // Preserve the source modification time (std-only, no new deps).
+        if let Ok(modified) = meta.modified() {
+            let times = std::fs::FileTimes::new().set_modified(modified);
+            let _ = output.set_times(times);
         }
+        Ok(())
+    })();
+    if result.is_err() {
+        // Cancelled or failed mid-file: remove the partial destination.
+        let _ = fs::remove_file(dst);
     }
-    let _ = tx.send(JobEvent::Progress {
-        id,
-        copied_bytes: *bytes,
-        current: src.to_string_lossy().into_owned(),
-    });
-    Ok(())
+    result
+}
+
+/// Opens the destination file atomically (create_new), preserving the
+/// source's permission bits on Unix.
+#[cfg(unix)]
+fn open_dest_file(dst: &Path, meta: &fs::Metadata) -> std::io::Result<File> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(meta.permissions().mode())
+        .open(dst)
+}
+
+#[cfg(not(unix))]
+fn open_dest_file(dst: &Path, _meta: &fs::Metadata) -> std::io::Result<File> {
+    OpenOptions::new().write(true).create_new(true).open(dst)
 }
 
 /// Sums file sizes in a tree, capped at [`MAX_ENTRIES`] entries.
@@ -490,7 +568,31 @@ mod batch_tests {
         let (tx, rx) = mpsc::channel();
         let job = make_job(paths, base.join("dst").to_str().unwrap());
         spawn_job(&job, tx);
-        let (last, all) = wait_done(&rx);
+        let mut failed_progress = false;
+        let mut last = None;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(ev) => match ev {
+                    JobEvent::Progress { current, .. } if current.starts_with("FAILED") => {
+                        failed_progress = true;
+                    }
+                    JobEvent::Done { .. }
+                    | JobEvent::Failed { .. }
+                    | JobEvent::Cancelled { .. } => {
+                        last = Some(ev);
+                        break;
+                    }
+                    _ => {}
+                },
+                Err(_) => {
+                    if last.is_some() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
 
         assert!(
             matches!(&last, Some(JobEvent::Failed { error, .. }) if error.contains("1 of 3 items failed")),
@@ -499,10 +601,7 @@ mod batch_tests {
         // Good items still transferred despite the middle failure.
         assert!(base.join("dst").join("good1").exists());
         assert!(base.join("dst").join("good2").exists());
-        // A FAILED progress event was reported for the bad path.
-        assert!(all.iter().any(
-            |ev| matches!(ev, JobEvent::Progress { current, .. } if current.starts_with("FAILED:"))
-        ));
+        assert!(failed_progress);
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -527,6 +626,221 @@ mod batch_tests {
         assert!(matches!(last, Some(JobEvent::Done { .. })));
         assert_eq!(std::fs::read_dir(base.join("dst")).unwrap().count(), 5);
         assert_eq!(std::fs::read_dir(base.join("src")).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn move_never_replaces_existing_destination() {
+        let base = std::env::temp_dir().join(format!("ira_hard_move_{}", std::process::id()));
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::create_dir_all(base.join("dst")).unwrap();
+        std::fs::write(base.join("src").join("a"), "NEW").unwrap();
+        std::fs::write(base.join("dst").join("a"), "PRECIOUS").unwrap();
+
+        let paths = vec![base.join("src").join("a").to_string_lossy().into_owned()];
+        let (tx, rx) = mpsc::channel();
+        let mut job = make_job(paths, base.join("dst").to_str().unwrap());
+        job.kind = JobKind::Move;
+        spawn_job(&job, tx);
+        let (last, _) = wait_done(&rx);
+
+        assert!(
+            matches!(&last, Some(JobEvent::Failed { error, .. }) if error.contains("1 of 1")),
+            "move onto an existing file must fail: {last:?}"
+        );
+        assert_eq!(
+            std::fs::read(base.join("dst").join("a")).unwrap(),
+            b"PRECIOUS",
+            "existing destination must never be replaced"
+        );
+        assert_eq!(
+            std::fs::read(base.join("src").join("a")).unwrap(),
+            b"NEW",
+            "the source must survive a rejected move"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn copy_never_truncates_existing_destination() {
+        let base = std::env::temp_dir().join(format!("ira_hard_copy_{}", std::process::id()));
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::create_dir_all(base.join("dst")).unwrap();
+        std::fs::write(base.join("src").join("b"), "NEWDATA").unwrap();
+        std::fs::write(base.join("dst").join("b"), "IMPORTANT-OLD").unwrap();
+
+        let paths = vec![base.join("src").join("b").to_string_lossy().into_owned()];
+        let (tx, rx) = mpsc::channel();
+        let job = make_job(paths, base.join("dst").to_str().unwrap());
+        spawn_job(&job, tx);
+        let (last, _) = wait_done(&rx);
+
+        assert!(
+            matches!(&last, Some(JobEvent::Failed { error, .. }) if error.contains("1 of 1")),
+            "copy onto an existing file must fail: {last:?}"
+        );
+        assert_eq!(
+            std::fs::read(base.join("dst").join("b")).unwrap(),
+            b"IMPORTANT-OLD",
+            "existing destination content must be intact"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_preserves_permissions_and_mtime() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!("ira_hard_perm_{}", std::process::id()));
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::create_dir_all(base.join("dst")).unwrap();
+        let src = base.join("src").join("script.sh");
+        std::fs::write(&src, "#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mtime =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        {
+            let f = std::fs::File::options().write(true).open(&src).unwrap();
+            f.set_times(std::fs::FileTimes::new().set_modified(mtime))
+                .unwrap();
+        }
+
+        let paths = vec![src.to_string_lossy().into_owned()];
+        let (tx, rx) = mpsc::channel();
+        let job = make_job(paths, base.join("dst").to_str().unwrap());
+        spawn_job(&job, tx);
+        let (last, _) = wait_done(&rx);
+        assert!(matches!(last, Some(JobEvent::Done { .. })));
+
+        let dst = base.join("dst").join("script.sh");
+        let meta = std::fs::metadata(&dst).unwrap();
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o755,
+            "exec bits preserved"
+        );
+        assert_eq!(
+            meta.modified()
+                .unwrap()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            1_700_000_000,
+            "mtime preserved"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_are_preserved_not_followed() {
+        let base = std::env::temp_dir().join(format!("ira_hard_link_{}", std::process::id()));
+        std::fs::create_dir_all(base.join("src").join("real")).unwrap();
+        std::fs::create_dir_all(base.join("dst")).unwrap();
+        std::fs::write(base.join("src").join("real").join("data"), "D").unwrap();
+        std::os::unix::fs::symlink("real", base.join("src").join("dirlink")).unwrap();
+        std::os::unix::fs::symlink(
+            base.join("src").join("real").join("data"),
+            base.join("src").join("filelink"),
+        )
+        .unwrap();
+
+        let paths = vec![
+            base.join("src")
+                .join("dirlink")
+                .to_string_lossy()
+                .into_owned(),
+            base.join("src")
+                .join("filelink")
+                .to_string_lossy()
+                .into_owned(),
+        ];
+        let (tx, rx) = mpsc::channel();
+        let job = make_job(paths, base.join("dst").to_str().unwrap());
+        spawn_job(&job, tx);
+        let (last, _) = wait_done(&rx);
+        assert!(matches!(last, Some(JobEvent::Done { .. })), "{last:?}");
+
+        // Links preserved as links, pointing at the same relative target.
+        let dl = base.join("dst").join("dirlink");
+        let fl = base.join("dst").join("filelink");
+        assert!(std::fs::symlink_metadata(&dl)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::symlink_metadata(&fl)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_link(&dl).unwrap(),
+            std::path::Path::new("real")
+        );
+        // No dereferenced copies were materialized.
+        assert!(!std::fs::symlink_metadata(&dl).unwrap().is_dir());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cyclic_symlink_terminates_without_hanging() {
+        let base = std::env::temp_dir().join(format!("ira_hard_cyc_{}", std::process::id()));
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::create_dir_all(base.join("dst")).unwrap();
+        std::os::unix::fs::symlink("..", base.join("src").join("loop")).unwrap();
+
+        let paths = vec![base.join("src").join("loop").to_string_lossy().into_owned()];
+        let (tx, rx) = mpsc::channel();
+        let job = make_job(paths, base.join("dst").to_str().unwrap());
+        spawn_job(&job, tx);
+        let (last, _) = wait_done(&rx);
+        assert!(
+            matches!(last, Some(JobEvent::Done { .. })),
+            "must terminate: {last:?}"
+        );
+        assert!(std::fs::symlink_metadata(base.join("dst").join("loop"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cancel_mid_copy_removes_partial_destination() {
+        let base = std::env::temp_dir().join(format!("ira_hard_cancel_{}", std::process::id()));
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::create_dir_all(base.join("dst")).unwrap();
+        let src = base.join("src").join("big.bin");
+        std::fs::write(&src, vec![0u8; 64 * 1024 * 1024]).unwrap();
+
+        let paths = vec![src.to_string_lossy().into_owned()];
+        let (tx, rx) = mpsc::channel();
+        let job = make_job(paths, base.join("dst").to_str().unwrap());
+        let control = job.control.clone();
+        spawn_job(&job, tx);
+
+        // Pause as soon as the partial dst appears: the worker parks at its
+        // next 256KB gate with the partial file still on disk.
+        let mut partial_seen = false;
+        for _ in 0..1000 {
+            if std::fs::symlink_metadata(base.join("dst").join("big.bin")).is_ok() {
+                control.set_paused(true);
+                partial_seen = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(partial_seen, "partial destination must exist mid-copy");
+        std::thread::sleep(Duration::from_millis(50)); // let the worker park
+        control.request_cancel();
+
+        let (last, _) = wait_done(&rx);
+        assert!(matches!(last, Some(JobEvent::Cancelled { .. })), "{last:?}");
+        assert!(
+            std::fs::symlink_metadata(base.join("dst").join("big.bin")).is_err(),
+            "partial destination must be removed on cancel"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
