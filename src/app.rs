@@ -139,15 +139,12 @@ pub struct Status {
 /// How long a status message stays visible.
 pub const STATUS_TTL: Duration = Duration::from_secs(8);
 
-/// Maximum rendered preview protocols kept in memory. Kitty/sixel payload
-/// sizes are proportional to the preview area, so the cap bounds RSS even
-/// while flipping through a folder of large images.
-const THUMB_CACHE_CAP: usize = 128;
-
-/// How long a failed preview request stays blacklisted. Long enough that
-/// scrolling past a broken file never re-queues it every frame; short
-/// enough that transient I/O errors recover within a session.
-const THUMB_FAIL_RETRY: Duration = Duration::from_secs(30);
+/// Minimum rendered preview protocols kept in memory. The effective cap is
+/// raised per frame to cover the grid working set (visible + prefetched
+/// cells, see `render_grid`): if the cap were smaller, prefetch would evict
+/// visible entries and they would re-decode every frame — visible as
+/// endless thumbnail flashing on large monitors.
+const THUMB_CACHE_CAP_MIN: usize = 256;
 
 /// Gap between navigation keys under which they count as "held down"
 /// (OS key-repeat fires at ~30 Hz; anything slower is a fresh press).
@@ -343,12 +340,18 @@ pub struct App {
     thumb_jobs: mpsc::SyncSender<ThumbRequest>,
     /// Rendered protocols keyed by [`ThumbRequest::mem_key`].
     thumb_cache: HashMap<String, Protocol>,
+    /// Effective eviction cap for `thumb_cache` this frame: at least
+    /// [`THUMB_CACHE_CAP_MIN`], raised by the grid renderer to cover its
+    /// working set. Reset every frame by `ui::render`.
+    thumb_cache_cap: usize,
     /// FIFO eviction order for `thumb_cache`.
     thumb_order: VecDeque<String>,
-    /// Requests that failed, with the time they did. A broken file must not
-    /// re-dispatch a worker on every frame; entries retry after a cooldown
-    /// so transient I/O errors recover.
-    thumb_failed: HashMap<String, Instant>,
+    /// Requests that failed this session (negative cache: a broken file
+    /// must not re-dispatch a worker on every frame, and retrying permanent
+    /// decode errors periodically just flashes the cell). A file that later
+    /// changes gets a new mtime/size and therefore a new key. Unbounded only
+    /// in the count of distinct broken files (small strings).
+    thumb_failed: HashSet<String>,
     /// Requests already dispatched to a worker (dedup guard).
     thumb_pending: HashSet<String>,
     /// Whether the optional `ffmpeg` runtime dependency is usable (probed
@@ -418,8 +421,9 @@ impl Default for App {
             thumb_pending: HashSet::new(),
             thumb_workers_started: false,
             thumb_cache: HashMap::new(),
+            thumb_cache_cap: THUMB_CACHE_CAP_MIN,
             thumb_order: VecDeque::new(),
-            thumb_failed: HashMap::new(),
+            thumb_failed: HashSet::new(),
             info_rx,
             ffmpeg_available: Arc::new(AtomicBool::new(false)),
         }
@@ -853,6 +857,19 @@ impl App {
         });
     }
 
+    /// Frame start for the thumbnail cache: lowers the effective eviction
+    /// cap back to the minimum; the grid renderer raises it again to cover
+    /// its working set (visible + prefetched cells).
+    pub fn begin_thumb_cache_frame(&mut self) {
+        self.thumb_cache_cap = THUMB_CACHE_CAP_MIN;
+    }
+
+    /// Raises the effective eviction cap if `min` is larger (never shrinks
+    /// within a frame; two grid panes both get their working set covered).
+    pub fn raise_thumb_cache_cap(&mut self, min: usize) {
+        self.thumb_cache_cap = self.thumb_cache_cap.max(min);
+    }
+
     /// Whether `path` can be previewed at all: images always, videos and
     /// HEIC only when the optional `ffmpeg` runtime dependency is present.
     pub fn preview_supported(&self, path: &str) -> bool {
@@ -1025,14 +1042,8 @@ impl App {
         if let Some(protocol) = self.thumb_cache.get(&key) {
             return Some(protocol);
         }
-        if let Some(failed_at) = self.thumb_failed.get(&key) {
-            if failed_at.elapsed() < THUMB_FAIL_RETRY {
-                return None;
-            }
-            // Cooldown elapsed: forget the failure and allow a retry.
-            self.thumb_failed.remove(&key);
-        }
         if self.picker.is_none()
+            || self.thumb_failed.contains(&key)
             || self.thumb_pending.contains(&key)
             || req.cols == 0
             || req.rows == 0
@@ -1057,7 +1068,7 @@ impl App {
                 }
                 ThumbEvent::Failed(req) => {
                     self.thumb_pending.remove(&req.mem_key());
-                    self.thumb_failed.insert(req.mem_key(), Instant::now());
+                    self.thumb_failed.insert(req.mem_key());
                 }
             }
         }
@@ -1067,7 +1078,7 @@ impl App {
     /// the currently displayed entry survives eviction to avoid a visible
     /// re-decode flicker.
     fn insert_thumb(&mut self, key: String, protocol: Protocol) {
-        while self.thumb_order.len() >= THUMB_CACHE_CAP {
+        while self.thumb_order.len() >= self.thumb_cache_cap {
             let Some(oldest) = self.thumb_order.pop_front() else {
                 break;
             };
@@ -3493,6 +3504,74 @@ mod preview_tests {
         assert_eq!(app.panes[0].preview_mode, PreviewMode::Grid);
         app.cycle_preview();
         assert_eq!(app.panes[0].preview_mode, PreviewMode::Off);
+    }
+
+    #[test]
+    fn grid_working_set_is_covered_by_the_cache_cap() {
+        // The flashing bug: at 81 visible cells the working set (visible +
+        // one prefetched screen above and below = 3 * per_screen) exceeded
+        // the fixed cap, so prefetch evicted visible entries and they
+        // re-decoded every frame.
+        let paths: Vec<String> = (0..12).map(|i| png_at(&format!("cap{i}.png"))).collect();
+        let mut app = App::default();
+        app.set_picker(ratatui_image::picker::Picker::halfblocks());
+        app.panes[0].preview_mode = PreviewMode::Grid;
+        app.panes[0].folder = Some(Folder::new(
+            "cap".into(),
+            std::env::temp_dir().to_string_lossy().into_owned(),
+            '1',
+        ));
+        app.panes[0].files = paths
+            .iter()
+            .map(|p| FEntry {
+                path: p.clone(),
+                label: p.rsplit('/').next().unwrap_or(p).to_string(),
+                is_dir: false,
+                size: 0,
+                modified: None,
+            })
+            .collect();
+        app.panes[0].listing_settled = true;
+        app.panes[0].state.select(Some(0));
+
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| crate::components::tab1_files_ui::render(f, &mut app, f.area(), 0, true))
+            .unwrap();
+        let per_screen = 5 * 4; // 78/14 cols x 22/5 rows on an 80x24 backend
+        assert!(
+            app.thumb_cache_cap >= 3 * per_screen + 16,
+            "cache cap {} does not cover grid working set {}",
+            app.thumb_cache_cap,
+            3 * per_screen + 16
+        );
+    }
+
+    #[test]
+    fn failed_thumbnails_stay_blacklisted_for_the_session() {
+        let mut app = app_with_selection("/nonexistent/missing.png");
+        let req = app.preview_request().unwrap();
+        assert!(app.preview_protocol(&req).is_none());
+        for _ in 0..500 {
+            let _ = app.preview_protocol(&req);
+            if app.thumb_failed.contains(&req.mem_key()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            app.thumb_failed.contains(&req.mem_key()),
+            "failure was not blacklisted"
+        );
+        // No cooldown retry: the broken file must never re-dispatch.
+        for _ in 0..20 {
+            let _ = app.preview_protocol(&req);
+        }
+        assert!(
+            !app.thumb_pending.contains(&req.mem_key()),
+            "failed file re-dispatched"
+        );
     }
 
     #[test]
