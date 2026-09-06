@@ -289,7 +289,7 @@ fn decode_pdf_first_page(path: &str) -> Result<DynamicImage, image::ImageError> 
         std::process::id(),
         PDF_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    let mut child = Command::new("pdftoppm")
+    let child = Command::new("pdftoppm")
         .args([
             "-png",
             "-f",

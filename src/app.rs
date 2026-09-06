@@ -1045,7 +1045,7 @@ impl App {
                 cols: area.0,
                 rows: area.1,
             };
-            let _ = self.try_send_prefetch(&req);
+            self.try_send_prefetch(&req);
         }
     }
 
