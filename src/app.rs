@@ -705,6 +705,14 @@ impl App {
                 pane.selected
                     .extend(std::iter::repeat_n(false, files.len()));
                 pane.files.extend(files);
+                // While streaming, follow the pending target as soon as its
+                // entry arrives (transfer results land mid-stream). The
+                // target is consumed by the final sorted pass.
+                if let Some(sel) = &pane.pending_select {
+                    if let Some(i) = pane.files.iter().position(|f| &f.path == sel) {
+                        pane.state.select(Some(i));
+                    }
+                }
             }
         }
     }
@@ -2154,6 +2162,21 @@ impl App {
                 JobEvent::Done { id } => {
                     if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id) {
                         j.status = JobStatus::Done;
+                        // Land the destination pane's cursor on the last
+                        // item of the batch so the new content is visible
+                        // without hunting for it.
+                        if let Some(last) = j.paths.last() {
+                            let dest_item = std::path::Path::new(&j.dest_dir)
+                                .join(std::path::Path::new(last).file_name().unwrap_or_default());
+                            if let Some(pane) = self
+                                .panes
+                                .iter_mut()
+                                .find(|p| p.folder.as_ref().is_some_and(|f| f.path == j.dest_dir))
+                            {
+                                pane.pending_select =
+                                    Some(dest_item.to_string_lossy().into_owned());
+                            }
+                        }
                     }
                     self.refresh_after_job();
                 }

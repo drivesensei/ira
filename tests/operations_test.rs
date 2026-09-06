@@ -1940,3 +1940,214 @@ fn goto_navigation_then_select_and_copy_shows_confirm() {
     );
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn copied_folder_appears_in_destination_pane_listing() {
+    use ira::handler::handle_key_events;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let base = std::env::temp_dir().join(format!("ira_cfld_{}", std::process::id()));
+    let src = base.join("src");
+    let dst = base.join("dst");
+    std::fs::create_dir_all(src.join("myfolder")).unwrap();
+    std::fs::create_dir_all(&dst).unwrap();
+    std::fs::write(src.join("myfolder").join("inner.txt"), "x").unwrap();
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new("src".into(), src.to_str().unwrap().into(), '#'));
+    app.panes[1].folder = Some(Folder::new("dst".into(), dst.to_str().unwrap().into(), '#'));
+    app.panes[0].files = vec![FEntry {
+        path: src.join("myfolder").to_str().unwrap().to_string(),
+        label: "myfolder".to_string(),
+        is_dir: true,
+        size: 0,
+        modified: None,
+    }];
+    app.panes[0].selected = vec![false];
+    app.panes[0].state.select(Some(0));
+    let key = |code| KeyEvent::new(code, KeyModifiers::empty());
+
+    // User flow: space-select the folder, c, confirm.
+    handle_key_events(key(KeyCode::Char(' ')), &mut app).unwrap();
+    handle_key_events(key(KeyCode::Char('c')), &mut app).unwrap();
+    assert!(app.confirming.is_some());
+    app.confirm_pending();
+    wait_for_jobs(&mut app);
+
+    assert!(dst.join("myfolder").is_dir(), "folder must be copied");
+    // THE assertion under test: the destination pane's listing must show it
+    // without any manual refresh.
+    assert!(
+        app.panes[1].files.iter().any(|f| f.label == "myfolder"),
+        "copied folder must appear in the destination pane listing automatically"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn moved_folder_appears_in_destination_pane_listing() {
+    use ira::handler::handle_key_events;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let base = std::env::temp_dir().join(format!("ira_mfld_{}", std::process::id()));
+    let src = base.join("src");
+    let dst = base.join("dst");
+    std::fs::create_dir_all(src.join("myfolder")).unwrap();
+    std::fs::create_dir_all(&dst).unwrap();
+    std::fs::write(src.join("myfolder").join("inner.txt"), "x").unwrap();
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new("src".into(), src.to_str().unwrap().into(), '#'));
+    app.panes[1].folder = Some(Folder::new("dst".into(), dst.to_str().unwrap().into(), '#'));
+    app.panes[0].files = vec![FEntry {
+        path: src.join("myfolder").to_str().unwrap().to_string(),
+        label: "myfolder".to_string(),
+        is_dir: true,
+        size: 0,
+        modified: None,
+    }];
+    app.panes[0].selected = vec![false];
+    app.panes[0].state.select(Some(0));
+    let key = |code| KeyEvent::new(code, KeyModifiers::empty());
+
+    handle_key_events(key(KeyCode::Char(' ')), &mut app).unwrap();
+    handle_key_events(key(KeyCode::Char('m')), &mut app).unwrap();
+    app.confirm_pending();
+    wait_for_jobs(&mut app);
+
+    assert!(dst.join("myfolder").is_dir());
+    assert!(
+        app.panes[1].files.iter().any(|f| f.label == "myfolder"),
+        "moved folder must appear in the destination pane listing"
+    );
+    assert!(!src.join("myfolder").exists());
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn copied_folder_appears_in_large_destination_async_refresh() {
+    use ira::handler::handle_key_events;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let base = std::env::temp_dir().join(format!("ira_cfld_big_{}", std::process::id()));
+    let src = base.join("src");
+    let dst = base.join("dst");
+    std::fs::create_dir_all(src.join("myfolder")).unwrap();
+    std::fs::create_dir_all(&dst).unwrap();
+    std::fs::write(src.join("myfolder").join("inner.txt"), "x").unwrap();
+    // Force the ASYNC streaming path: more entries than LISTING_CHUNK.
+    for i in 0..700 {
+        std::fs::write(dst.join(format!("pad{i:04}.txt")), "x").unwrap();
+    }
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new("src".into(), src.to_str().unwrap().into(), '#'));
+    app.panes[1].folder = Some(Folder::new("dst".into(), dst.to_str().unwrap().into(), '#'));
+    app.panes[0].files = vec![FEntry {
+        path: src.join("myfolder").to_str().unwrap().to_string(),
+        label: "myfolder".to_string(),
+        is_dir: true,
+        size: 0,
+        modified: None,
+    }];
+    app.panes[0].selected = vec![false];
+    app.panes[0].state.select(Some(0));
+    let key = |code| KeyEvent::new(code, KeyModifiers::empty());
+
+    handle_key_events(key(KeyCode::Char(' ')), &mut app).unwrap();
+    handle_key_events(key(KeyCode::Char('c')), &mut app).unwrap();
+    app.confirm_pending();
+    wait_for_jobs(&mut app);
+
+    assert!(dst.join("myfolder").is_dir(), "folder must be copied");
+    for _ in 0..500 {
+        app.tick();
+        if app.file_list_settled(1) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        app.panes[1].files.iter().any(|f| f.label == "myfolder"),
+        "copied folder must appear in the destination pane listing (async path)"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn copied_folder_is_revealed_mid_stream_in_large_destination() {
+    use ira::handler::handle_key_events;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let base = std::env::temp_dir().join(format!("ira_cfld_stream_{}", std::process::id()));
+    let src = base.join("src");
+    let dst = base.join("dst");
+    std::fs::create_dir_all(src.join("myfolder")).unwrap();
+    std::fs::create_dir_all(&dst).unwrap();
+    std::fs::write(src.join("myfolder").join("inner.txt"), "x").unwrap();
+    for i in 0..700 {
+        std::fs::write(dst.join(format!("pad{i:04}.txt")), "x").unwrap();
+    }
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new("src".into(), src.to_str().unwrap().into(), '#'));
+    app.panes[1].folder = Some(Folder::new("dst".into(), dst.to_str().unwrap().into(), '#'));
+    app.panes[0].files = vec![FEntry {
+        path: src.join("myfolder").to_str().unwrap().to_string(),
+        label: "myfolder".to_string(),
+        is_dir: true,
+        size: 0,
+        modified: None,
+    }];
+    app.panes[0].selected = vec![false];
+    app.panes[0].state.select(Some(0));
+    let key = |code| KeyEvent::new(code, KeyModifiers::empty());
+
+    handle_key_events(key(KeyCode::Char(' ')), &mut app).unwrap();
+    handle_key_events(key(KeyCode::Char('c')), &mut app).unwrap();
+    app.confirm_pending();
+
+    // While the destination listing streams, the cursor must land on the
+    // copied folder as soon as its entry arrives — BEFORE the final sorted
+    // pass.
+    let mut revealed = false;
+    for _ in 0..2000 {
+        app.tick();
+        let idx = app.panes[1].state.selected();
+        if let Some(i) = idx {
+            if app.panes[1]
+                .files
+                .get(i)
+                .is_some_and(|f| f.label == "myfolder")
+            {
+                revealed = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(revealed, "cursor must land on the copied folder mid-stream");
+
+    // And it stays selected after the final sorted pass.
+    let mut settled = false;
+    for _ in 0..2000 {
+        app.tick();
+        if app.file_list_settled(1) {
+            settled = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(settled);
+    let idx = app.panes[1].state.selected().unwrap();
+    assert_eq!(
+        app.panes[1].files.get(idx).unwrap().label,
+        "myfolder",
+        "cursor stays on the copied folder after the sorted pass"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
