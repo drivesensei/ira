@@ -113,6 +113,13 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         return Ok(());
     }
 
+    // Keybindings help dialog (`*`): any key closes it — checked first so a
+    // background notice (transfer done, delete error) can't steal the key.
+    if app.keybindings_visible {
+        app.close_keybindings();
+        return Ok(());
+    }
+
     // Error dialog: any key dismisses it. Checked before the info dialog so
     // an eject failure's error box never swallows the next action.
     if app.status.is_some() {
@@ -131,12 +138,6 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
     // running in the background (sizes stay cached).
     if app.multi_info.is_some() {
         app.multi_info = None;
-        return Ok(());
-    }
-
-    // Keybindings help dialog (`*`): any key closes it.
-    if app.keybindings_visible {
-        app.close_keybindings();
         return Ok(());
     }
 
@@ -203,6 +204,7 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
     if app.board_has_focus() {
         match key_event.code {
             KeyCode::Esc | KeyCode::Char('`') => app.toggle_copy_board(),
+            KeyCode::Char('*') => app.show_keybindings(),
             KeyCode::Char('v') => app.cycle_preview(),
             KeyCode::Up => app.copy_board_prev(),
             KeyCode::Down => app.copy_board_next(),

@@ -355,16 +355,21 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     // Keybindings help dialog (`*`): documents the keys that have no
     // on-screen hint. Any key closes it (handler.rs).
     if app.keybindings_visible {
-        let bold = Style::default().add_modifier(Modifier::BOLD);
+        // One pair per row, no section headers: 13 rows + borders fit the
+        // minimum supported terminal (90x15) without clipping.
         let lines: Vec<Line<'static>> = vec![
-            Line::styled(" Files & navigation", bold),
-            bind_pair("←→↑↓", "navigate; ←/→ open/leave", "z / x", "top / bottom"),
+            bind_pair(
+                "Arrows",
+                "navigate; ←/→ open/leave",
+                "z / x",
+                "top / bottom",
+            ),
             bind_pair("Space", "multi-select entry", "c", "copy to other pane"),
             bind_pair("m", "move to other pane", "Enter", "rename entry"),
             bind_pair("Del", "delete (with confirm)", "n", "new folder / file"),
             bind_pair(".", "toggle hidden files", ",", "cycle sort mode"),
+            bind_pair("v", "cycle image preview", "Tab", "switch pane"),
             bind_pair("Ctrl+A", "select / clear all", "Alt+I", "invert selection"),
-            Line::styled(" Views & paths", bold),
             bind_pair("+", "split pane", "`", "copy board"),
             bind_pair("b", "bookmark this folder", "/", "fuzzy search"),
             bind_pair("Esc", "clear search filter", "?", "entry info"),
@@ -374,7 +379,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         ];
         let max_w = lines.iter().map(|l| l.width() as u16).max().unwrap_or(40);
         let w = (max_w + 4).min(frame.area().width.saturating_sub(4));
-        let h = (lines.len() as u16 + 2).min(frame.area().height.saturating_sub(2));
+        let h = (lines.len() as u16 + 2).min(frame.area().height);
         let style = Style::default().fg(Color::Black).bg(Color::White);
         let area = centered_rect(w, h, frame.area());
         paint_bg(frame, area, style);
@@ -640,9 +645,10 @@ mod tests {
 
         let key_event = KeyEvent::new(KeyCode::Char('*'), KeyModifiers::empty());
 
-        // `*` opens the dialog; it documents the keys that have no on-screen
-        // hint (drive/common-folder/bookmark shortcuts and the Actions box
-        // are deliberately absent).
+        // `*` opens the dialog; it documents every normal-mode binding that
+        // has no on-screen hint. Excluded: drive digits, common-folder and
+        // bookmark shortcuts (visible in their boxes) and dialog-internal
+        // keys (shown inside their own dialogs).
         let mut app = App::default();
         handle_key_events(key_event, &mut app).unwrap();
         assert!(app.keybindings_visible, "`*` must open the dialog");
@@ -661,6 +667,8 @@ mod tests {
             "eject drive",
             "select / clear all",
             "invert selection",
+            "cycle image preview",
+            "switch pane",
         ] {
             assert!(text.contains(binding), "missing {binding:?}: {text}");
         }
@@ -671,6 +679,29 @@ mod tests {
         assert!(!app.keybindings_visible);
         let text = rendered(&mut app);
         assert!(!text.contains("this help"), "{text}");
+    }
+
+    #[test]
+    fn keybindings_dialog_fits_minimum_supported_terminal() {
+        // 90x15 is the smallest terminal the app accepts
+        // (should_increase_size): 13 rows + borders must fit, so the quit
+        // and reopen hints are never clipped.
+        let mut app = App::default();
+        app.keybindings_visible = true;
+        let backend = TestBackend::new(90, 15);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| super::render(&mut app, f)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(text.contains("this help"), "{text}");
+        assert!(text.contains("quit"), "{text}");
+        assert!(text.contains("switch pane"), "{text}");
     }
 }
 

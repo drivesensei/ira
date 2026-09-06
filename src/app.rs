@@ -1348,6 +1348,7 @@ impl App {
             || self.multi_info.is_some()
             || self.info.is_some()
             || self.deletion_box_visible()
+            || self.keybindings_visible
     }
 
     /// Cycles the image preview presentation of the ACTIVE pane (`v`):
