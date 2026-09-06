@@ -53,11 +53,18 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
             );
         }
         None => {
-            let pane = &app.panes[app.active_pane];
-            let reason = match pane.state.selected().and_then(|i| pane.files.get(i)) {
+            let reason = match app.selected_visible_entry() {
                 None => " select a file ",
                 Some(entry) if entry.is_dir => " folders have no image preview ",
-                Some(_) => " format not supported (png/jpg/gif/bmp/webp) ",
+                Some(entry) => match crate::services::thumbnails::preview_kind(&entry.path) {
+                    Some(crate::services::thumbnails::PreviewKind::Video) => {
+                        " install ffmpeg for video previews "
+                    }
+                    Some(crate::services::thumbnails::PreviewKind::Heic) => {
+                        " install ffmpeg for HEIC previews "
+                    }
+                    _ => " format not supported (png/jpg/gif/bmp/webp/mp4/mov/heic) ",
+                },
             };
             frame.render_widget(
                 Paragraph::new(Line::raw(reason)).style(

@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::error;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -23,7 +24,8 @@ use crate::{
         list_files::{list_files_bounded, list_files_chunked, FEntry, LISTING_CHUNK},
         state::{load_state, load_state_from, save_state, save_state_to, SessionState, SizeEntry},
         thumbnails::{
-            is_previewable, prune_cache, spawn_workers, ThumbEvent, ThumbRequest, JOB_QUEUE_CAP,
+            preview_kind, prune_cache, spawn_workers, PreviewKind, ThumbEvent, ThumbRequest,
+            JOB_QUEUE_CAP,
         },
         transfer::{
             spawn_delete_job, spawn_job, Job, JobControl, JobEvent, JobKind, JobStatus,
@@ -328,6 +330,9 @@ pub struct App {
     thumb_failed: HashMap<String, Instant>,
     /// Requests already dispatched to a worker (dedup guard).
     thumb_pending: HashSet<String>,
+    /// Whether the optional `ffmpeg` runtime dependency is usable (probed
+    /// once in the background); gates video and HEIC previews.
+    ffmpeg_available: Arc<AtomicBool>,
     /// Protocol currently displayed; kept alive across evictions.
     thumb_shown: Option<String>,
     /// Decode workers started (once, on the first picker install).
@@ -400,12 +405,11 @@ impl Default for App {
             thumb_failed: HashMap::new(),
             thumb_shown: None,
             info_rx,
+            ffmpeg_available: Arc::new(AtomicBool::new(false)),
         }
     }
 }
 
-/// Expands a user-typed path: `~`/`~/...` to the home dir; relative paths
-/// anchor at `base` (the active pane's folder) when provided.
 fn expand_path(raw: &str, base: Option<String>) -> std::path::PathBuf {
     let trimmed = raw.trim();
     if trimmed == "~" || trimmed.starts_with("~/") {
@@ -818,6 +822,32 @@ impl App {
             .expect("thumb workers started twice");
         spawn_workers(picker, Arc::new(Mutex::new(jobs)), self.thumb_tx.clone());
         std::thread::spawn(prune_cache);
+        // Probe for the optional runtime dependency once (background: the
+        // spawn costs a few ms). While unknown, videos/HEIC show glyphs.
+        let flag = Arc::clone(&self.ffmpeg_available);
+        std::thread::spawn(move || {
+            let ok = std::process::Command::new("ffmpeg")
+                .arg("-version")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            flag.store(ok, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+
+    /// Whether `path` can be previewed at all: images always, videos and
+    /// HEIC only when the optional `ffmpeg` runtime dependency is present.
+    pub fn preview_supported(&self, path: &str) -> bool {
+        use std::sync::atomic::Ordering;
+        match preview_kind(path) {
+            Some(PreviewKind::Image) => true,
+            Some(PreviewKind::Video | PreviewKind::Heic) => {
+                self.ffmpeg_available.load(Ordering::Relaxed)
+            }
+            None => false,
+        }
     }
 
     /// Whether a modal overlay (dialogs centered over the files area) is
@@ -849,6 +879,22 @@ impl App {
         self.set_status(format!("Preview: {label}"), false);
     }
 
+    /// Resolves the active pane's selected entry in *visible-row* index
+    /// space (live search, confirmed filter, or the full listing).
+    /// `state.selected()` is an index into those rows — never `files`.
+    pub fn selected_visible_entry(&self) -> Option<&FEntry> {
+        let pane = self.pane();
+        let vis = pane.state.selected()?;
+        let indices = if self.is_searching() {
+            self.search_matches()
+        } else if pane.filter_query.is_some() {
+            pane.filter_indices.clone()
+        } else {
+            (0..pane.files.len()).collect::<Vec<usize>>()
+        };
+        indices.get(vis).and_then(|&i| pane.files.get(i))
+    }
+
     /// Builds the preview request for the active pane's selected entry, or
     /// `None` when the preview column has nothing to show an image for
     /// (closed, nothing selected, folder, unsupported format).
@@ -856,21 +902,8 @@ impl App {
         if self.preview_mode == PreviewMode::Off {
             return None;
         }
-        let pane = self.pane();
-        // `state.selected()` is an index into the *visible* rows (live
-        // search, confirmed filter, or the full listing) — resolve it
-        // through the same rows the list renders, never `files` directly.
-        let entry = pane.state.selected().and_then(|vis| {
-            let indices = if self.is_searching() {
-                self.search_matches()
-            } else if pane.filter_query.is_some() {
-                pane.filter_indices.clone()
-            } else {
-                (0..pane.files.len()).collect::<Vec<usize>>()
-            };
-            indices.get(vis).and_then(|&i| pane.files.get(i))
-        })?;
-        if entry.is_dir || !is_previewable(&entry.path) {
+        let entry = self.selected_visible_entry()?;
+        if entry.is_dir || !self.preview_supported(&entry.path) {
             return None;
         }
         Some(ThumbRequest {
@@ -3358,6 +3391,33 @@ mod preview_tests {
         assert_eq!(app.preview_mode, PreviewMode::Off);
     }
 
+    #[test]
+    fn preview_supported_gates_video_on_ffmpeg_probe() {
+        use std::sync::atomic::AtomicBool;
+        let mut app = App::default();
+        app.preview_mode = PreviewMode::Column;
+        app.panes[0].files = vec![FEntry {
+            path: "/tmp/clip.mp4".into(),
+            label: "clip.mp4".into(),
+            is_dir: false,
+            size: 0,
+            modified: None,
+        }];
+        app.panes[0].state.select(Some(0));
+
+        // Probe pending / ffmpeg absent: video is not previewable.
+        assert!(!app.preview_supported("/tmp/clip.mp4"));
+        assert!(app.preview_request().is_none());
+
+        // ffmpeg detected: video becomes previewable like any image.
+        app.ffmpeg_available = Arc::new(AtomicBool::new(true));
+        assert!(app.preview_supported("/tmp/clip.mp4"));
+        assert!(app.preview_request().is_some());
+
+        // Images never depend on the probe.
+        assert!(!app.preview_supported("/tmp/x.txt"));
+        assert!(app.preview_supported("/tmp/x.png"));
+    }
     #[test]
     fn preview_request_resolves_the_visible_row_not_files_index() {
         // Two entries; the filter shows them in reverse order, so visible

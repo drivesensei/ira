@@ -11,6 +11,7 @@ use std::io::BufReader;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageReader};
@@ -43,17 +44,36 @@ pub const CACHE_MAX_FILES: usize = 512;
 /// a cache hit decodes in microseconds.
 pub const THUMB_MAX_PX: u32 = 512;
 
-/// Extensions the preview supports — exactly the formats `ira` compiles in
-/// via the `image` crate's feature set. Anything else shows a placeholder.
-pub fn is_previewable(path: &str) -> bool {
+/// Wall-clock budget for one ffmpeg frame extraction. Long enough for a
+/// seek into a large network-hosted video; short enough that a hung process
+/// can't occupy a bounded-pool worker forever.
+pub const FFMPEG_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What a path can preview as, by extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewKind {
+    /// Decoded in-process by the `image` crate.
+    Image,
+    /// Video container — needs a frame extracted by an external `ffmpeg`
+    /// binary (optional runtime dependency, never a build dependency).
+    Video,
+    /// HEIC/HEIF photo — needs HEVC; attempted via `ffmpeg` when available
+    /// (many builds decode it, some don't).
+    Heic,
+}
+
+/// Classifies a path by extension. `None` = no preview at all.
+pub fn preview_kind(path: &str) -> Option<PreviewKind> {
     let ext = std::path::Path::new(path)
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase());
-    matches!(
-        ext.as_deref(),
-        Some("png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp")
-    )
+    match ext.as_deref() {
+        Some("png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp") => Some(PreviewKind::Image),
+        Some("mp4" | "mov" | "m4v" | "webm" | "mkv" | "avi") => Some(PreviewKind::Video),
+        Some("heic" | "heif") => Some(PreviewKind::Heic),
+        _ => None,
+    }
 }
 
 /// FNV-1a 64-bit — a stable, dependency-free hash for cache file names.
@@ -139,12 +159,87 @@ pub fn load_thumbnail(
             }
         }
     }
-    let img = decode_source(path)?;
-    let thumb = img.thumbnail(THUMB_MAX_PX, THUMB_MAX_PX);
+    let img = match preview_kind(path) {
+        Some(PreviewKind::Image) | None => decode_source(path)?,
+        Some(PreviewKind::Video) | Some(PreviewKind::Heic) => decode_video_frame(path)?,
+    };
+    // The ffmpeg path already returns ≤512 px frames; don't upscale those.
+    let thumb = if img.width() <= THUMB_MAX_PX && img.height() <= THUMB_MAX_PX {
+        img
+    } else {
+        img.thumbnail(THUMB_MAX_PX, THUMB_MAX_PX)
+    };
     if let Some(cached) = &cache_path {
         store_thumbnail(&thumb, cached);
     }
     Ok(thumb)
+}
+
+/// Extracts a representative frame from a video (or HEIC photo) with the
+/// system `ffmpeg` binary and decodes it to a `DynamicImage`. Pure Rust
+/// cannot demux MP4 or decode H.264/HEVC, so this is the sanctioned
+/// runtime-shell-out tier: `ffmpeg` is looked up on `PATH` per call, never
+/// linked or required at build time. A watchdog kills the child after
+/// [`FFMPEG_TIMEOUT`] so a hung process can't occupy a pool worker forever.
+fn decode_video_frame(path: &str) -> Result<DynamicImage, image::ImageError> {
+    use std::io::{Cursor, Read};
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-i",
+            path,
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale='min(iw,512)':-2",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "png",
+            "pipe:1",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(image::ImageError::IoError)?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("no ffmpeg stdout"))?;
+
+    let shared: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(Some(child)));
+    let watchdog = shared.clone();
+    std::thread::spawn(move || {
+        for _ in 0..(FFMPEG_TIMEOUT.as_millis() / 200) {
+            std::thread::sleep(Duration::from_millis(200));
+            if watchdog.lock().expect("watchdog poisoned").is_none() {
+                return;
+            }
+        }
+        if let Some(mut c) = watchdog.lock().expect("watchdog poisoned").take() {
+            let _ = c.kill();
+        }
+    });
+
+    let mut bytes = Vec::new();
+    stdout
+        .read_to_end(&mut bytes)
+        .map_err(image::ImageError::IoError)?;
+    if let Some(mut c) = shared.lock().expect("ffmpeg child poisoned").take() {
+        let _ = c.wait();
+    }
+    if bytes.is_empty() {
+        return Err(std::io::Error::other("ffmpeg produced no frame").into());
+    }
+    ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()?
+        .decode()
 }
 
 /// Decodes a source image with content sniffing (extension can lie) and EXIF
@@ -301,13 +396,65 @@ mod tests {
     }
 
     #[test]
-    fn only_image_extensions_are_previewable() {
+    fn preview_kind_classifies_extensions() {
         for name in ["a.png", "a.JPG", "a.jpeg", "a.gif", "a.bmp", "a.webp"] {
-            assert!(is_previewable(name), "{name} should preview");
+            assert_eq!(preview_kind(name), Some(PreviewKind::Image), "{name}");
+        }
+        for name in ["a.mp4", "a.MOV", "a.m4v", "a.webm", "a.mkv", "a.avi"] {
+            assert_eq!(preview_kind(name), Some(PreviewKind::Video), "{name}");
+        }
+        for name in ["a.heic", "a.heif"] {
+            assert_eq!(preview_kind(name), Some(PreviewKind::Heic), "{name}");
         }
         for name in ["a.txt", "a.tar.gz", "a", "a.rs", "a.PDF"] {
-            assert!(!is_previewable(name), "{name} must not preview");
+            assert_eq!(preview_kind(name), None, "{name} must not preview");
         }
+    }
+
+    #[test]
+    fn video_frame_extracts_through_ffmpeg() {
+        use std::process::{Command, Stdio};
+        // Needs the optional runtime dependency; skipped where absent.
+        if Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_err()
+        {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        use_test_cache();
+        let dir = std::env::temp_dir().join("ira_thumb_tests");
+        fs::create_dir_all(&dir).unwrap();
+        let video = dir.join("clip.mp4");
+        let ok = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=0.5:size=1280x720:rate=10",
+                "-pix_fmt",
+                "yuv420p",
+                video.to_str().unwrap(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("ffmpeg status")
+            .success();
+        assert!(ok, "ffmpeg could not render the test clip");
+        let size = fs::metadata(&video).unwrap().len();
+
+        let thumb = load_thumbnail(video.to_str().unwrap(), Some(1), size).unwrap();
+        // ffmpeg downscales to ≤512 on extract; no upscale from our side.
+        assert!(thumb.width() <= THUMB_MAX_PX && thumb.height() <= THUMB_MAX_PX);
+        assert_eq!(thumb.width(), 512, "16:9 video frame keeps aspect ratio");
     }
 
     #[test]

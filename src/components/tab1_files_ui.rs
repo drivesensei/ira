@@ -14,8 +14,9 @@ use crate::services::file_info::{list_note, spinner_char, SizeInfo};
 /// Renders one file-browser pane. When `active`, the pane shows its cursor and
 /// any active search filter; otherwise it renders dimmed with no cursor.
 pub fn render(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, active: bool) {
-    // Grid mode replaces the one-row-per-file list with a thumbnail grid.
-    if matches!(app.preview_mode, crate::app::PreviewMode::Grid) {
+    // Grid mode replaces the one-row-per-file list with a thumbnail grid —
+    // on the highlighted (active) pane only; the other pane stays a list.
+    if active && matches!(app.preview_mode, crate::app::PreviewMode::Grid) {
         render_grid(f, app, area, pane_index, active);
         return;
     }
@@ -203,7 +204,7 @@ fn render_grid(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, acti
         let dim = Style::default().fg(Color::DarkGray);
 
         // Image area: thumbnail, or a kind glyph for folders/unsupported.
-        if !entry.is_dir && crate::services::thumbnails::is_previewable(&entry.path) {
+        if !entry.is_dir && app.preview_supported(&entry.path) {
             let req = crate::services::thumbnails::ThumbRequest {
                 path: entry.path.clone(),
                 mtime: entry.modified,
@@ -216,7 +217,17 @@ fn render_grid(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, acti
                 None => f.render_widget(Paragraph::new(Span::raw(" …").style(dim)), img_area),
             }
         } else {
-            let glyph = if entry.is_dir { "□" } else { "·" };
+            let glyph = if entry.is_dir {
+                "□"
+            } else if matches!(
+                crate::services::thumbnails::preview_kind(&entry.path),
+                Some(crate::services::thumbnails::PreviewKind::Video)
+            ) {
+                // Video without the optional ffmpeg runtime dependency.
+                "▶"
+            } else {
+                "·"
+            };
             f.render_widget(
                 Paragraph::new(Span::styled(glyph, dim)).centered(),
                 img_area,
