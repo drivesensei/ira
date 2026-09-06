@@ -330,6 +330,25 @@ fn run_batch(
     Ok(())
 }
 
+/// Windows fallback for symlink sources: creating symlinks needs
+/// privileges, so the link is followed and its destination copied as a
+/// regular file or directory. Broken links and link cycles fail with an
+/// error instead of recursing (canonicalize resolves the chain or errors).
+#[cfg(not(unix))]
+fn copy_file_follow(
+    src: &Path,
+    dst: &Path,
+    control: &JobControl,
+    id: u64,
+    tx: &mpsc::Sender<JobEvent>,
+    bytes: &mut u64,
+) -> Result<(), JobError> {
+    let target = fs::read_link(src)?;
+    let link_dir = src.parent().unwrap_or(Path::new("."));
+    let resolved = fs::canonicalize(link_dir.join(&target))?;
+    copy_entry(&resolved, dst, control, id, tx, bytes)
+}
+
 fn copy_entry(
     src: &Path,
     dst: &Path,
