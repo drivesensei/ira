@@ -99,7 +99,7 @@ after a restart.
 
 | Key | Action |
 | --- | --- |
-| `v` | Cycle image preview: off → column → grid |
+| `v` | Cycle the active pane's image preview: off → column → grid (per pane, persisted) |
 
 **Column** renders the selected entry as an image in a side column. **Grid** replaces the file
 list with a thumbnail grid — image thumbnails, glyphs for folders and unsupported formats, the

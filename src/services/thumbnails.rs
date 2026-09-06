@@ -27,13 +27,15 @@ pub const DECODE_MAX_ALLOC: u64 = 256 * 1024 * 1024;
 
 /// Upper bound on decode workers. Scrolling a photo folder must never fork
 /// the machine; `available_parallelism` is capped because each in-flight
-/// decode can hold up to [`DECODE_MAX_ALLOC`] of pixel data.
-pub const MAX_DECODE_THREADS: usize = 4;
+/// decode can hold up to [`DECODE_MAX_ALLOC`] of pixel data. Six workers
+/// keep up with scrolling photo folders while staying polite on 8-core
+/// machines (the UI thread still gets a core).
+pub const MAX_DECODE_THREADS: usize = 6;
 
 /// Queued-request capacity between the UI and the worker pool. `try_send`
 /// into a full queue is dropped (retried on a later frame), so scrolling
 /// cannot build an unbounded backlog.
-pub const JOB_QUEUE_CAP: usize = 16;
+pub const JOB_QUEUE_CAP: usize = 64;
 
 /// Maximum number of files kept in the on-disk thumbnail cache; the oldest
 /// (by mtime) are removed at startup.

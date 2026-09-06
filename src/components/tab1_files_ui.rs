@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use ratatui::{
-    layout::Rect,
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::Span,
     widgets::{Block, List, ListState, Paragraph},
@@ -13,13 +13,32 @@ use crate::services::file_info::{list_note, spinner_char, SizeInfo};
 
 /// Renders one file-browser pane. When `active`, the pane shows its cursor and
 /// any active search filter; otherwise it renders dimmed with no cursor.
+/// Dispatches to the pane's preview mode: grid, list + own preview column,
+/// or the plain list. Modes are per pane — switching panes with Tab never
+/// touches either pane's mode.
 pub fn render(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, active: bool) {
-    // Grid mode replaces the one-row-per-file list with a thumbnail grid —
-    // on the highlighted (active) pane only; the other pane stays a list.
-    if active && matches!(app.preview_mode, crate::app::PreviewMode::Grid) {
-        render_grid(f, app, area, pane_index, active);
-        return;
+    match app.panes[pane_index].preview_mode {
+        crate::app::PreviewMode::Grid => {
+            render_grid(f, app, area, pane_index, active);
+        }
+        crate::app::PreviewMode::Column => {
+            let with_preview = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Min(24),
+                    Constraint::Max(crate::components::preview_ui::PREVIEW_COLS),
+                ])
+                .split(area);
+            render_list(f, app, with_preview[0], pane_index, active);
+            crate::components::preview_ui::render(f, app, with_preview[1], pane_index);
+        }
+        crate::app::PreviewMode::Off => {
+            render_list(f, app, area, pane_index, active);
+        }
     }
+}
+
+fn render_list(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, active: bool) {
     let height = area.height.saturating_sub(2) as usize;
 
     let (title, file_spans, window_start, cursor) = {
@@ -150,7 +169,7 @@ fn render_grid(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, acti
     let grid_rows = (inner_h / (GRID_IMG_H + GRID_NAME_H) as usize).max(1);
     let per_screen = cols * grid_rows;
 
-    let (title, top, window) = {
+    let (title, top, window, prefetch) = {
         let pane = &app.panes[pane_index];
         let Some(folder) = &pane.folder else {
             f.render_widget(
@@ -169,7 +188,16 @@ fn render_grid(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, acti
             .iter()
             .map(|(i, e)| (*i, (*e).clone()))
             .collect();
-        (title, top, window)
+        // Prefetch one screen above and below the visible window so
+        // scrolling shows already-decoded thumbnails.
+        let pf_from = top.saturating_sub(per_screen);
+        let prefetch: Vec<crate::services::list_files::FEntry> = rows
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| (*i < top || *i >= end) && *i >= pf_from && *i < end + per_screen)
+            .map(|(_, (_, e))| (*e).clone())
+            .collect();
+        (title, top, window, prefetch)
     };
     app.panes[pane_index].grid_top = top;
 
@@ -194,10 +222,12 @@ fn render_grid(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, acti
             width: GRID_CELL_W,
             height: GRID_IMG_H,
         };
+        // One column of padding on each side so neighboring names don't
+        // read as one word; the thumbnail above stays full-bleed.
         let name_area = Rect {
-            x: cell_x,
+            x: cell_x + 1,
             y: cell_y + GRID_IMG_H,
-            width: GRID_CELL_W,
+            width: GRID_CELL_W.saturating_sub(2),
             height: GRID_NAME_H,
         };
         let is_selected = active && selected == Some(top + k);
@@ -257,6 +287,10 @@ fn render_grid(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, acti
             name_area,
         );
     }
+
+    // Prefetch the screens adjacent to the viewport (no-ops for cached
+    // entries; the job queue caps how much this can enqueue per frame).
+    app.prefetch_grid_cells(pane_index, &prefetch, GRID_CELL_W, GRID_IMG_H);
 }
 
 /// Computes the first visible index of a grid window of `per_screen` cells,

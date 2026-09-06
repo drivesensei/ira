@@ -25,6 +25,8 @@ pub struct SessionState {
     pub show_hidden: bool,
     pub left: Option<Folder>,
     pub right: Option<Folder>,
+    /// Per-pane image preview mode (0=off, 1=column, 2=grid).
+    pub preview: [u8; 2],
     pub sizes: Vec<SizeEntry>,
 }
 
@@ -73,6 +75,8 @@ fn serialize_state(state: &SessionState) -> String {
     content.push_str(&format!("split={}\n", state.split as u8));
     content.push_str(&format!("active={}\n", state.active_pane));
     content.push_str(&format!("hidden={}\n", state.show_hidden as u8));
+    content.push_str(&format!("preview0={}\n", state.preview[0]));
+    content.push_str(&format!("preview1={}\n", state.preview[1]));
     for (key, folder) in [("left", &state.left), ("right", &state.right)] {
         match folder {
             Some(f) => content.push_str(&format!("{}={}\t{}\n", key, f.label, f.path)),
@@ -103,6 +107,8 @@ fn parse_state(contents: &str) -> SessionState {
             "split" => state.split = value == "1",
             "active" => state.active_pane = value.parse::<usize>().unwrap_or(0).min(1),
             "hidden" => state.show_hidden = value == "1",
+            "preview0" => state.preview[0] = value.parse::<u8>().unwrap_or(0).min(2),
+            "preview1" => state.preview[1] = value.parse::<u8>().unwrap_or(0).min(2),
             "left" => state.left = parse_folder(value),
             "right" => state.right = parse_folder(value),
             "size" => {
@@ -201,6 +207,7 @@ mod tests {
                 "/mnt/data".to_string(),
                 '#',
             )),
+            preview: [1, 2],
             sizes: vec![
                 SizeEntry {
                     path: "/home/vlad/big folder".to_string(),
@@ -222,6 +229,7 @@ mod tests {
         };
         assert_eq!(parse_state(&serialize_state(&state)), state);
         assert!(state.show_hidden, "hidden flag must roundtrip");
+        assert_eq!(state.preview, [1, 2], "preview modes must roundtrip");
     }
 
     #[test]

@@ -8,25 +8,29 @@ use ratatui::{
 
 use crate::app::App;
 
-/// Width of the preview column in terminal cells.
+/// Width of the preview column in terminal cells (upper bound; the column
+/// yields space to the panes on narrow terminals).
 pub const PREVIEW_COLS: u16 = 40;
 
-/// Renders the image preview column: the active pane's selected entry as a
+/// Renders one pane's preview column: that pane's selected entry as a
 /// terminal image (protocol chosen at startup by `Picker`), or a contextual
 /// placeholder while a background decode runs / when nothing is previewable.
-pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
+/// Also prefetches the next images in the pane's visible order so scrolling
+/// shows already-decoded thumbnails.
+pub fn render(frame: &mut Frame, app: &mut App, area: Rect, pane_index: usize) {
     let block = Block::bordered().title(" Preview (v) ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     // Report the drawable area back so the app requests protocols that fit
     // exactly (protocol encoding is area-dependent).
-    app.preview_area = (inner.width, inner.height);
+    app.panes[pane_index].preview_area = (inner.width, inner.height);
 
-    // A modal dialog centered over the files area cannot hide a
-    // graphics-protocol image (it lives above the cell grid), so suspend
-    // the preview while any overlay is open.
-    if app.overlay_covers_preview() {
+    let suspended = app.overlay_covers_preview();
+    if suspended {
+        // A modal dialog centered over the files area cannot hide a
+        // graphics-protocol image (it lives above the cell grid), so
+        // suspend the preview while any overlay is open.
         frame.render_widget(
             Paragraph::new(Line::raw(" preview paused "))
                 .style(Style::default().fg(Color::DarkGray)),
@@ -34,26 +38,27 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         );
         return;
     }
-    match app.preview_request() {
+
+    match app.preview_request_for(pane_index) {
         Some(req) => {
             if let Some(protocol) = app.preview_protocol(&req) {
                 frame.render_widget(ratatui_image::Image::new(protocol), inner);
-                return;
+            } else {
+                // First sight dispatched a background job; the thumbnail
+                // appears on a later frame. Never block the render thread.
+                let label = std::path::Path::new(&req.path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                frame.render_widget(
+                    Paragraph::new(Line::raw(format!(" loading {label}… ")))
+                        .style(Style::default().fg(Color::DarkGray)),
+                    inner,
+                );
             }
-            // First sight dispatched a background job; the thumbnail appears
-            // on a later frame. Never block the render thread here.
-            let label = std::path::Path::new(&req.path)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            frame.render_widget(
-                Paragraph::new(Line::raw(format!(" loading {label}… ")))
-                    .style(Style::default().fg(Color::DarkGray)),
-                inner,
-            );
         }
         None => {
-            let reason = match app.selected_visible_entry() {
+            let reason = match app.selected_visible_entry_for(pane_index) {
                 None => " select a file ",
                 Some(entry) if entry.is_dir => " folders have no image preview ",
                 Some(entry) => match crate::services::thumbnails::preview_kind(&entry.path) {
@@ -76,4 +81,8 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
             );
         }
     }
+
+    // Prefetch the next images in visible order ("instant" scrolling). A
+    // no-op while an overlay is open.
+    app.prefetch_column(pane_index, 8);
 }

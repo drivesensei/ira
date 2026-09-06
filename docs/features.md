@@ -79,7 +79,7 @@ Shows the contents of the currently selected folder (`src/services/list_files.rs
 | `Alt+↑` / `Alt+↓` | Jump to top / bottom of the list |
 | `z` / `x` | Jump to top / bottom of the list |
 | `/` | Start fuzzy search of the current folder's files |
-| `v` | Cycle image preview: off → column → grid |
+| `v` | Cycle the active pane's image preview: off → column → grid (per pane, persisted) |
 | `+` | Split / unsplit the files pane (side by side) |
 | `Tab` | Switch focus (panes / Copy Board) |
 | `q` / `Ctrl+C` | Quit |
@@ -96,7 +96,7 @@ While searching, typed characters filter the file list by fuzzy subsequence matc
 
 **Selection & visibility:** `Space` multi-selects (rows show `[*]`/`[ ]`); `Ctrl+A` selects or clears everything, `Alt+I` inverts the selection. (Super-based binds are not reliable in terminals, so `Ctrl`/`Alt` are used instead.) `.` toggles whether hidden (dot) files are listed. Rows carry a folder glyph (`□`) or file glyph (`·`), both single-width Unicode that render identically on Linux/macOS/Windows terminal fonts.
 
-**Image preview:** `v` cycles preview modes. **Column** renders the selected file as an image in a side column. **Grid** replaces the file list with a thumbnail grid (image thumbnails, glyphs for folders and unsupported files, cursor highlighted; all formats the list shows are shown, including filtered views). Rendering picks the best protocol the terminal supports at startup — kitty, iTerm2, or Sixel for true graphics — and falls back to Unicode half-blocks everywhere else. Supported formats: PNG, JPEG, GIF, BMP, WebP — plus MP4/MOV videos and HEIC photos when `ffmpeg` is on `PATH` (optional runtime dependency; without it they show a `▶` glyph). Decoding runs on a bounded background worker pool and never blocks the UI; thumbnails are cached in memory and on disk (`~/.cache/ira/thumbnails`, keyed by path + mtime + size, so edited images refresh automatically).
+**Image preview:** `v` cycles the ACTIVE pane's preview mode — modes are per pane, survive restarts, and switching panes with Tab never changes either pane's mode. **Column** renders the selected file as an image in a side column. **Grid** replaces the file list with a thumbnail grid (image thumbnails, glyphs for folders and unsupported files, cursor highlighted; all formats the list shows are shown, including filtered views). Rendering picks the best protocol the terminal supports at startup — kitty, iTerm2, or Sixel for true graphics — and falls back to Unicode half-blocks everywhere else. Supported formats: PNG, JPEG, GIF, BMP, WebP — plus MP4/MOV videos and HEIC photos when `ffmpeg` is on `PATH` (optional runtime dependency; without it they show a `▶` glyph). Thumbnails for the screens adjacent to the viewport are prefetched in the background, so scrolling large folders feels instant. Decoding runs on a bounded background worker pool and never blocks the UI; thumbnails are cached in memory and on disk (`~/.cache/ira/thumbnails`, keyed by path + mtime + size, so edited images refresh automatically).
 
 ## Domain model
 

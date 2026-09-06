@@ -53,6 +53,12 @@ pub struct Pane {
     pub render_scroll: usize,
     /// First visible index of the grid-mode window (thumbnail grid).
     pub grid_top: usize,
+    /// Image preview presentation of THIS pane (`v` cycles it); modes are
+    /// per pane and persist across restarts.
+    pub preview_mode: PreviewMode,
+    /// Preview column area in cells; written by the UI every frame while
+    /// this pane's column is open (0 × 0 until the first preview frame).
+    pub preview_area: (u16, u16),
     /// `false` while a chunked listing is still streaming; `true` once the
     /// final sorted pass replaced the streamed prefix (or the listing
     /// errored). Test/UI hook for "listing is complete".
@@ -84,6 +90,26 @@ pub enum PreviewMode {
     Column,
     /// Thumbnail grid replacing the file list.
     Grid,
+}
+
+impl PreviewMode {
+    /// Persisted representation (state file `preview<N>=`).
+    pub fn as_u8(self) -> u8 {
+        match self {
+            PreviewMode::Off => 0,
+            PreviewMode::Column => 1,
+            PreviewMode::Grid => 2,
+        }
+    }
+
+    /// Inverse of [`PreviewMode::as_u8`]; unknown values read as off.
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => PreviewMode::Column,
+            2 => PreviewMode::Grid,
+            _ => PreviewMode::Off,
+        }
+    }
 }
 
 /// An in-place rename being edited in a modal text box.
@@ -310,11 +336,6 @@ pub struct App {
     /// Terminal image-rendering picker (protocol + font size), probed once
     /// at startup before raw mode. `None` disables previews entirely.
     pub picker: Option<Picker>,
-    /// Image preview presentation (`v` cycles off → column → grid).
-    pub preview_mode: PreviewMode,
-    /// Preview column area in cells; written by the UI every frame while
-    /// the column is open (0 × 0 until the first preview frame).
-    pub preview_area: (u16, u16),
     /// Finished preview jobs, delivered by the worker pool.
     thumb_tx: mpsc::Sender<ThumbEvent>,
     thumb_rx: mpsc::Receiver<ThumbEvent>,
@@ -333,8 +354,6 @@ pub struct App {
     /// Whether the optional `ffmpeg` runtime dependency is usable (probed
     /// once in the background); gates video and HEIC previews.
     ffmpeg_available: Arc<AtomicBool>,
-    /// Protocol currently displayed; kept alive across evictions.
-    thumb_shown: Option<String>,
     /// Decode workers started (once, on the first picker install).
     thumb_workers_started: bool,
     /// State file location override; `None` = the real `~/.config/ira/state`.
@@ -391,8 +410,6 @@ impl Default for App {
             file_list_tx,
             file_list_rx,
             picker: None,
-            preview_mode: PreviewMode::Off,
-            preview_area: (0, 0),
             info_tx,
             thumb_tx,
             thumb_rx,
@@ -403,7 +420,6 @@ impl Default for App {
             thumb_cache: HashMap::new(),
             thumb_order: VecDeque::new(),
             thumb_failed: HashMap::new(),
-            thumb_shown: None,
             info_rx,
             ffmpeg_available: Arc::new(AtomicBool::new(false)),
         }
@@ -850,6 +866,75 @@ impl App {
         }
     }
 
+    /// Dispatches thumbnail jobs for grid cells just outside the visible
+    /// window (prefetch): by the time the user scrolls there, the protocols
+    /// are usually cached. Deduped by `thumb_pending`, capped by the job
+    /// queue; the visible cells are always enqueued first (same frame), so
+    /// prefetch never starves them.
+    pub fn prefetch_grid_cells(
+        &mut self,
+        pane_index: usize,
+        entries: &[FEntry],
+        cols: u16,
+        rows: u16,
+    ) {
+        if self.panes[pane_index].preview_mode != PreviewMode::Grid {
+            return;
+        }
+        for entry in entries {
+            if entry.is_dir || !self.preview_supported(&entry.path) {
+                continue;
+            }
+            let req = ThumbRequest {
+                path: entry.path.clone(),
+                mtime: entry.modified,
+                size: entry.size,
+                cols,
+                rows,
+            };
+            let _ = self.preview_protocol(&req);
+        }
+    }
+
+    /// Dispatches thumbnail jobs for the entries near the column preview's
+    /// selection: `ahead` rows below and 2 above the cursor in visible
+    /// space, so scrolling the list previews the next images instantly.
+    pub fn prefetch_column(&mut self, pane_index: usize, ahead: usize) {
+        let (mode, area, sel) = {
+            let pane = &self.panes[pane_index];
+            (pane.preview_mode, pane.preview_area, pane.state.selected())
+        };
+        if mode != PreviewMode::Column || area.0 == 0 {
+            return;
+        }
+        let sel = sel.unwrap_or(0);
+        // Materialize the prefetch candidates (owned) before dispatching:
+        // `preview_protocol` takes `&mut self`.
+        let candidates: Vec<FEntry> = {
+            let vis = self.pane_visible_rows(pane_index);
+            let start = sel.saturating_sub(2);
+            vis.iter()
+                .skip(start)
+                .take(ahead + 2 + (sel - start))
+                .filter(|(vis_idx, entry)| *vis_idx != sel && !entry.is_dir)
+                .map(|(_, e)| (*e).clone())
+                .collect()
+        };
+        for entry in &candidates {
+            if !self.preview_supported(&entry.path) {
+                continue;
+            }
+            let req = ThumbRequest {
+                path: entry.path.clone(),
+                mtime: entry.modified,
+                size: entry.size,
+                cols: area.0,
+                rows: area.1,
+            };
+            let _ = self.preview_protocol(&req);
+        }
+    }
+
     /// Whether a modal overlay (dialogs centered over the files area) is
     /// open. Graphics-protocol previews (sixel/iTerm2) live in a layer above
     /// the cell grid, so they must be suppressed while a dialog is shown —
@@ -864,14 +949,17 @@ impl App {
             || self.deletion_box_visible()
     }
 
-    /// Cycles the image preview presentation (`v`): off → column → grid.
+    /// Cycles the image preview presentation of the ACTIVE pane (`v`):
+    /// off → column → grid. Modes are per pane — switching panes with Tab
+    /// never changes either pane's mode.
     pub fn cycle_preview(&mut self) {
-        self.preview_mode = match self.preview_mode {
+        let next = match self.pane().preview_mode {
             PreviewMode::Off => PreviewMode::Column,
             PreviewMode::Column => PreviewMode::Grid,
             PreviewMode::Grid => PreviewMode::Off,
         };
-        let label = match self.preview_mode {
+        self.pane_mut().preview_mode = next;
+        let label = match next {
             PreviewMode::Off => "off",
             PreviewMode::Column => "column",
             PreviewMode::Grid => "grid",
@@ -883,7 +971,12 @@ impl App {
     /// space (live search, confirmed filter, or the full listing).
     /// `state.selected()` is an index into those rows — never `files`.
     pub fn selected_visible_entry(&self) -> Option<&FEntry> {
-        let pane = self.pane();
+        self.selected_visible_entry_for(self.active_pane)
+    }
+
+    /// Per-pane variant of [`Self::selected_visible_entry`].
+    pub fn selected_visible_entry_for(&self, pane_index: usize) -> Option<&FEntry> {
+        let pane = &self.panes[pane_index];
         let vis = pane.state.selected()?;
         let indices = if self.is_searching() {
             self.search_matches()
@@ -899,10 +992,16 @@ impl App {
     /// `None` when the preview column has nothing to show an image for
     /// (closed, nothing selected, folder, unsupported format).
     pub fn preview_request(&self) -> Option<ThumbRequest> {
-        if self.preview_mode == PreviewMode::Off {
+        self.preview_request_for(self.active_pane)
+    }
+
+    /// Per-pane variant of [`Self::preview_request`].
+    pub fn preview_request_for(&self, pane_index: usize) -> Option<ThumbRequest> {
+        let pane = &self.panes[pane_index];
+        if pane.preview_mode == PreviewMode::Off {
             return None;
         }
-        let entry = self.selected_visible_entry()?;
+        let entry = self.selected_visible_entry_for(pane_index)?;
         if entry.is_dir || !self.preview_supported(&entry.path) {
             return None;
         }
@@ -910,8 +1009,8 @@ impl App {
             path: entry.path.clone(),
             mtime: entry.modified,
             size: entry.size,
-            cols: self.preview_area.0,
-            rows: self.preview_area.1,
+            cols: pane.preview_area.0,
+            rows: pane.preview_area.1,
         })
     }
 
@@ -924,7 +1023,6 @@ impl App {
         self.pick_up_thumbnails();
         let key = req.mem_key();
         if let Some(protocol) = self.thumb_cache.get(&key) {
-            self.thumb_shown = Some(key);
             return Some(protocol);
         }
         if let Some(failed_at) = self.thumb_failed.get(&key) {
@@ -973,12 +1071,7 @@ impl App {
             let Some(oldest) = self.thumb_order.pop_front() else {
                 break;
             };
-            if self.thumb_shown.as_ref() != Some(&oldest) {
-                self.thumb_cache.remove(&oldest);
-            } else {
-                self.thumb_order.push_back(oldest);
-                break;
-            }
+            self.thumb_cache.remove(&oldest);
         }
         self.thumb_cache.insert(key.clone(), protocol);
         self.thumb_order.push_back(key);
@@ -2767,6 +2860,9 @@ impl App {
         if let Some(right) = state.right {
             self.panes[1].folder = Some(right);
         }
+        // Preview modes are per pane and survive restarts.
+        self.panes[0].preview_mode = PreviewMode::from_u8(state.preview[0]);
+        self.panes[1].preview_mode = PreviewMode::from_u8(state.preview[1]);
         // Folder sizes measured in earlier sessions reappear instantly;
         // re-querying one of these folders skips the walk.
         self.restore_sizes(state.sizes);
@@ -2820,6 +2916,10 @@ impl App {
             show_hidden: self.show_hidden,
             left: self.panes[0].folder.clone(),
             right: self.panes[1].folder.clone(),
+            preview: [
+                self.panes[0].preview_mode.as_u8(),
+                self.panes[1].preview_mode.as_u8(),
+            ],
             sizes: self.size_entries(),
         };
         match &self.state_path {
@@ -3124,6 +3224,10 @@ mod tests {
                 show_hidden: app.show_hidden,
                 left: app.panes[0].folder.clone(),
                 right: app.panes[1].folder.clone(),
+                preview: [
+                    app.panes[0].preview_mode.as_u8(),
+                    app.panes[1].preview_mode.as_u8(),
+                ],
                 sizes: entries,
             },
         );
@@ -3366,8 +3470,8 @@ mod preview_tests {
     fn app_with_selection(path: &str) -> App {
         let mut app = App::default();
         app.set_picker(ratatui_image::picker::Picker::halfblocks());
-        app.preview_mode = PreviewMode::Column;
-        app.preview_area = (38, 10);
+        app.panes[0].preview_mode = PreviewMode::Column;
+        app.panes[0].preview_area = (38, 10);
         app.panes[0].files = vec![FEntry {
             path: path.to_string(),
             label: "img.png".to_string(),
@@ -3380,22 +3484,36 @@ mod preview_tests {
     }
 
     #[test]
-    fn cycle_preview_walks_modes() {
+    fn cycle_preview_walks_modes_per_pane() {
         let mut app = App::default();
-        assert_eq!(app.preview_mode, PreviewMode::Off);
+        assert_eq!(app.panes[0].preview_mode, PreviewMode::Off);
         app.cycle_preview();
-        assert_eq!(app.preview_mode, PreviewMode::Column);
+        assert_eq!(app.panes[0].preview_mode, PreviewMode::Column);
         app.cycle_preview();
-        assert_eq!(app.preview_mode, PreviewMode::Grid);
+        assert_eq!(app.panes[0].preview_mode, PreviewMode::Grid);
         app.cycle_preview();
-        assert_eq!(app.preview_mode, PreviewMode::Off);
+        assert_eq!(app.panes[0].preview_mode, PreviewMode::Off);
+    }
+
+    #[test]
+    fn preview_modes_are_independent_per_pane() {
+        let mut app = App::default();
+        app.split = true; // Tab moves focus between panes only when split
+        app.cycle_preview(); // pane 0 -> Column
+        app.switch_pane(); // focus pane 1
+        app.cycle_preview();
+        app.cycle_preview(); // pane 1 -> Grid
+                             // Switching focus never altered the other pane's mode.
+        assert_eq!(app.panes[0].preview_mode, PreviewMode::Column);
+        assert_eq!(app.panes[1].preview_mode, PreviewMode::Grid);
     }
 
     #[test]
     fn preview_supported_gates_video_on_ffmpeg_probe() {
         use std::sync::atomic::AtomicBool;
         let mut app = App::default();
-        app.preview_mode = PreviewMode::Column;
+        app.panes[0].preview_mode = PreviewMode::Column;
+        app.panes[0].preview_area = (38, 10);
         app.panes[0].files = vec![FEntry {
             path: "/tmp/clip.mp4".into(),
             label: "clip.mp4".into(),
@@ -3426,8 +3544,8 @@ mod preview_tests {
         let png_b = png_at("filter_b.png");
         let mut app = App::default();
         app.set_picker(ratatui_image::picker::Picker::halfblocks());
-        app.preview_mode = PreviewMode::Column;
-        app.preview_area = (38, 10);
+        app.panes[0].preview_mode = PreviewMode::Column;
+        app.panes[0].preview_area = (38, 10);
         app.panes[0].files = vec![
             FEntry {
                 path: png_a.clone(),
@@ -3467,7 +3585,7 @@ mod preview_tests {
 
         // Closed preview: no request even for a valid image.
         app.panes[0].files[0].path = png;
-        app.preview_mode = PreviewMode::Off;
+        app.panes[0].preview_mode = PreviewMode::Off;
         assert!(app.preview_request().is_none());
     }
 
@@ -3514,7 +3632,6 @@ mod preview_tests {
     fn queued_requests_all_resolve_through_the_pool() {
         let mut app = App::default();
         app.set_picker(ratatui_image::picker::Picker::halfblocks());
-        app.preview_area = (38, 10);
         let reqs: Vec<ThumbRequest> = (0..6)
             .map(|i| ThumbRequest {
                 path: png_at(&format!("pool{i}.png")),
@@ -3561,7 +3678,7 @@ mod preview_tests {
         let backend = ratatui::backend::TestBackend::new(50, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| crate::components::preview_ui::render(f, &mut app, f.area()))
+            .draw(|f| crate::components::preview_ui::render(f, &mut app, f.area(), 0))
             .unwrap();
         assert!(
             app.thumb_pending.is_empty(),
@@ -3574,7 +3691,7 @@ mod preview_tests {
         let paths: Vec<String> = (0..12).map(|i| png_at(&format!("grid{i}.png"))).collect();
         let mut app = App::default();
         app.set_picker(ratatui_image::picker::Picker::halfblocks());
-        app.preview_mode = PreviewMode::Grid;
+        app.panes[0].preview_mode = PreviewMode::Grid;
         app.panes[0].folder = Some(Folder::new(
             "grid".into(),
             std::env::temp_dir().to_string_lossy().into_owned(),

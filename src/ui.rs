@@ -84,22 +84,8 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         crate::components::copy_board_ui::render(frame, app, board[1]);
         files_area = board[0];
     }
-    // Image preview column (`v`): a fixed right slice of the files area,
-    // inside any Copy Board sidebar and outside the pane split.
-    let preview_area = if matches!(app.preview_mode, crate::app::PreviewMode::Column) {
-        let with_preview = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Min(24),
-                Constraint::Max(crate::components::preview_ui::PREVIEW_COLS),
-            ])
-            .split(files_area);
-        files_area = with_preview[0];
-        Some(with_preview[1])
-    } else {
-        None
-    };
-
+    // Preview columns (per-pane `v` column mode) are drawn inside each
+    // pane's own renderer; the files area itself is untouched here.
     if app.split {
         let files = Layout::default()
             .direction(Direction::Horizontal)
@@ -109,10 +95,6 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         crate::components::tab1_files_ui::render(frame, app, files[1], 1, app.active_pane == 1);
     } else {
         crate::components::tab1_files_ui::render(frame, app, files_area, 0, true);
-    }
-
-    if let Some(preview) = preview_area {
-        crate::components::preview_ui::render(frame, app, preview);
     }
 
     // Deletion progress dialog: shown while the background delete worker
