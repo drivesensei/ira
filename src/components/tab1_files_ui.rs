@@ -14,7 +14,11 @@ use crate::services::file_info::{list_note, spinner_char, SizeInfo};
 /// Renders one file-browser pane. When `active`, the pane shows its cursor and
 /// any active search filter; otherwise it renders dimmed with no cursor.
 pub fn render(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, active: bool) {
-    // Rows visible inside the bordered block.
+    // Grid mode replaces the one-row-per-file list with a thumbnail grid.
+    if matches!(app.preview_mode, crate::app::PreviewMode::Grid) {
+        render_grid(f, app, area, pane_index, active);
+        return;
+    }
     let height = area.height.saturating_sub(2) as usize;
 
     let (title, file_spans, window_start, cursor) = {
@@ -128,6 +132,141 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, activ
     }
 }
 
+/// Grid-cell geometry: image area on top, one name line below.
+const GRID_CELL_W: u16 = 14;
+const GRID_IMG_H: u16 = 4;
+const GRID_NAME_H: u16 = 1;
+
+/// Thumbnail grid for one pane: every visible image entry is rendered as a
+/// thumbnail (dispatched through the same cache/pool as the preview column),
+/// folders and unsupported files as centered glyphs. Visible index space is
+/// the pane's rendered rows (live search / filter / full list), matching
+/// `state.selected()`.
+fn render_grid(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, active: bool) {
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let cols = (inner_w / GRID_CELL_W as usize).max(1);
+    let grid_rows = (inner_h / (GRID_IMG_H + GRID_NAME_H) as usize).max(1);
+    let per_screen = cols * grid_rows;
+
+    let (title, top, window) = {
+        let pane = &app.panes[pane_index];
+        let Some(folder) = &pane.folder else {
+            f.render_widget(
+                Paragraph::new("").block(Block::bordered().title("  ")),
+                area,
+            );
+            return;
+        };
+        let title = format!("  {}  {}  ", folder.label, folder.path);
+        let rows = app.pane_visible_rows(pane_index);
+        let total = rows.len();
+        let selected = pane.state.selected();
+        let top = grid_window(total, selected, pane.grid_top, per_screen);
+        let end = (top + per_screen).min(total);
+        let window: Vec<(usize, crate::services::list_files::FEntry)> = rows[top..end]
+            .iter()
+            .map(|(i, e)| (*i, (*e).clone()))
+            .collect();
+        (title, top, window)
+    };
+    app.panes[pane_index].grid_top = top;
+
+    let border_style = if active {
+        Style::default()
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let block = Block::bordered().title(title).border_style(border_style);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let selected = app.panes[pane_index].state.selected();
+    for (k, (file_idx, entry)) in window.iter().enumerate() {
+        let col = (k % cols) as u16;
+        let row = (k / cols) as u16;
+        let cell_x = inner.x + col * GRID_CELL_W;
+        let cell_y = inner.y + row * (GRID_IMG_H + GRID_NAME_H);
+        let img_area = Rect {
+            x: cell_x,
+            y: cell_y,
+            width: GRID_CELL_W,
+            height: GRID_IMG_H,
+        };
+        let name_area = Rect {
+            x: cell_x,
+            y: cell_y + GRID_IMG_H,
+            width: GRID_CELL_W,
+            height: GRID_NAME_H,
+        };
+        let is_selected = active && selected == Some(top + k);
+        let dim = Style::default().fg(Color::DarkGray);
+
+        // Image area: thumbnail, or a kind glyph for folders/unsupported.
+        if !entry.is_dir && crate::services::thumbnails::is_previewable(&entry.path) {
+            let req = crate::services::thumbnails::ThumbRequest {
+                path: entry.path.clone(),
+                mtime: entry.modified,
+                size: entry.size,
+                cols: GRID_CELL_W,
+                rows: GRID_IMG_H,
+            };
+            match app.preview_protocol(&req) {
+                Some(protocol) => f.render_widget(ratatui_image::Image::new(protocol), img_area),
+                None => f.render_widget(Paragraph::new(Span::raw(" …").style(dim)), img_area),
+            }
+        } else {
+            let glyph = if entry.is_dir { "□" } else { "·" };
+            f.render_widget(
+                Paragraph::new(Span::styled(glyph, dim)).centered(),
+                img_area,
+            );
+        }
+
+        // Name line: reversed for the cursor; `*` marks multi-selection.
+        let marker = if app.panes[pane_index]
+            .selected
+            .get(*file_idx)
+            .copied()
+            .unwrap_or(false)
+        {
+            "*"
+        } else {
+            ""
+        };
+        let name_style = if is_selected {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else if !active {
+            dim
+        } else {
+            Style::default()
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled(format!("{marker}{}", entry.label), name_style)),
+            name_area,
+        );
+    }
+}
+
+/// Computes the first visible index of a grid window of `per_screen` cells,
+/// keeping the cursor inside, seeded from the previous window start.
+fn grid_window(total: usize, selected: Option<usize>, scroll: usize, per_screen: usize) -> usize {
+    if total == 0 || per_screen == 0 {
+        return 0;
+    }
+    let max_top = total.saturating_sub(per_screen);
+    let mut top = scroll.min(max_top);
+    if let Some(sel) = selected {
+        let sel = sel.min(total - 1);
+        if sel < top {
+            top = sel;
+        } else if sel >= top + per_screen {
+            top = sel + 1 - per_screen;
+        }
+    }
+    top
+}
+
 /// Computes the `(start, end)` row window to render for a list of `total`
 /// rows, keeping the cursor row (`selected`) inside a viewport of `height`
 /// rows, seeded from the previous window start (`scroll`). Clamps `end` to
@@ -191,8 +330,7 @@ fn icon_for(is_dir: bool) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::row_span;
-    use super::visible_window;
+    use super::{grid_window, row_span, visible_window};
     use crate::services::list_files::FEntry;
 
     #[test]
@@ -311,5 +449,20 @@ mod tests {
         // No selection keeps the window parked at the clamped scroll.
         assert_eq!(visible_window(1000, None, 30, 20), (30, 50));
         assert_eq!(visible_window(10, None, 30, 20), (0, 10));
+    }
+
+    #[test]
+    fn grid_window_keeps_cursor_inside_viewport() {
+        // Fewer cells than the viewport: window stays at 0.
+        assert_eq!(grid_window(10, Some(9), 0, 20), 0);
+        // Cursor walks past the window: window follows.
+        assert_eq!(grid_window(100, Some(25), 0, 20), 6);
+        // Cursor walks back above it: window follows.
+        assert_eq!(grid_window(100, Some(5), 6, 20), 5);
+        // Stale scroll beyond the last full page clamps.
+        assert_eq!(grid_window(30, None, 25, 20), 10);
+        // Empty list / zero viewport.
+        assert_eq!(grid_window(0, Some(0), 0, 20), 0);
+        assert_eq!(grid_window(10, Some(0), 0, 0), 0);
     }
 }

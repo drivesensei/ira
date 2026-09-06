@@ -99,12 +99,15 @@ after a restart.
 
 | Key | Action |
 | --- | --- |
-| `v` | Toggle the preview column for the selected entry |
+| `v` | Cycle image preview: off → column → grid |
 
-Select an image (PNG, JPEG, GIF, BMP, WebP) and ira renders it in a side column — full graphics
-in terminals that support the kitty, iTerm2, or Sixel protocols, Unicode half-blocks everywhere
-else. Decoding happens on background threads and is cached in memory and on disk, so scrolling
-through a folder of photos stays instant and the UI never blocks.
+**Column** renders the selected entry as an image in a side column. **Grid** replaces the file
+list with a thumbnail grid — image thumbnails, glyphs for folders and unsupported formats, the
+cursor highlighted, filtered (`/`) views included. Select an image (PNG, JPEG, GIF, BMP, WebP)
+and ira renders it with full graphics in terminals that support the kitty, iTerm2, or Sixel
+protocols, Unicode half-blocks everywhere else. Decoding happens on a bounded background worker
+pool and is cached in memory and on disk, so scrolling through a folder of photos stays instant
+and the UI never blocks.
 
 ## Create, Go To, and Clipboard
 

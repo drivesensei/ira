@@ -86,7 +86,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     }
     // Image preview column (`v`): a fixed right slice of the files area,
     // inside any Copy Board sidebar and outside the pane split.
-    let preview_area = if app.preview {
+    let preview_area = if matches!(app.preview_mode, crate::app::PreviewMode::Column) {
         let with_preview = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
