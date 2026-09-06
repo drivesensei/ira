@@ -210,10 +210,16 @@ pub const EDIT_MAX_BYTES: u64 = 5 * 1024 * 1024;
 pub struct EditState {
     /// Which pane's preview column owns this editor.
     pub pane_index: usize,
+    /// Path as listed in the pane (display + entry lookup).
     pub path: String,
-    /// mtime (epoch secs) when opened / last saved — the on-disk change
-    /// guard for `save_edit`.
-    pub mtime_at_open: Option<i64>,
+    /// Canonical filesystem path used for ALL I/O: saving via the listed
+    /// path would `rename` over a symlink and destroy the link instead of
+    /// updating its target.
+    pub fs_path: std::path::PathBuf,
+    /// Full-precision mtime when opened / last saved — the on-disk change
+    /// guard for `save_edit`. Second-granularity comparisons clobber
+    /// external edits made within the same second.
+    pub mtime_at_open: Option<SystemTime>,
     /// Original permissions, restored on save.
     pub permissions: std::fs::Permissions,
     pub textarea: ratatui_textarea::TextArea<'static>,
@@ -221,11 +227,15 @@ pub struct EditState {
     pub dirty: bool,
     /// Opened without write access: the buffer renders but never saves.
     pub read_only: bool,
+    /// File uses CRLF endings; Enter inserts `\r\n` to stay consistent.
+    pub crlf: bool,
 }
 
 /// Head of a text file for the preview column.
 #[derive(Debug, Clone)]
 pub struct TextPreview {
+    /// Listed path of the file this head came from (cache eviction key).
+    pub path: String,
     pub content: String,
     /// NUL byte found in the head — treat as binary, don't render text.
     pub binary: bool,
@@ -591,6 +601,15 @@ impl App {
         if cleaned.is_empty() {
             return;
         }
+        if self.edit_focus {
+            if let Some(edit) = &mut self.edit {
+                if !edit.read_only {
+                    edit.textarea.insert_str(cleaned);
+                    edit.dirty = true;
+                }
+            }
+            return;
+        }
         if self.goto_prompt.is_some() {
             self.goto_push(cleaned);
         } else if let Some(p) = self.new_entry.as_mut() {
@@ -944,8 +963,27 @@ impl App {
         if entry.is_dir || preview_kind(&entry.path) != Some(PreviewKind::Text) {
             return;
         }
-        let path = entry.path.clone();
-        let metadata = match std::fs::metadata(&path) {
+        let list_path = entry.path.clone();
+        // Canonicalize for I/O: saving renames over this path, and renaming
+        // a symlink destroys the link instead of updating its target.
+        let fs_path = match std::fs::canonicalize(&list_path) {
+            Ok(p) => p,
+            Err(e) => {
+                self.set_status(format!("open failed: {e}"), true);
+                return;
+            }
+        };
+        // One consistent snapshot: metadata is taken on the OPEN HANDLE, so
+        // the mtime guard compares against exactly the bytes we read — not
+        // a stat from an earlier moment (TOCTOU).
+        let file = match std::fs::File::open(&fs_path) {
+            Ok(f) => f,
+            Err(e) => {
+                self.set_status(format!("open failed: {e}"), true);
+                return;
+            }
+        };
+        let metadata = match file.metadata() {
             Ok(m) => m,
             Err(e) => {
                 self.set_status(format!("open failed: {e}"), true);
@@ -956,13 +994,19 @@ impl App {
             self.set_status("file too large to edit (> 5 MB)", true);
             return;
         }
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(e) => {
-                self.set_status(format!("open failed: {e}"), true);
-                return;
-            }
-        };
+        // Cap the read itself (+1 sentinel): a file that grows between the
+        // size check and the read can't blow the memory budget.
+        let mut bytes = Vec::new();
+        let mut reader = file.take(EDIT_MAX_BYTES + 1);
+        use std::io::Read as _;
+        if let Err(e) = reader.read_to_end(&mut bytes) {
+            self.set_status(format!("open failed: {e}"), true);
+            return;
+        }
+        if bytes.len() as u64 > EDIT_MAX_BYTES {
+            self.set_status("file too large to edit (> 5 MB)", true);
+            return;
+        }
         if bytes.contains(&0) {
             self.set_status("binary file — not editable", true);
             return;
@@ -974,22 +1018,32 @@ impl App {
                 return;
             }
         };
-        let mtime_at_open = metadata
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64);
+        let mtime_at_open = metadata.modified().ok();
+        // CRLF files are normalized to LF in the buffer and re-encoded on
+        // save: the textarea strips CR on every insert path, so keeping CR
+        // in the buffer would produce mixed endings after an edit.
+        let crlf = content.contains("\r\n");
+        let normalized = if crlf {
+            content.replace("\r\n", "\n")
+        } else {
+            content
+        };
         let textarea = ratatui_textarea::TextArea::from(
-            content.split('\n').map(str::to_string).collect::<Vec<_>>(),
+            normalized
+                .split('\n')
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
         );
         self.edit = Some(EditState {
             pane_index,
-            path,
+            path: list_path,
+            fs_path,
             mtime_at_open,
             permissions: metadata.permissions(),
             textarea,
             dirty: false,
             read_only: metadata.permissions().readonly(),
+            crlf,
         });
     }
 
@@ -999,14 +1053,28 @@ impl App {
     }
 
     /// Forwards a key event to the editor buffer; reports whether the
-    /// buffer changed (drives the dirty marker).
+    /// buffer changed (drives the dirty marker). Read-only editors accept
+    /// movement keys (so the head can be scrolled) but no modifications.
     pub fn edit_input(&mut self, key: ratatui::crossterm::event::KeyEvent) -> bool {
+        use ratatui::crossterm::event::KeyCode;
         let Some(edit) = &mut self.edit else {
             return false;
         };
         if edit.read_only {
-            return false;
+            return match key.code {
+                KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::PageUp
+                | KeyCode::PageDown => edit.textarea.input(key),
+                _ => false,
+            };
         }
+        // The buffer is LF-normalized (CRLF re-encoded on save), so every
+        // key — Enter included — flows through unchanged.
         let modified = edit.textarea.input(key);
         if modified {
             edit.dirty = true;
@@ -1018,41 +1086,50 @@ impl App {
     /// permissions, guarding against on-disk changes, and refreshing the
     /// pane entry + caches so previews re-read the saved content.
     pub fn save_edit(&mut self) {
+        let name = self
+            .edit
+            .as_ref()
+            .map(|e| {
+                std::path::Path::new(&e.path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
         let Some(edit) = &mut self.edit else {
             return;
         };
-        let name = std::path::Path::new(&edit.path)
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
         if edit.read_only {
             self.set_status(format!("{name} is read-only"), true);
             return;
         }
         // On-disk change guard: refuse to clobber a file modified elsewhere.
-        match std::fs::metadata(&edit.path) {
-            Ok(m) => {
-                let mtime = m
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64);
-                if mtime != edit.mtime_at_open {
-                    self.set_status("file changed on disk — press Esc and reopen", true);
-                    return;
-                }
-            }
-            Err(e) => {
-                self.set_status(format!("save failed: {e}"), true);
+        // Full-precision SystemTime comparison — a seconds-truncated guard
+        // misses external edits made within the same second. An unknown
+        // open-time mtime skips the guard rather than blocking all saves.
+        let current_mtime = std::fs::metadata(&edit.fs_path)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        if let (Some(expected), Some(actual)) = (edit.mtime_at_open, current_mtime) {
+            if expected != actual {
+                self.set_status("file changed on disk — press Esc and reopen", true);
                 return;
             }
         }
-        let content = edit.textarea.lines().join("\n");
-        let tmp = std::path::PathBuf::from(format!("{}.ira-tmp", edit.path));
+        let mut content = edit.textarea.lines().join("\n");
+        if edit.crlf {
+            content = content.replace('\n', "\r\n");
+        }
+        // Owned copies for the I/O step: no borrows across the writes.
+        let fs_path = edit.fs_path.clone();
+        let permissions = edit.permissions.clone();
+        let pane_index = edit.pane_index;
+        let list_path = edit.path.clone();
+        let tmp = std::path::PathBuf::from(format!("{}.ira-tmp", fs_path.display()));
         let write = || -> std::io::Result<()> {
             std::fs::write(&tmp, content.as_bytes())?;
-            std::fs::set_permissions(&tmp, edit.permissions.clone())?;
-            std::fs::rename(&tmp, &edit.path)
+            std::fs::set_permissions(&tmp, permissions)?;
+            std::fs::rename(&tmp, &fs_path)
         };
         if let Err(e) = write() {
             let _ = std::fs::remove_file(&tmp);
@@ -1060,30 +1137,25 @@ impl App {
             return;
         }
         // Refresh what we know about the file: editor guard, pane entry,
-        // and the text cache (keys are mtime/size based; a clear is cheap).
-        let (new_mtime, new_size) = match std::fs::metadata(&edit.path) {
-            Ok(m) => (
-                m.modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64),
-                m.len(),
-            ),
+        // and the text cache (keys are mtime/size based; evict this file's
+        // entries by path).
+        let (new_mtime, new_size) = match std::fs::metadata(&fs_path) {
+            Ok(m) => (m.modified().ok(), m.len()),
             Err(_) => (None, 0),
         };
         edit.mtime_at_open = new_mtime;
         edit.dirty = false;
-        let pane_index = edit.pane_index;
-        let path = edit.path.clone();
         if let Some(entry) = self.panes[pane_index]
             .files
             .iter_mut()
-            .find(|f| f.path == path)
+            .find(|f| f.path == list_path)
         {
             entry.size = new_size;
-            entry.modified = new_mtime;
+            entry.modified = new_mtime
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64);
         }
-        self.text_cache.clear();
+        self.text_cache.retain(|_, tp| tp.path != list_path);
         self.set_status(format!("Saved {name}"), false);
     }
 
@@ -1371,6 +1443,7 @@ impl App {
                     self.text_cache.insert(
                         req.mem_key(),
                         TextPreview {
+                            path: req.path.clone(),
                             content,
                             binary,
                             truncated,
@@ -1794,13 +1867,16 @@ impl App {
     pub fn switch_pane(&mut self) {
         self.search_query = None;
         // Tab reaches the preview editor when the focused pane shows an
-        // editable text file in column mode; Tab while editing discards
-        // unsaved changes and falls through to the normal focus cycle.
-        if self.edit_focus {
+        // editable text file in column mode. Tab WHILE editing discards
+        // unsaved changes and falls through to the normal focus cycle —
+        // it must not re-offer the editor it just closed (same selection,
+        // same pane: that would trap the user in the editor forever).
+        let was_editing = self.edit_focus;
+        if was_editing {
             self.edit_focus = false;
             self.close_edit();
         }
-        if !self.board_focused && self.active_pane_offers_edit() {
+        if !was_editing && !self.board_focused && self.active_pane_offers_edit() {
             self.open_edit();
             if self.edit.is_some() {
                 self.edit_focus = true;
@@ -3786,6 +3862,7 @@ mod preview_tests {
     use super::*;
     use crate::handler::handle_key_events;
     use image::DynamicImage;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     /// Writes a small PNG and returns its path.
     fn png_at(name: &str) -> String {
@@ -4276,6 +4353,225 @@ mod preview_tests {
         app.switch_pane();
         assert!(!app.edit_focus, "image preview must not offer the editor");
         assert!(app.edit.is_none());
+    }
+
+    #[test]
+    fn tab_while_editing_discards_and_leaves_without_reopening() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use std::fs;
+        let dir = std::env::temp_dir().join("ira_preview_tests");
+        let path = dir.join("trap.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "keep\n").unwrap();
+
+        let mut app = App::default();
+        app.set_picker(ratatui_image::picker::Picker::halfblocks());
+        app.panes[0].preview_mode = PreviewMode::Column;
+        app.panes[0].preview_area = (38, 10);
+        app.panes[0].files = vec![FEntry {
+            path: path.to_string_lossy().into_owned(),
+            label: "trap.txt".into(),
+            is_dir: false,
+            size: 5,
+            modified: None,
+        }];
+        app.panes[0].state.select(Some(0));
+
+        app.switch_pane();
+        assert!(app.edit_focus);
+        // Dirty the buffer, then Tab: the edit must be DISCARDED and the
+        // editor must NOT immediately reopen on the same file (the
+        // reopen trap made Tab unusable while editing).
+        handle_key_events(
+            KeyEvent::new(KeyCode::Char('X'), KeyModifiers::empty()),
+            &mut app,
+        )
+        .unwrap();
+        app.switch_pane();
+        assert!(!app.edit_focus);
+        assert!(app.edit.is_none(), "editor reopened after Tab");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "keep\n");
+        // The next Tab re-offers the editor (normal cycle restored).
+        app.switch_pane();
+        assert!(app.edit_focus);
+    }
+
+    #[test]
+    fn save_refuses_after_external_modification() {
+        use std::fs;
+        let dir = std::env::temp_dir().join("ira_preview_tests");
+        let path = dir.join("clobber.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "mine\n").unwrap();
+
+        let mut app = App::default();
+        app.set_picker(ratatui_image::picker::Picker::halfblocks());
+        app.panes[0].preview_mode = PreviewMode::Column;
+        app.panes[0].preview_area = (38, 10);
+        app.panes[0].files = vec![FEntry {
+            path: path.to_string_lossy().into_owned(),
+            label: "clobber.txt".into(),
+            is_dir: false,
+            size: 5,
+            modified: None,
+        }];
+        app.panes[0].state.select(Some(0));
+        app.switch_pane();
+
+        // Another process overwrites the file AFTER we opened it. The
+        // full-precision mtime guard must refuse the save even within the
+        // same second.
+        fs::write(&path, "theirs\n").unwrap();
+        app.save_edit();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "theirs\n",
+            "save clobbered an external modification"
+        );
+        assert!(app.status.as_ref().is_some_and(|s| s.is_error));
+    }
+
+    #[test]
+    fn paste_reaches_the_editor() {
+        use std::fs;
+        let dir = std::env::temp_dir().join("ira_preview_tests");
+        let path = dir.join("paste.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "start\n").unwrap();
+
+        let mut app = App::default();
+        app.set_picker(ratatui_image::picker::Picker::halfblocks());
+        app.panes[0].preview_mode = PreviewMode::Column;
+        app.panes[0].preview_area = (38, 10);
+        app.panes[0].files = vec![FEntry {
+            path: path.to_string_lossy().into_owned(),
+            label: "paste.txt".into(),
+            is_dir: false,
+            size: 6,
+            modified: None,
+        }];
+        app.panes[0].state.select(Some(0));
+        app.switch_pane();
+
+        app.handle_paste("PASTED");
+        assert!(app.edit.as_ref().unwrap().dirty);
+        assert_eq!(
+            app.edit.as_ref().unwrap().textarea.lines(),
+            vec!["PASTEDstart".to_string(), String::new()]
+        );
+    }
+
+    #[test]
+    fn ctrl_a_does_not_toggle_selection_while_editing() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use std::fs;
+        let dir = std::env::temp_dir().join("ira_preview_tests");
+        let path = dir.join("ctrl.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "buf\n").unwrap();
+
+        let mut app = App::default();
+        app.set_picker(ratatui_image::picker::Picker::halfblocks());
+        app.panes[0].preview_mode = PreviewMode::Column;
+        app.panes[0].preview_area = (38, 10);
+        app.panes[0].files = vec![FEntry {
+            path: path.to_string_lossy().into_owned(),
+            label: "ctrl.txt".into(),
+            is_dir: false,
+            size: 4,
+            modified: None,
+        }];
+        app.panes[0].state.select(Some(0));
+        app.switch_pane();
+
+        handle_key_events(
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            &mut app,
+        )
+        .unwrap();
+        assert!(
+            app.panes[0].selected.iter().all(|s| !*s),
+            "Ctrl+A leaked into pane selection while editing"
+        );
+        // The keystroke reached the textarea as a movement (Ctrl+A = line
+        // start, a no-op at (0,0)) — buffer unchanged, selection untouched.
+        assert_eq!(
+            app.edit.as_ref().unwrap().textarea.lines(),
+            vec!["buf".to_string(), String::new()]
+        );
+    }
+
+    #[test]
+    fn crlf_files_keep_their_endings() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use std::fs;
+        let dir = std::env::temp_dir().join("ira_preview_tests");
+        let path = dir.join("crlf.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "a\r\nb\r\n").unwrap();
+
+        let mut app = App::default();
+        app.set_picker(ratatui_image::picker::Picker::halfblocks());
+        app.panes[0].preview_mode = PreviewMode::Column;
+        app.panes[0].preview_area = (38, 10);
+        app.panes[0].files = vec![FEntry {
+            path: path.to_string_lossy().into_owned(),
+            label: "crlf.txt".into(),
+            is_dir: false,
+            size: fs::metadata(&path).unwrap().len(),
+            modified: None,
+        }];
+        app.panes[0].state.select(Some(0));
+        app.switch_pane();
+        assert!(app.edit.as_ref().unwrap().crlf);
+
+        // Enter at the top inserts the file's own CRLF ending.
+        handle_key_events(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut app,
+        )
+        .unwrap();
+        app.save_edit();
+        assert_eq!(fs::read(&path).unwrap(), b"\r\na\r\nb\r\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_through_a_symlink_updates_the_target() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join("ira_preview_tests");
+        let target = dir.join("symlink_target.txt");
+        let link = dir.join("symlink_link.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&target, "target\n").unwrap();
+        let _ = fs::remove_file(&link);
+        symlink(&target, &link).unwrap();
+
+        let mut app = App::default();
+        app.set_picker(ratatui_image::picker::Picker::halfblocks());
+        app.panes[0].preview_mode = PreviewMode::Column;
+        app.panes[0].preview_area = (38, 10);
+        app.panes[0].files = vec![FEntry {
+            path: link.to_string_lossy().into_owned(),
+            label: "symlink_link.txt".into(),
+            is_dir: false,
+            size: 7,
+            modified: None,
+        }];
+        app.panes[0].state.select(Some(0));
+        app.switch_pane();
+
+        handle_key_events(
+            KeyEvent::new(KeyCode::Char('X'), KeyModifiers::empty()),
+            &mut app,
+        )
+        .unwrap();
+        app.save_edit();
+
+        // The link survives and points at the updated target.
+        assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "Xtarget\n");
     }
 
     #[test]

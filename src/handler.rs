@@ -19,33 +19,27 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
     // Ctrl combos: Ctrl+C quits in every mode; Ctrl+A selects all / clears all
     // (except while editing a rename). Ctrl is the only modifier every
     // terminal reports reliably.
-    if key_event.modifiers == KeyModifiers::CONTROL {
-        match key_event.code {
-            KeyCode::Char('c') | KeyCode::Char('C') => {
-                app.quit();
-                return Ok(());
-            }
-            _ => {}
-        }
-        if app.renaming.is_none() {
-            match key_event.code {
-                KeyCode::Char('a') | KeyCode::Char('A') => app.toggle_select_all(),
-                _ => {}
-            }
-        }
-        return Ok(());
-    }
-
     // Preview text editor (Tab-focused): the buffer captures every key —
     // chars insert (including `q`), `s` saves without inserting, `Esc`
     // exits back to pane focus, `Tab` moves focus on (discarding edits).
-    // Ctrl+C above still hard-quits.
+    // Ctrl+C still hard-quits; other Ctrl combos reach the textarea
+    // (Ctrl+A = line start, Ctrl+E = line end) instead of pane actions.
     if app.edit_focus {
+        if key_event.modifiers == KeyModifiers::CONTROL {
+            match key_event.code {
+                KeyCode::Char('c') | KeyCode::Char('C') => {
+                    app.quit();
+                    return Ok(());
+                }
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    app.save_edit();
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
         match key_event.code {
-            KeyCode::Char('s')
-                if key_event.modifiers.is_empty()
-                    || key_event.modifiers == KeyModifiers::CONTROL =>
-            {
+            KeyCode::Char('s') if key_event.modifiers.is_empty() => {
                 app.save_edit();
                 return Ok(());
             }
@@ -63,6 +57,22 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
                 return Ok(());
             }
         }
+    }
+    if key_event.modifiers == KeyModifiers::CONTROL {
+        match key_event.code {
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                app.quit();
+                return Ok(());
+            }
+            _ => {}
+        }
+        if app.renaming.is_none() {
+            match key_event.code {
+                KeyCode::Char('a') | KeyCode::Char('A') => app.toggle_select_all(),
+                _ => {}
+            }
+        }
+        return Ok(());
     }
 
     // Rename text editor.
