@@ -25,7 +25,7 @@ use crate::{
         state::{load_state, load_state_from, save_state, save_state_to, SessionState, SizeEntry},
         thumbnails::{
             preview_kind, prune_cache, spawn_workers, PreviewKind, ThumbEvent, ThumbRequest,
-            JOB_QUEUE_CAP,
+            WorkerQueues, JOB_QUEUE_HI_CAP, JOB_QUEUE_LO_CAP,
         },
         transfer::{
             spawn_delete_job, spawn_job, Job, JobControl, JobEvent, JobKind, JobStatus,
@@ -336,8 +336,12 @@ pub struct App {
     /// Finished preview jobs, delivered by the worker pool.
     thumb_tx: mpsc::Sender<ThumbEvent>,
     thumb_rx: mpsc::Receiver<ThumbEvent>,
-    thumb_job_rx: Option<mpsc::Receiver<ThumbRequest>>,
-    thumb_jobs: mpsc::SyncSender<ThumbRequest>,
+    /// High-priority queue: on-screen cells jump ahead of prefetch.
+    thumb_jobs_hi: mpsc::SyncSender<ThumbRequest>,
+    thumb_jobs_hi_rx: Option<mpsc::Receiver<ThumbRequest>>,
+    /// Prefetch queue: screens adjacent to the viewport.
+    thumb_jobs_lo: mpsc::SyncSender<ThumbRequest>,
+    thumb_jobs_lo_rx: Option<mpsc::Receiver<ThumbRequest>>,
     /// Rendered protocols keyed by [`ThumbRequest::mem_key`].
     thumb_cache: HashMap<String, Protocol>,
     /// Effective eviction cap for `thumb_cache` this frame: at least
@@ -370,7 +374,8 @@ impl Default for App {
         let (file_list_tx, file_list_rx) = mpsc::channel();
         let (info_tx, info_rx) = mpsc::channel();
         let (thumb_tx, thumb_rx) = mpsc::channel();
-        let (thumb_jobs, thumb_job_rx) = mpsc::sync_channel(JOB_QUEUE_CAP);
+        let (thumb_jobs_hi, thumb_jobs_hi_rx) = mpsc::sync_channel(JOB_QUEUE_HI_CAP);
+        let (thumb_jobs_lo, thumb_jobs_lo_rx) = mpsc::sync_channel(JOB_QUEUE_LO_CAP);
         Self {
             running: true,
             size: (1024, 768),
@@ -416,8 +421,10 @@ impl Default for App {
             info_tx,
             thumb_tx,
             thumb_rx,
-            thumb_jobs,
-            thumb_job_rx: Some(thumb_job_rx),
+            thumb_jobs_hi,
+            thumb_jobs_hi_rx: Some(thumb_jobs_hi_rx),
+            thumb_jobs_lo,
+            thumb_jobs_lo_rx: Some(thumb_jobs_lo_rx),
             thumb_pending: HashSet::new(),
             thumb_workers_started: false,
             thumb_cache: HashMap::new(),
@@ -836,11 +843,22 @@ impl App {
             return;
         }
         self.thumb_workers_started = true;
-        let jobs = self
-            .thumb_job_rx
+        let hi = self
+            .thumb_jobs_hi_rx
             .take()
             .expect("thumb workers started twice");
-        spawn_workers(picker, Arc::new(Mutex::new(jobs)), self.thumb_tx.clone());
+        let lo = self
+            .thumb_jobs_lo_rx
+            .take()
+            .expect("thumb workers started twice");
+        spawn_workers(
+            picker,
+            WorkerQueues {
+                hi: Arc::new(Mutex::new(hi)),
+                lo: Arc::new(Mutex::new(lo)),
+            },
+            self.thumb_tx.clone(),
+        );
         std::thread::spawn(prune_cache);
         // Probe for the optional runtime dependency once (background: the
         // spawn costs a few ms). While unknown, videos/HEIC show glyphs.
@@ -855,6 +873,23 @@ impl App {
                 .is_ok_and(|s| s.success());
             flag.store(ok, std::sync::atomic::Ordering::Relaxed);
         });
+    }
+
+    /// Enqueues a prefetch request on the low-priority queue (deduped by
+    /// `thumb_pending`; dropped when the queue is full, retried on a later
+    /// frame). Never blocks the caller.
+    fn try_send_prefetch(&mut self, req: &ThumbRequest) {
+        let key = req.mem_key();
+        if self.picker.is_none()
+            || self.thumb_failed.contains(&key)
+            || self.thumb_pending.contains(&key)
+            || self.thumb_cache.contains_key(&key)
+        {
+            return;
+        }
+        if self.thumb_jobs_lo.try_send(req.clone()).is_ok() {
+            self.thumb_pending.insert(key);
+        }
     }
 
     /// Frame start for the thumbnail cache: lowers the effective eviction
@@ -948,7 +983,7 @@ impl App {
                 cols: area.0,
                 rows: area.1,
             };
-            let _ = self.preview_protocol(&req);
+            let _ = self.try_send_prefetch(&req);
         }
     }
 
@@ -1050,9 +1085,10 @@ impl App {
         {
             return None;
         }
-        // Bounded queue: a full queue drops the request (retried on a later
-        // frame via `preview_request`), so scrolling never builds a backlog.
-        if self.thumb_jobs.try_send(req.clone()).is_ok() {
+        // Bounded queues: a full queue drops the request (retried on a
+        // later frame via `preview_request`), so scrolling never builds an
+        // unbounded backlog.
+        if self.thumb_jobs_hi.try_send(req.clone()).is_ok() {
             self.thumb_pending.insert(key);
         }
         None

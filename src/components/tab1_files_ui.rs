@@ -189,13 +189,14 @@ fn render_grid(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, acti
             .map(|(i, e)| (*i, (*e).clone()))
             .collect();
         // Prefetch one screen above and below the visible window so
-        // scrolling shows already-decoded thumbnails.
+        // scrolling shows already-decoded thumbnails. Sliced, not filtered:
+        // O(window) per frame, not O(folder).
         let pf_from = top.saturating_sub(per_screen);
-        let prefetch: Vec<crate::services::list_files::FEntry> = rows
+        let pf_to = (end + per_screen).min(total);
+        let prefetch: Vec<crate::services::list_files::FEntry> = rows[pf_from..top]
             .iter()
-            .enumerate()
-            .filter(|(i, _)| (*i < top || *i >= end) && *i >= pf_from && *i < end + per_screen)
-            .map(|(_, (_, e))| (*e).clone())
+            .chain(rows[end..pf_to].iter())
+            .map(|(_, e)| (*e).clone())
             .collect();
         (title, top, window, prefetch)
     };

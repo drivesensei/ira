@@ -32,10 +32,20 @@ pub const DECODE_MAX_ALLOC: u64 = 256 * 1024 * 1024;
 /// machines (the UI thread still gets a core).
 pub const MAX_DECODE_THREADS: usize = 6;
 
-/// Queued-request capacity between the UI and the worker pool. `try_send`
-/// into a full queue is dropped (retried on a later frame), so scrolling
-/// cannot build an unbounded backlog.
-pub const JOB_QUEUE_CAP: usize = 64;
+/// Capacity of the high-priority queue (on-screen cells). `try_send` into a
+/// full queue is dropped (retried on a later frame), so scrolling cannot
+/// build an unbounded backlog.
+pub const JOB_QUEUE_HI_CAP: usize = 32;
+
+/// Capacity of the prefetch queue (screens adjacent to the viewport). Kept
+/// separate from the visible queue so a big prefetch backlog — e.g. the
+/// first fill of a 500-cell grid — can never delay what the user is
+/// currently looking at.
+pub const JOB_QUEUE_LO_CAP: usize = 256;
+
+/// Idle poll interval for decode workers waiting on both empty queues
+/// (std mpsc has no select). Wake latency for a new visible request.
+pub const JOB_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// Maximum number of files kept in the on-disk thumbnail cache; the oldest
 /// (by mtime) are removed at startup.
@@ -253,26 +263,58 @@ fn decode_source(path: &str) -> Result<DynamicImage, image::ImageError> {
     decode_oriented(reader)
 }
 
+/// The two job queues workers consume. Visible (on-screen) requests always
+/// jump ahead of prefetch requests, so scrolling stays responsive even when
+/// hundreds of prefetch jobs are backed up.
+pub struct WorkerQueues {
+    pub hi: Arc<Mutex<Receiver<ThumbRequest>>>,
+    pub lo: Arc<Mutex<Receiver<ThumbRequest>>>,
+}
+
 /// Runs the decode worker pool: `n ≤ MAX_DECODE_THREADS` threads consuming
-/// the shared `jobs` queue until it closes, delivering results on `tx`.
+/// the shared job queues until they close, delivering results on `tx`.
 /// Workers own a `Picker` clone once, so protocol re-encoding per job is the
 /// only per-request setup.
-pub fn spawn_workers(
-    picker: Picker,
-    jobs: Arc<Mutex<Receiver<ThumbRequest>>>,
-    tx: Sender<ThumbEvent>,
-) {
+pub fn spawn_workers(picker: Picker, queues: WorkerQueues, tx: Sender<ThumbEvent>) {
     let n = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2)
         .min(MAX_DECODE_THREADS);
     for _ in 0..n {
         let picker = picker.clone();
-        let jobs = jobs.clone();
+        let hi = queues.hi.clone();
+        let lo = queues.lo.clone();
         let tx = tx.clone();
         std::thread::spawn(move || loop {
-            let Ok(req) = jobs.lock().expect("job queue poisoned").recv() else {
-                break;
+            // On-screen requests always jump ahead of prefetch. std mpsc has
+            // no select(), so idle workers poll both queues on a short
+            // interval — two try_recv calls per worker per 5 ms is
+            // negligible, and a hi request is picked up within one tick.
+            let next = {
+                let hi = hi.lock().expect("hi queue poisoned");
+                match hi.try_recv() {
+                    Ok(req) => Some(req),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        drop(hi);
+                        let lo = lo.lock().expect("lo queue poisoned");
+                        match lo.try_recv() {
+                            Ok(req) => Some(req),
+                            Err(_) => {
+                                drop(lo);
+                                std::thread::sleep(JOB_POLL_INTERVAL);
+                                None
+                            }
+                        }
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        // Hi closed (App dropped): drain lo, then exit.
+                        drop(hi);
+                        lo.lock().expect("lo queue poisoned").recv().ok()
+                    }
+                }
+            };
+            let Some(req) = next else {
+                continue;
             };
             let event = match load_thumbnail(&req.path, req.mtime, req.size)
                 .ok()
