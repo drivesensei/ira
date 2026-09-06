@@ -2151,3 +2151,80 @@ fn copied_folder_is_revealed_mid_stream_in_large_destination() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn transfer_reveals_folder_live_in_destination_pane() {
+    let base = std::env::temp_dir().join(format!("ira_live_dest_{}", std::process::id()));
+    let src = base.join("src");
+    let dst = base.join("dst");
+    std::fs::create_dir_all(src.join("photos")).unwrap();
+    std::fs::create_dir_all(&dst).unwrap();
+    // Make the copy take long enough to observe the live reveal.
+    for i in 0..2000 {
+        std::fs::write(
+            src.join("photos").join(format!("p{i:04}.jpg")),
+            vec![0u8; 100 * 1024],
+        )
+        .unwrap();
+    }
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new("src".into(), src.to_str().unwrap().into(), '#'));
+    app.panes[1].folder = Some(Folder::new("dst".into(), dst.to_str().unwrap().into(), '#'));
+    app.panes[0].files = vec![FEntry {
+        path: src.join("photos").to_str().unwrap().to_string(),
+        label: "photos".to_string(),
+        is_dir: true,
+        size: 0,
+        modified: None,
+    }];
+    app.panes[0].selected = vec![false];
+    app.panes[0].state.select(Some(0));
+
+    app.request_copy();
+    app.confirm_pending();
+    assert!(app.transfer_dest.is_some(), "live sync armed");
+
+    // Deterministic stall: let the folder be created, then pause the worker
+    // mid-copy (it parks at a 256KB chunk gate with partial content).
+    std::thread::sleep(Duration::from_millis(80));
+    app.jobs[0].control.set_paused(true);
+
+    // The reveal must happen while the transfer is stalled: the destination
+    // listing refresh (1s cadence) shows the folder and the cursor lands on
+    // it via the reveal target.
+    let mut revealed_while_stalled = false;
+    for _ in 0..300 {
+        app.tick();
+        let idx = app.panes[1].state.selected();
+        if idx
+            .and_then(|i| app.panes[1].files.get(i))
+            .is_some_and(|f| f.label == "photos")
+        {
+            revealed_while_stalled = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        revealed_while_stalled,
+        "folder must be revealed live while the transfer is paused"
+    );
+
+    // Resume: the copy completes, live sync clears, folder present.
+    app.jobs[0].control.set_paused(false);
+    for _ in 0..4000 {
+        app.tick();
+        if app.transfer_dest.is_none() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        app.transfer_dest.is_none(),
+        "live sync cleared on completion"
+    );
+    assert!(app.panes[1].files.iter().any(|f| f.label == "photos"));
+
+    let _ = std::fs::remove_dir_all(&base);
+}

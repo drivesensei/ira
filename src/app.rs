@@ -113,6 +113,17 @@ pub struct MultiInfoState {
     pub started: Instant,
 }
 
+/// Live sync state while a transfer writes into a folder: the destination
+/// pane's listing is refreshed periodically so copied items appear live,
+/// even while the transfer is still running.
+#[derive(Debug, Clone)]
+pub struct TransferDestSync {
+    pub dest_dir: String,
+    /// Destination path of the first item (cursor reveal target).
+    pub reveal_path: String,
+    pub last_refresh: Instant,
+}
+
 /// Live state of the background batch deletion.
 #[derive(Debug)]
 pub struct DeletionState {
@@ -220,6 +231,8 @@ pub struct App {
     /// "Go to path" dialog (`[`); `None` when closed. Existing paths are
     /// navigated to; missing ones are created (nested, kind by extension).
     pub goto_prompt: Option<String>,
+    /// Live destination sync while a transfer writes into a folder.
+    pub transfer_dest: Option<TransferDestSync>,
 
     /// Transient status/error message shown in the bottom bar until it
     /// expires (or the next action replaces it).
@@ -295,6 +308,7 @@ impl Default for App {
             renaming: None,
             new_entry: None,
             goto_prompt: None,
+            transfer_dest: None,
             info: None,
             multi_info: None,
             status: None,
@@ -411,6 +425,7 @@ impl App {
         self.drain_info_results();
         self.refresh_drives();
         self.pick_up_pane_listings();
+        self.refresh_transfer_destinations();
         self.expire_status();
     }
 
@@ -1981,6 +1996,11 @@ impl App {
 
         let id = self.next_job_id;
         self.next_job_id += 1;
+        let reveal = std::path::Path::new(&dest).join(
+            std::path::Path::new(&paths[0])
+                .file_name()
+                .unwrap_or_default(),
+        );
         self.jobs.push(Job {
             id,
             kind,
@@ -1997,6 +2017,12 @@ impl App {
         });
         let job = self.jobs.last().unwrap();
         spawn_job(job, self.job_tx.clone());
+
+        self.transfer_dest = Some(TransferDestSync {
+            dest_dir: dest.clone(),
+            reveal_path: reveal.to_string_lossy().into_owned(),
+            last_refresh: Instant::now(),
+        });
 
         // The selection is handled; drop it and focus the Copy Board.
         self.pane_mut().selected.fill(false);
@@ -2162,6 +2188,7 @@ impl App {
                 JobEvent::Done { id } => {
                     if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id) {
                         j.status = JobStatus::Done;
+                        self.transfer_dest = None;
                         // Land the destination pane's cursor on the last
                         // item of the batch so the new content is visible
                         // without hunting for it.
@@ -2232,6 +2259,54 @@ impl App {
     fn refresh_after_job(&mut self) {
         self.list_files_for_pane(0);
         self.list_files_for_pane(1);
+    }
+
+    /// While a transfer writes into a folder, re-lists panes that show that
+    /// folder (or are inside it) once per second, so copied items appear
+    /// live. Never blocks the UI: listings run on background workers.
+    fn refresh_transfer_destinations(&mut self) {
+        let Some(sync) = self.transfer_dest.clone() else {
+            return;
+        };
+        if !self
+            .jobs
+            .iter()
+            .any(|j| matches!(j.status, JobStatus::Running | JobStatus::Paused))
+        {
+            self.transfer_dest = None;
+            return;
+        }
+        // The destination folder appears once the first item starts copying.
+        if std::fs::metadata(&sync.dest_dir).is_err() {
+            return;
+        }
+        if sync.last_refresh.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        for i in 0..self.panes.len() {
+            let viewing = self.panes[i].folder.as_ref().is_some_and(|f| {
+                f.path == sync.dest_dir || f.path.starts_with(&format!("{}/", sync.dest_dir))
+            });
+            if !viewing {
+                continue;
+            }
+            let pane = &mut self.panes[i];
+            if pane
+                .folder
+                .as_ref()
+                .is_some_and(|f| f.path == sync.dest_dir)
+            {
+                // Reveal mode: keep the cursor on the incoming item.
+                pane.pending_select = Some(sync.reveal_path.clone());
+            } else if let Some(cur) = pane.state.selected().and_then(|vi| pane.files.get(vi)) {
+                // Inside the incoming folder: preserve the cursor position.
+                pane.pending_select = Some(cur.path.clone());
+            }
+            self.list_files_for_pane(i);
+        }
+        if let Some(s) = &mut self.transfer_dest {
+            s.last_refresh = Instant::now();
+        }
     }
 
     /// Whether fuzzy search within the current folder is active.
