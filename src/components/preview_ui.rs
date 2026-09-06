@@ -31,9 +31,9 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect, pane_index: usize) {
     let title = if editing {
         let dirty = app.edit.as_ref().is_some_and(|e| e.dirty);
         if dirty {
-            " * Editing — s save · Esc exit ".to_string()
+            " * Editing — Ctrl+S save · Esc exit ".to_string()
         } else {
-            " Editing — s save · Esc exit ".to_string()
+            " Editing — Ctrl+S save · Esc exit ".to_string()
         }
     } else if editing_ro {
         " Preview (read-only) ".to_string()

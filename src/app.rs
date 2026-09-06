@@ -4278,32 +4278,37 @@ mod preview_tests {
         app.switch_pane(); // Tab offers the editor and focuses it
         assert!(app.edit_focus);
 
-        // `q` inserts into the buffer instead of quitting...
+        // `q` and `s` insert into the buffer instead of quitting/saving...
         handle_key_events(
             KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty()),
             &mut app,
         )
         .unwrap();
         assert!(app.running, "q must not quit in edit mode");
-        assert_eq!(
-            app.edit.as_ref().unwrap().textarea.lines(),
-            vec!["qline".to_string(), String::new()]
-        );
-
-        // ...`s` saves WITHOUT inserting an `s`...
         handle_key_events(
             KeyEvent::new(KeyCode::Char('s'), KeyModifiers::empty()),
             &mut app,
         )
         .unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), "qline\n");
+        assert_eq!(
+            app.edit.as_ref().unwrap().textarea.lines(),
+            vec!["qsline".to_string(), String::new()]
+        );
+
+        // ...Ctrl+S saves WITHOUT inserting anything...
+        handle_key_events(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            &mut app,
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "qsline\n");
         let lines_after_save = app.edit.as_ref().unwrap().textarea.lines().clone();
-        assert_eq!(lines_after_save, vec!["qline".to_string(), String::new()]);
+        assert_eq!(lines_after_save, vec!["qsline".to_string(), String::new()]);
 
         // ...and Esc exits edit mode, leaving the file as saved.
         handle_key_events(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()), &mut app).unwrap();
         assert!(app.edit.is_none() && !app.edit_focus);
-        assert_eq!(fs::read_to_string(&path).unwrap(), "qline\n");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "qsline\n");
     }
 
     #[test]

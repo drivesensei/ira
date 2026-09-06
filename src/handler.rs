@@ -20,7 +20,7 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
     // (except while editing a rename). Ctrl is the only modifier every
     // terminal reports reliably.
     // Preview text editor (Tab-focused): the buffer captures every key —
-    // chars insert (including `q`), `s` saves without inserting, `Esc`
+    // chars insert (including `q` and `s`), Ctrl+S saves, `Esc`
     // exits back to pane focus, `Tab` moves focus on (discarding edits).
     // Ctrl+C still hard-quits; other Ctrl combos reach the textarea
     // (Ctrl+A = line start, Ctrl+E = line end) instead of pane actions.
@@ -38,11 +38,8 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
                 _ => {}
             }
         }
+        // Plain `s` (and Shift+S) insert text — only Ctrl+S saves.
         match key_event.code {
-            KeyCode::Char('s') if key_event.modifiers.is_empty() => {
-                app.save_edit();
-                return Ok(());
-            }
             KeyCode::Esc => {
                 app.close_edit();
                 app.edit_focus = false;

@@ -101,11 +101,11 @@ after a restart.
 | --- | --- |
 | `v` | Cycle the active pane's image preview: off → column → grid (per pane, persisted) |
 | `Tab` | Focus the text editor when a text file is previewed |
-| `s` / `Ctrl+S` | Save (editor focused) |
+| `Ctrl+S` | Save (editor focused); plain letters type |
 | `Esc` | Exit the editor, back to the pane |
 
 **Edit text in the preview:** with a text file previewed in column mode, `Tab` focuses the
-editor — type to edit, `s` (or `Ctrl+S`) saves atomically, `Esc` exits. `q` types a `q`; nothing
+editor — type to edit, `Ctrl+S` saves atomically, `Esc` exits — plain letters type. `q` types a `q`; nothing
 quits while editing. Read-only, binary, non-UTF-8, and >5 MB files open read-only instead, and
 unsaved changes are discarded on `Esc`/`Tab` (a `*` in the border marks them).
 
