@@ -1103,6 +1103,17 @@ impl App {
             self.set_status(format!("{name} is read-only"), true);
             return;
         }
+        // Path-identity guard: if the listed path was a symlink that has
+        // been retargeted since open, the canonical path no longer matches
+        // the one we snappedshotted — refuse rather than write a file the
+        // user is no longer looking at.
+        match std::fs::canonicalize(&edit.path) {
+            Ok(current) if current == edit.fs_path => {}
+            _ => {
+                self.set_status("file path changed on disk — press Esc and reopen", true);
+                return;
+            }
+        }
         // On-disk change guard: refuse to clobber a file modified elsewhere.
         // Full-precision SystemTime comparison — a seconds-truncated guard
         // misses external edits made within the same second. An unknown
@@ -4572,6 +4583,20 @@ mod preview_tests {
         // The link survives and points at the updated target.
         assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
         assert_eq!(fs::read_to_string(&target).unwrap(), "Xtarget\n");
+
+        // N3 regression: retarget the link AFTER opening the editor — the
+        // save must refuse instead of writing through the stale path.
+        let target2 = dir.join("symlink_target2.txt");
+        fs::write(&target2, "new\n").unwrap();
+        let _ = fs::remove_file(&link);
+        symlink(&target2, &link).unwrap();
+        app.save_edit();
+        assert_eq!(
+            fs::read_to_string(&target2).unwrap(),
+            "new\n",
+            "save wrote through a retargeted symlink"
+        );
+        assert!(app.status.as_ref().is_some_and(|s| s.is_error));
     }
 
     #[test]
