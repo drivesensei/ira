@@ -1,15 +1,16 @@
 //! Image preview pipeline: decode → thumbnail cache → terminal protocol.
 //!
-//! Runs entirely off the UI thread (one worker per request, spawned from
-//! [`spawn_thumbnail_job`]); results are delivered as [`ThumbEvent`]s over a
-//! channel and picked up on the next tick, mirroring the pane-listing and
-//! drive-poller patterns. The UI thread only ever renders a finished
-//! [`ratatui_image::protocol::Protocol`].
+//! Runs entirely off the UI thread: a bounded pool of decode workers (see
+//! [`spawn_workers`]) consumes queued [`ThumbRequest`]s and delivers
+//! [`ThumbEvent`]s over a channel, picked up on the next tick, mirroring the
+//! pane-listing and drive-poller patterns. The UI thread only ever renders a
+//! finished [`ratatui_image::protocol::Protocol`].
 
 use std::fs;
 use std::io::BufReader;
 use std::path::PathBuf;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageReader};
@@ -17,6 +18,25 @@ use ratatui::layout::Size;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
 use ratatui_image::Resize;
+
+/// Decode budget per image. Caps decompression-bomb allocation (the limit
+/// applies to the decoded buffer): anything bigger fails cleanly and shows
+/// the unsupported placeholder instead of spiking RSS.
+pub const DECODE_MAX_ALLOC: u64 = 256 * 1024 * 1024;
+
+/// Upper bound on decode workers. Scrolling a photo folder must never fork
+/// the machine; `available_parallelism` is capped because each in-flight
+/// decode can hold up to [`DECODE_MAX_ALLOC`] of pixel data.
+pub const MAX_DECODE_THREADS: usize = 4;
+
+/// Queued-request capacity between the UI and the worker pool. `try_send`
+/// into a full queue is dropped (retried on a later frame), so scrolling
+/// cannot build an unbounded backlog.
+pub const JOB_QUEUE_CAP: usize = 16;
+
+/// Maximum number of files kept in the on-disk thumbnail cache; the oldest
+/// (by mtime) are removed at startup.
+pub const CACHE_MAX_FILES: usize = 512;
 
 /// Longest side of a stored disk-cache thumbnail in pixels. Big enough to
 /// stay sharp when re-fitted into a large preview column, small enough that
@@ -59,10 +79,43 @@ pub fn cache_key(path: &str, mtime: Option<i64>, size: u64) -> String {
 }
 
 /// Thumbnail cache directory (`$XDG_CACHE_HOME/ira/thumbnails` or the
-/// platform equivalent); `None` when no cache dir is available — previews
-/// still work, they just re-decode every time.
+/// platform equivalent), overridable with `IRA_THUMBNAIL_CACHE_DIR` (used by
+/// tests to keep their fixtures out of the user's real cache). `None` when no
+/// cache dir is available — previews still work, they just re-decode every
+/// time.
 fn cache_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("IRA_THUMBNAIL_CACHE_DIR") {
+        return Some(PathBuf::from(dir));
+    }
     dirs_next::cache_dir().map(|d| d.join("ira").join("thumbnails"))
+}
+
+/// Caps the on-disk cache at [`CACHE_MAX_FILES`], deleting the oldest entries
+/// (by mtime). Called once at startup on a background thread; failures are
+/// ignored — pruning is an optimization, not a correctness requirement.
+pub fn prune_cache() {
+    let Some(dir) = cache_dir() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "png"))
+        .filter_map(|e| {
+            let md = e.metadata().ok()?;
+            Some((md.modified().ok()?, e.path()))
+        })
+        .collect();
+    if files.len() <= CACHE_MAX_FILES {
+        return;
+    }
+    files.sort_by_key(|(t, _)| *t);
+    let excess = files.len() - CACHE_MAX_FILES;
+    for (_, path) in files.into_iter().take(excess) {
+        let _ = fs::remove_file(path);
+    }
 }
 
 /// Loads a thumbnail-sized [`DynamicImage`] for `path`: from the disk cache
@@ -94,11 +147,46 @@ pub fn load_thumbnail(
     Ok(thumb)
 }
 
-/// Decodes a source image with EXIF orientation applied (phone photos would
-/// otherwise preview sideways).
+/// Decodes a source image with content sniffing (extension can lie) and EXIF
 fn decode_source(path: &str) -> Result<DynamicImage, image::ImageError> {
-    let reader = ImageReader::open(path)?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(DECODE_MAX_ALLOC);
+    let mut reader = ImageReader::open(path)?.with_guessed_format()?;
+    reader.limits(limits);
     decode_oriented(reader)
+}
+
+/// Runs the decode worker pool: `n ≤ MAX_DECODE_THREADS` threads consuming
+/// the shared `jobs` queue until it closes, delivering results on `tx`.
+/// Workers own a `Picker` clone once, so protocol re-encoding per job is the
+/// only per-request setup.
+pub fn spawn_workers(
+    picker: Picker,
+    jobs: Arc<Mutex<Receiver<ThumbRequest>>>,
+    tx: Sender<ThumbEvent>,
+) {
+    let n = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .min(MAX_DECODE_THREADS);
+    for _ in 0..n {
+        let picker = picker.clone();
+        let jobs = jobs.clone();
+        let tx = tx.clone();
+        std::thread::spawn(move || loop {
+            let Ok(req) = jobs.lock().expect("job queue poisoned").recv() else {
+                break;
+            };
+            let event = match load_thumbnail(&req.path, req.mtime, req.size)
+                .ok()
+                .and_then(|img| build_protocol(&picker, img, req.cols, req.rows).ok())
+            {
+                Some(protocol) => ThumbEvent::Ready(req.clone(), protocol),
+                None => ThumbEvent::Failed(req.clone()),
+            };
+            let _ = tx.send(event);
+        });
+    }
 }
 
 fn decode_oriented(
@@ -138,13 +226,14 @@ pub struct ThumbRequest {
 }
 
 impl ThumbRequest {
-    /// In-memory cache key (disk cache uses [`cache_key`] — area must not
-    /// invalidate the pixel cache, only the rendered protocol).
+    /// In-memory cache key: content identity (path+mtime+size via
+    /// [`cache_key`]) plus the preview area, which the protocol encoding
+    /// depends on. The disk cache uses [`cache_key`] alone — area must not
+    /// invalidate the pixel cache.
     pub fn mem_key(&self) -> String {
         format!(
-            "{}\0{}\0{}\0{}",
+            "{}\0{}\0{}",
             cache_key(&self.path, self.mtime, self.size),
-            self.size,
             self.cols,
             self.rows
         )
@@ -172,27 +261,20 @@ pub fn build_protocol(
     picker.new_protocol(img, Size::new(cols, rows), Resize::Fit(None))
 }
 
-/// Spawns a worker thread that resolves `req` and delivers the result on
-/// `tx`. One thread per request: requests are rare (selection changes) and
-/// `std::thread::spawn` beats building a pool for this cadence.
-pub fn spawn_thumbnail_job(req: ThumbRequest, picker: Picker, tx: Sender<ThumbEvent>) {
-    std::thread::spawn(move || {
-        let event = match load_thumbnail(&req.path, req.mtime, req.size)
-            .ok()
-            .and_then(|img| build_protocol(&picker, img, req.cols, req.rows).ok())
-        {
-            Some(protocol) => ThumbEvent::Ready(req.clone(), protocol),
-            None => ThumbEvent::Failed(req.clone()),
-        };
-        let _ = tx.send(event);
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
 
+    /// Redirects the disk cache to a temp dir so tests never touch the
+    /// user's real `~/.cache/ira/thumbnails`. Process-global: tests calling
+    /// this stay isolated from the user's data even if they share a dir.
+    fn use_test_cache() {
+        std::env::set_var(
+            "IRA_THUMBNAIL_CACHE_DIR",
+            std::env::temp_dir().join("ira_thumb_cache_tests"),
+        );
+    }
     /// Writes a solid-color PNG and returns its path.
     fn temp_png(name: &str, w: u32, h: u32) -> PathBuf {
         let dir = std::env::temp_dir().join("ira_thumb_tests");
@@ -230,6 +312,7 @@ mod tests {
 
     #[test]
     fn decodes_scales_and_caches() {
+        use_test_cache();
         let src = temp_png("src.png", 1024, 512);
         let mtime: Option<i64> = fs::metadata(&src).ok().and_then(|m| {
             m.modified()
@@ -256,8 +339,8 @@ mod tests {
 
     #[test]
     fn undecodable_file_fails_cleanly() {
+        use_test_cache();
         let dir = std::env::temp_dir().join("ira_thumb_tests");
-        fs::create_dir_all(&dir).unwrap();
         let path = dir.join("not_an_image.png");
         let mut f = fs::File::create(&path).unwrap();
         f.write_all(b"definitely not a png").unwrap();

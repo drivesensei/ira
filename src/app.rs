@@ -22,7 +22,9 @@ use crate::{
         folders::list_common_folders,
         list_files::{list_files_bounded, list_files_chunked, FEntry, LISTING_CHUNK},
         state::{load_state, load_state_from, save_state, save_state_to, SessionState, SizeEntry},
-        thumbnails::{is_previewable, spawn_thumbnail_job, ThumbEvent, ThumbRequest},
+        thumbnails::{
+            is_previewable, prune_cache, spawn_workers, ThumbEvent, ThumbRequest, JOB_QUEUE_CAP,
+        },
         transfer::{
             spawn_delete_job, spawn_job, Job, JobControl, JobEvent, JobKind, JobStatus,
             OverwritePolicy,
@@ -100,6 +102,11 @@ pub const STATUS_TTL: Duration = Duration::from_secs(8);
 /// sizes are proportional to the preview area, so the cap bounds RSS even
 /// while flipping through a folder of large images.
 const THUMB_CACHE_CAP: usize = 32;
+
+/// How long a failed preview request stays blacklisted. Long enough that
+/// scrolling past a broken file never re-queues it every frame; short
+/// enough that transient I/O errors recover within a session.
+const THUMB_FAIL_RETRY: Duration = Duration::from_secs(30);
 
 /// Gap between navigation keys under which they count as "held down"
 /// (OS key-repeat fires at ~30 Hz; anything slower is a fresh press).
@@ -293,20 +300,25 @@ pub struct App {
     /// Preview column area in cells; written by the UI every frame while
     /// the column is open (0 × 0 until the first preview frame).
     pub preview_area: (u16, u16),
-    /// Finished preview jobs, delivered by off-thread workers.
+    /// Finished preview jobs, delivered by the worker pool.
     thumb_tx: mpsc::Sender<ThumbEvent>,
     thumb_rx: mpsc::Receiver<ThumbEvent>,
+    thumb_job_rx: Option<mpsc::Receiver<ThumbRequest>>,
+    thumb_jobs: mpsc::SyncSender<ThumbRequest>,
     /// Rendered protocols keyed by [`ThumbRequest::mem_key`].
     thumb_cache: HashMap<String, Protocol>,
     /// FIFO eviction order for `thumb_cache`.
     thumb_order: VecDeque<String>,
-    /// Requests that already failed this session (negative cache: a broken
-    /// file must not re-dispatch a worker on every frame).
-    thumb_failed: HashSet<String>,
+    /// Requests that failed, with the time they did. A broken file must not
+    /// re-dispatch a worker on every frame; entries retry after a cooldown
+    /// so transient I/O errors recover.
+    thumb_failed: HashMap<String, Instant>,
     /// Requests already dispatched to a worker (dedup guard).
     thumb_pending: HashSet<String>,
     /// Protocol currently displayed; kept alive across evictions.
     thumb_shown: Option<String>,
+    /// Decode workers started (once, on the first picker install).
+    thumb_workers_started: bool,
     /// State file location override; `None` = the real `~/.config/ira/state`.
     /// Integration tests set this so their walks never touch user config.
     pub state_path: Option<PathBuf>,
@@ -318,6 +330,7 @@ impl Default for App {
         let (file_list_tx, file_list_rx) = mpsc::channel();
         let (info_tx, info_rx) = mpsc::channel();
         let (thumb_tx, thumb_rx) = mpsc::channel();
+        let (thumb_jobs, thumb_job_rx) = mpsc::sync_channel(JOB_QUEUE_CAP);
         Self {
             running: true,
             size: (1024, 768),
@@ -365,10 +378,13 @@ impl Default for App {
             info_tx,
             thumb_tx,
             thumb_rx,
+            thumb_jobs,
+            thumb_job_rx: Some(thumb_job_rx),
+            thumb_pending: HashSet::new(),
+            thumb_workers_started: false,
             thumb_cache: HashMap::new(),
             thumb_order: VecDeque::new(),
-            thumb_pending: HashSet::new(),
-            thumb_failed: HashSet::new(),
+            thumb_failed: HashMap::new(),
             thumb_shown: None,
             info_rx,
         }
@@ -774,9 +790,34 @@ impl App {
     }
 
     /// Installs the terminal image picker probed at startup (before raw
-    /// mode); see `main`.
+    /// mode); see `main`. Also starts the bounded decode worker pool and a
+    /// one-shot disk-cache prune.
     pub fn set_picker(&mut self, picker: Picker) {
-        self.picker = Some(picker);
+        self.picker = Some(picker.clone());
+        if self.thumb_workers_started {
+            return;
+        }
+        self.thumb_workers_started = true;
+        let jobs = self
+            .thumb_job_rx
+            .take()
+            .expect("thumb workers started twice");
+        spawn_workers(picker, Arc::new(Mutex::new(jobs)), self.thumb_tx.clone());
+        std::thread::spawn(prune_cache);
+    }
+
+    /// Whether a modal overlay (dialogs centered over the files area) is
+    /// open. Graphics-protocol previews (sixel/iTerm2) live in a layer above
+    /// the cell grid, so they must be suppressed while a dialog is shown —
+    /// clearing cells does not clear the graphic.
+    pub fn overlay_covers_preview(&self) -> bool {
+        self.confirming.is_some()
+            || self.renaming.is_some()
+            || self.goto_prompt.is_some()
+            || self.new_entry.is_some()
+            || self.multi_info.is_some()
+            || self.info.is_some()
+            || self.deletion_box_visible()
     }
 
     /// Toggles the image preview column (`v`).
@@ -817,16 +858,25 @@ impl App {
             self.thumb_shown = Some(key);
             return Some(protocol);
         }
+        if let Some(failed_at) = self.thumb_failed.get(&key) {
+            if failed_at.elapsed() < THUMB_FAIL_RETRY {
+                return None;
+            }
+            // Cooldown elapsed: forget the failure and allow a retry.
+            self.thumb_failed.remove(&key);
+        }
         if self.picker.is_none()
-            || self.thumb_failed.contains(&key)
             || self.thumb_pending.contains(&key)
             || req.cols == 0
+            || req.rows == 0
         {
             return None;
         }
-        self.thumb_pending.insert(key);
-        let picker = self.picker.clone().expect("picker checked above");
-        spawn_thumbnail_job(req.clone(), picker, self.thumb_tx.clone());
+        // Bounded queue: a full queue drops the request (retried on a later
+        // frame via `preview_request`), so scrolling never builds a backlog.
+        if self.thumb_jobs.try_send(req.clone()).is_ok() {
+            self.thumb_pending.insert(key);
+        }
         None
     }
 
@@ -840,7 +890,7 @@ impl App {
                 }
                 ThumbEvent::Failed(req) => {
                     self.thumb_pending.remove(&req.mem_key());
-                    self.thumb_failed.insert(req.mem_key());
+                    self.thumb_failed.insert(req.mem_key(), Instant::now());
                 }
             }
         }
@@ -3326,5 +3376,63 @@ mod preview_tests {
         }
         assert!(settled, "failed job stayed pending");
         assert!(app.preview_protocol(&req).is_none());
+    }
+
+    #[test]
+    fn queued_requests_all_resolve_through_the_pool() {
+        let mut app = App::default();
+        app.set_picker(ratatui_image::picker::Picker::halfblocks());
+        app.preview_area = (38, 10);
+        let reqs: Vec<ThumbRequest> = (0..6)
+            .map(|i| ThumbRequest {
+                path: png_at(&format!("pool{i}.png")),
+                mtime: None,
+                size: 0,
+                cols: 38,
+                rows: 10,
+            })
+            .collect();
+        for req in &reqs {
+            let _ = app.preview_protocol(req);
+        }
+        // The pool drains the queue even though only ≤4 workers exist.
+        let mut done = 0;
+        for _ in 0..1000 {
+            for r in &reqs {
+                let _ = app.preview_protocol(r);
+            }
+            done = reqs
+                .iter()
+                .filter(|r| app.thumb_cache.contains_key(&r.mem_key()))
+                .count();
+            if done == reqs.len() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(done, reqs.len(), "queued requests did not all resolve");
+    }
+
+    #[test]
+    fn modal_overlay_suppresses_dispatch_and_render() {
+        let png = png_at("overlay.png");
+        let mut app = app_with_selection(&png);
+        app.confirming = Some(Confirm {
+            action: ConfirmAction::Delete,
+            label: "x".into(),
+            paths: vec![],
+            dest_dir: None,
+        });
+        assert!(app.overlay_covers_preview());
+
+        let backend = ratatui::backend::TestBackend::new(50, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| crate::components::preview_ui::render(f, &mut app, f.area()))
+            .unwrap();
+        assert!(
+            app.thumb_pending.is_empty(),
+            "dispatched a job while a modal overlay was open"
+        );
     }
 }

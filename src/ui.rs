@@ -90,8 +90,8 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         let with_preview = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Min(0),
-                Constraint::Length(crate::components::preview_ui::PREVIEW_COLS),
+                Constraint::Min(24),
+                Constraint::Max(crate::components::preview_ui::PREVIEW_COLS),
             ])
             .split(files_area);
         files_area = with_preview[0];

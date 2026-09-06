@@ -161,6 +161,7 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
     if app.board_has_focus() {
         match key_event.code {
             KeyCode::Esc | KeyCode::Char('`') => app.toggle_copy_board(),
+            KeyCode::Char('v') => app.toggle_preview(),
             KeyCode::Tab => app.switch_pane(),
             KeyCode::Up => app.copy_board_prev(),
             KeyCode::Down => app.copy_board_next(),

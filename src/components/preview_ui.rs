@@ -23,6 +23,17 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     // exactly (protocol encoding is area-dependent).
     app.preview_area = (inner.width, inner.height);
 
+    // A modal dialog centered over the files area cannot hide a
+    // graphics-protocol image (it lives above the cell grid), so suspend
+    // the preview while any overlay is open.
+    if app.overlay_covers_preview() {
+        frame.render_widget(
+            Paragraph::new(Line::raw(" preview paused "))
+                .style(Style::default().fg(Color::DarkGray)),
+            inner,
+        );
+        return;
+    }
     match app.preview_request() {
         Some(req) => {
             if let Some(protocol) = app.preview_protocol(&req) {
