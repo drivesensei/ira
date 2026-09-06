@@ -46,7 +46,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect, pane_index: usize) {
 
     if editing {
         let edit = app.edit.as_ref().expect("checked above");
-        frame.render_widget(edit.textarea.widget(), inner);
+        frame.render_widget(&edit.textarea, inner);
         return;
     }
     if editing_ro {
