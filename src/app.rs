@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::error;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use open::that_detached;
 use ratatui::widgets::ListState;
+use ratatui_image::{picker::Picker, protocol::Protocol};
 
 use crate::{
     domain::data::Folder,
@@ -21,6 +22,7 @@ use crate::{
         folders::list_common_folders,
         list_files::{list_files_bounded, list_files_chunked, FEntry, LISTING_CHUNK},
         state::{load_state, load_state_from, save_state, save_state_to, SessionState, SizeEntry},
+        thumbnails::{is_previewable, spawn_thumbnail_job, ThumbEvent, ThumbRequest},
         transfer::{
             spawn_delete_job, spawn_job, Job, JobControl, JobEvent, JobKind, JobStatus,
             OverwritePolicy,
@@ -93,6 +95,11 @@ pub struct Status {
 
 /// How long a status message stays visible.
 pub const STATUS_TTL: Duration = Duration::from_secs(8);
+
+/// Maximum rendered preview protocols kept in memory. Kitty/sixel payload
+/// sizes are proportional to the preview area, so the cap bounds RSS even
+/// while flipping through a folder of large images.
+const THUMB_CACHE_CAP: usize = 32;
 
 /// Gap between navigation keys under which they count as "held down"
 /// (OS key-repeat fires at ~30 Hz; anything slower is a fresh press).
@@ -278,6 +285,28 @@ pub struct App {
     /// a slow folder (e.g. a cold spin-up HDD) can't block `App::new()`.
     file_list_tx: mpsc::Sender<(usize, Vec<FEntry>, bool, u64)>,
     file_list_rx: mpsc::Receiver<(usize, Vec<FEntry>, bool, u64)>,
+    /// Terminal image-rendering picker (protocol + font size), probed once
+    /// at startup before raw mode. `None` disables previews entirely.
+    pub picker: Option<Picker>,
+    /// Whether the image preview column is open (`v`).
+    pub preview: bool,
+    /// Preview column area in cells; written by the UI every frame while
+    /// the column is open (0 × 0 until the first preview frame).
+    pub preview_area: (u16, u16),
+    /// Finished preview jobs, delivered by off-thread workers.
+    thumb_tx: mpsc::Sender<ThumbEvent>,
+    thumb_rx: mpsc::Receiver<ThumbEvent>,
+    /// Rendered protocols keyed by [`ThumbRequest::mem_key`].
+    thumb_cache: HashMap<String, Protocol>,
+    /// FIFO eviction order for `thumb_cache`.
+    thumb_order: VecDeque<String>,
+    /// Requests that already failed this session (negative cache: a broken
+    /// file must not re-dispatch a worker on every frame).
+    thumb_failed: HashSet<String>,
+    /// Requests already dispatched to a worker (dedup guard).
+    thumb_pending: HashSet<String>,
+    /// Protocol currently displayed; kept alive across evictions.
+    thumb_shown: Option<String>,
     /// State file location override; `None` = the real `~/.config/ira/state`.
     /// Integration tests set this so their walks never touch user config.
     pub state_path: Option<PathBuf>,
@@ -288,6 +317,7 @@ impl Default for App {
         let (job_tx, job_rx) = mpsc::channel();
         let (file_list_tx, file_list_rx) = mpsc::channel();
         let (info_tx, info_rx) = mpsc::channel();
+        let (thumb_tx, thumb_rx) = mpsc::channel();
         Self {
             running: true,
             size: (1024, 768),
@@ -329,7 +359,17 @@ impl Default for App {
             drives_running: false,
             file_list_tx,
             file_list_rx,
+            picker: None,
+            preview: false,
+            preview_area: (0, 0),
             info_tx,
+            thumb_tx,
+            thumb_rx,
+            thumb_cache: HashMap::new(),
+            thumb_order: VecDeque::new(),
+            thumb_pending: HashSet::new(),
+            thumb_failed: HashSet::new(),
+            thumb_shown: None,
             info_rx,
         }
     }
@@ -426,6 +466,7 @@ impl App {
         self.refresh_drives();
         self.pick_up_pane_listings();
         self.refresh_transfer_destinations();
+        self.pick_up_thumbnails();
         self.expire_status();
     }
 
@@ -730,6 +771,98 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Installs the terminal image picker probed at startup (before raw
+    /// mode); see `main`.
+    pub fn set_picker(&mut self, picker: Picker) {
+        self.picker = Some(picker);
+    }
+
+    /// Toggles the image preview column (`v`).
+    pub fn toggle_preview(&mut self) {
+        self.preview = !self.preview;
+    }
+
+    /// Builds the preview request for the active pane's selected entry, or
+    /// `None` when the preview column has nothing to show an image for
+    /// (closed, nothing selected, folder, unsupported format).
+    pub fn preview_request(&self) -> Option<ThumbRequest> {
+        if !self.preview {
+            return None;
+        }
+        let pane = self.pane();
+        let entry = pane.state.selected().and_then(|i| pane.files.get(i))?;
+        if entry.is_dir || !is_previewable(&entry.path) {
+            return None;
+        }
+        Some(ThumbRequest {
+            path: entry.path.clone(),
+            mtime: entry.modified,
+            size: entry.size,
+            cols: self.preview_area.0,
+            rows: self.preview_area.1,
+        })
+    }
+
+    /// Returns the rendered protocol for `req`, dispatching a background
+    /// decode+encode job on first sight. `None` means still loading — the
+    /// UI shows a placeholder until a later frame. Draining the result
+    /// channel here (not only on ticks) makes a finished thumbnail appear
+    /// on the next redraw instead of up to a tick later.
+    pub fn preview_protocol(&mut self, req: &ThumbRequest) -> Option<&Protocol> {
+        self.pick_up_thumbnails();
+        let key = req.mem_key();
+        if let Some(protocol) = self.thumb_cache.get(&key) {
+            self.thumb_shown = Some(key);
+            return Some(protocol);
+        }
+        if self.picker.is_none()
+            || self.thumb_failed.contains(&key)
+            || self.thumb_pending.contains(&key)
+            || req.cols == 0
+        {
+            return None;
+        }
+        self.thumb_pending.insert(key);
+        let picker = self.picker.clone().expect("picker checked above");
+        spawn_thumbnail_job(req.clone(), picker, self.thumb_tx.clone());
+        None
+    }
+
+    /// Collects finished thumbnail jobs into the protocol cache.
+    fn pick_up_thumbnails(&mut self) {
+        while let Ok(event) = self.thumb_rx.try_recv() {
+            match event {
+                ThumbEvent::Ready(req, protocol) => {
+                    self.thumb_pending.remove(&req.mem_key());
+                    self.insert_thumb(req.mem_key(), protocol);
+                }
+                ThumbEvent::Failed(req) => {
+                    self.thumb_pending.remove(&req.mem_key());
+                    self.thumb_failed.insert(req.mem_key());
+                }
+            }
+        }
+    }
+    /// Inserts a finished protocol with FIFO eviction. Protocols are heavy
+    /// (kitty payloads are full escape sequences), so the cache is bounded;
+    /// the currently displayed entry survives eviction to avoid a visible
+    /// re-decode flicker.
+    fn insert_thumb(&mut self, key: String, protocol: Protocol) {
+        while self.thumb_order.len() >= THUMB_CACHE_CAP {
+            let Some(oldest) = self.thumb_order.pop_front() else {
+                break;
+            };
+            if self.thumb_shown.as_ref() != Some(&oldest) {
+                self.thumb_cache.remove(&oldest);
+            } else {
+                self.thumb_order.push_back(oldest);
+                break;
+            }
+        }
+        self.thumb_cache.insert(key.clone(), protocol);
+        self.thumb_order.push_back(key);
     }
 
     pub fn get_drive_shortcuts(&self) -> Vec<char> {
@@ -3091,4 +3224,107 @@ fn matching_drive_picks_longest_mount_prefix() {
         device: Some("/dev/x".to_string()),
     }];
     assert!(matching_drive(&none, "/anything").is_none());
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+    use image::DynamicImage;
+
+    /// Writes a small PNG and returns its path.
+    fn png_at(name: &str) -> String {
+        let dir = std::env::temp_dir().join("ira_preview_tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        let img = DynamicImage::ImageRgb8(image::RgbImage::from_fn(64, 32, |x, y| {
+            image::Rgb([x as u8, y as u8, 0])
+        }));
+        img.save_with_format(&path, image::ImageFormat::Png)
+            .unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn app_with_selection(path: &str) -> App {
+        let mut app = App::default();
+        app.set_picker(ratatui_image::picker::Picker::halfblocks());
+        app.preview = true;
+        app.preview_area = (38, 10);
+        app.panes[0].files = vec![FEntry {
+            path: path.to_string(),
+            label: "img.png".to_string(),
+            is_dir: false,
+            size: 0,
+            modified: None,
+        }];
+        app.panes[0].state.select(Some(0));
+        app
+    }
+
+    #[test]
+    fn toggle_flips_preview() {
+        let mut app = App::default();
+        assert!(!app.preview);
+        app.toggle_preview();
+        assert!(app.preview);
+        app.toggle_preview();
+        assert!(!app.preview);
+    }
+
+    #[test]
+    fn preview_request_gates_on_kind_and_visibility() {
+        let png = png_at("gate.png");
+        let mut app = app_with_selection(&png);
+        assert!(app.preview_request().is_some());
+
+        // Folders and non-image extensions never produce a request.
+        app.panes[0].files[0].is_dir = true;
+        assert!(app.preview_request().is_none());
+        app.panes[0].files[0].is_dir = false;
+        app.panes[0].files[0].path = "/tmp/notes.txt".into();
+        assert!(app.preview_request().is_none());
+
+        // Closed preview: no request even for a valid image.
+        app.panes[0].files[0].path = png;
+        app.preview = false;
+        assert!(app.preview_request().is_none());
+    }
+
+    #[test]
+    fn preview_protocol_dispatches_and_becomes_ready() {
+        let png = png_at("roundtrip.png");
+        let mut app = app_with_selection(&png);
+        let req = app.preview_request().unwrap();
+
+        // First call dispatches a worker; "loading" until it finishes.
+        assert!(app.preview_protocol(&req).is_none());
+        let mut ready = false;
+        for _ in 0..500 {
+            if app.preview_protocol(&req).is_some() {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready, "thumbnail never became ready");
+    }
+
+    #[test]
+    fn failed_decode_does_not_stick_pending() {
+        let mut app = app_with_selection("/nonexistent/missing.png");
+        let req = app.preview_request().unwrap();
+        assert!(app.preview_protocol(&req).is_none());
+        // preview_protocol drains finished jobs; failure must clear pending
+        // and keep reporting "loading" (None) without re-dispatching.
+        let mut settled = false;
+        for _ in 0..500 {
+            let _ = app.preview_protocol(&req);
+            if app.thumb_pending.is_empty() {
+                settled = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(settled, "failed job stayed pending");
+        assert!(app.preview_protocol(&req).is_none());
+    }
 }

@@ -214,6 +214,9 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         KeyCode::Char('/') => app.start_search(),
 
         // `+` toggles the vertical split of the files pane.
+
+        // `v` toggles the image preview column for the selected entry.
+        KeyCode::Char('v') => app.toggle_preview(),
         KeyCode::Char('+') => app.toggle_split(),
 
         // Backtick toggles the Copy Board sidebar.

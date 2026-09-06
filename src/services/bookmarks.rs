@@ -12,8 +12,8 @@ pub const KEYBOARD_ORDER: &[char] = &[
 pub const COMMON_FOLDER_KEYS: &[char] = &['w', 'e', 'r', 't', 'y', 'u', 'i'];
 
 /// Letters reserved for non-bookmark actions (quit, Ctrl-C, top, bottom,
-/// toggle, copy, move).
-pub const RESERVED_KEYS: &[char] = &['q', 'c', 'z', 'x', 'b', 'm'];
+/// toggle, copy, move, image preview).
+pub const RESERVED_KEYS: &[char] = &['q', 'c', 'z', 'x', 'b', 'm', 'v'];
 
 /// First letter in keyboard order not present in `used`.
 pub fn first_free_shortcut(used: &[char]) -> Option<char> {
@@ -94,7 +94,7 @@ mod tests {
 
         assert_eq!(
             assigned,
-            vec!['o', 'p', 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', 'v', 'n']
+            vec!['o', 'p', 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', 'n']
         );
     }
 }

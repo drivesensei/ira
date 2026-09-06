@@ -95,6 +95,17 @@ reports **"N folders / M files selected"** with the summed data size and on-disk
 measurements are cached and persisted, so reopening a folder shows its size instantly — even
 after a restart.
 
+## Image Preview
+
+| Key | Action |
+| --- | --- |
+| `v` | Toggle the preview column for the selected entry |
+
+Select an image (PNG, JPEG, GIF, BMP, WebP) and ira renders it in a side column — full graphics
+in terminals that support the kitty, iTerm2, or Sixel protocols, Unicode half-blocks everywhere
+else. Decoding happens on background threads and is cached in memory and on disk, so scrolling
+through a folder of photos stays instant and the UI never blocks.
+
 ## Create, Go To, and Clipboard
 
 | Key | Action |
