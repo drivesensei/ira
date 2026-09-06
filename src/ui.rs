@@ -14,6 +14,9 @@ use crate::services::file_info::{
 /// Renders the user interface widgets.
 pub fn render(app: &mut App, frame: &mut Frame) {
     let Rect { width, height, .. } = frame.area();
+    // Frame-scoped thumbnail-cache cap: the grid renderer raises it to
+    // cover its working set (visible + prefetched cells).
+    app.begin_thumb_cache_frame();
 
     let app_title_block = Block::bordered()
         .title("     IRA (Integrated Retro Archives)    ")
@@ -84,7 +87,8 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         crate::components::copy_board_ui::render(frame, app, board[1]);
         files_area = board[0];
     }
-
+    // Preview columns (per-pane `v` column mode) are drawn inside each
+    // pane's own renderer; the files area itself is untouched here.
     if app.split {
         let files = Layout::default()
             .direction(Direction::Horizontal)

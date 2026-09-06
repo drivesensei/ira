@@ -45,9 +45,9 @@ Folders that don't exist on the platform are skipped automatically.
 
 ### Bookmarks
 
-Bookmarks give one-key access to folders. Press `b` while viewing a folder to bookmark it (press `b` again to remove it). Each bookmark gets a single-letter shortcut auto-assigned in QWERTY keyboard order, skipping letters already used by the common folders (`w e r t y u i`) and reserved keys (`q` quit, `c` Ctrl-C, `z`/`x` top/bottom, `b` toggle).
+Bookmarks give one-key access to folders. Press `b` while viewing a folder to bookmark it (press `b` again to remove it). Each bookmark gets a single-letter shortcut auto-assigned in QWERTY keyboard order, skipping letters already used by the common folders (`w e r t y u i`) and reserved keys (`q` quit, `c` Ctrl-C, `z`/`x` top/bottom, `b` toggle, `v` image preview).
 
-The letters are assigned in this order: `o`, `p`, `a`, `s`, `d`, `f`, `g`, `h`, `j`, `k`, `l`, `v`, `n`, `m`.
+The letters are assigned in this order: `o`, `p`, `a`, `s`, `d`, `f`, `g`, `h`, `j`, `k`, `l`, `n`, `m`.
 
 Bookmarks persist to `~/.config/ira/bookmarks` (one `label<TAB>path` line each).
 
@@ -79,6 +79,7 @@ Shows the contents of the currently selected folder (`src/services/list_files.rs
 | `Alt+↑` / `Alt+↓` | Jump to top / bottom of the list |
 | `z` / `x` | Jump to top / bottom of the list |
 | `/` | Start fuzzy search of the current folder's files |
+| `v` | Cycle the active pane's image preview: off → column → grid (per pane, persisted) |
 | `+` | Split / unsplit the files pane (side by side) |
 | `Tab` | Switch focus (panes / Copy Board) |
 | `q` / `Ctrl+C` | Quit |
@@ -94,6 +95,8 @@ While searching, typed characters filter the file list by fuzzy subsequence matc
 **Info:** `?` opens a metadata dialog showing name, full path, kind (folder, or a file type derived from the extension), hidden status, size (recursive for folders), and added/modified dates (UTC). Any key dismisses it.
 
 **Selection & visibility:** `Space` multi-selects (rows show `[*]`/`[ ]`); `Ctrl+A` selects or clears everything, `Alt+I` inverts the selection. (Super-based binds are not reliable in terminals, so `Ctrl`/`Alt` are used instead.) `.` toggles whether hidden (dot) files are listed. Rows carry a folder glyph (`□`) or file glyph (`·`), both single-width Unicode that render identically on Linux/macOS/Windows terminal fonts.
+
+**Image preview:** `v` cycles the ACTIVE pane's preview mode — modes are per pane, survive restarts, and switching panes with Tab never changes either pane's mode. **Column** renders the selected file as an image in a side column. **Grid** replaces the file list with a thumbnail grid (image thumbnails, glyphs for folders and unsupported files, cursor highlighted; all formats the list shows are shown, including filtered views). Rendering picks the best protocol the terminal supports at startup — kitty, iTerm2, or Sixel for true graphics — and falls back to Unicode half-blocks everywhere else. Supported formats: PNG, JPEG, GIF, BMP, WebP — plus MP4/MOV videos and HEIC photos when `ffmpeg` is on `PATH`, and PDF first pages when `pdftoppm` (poppler) is on `PATH` (both optional runtime dependencies; without them those files show glyphs). **Text and code files** (`txt md json toml yaml csv rs py sh c html`…) render natively in the column — head of the file, NUL-sniffed so binaries never render as garbage, capped at 256 KB with a truncation notice. Thumbnails for the screens adjacent to the viewport are prefetched in the background, so scrolling large folders feels instant. Decoding runs on a bounded background worker pool and never blocks the UI; thumbnails are cached in memory and on disk (`~/.cache/ira/thumbnails`, keyed by path + mtime + size, so edited images refresh automatically).
 
 ## Domain model
 

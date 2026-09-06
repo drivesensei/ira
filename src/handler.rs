@@ -161,7 +161,7 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
     if app.board_has_focus() {
         match key_event.code {
             KeyCode::Esc | KeyCode::Char('`') => app.toggle_copy_board(),
-            KeyCode::Tab => app.switch_pane(),
+            KeyCode::Char('v') => app.cycle_preview(),
             KeyCode::Up => app.copy_board_prev(),
             KeyCode::Down => app.copy_board_next(),
             KeyCode::Char('p') | KeyCode::Char(' ') => app.toggle_selected_job_pause(),
@@ -214,6 +214,9 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         KeyCode::Char('/') => app.start_search(),
 
         // `+` toggles the vertical split of the files pane.
+
+        // `v` cycles the image preview: off → column → grid.
+        KeyCode::Char('v') => app.cycle_preview(),
         KeyCode::Char('+') => app.toggle_split(),
 
         // Backtick toggles the Copy Board sidebar.

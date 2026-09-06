@@ -5,5 +5,6 @@ pub mod file_info;
 pub mod folders;
 pub mod list_files;
 pub mod state;
+pub mod thumbnails;
 pub mod transfer;
 mod windows_drives_labels;

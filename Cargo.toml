@@ -14,6 +14,19 @@ dirs-next = "2.0.0"
 open = "5.4.3"
 parking_lot = "0.12.5"
 ratatui = "0.30.2"
+image = { version = "0.25.6", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "bmp",
+    "webp",
+] }
+# Terminal image rendering (kitty/iTerm2/sixel/halfblocks). Default features
+# are disabled: they pull chafa-dyn, a runtime dependency on libchafa.so that
+# breaks Windows/macOS distribution of prebuilt binaries.
+ratatui-image = { version = "11", default-features = false, features = [
+    "crossterm",
+] }
 winapi = { version = "0.3.9", features = [
     "fileapi",
     "winbase",

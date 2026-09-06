@@ -4,6 +4,7 @@ use ira::handler::handle_key_events;
 use ira::tui::Tui;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui_image::picker::{Picker, ProtocolType};
 use std::io;
 
 fn main() -> AppResult<()> {
@@ -16,8 +17,20 @@ fn main() -> AppResult<()> {
         println!("ira {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    // Create an application.
+
+    // Probe the terminal for image-protocol support and font size BEFORE raw
+    // mode and the alternate screen: the probe runs blocking stdin queries
+    // that would otherwise race crossterm's event reader (same class of stall
+    // as the `terminal.clear()` note in `Tui::init`). Halfblocks renders in
+    // every terminal and is the universal fallback.
+    let picker = match Picker::from_query_stdio() {
+        Ok(picker) => picker,
+        Err(_) => Picker::halfblocks(),
+    };
+
+    // Create the application and install the probed picker.
     let mut app = App::new();
+    app.set_picker(picker);
 
     // Initialize the terminal user interface.
     let backend = CrosstermBackend::new(io::stderr());
@@ -47,7 +60,16 @@ fn main() -> AppResult<()> {
     }
     // Persist session state (split layout and pane folders) on exit.
     app.persist_state();
-
+    // Graphics-protocol cleanup: transmitted kitty images persist in the
+    // terminal beyond the program's lifetime unless explicitly deleted.
+    if matches!(
+        app.picker.as_ref().map(|p| p.protocol_type()),
+        Some(ProtocolType::Kitty)
+    ) {
+        use std::io::Write as _;
+        let _ = write!(io::stderr(), "\x1b_Ga=d,d=e\x1b\\");
+        let _ = io::stderr().flush();
+    }
     // Exit the user interface.
     tui.exit()?;
     Ok(())
