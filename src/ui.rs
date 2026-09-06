@@ -130,18 +130,39 @@ pub fn render(app: &mut App, frame: &mut Frame) {
             crate::app::ConfirmAction::Copy => "Copy",
             crate::app::ConfirmAction::Move => "Move",
         };
+        let policy = match &confirm.action {
+            crate::app::ConfirmAction::Delete => String::new(),
+            _ => match confirm.policy {
+                crate::services::transfer::OverwritePolicy::AutoRename => {
+                    "  [o] if exists: auto-rename".to_string()
+                }
+                crate::services::transfer::OverwritePolicy::Overwrite => {
+                    "  [o] if exists: overwrite".to_string()
+                }
+                crate::services::transfer::OverwritePolicy::SkipExisting => {
+                    "  [o] if exists: skip".to_string()
+                }
+            },
+        };
         let prompt = match &confirm.dest_dir {
             Some(dest) => {
                 let dest_name = std::path::Path::new(dest)
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| dest.clone());
-                format!(" {verb} {} → {dest_name}?  [y]es  [n]o ", confirm.label)
+                format!(
+                    " {verb} {} → {dest_name}?  [y]es  [n]o {policy} ",
+                    confirm.label
+                )
             }
             None => format!(" {verb} {}?  [y]es  [n]o ", confirm.label),
         };
         let style = Style::default().fg(Color::Black).bg(Color::White);
-        let area = centered_rect(60, 3, frame.area());
+        // Content-based width (capped) so the policy hint always fits.
+        let w = (prompt.len() as u16 + 4)
+            .max(40)
+            .min(frame.area().width.saturating_sub(4));
+        let area = centered_rect(w, 3, frame.area());
         paint_bg(frame, area, style);
         let block = Block::bordered().title(" Confirm ").style(style);
         frame.render_widget(

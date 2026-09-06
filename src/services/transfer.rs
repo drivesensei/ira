@@ -23,6 +23,19 @@ pub enum JobKind {
     Move,
 }
 
+/// What happens when a destination path already exists.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OverwritePolicy {
+    /// Never overwrite: colliding destinations are renamed to
+    /// `name (2).ext`, `name (3).ext`, ... (first free number).
+    #[default]
+    AutoRename,
+    /// Never overwrite: colliding destinations are skipped and reported.
+    SkipExisting,
+    /// Replace existing destination files outright (folders merge).
+    Overwrite,
+}
+
 /// Lifecycle state of a job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobStatus {
@@ -135,6 +148,7 @@ impl From<std::io::Error> for JobError {
 pub struct Job {
     pub id: u64,
     pub kind: JobKind,
+    pub overwrite: OverwritePolicy,
     /// All paths to copy/move, processed sequentially by the worker.
     pub paths: Vec<String>,
     pub dest_dir: String,
@@ -159,9 +173,18 @@ pub fn spawn_job(job: &Job, tx: mpsc::Sender<JobEvent>) {
     let control = job.control.clone();
     let paths = job.paths.clone();
     let dest_dir = job.dest_dir.clone();
+    let policy = job.overwrite;
 
     thread::spawn(move || {
-        let result = run_batch(id, kind, &paths, Path::new(&dest_dir), &control, &tx);
+        let result = run_batch(
+            id,
+            kind,
+            &paths,
+            Path::new(&dest_dir),
+            policy,
+            &control,
+            &tx,
+        );
         let event = match result {
             Ok(()) => JobEvent::Done { id },
             Err(JobError::Cancelled) => JobEvent::Cancelled { id },
@@ -169,6 +192,44 @@ pub fn spawn_job(job: &Job, tx: mpsc::Sender<JobEvent>) {
         };
         let _ = tx.send(event);
     });
+}
+
+/// Resolves the destination path under the overwrite policy. Returns the
+/// final destination, or `None` when the policy says to skip the item.
+fn resolve_destination(
+    src: &Path,
+    dest_dir: &Path,
+    policy: OverwritePolicy,
+) -> Option<std::path::PathBuf> {
+    let name = src.file_name().unwrap_or_default();
+    let dst = dest_dir.join(name);
+    if fs::symlink_metadata(&dst).is_err() {
+        return Some(dst);
+    }
+    match policy {
+        OverwritePolicy::Overwrite => Some(dst),
+        OverwritePolicy::SkipExisting => None,
+        OverwritePolicy::AutoRename => {
+            // name (2).ext, name (3).ext, ... — first free number.
+            let stem = Path::new(name)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let ext = Path::new(name)
+                .extension()
+                .map(|e| format!(".{}", e.to_string_lossy()));
+            for n in 2.. {
+                let candidate = match &ext {
+                    Some(e) => dest_dir.join(format!("{stem} ({n}){e}")),
+                    None => dest_dir.join(format!("{stem} ({n})")),
+                };
+                if fs::symlink_metadata(&candidate).is_err() {
+                    return Some(candidate);
+                }
+            }
+            None
+        }
+    }
 }
 
 /// Runs the batch: pre-scans total bytes, then copies/moves each path in
@@ -180,6 +241,7 @@ fn run_batch(
     kind: JobKind,
     paths: &[String],
     dest_dir: &Path,
+    policy: OverwritePolicy,
     control: &JobControl,
     tx: &mpsc::Sender<JobEvent>,
 ) -> Result<(), JobError> {
@@ -202,17 +264,21 @@ fn run_batch(
     for p in paths {
         control.gate()?;
         let src = Path::new(p);
-        let dst = dest_dir.join(src.file_name().unwrap_or_default());
-        // Overwrite policy: an existing destination is never touched. The
-        // item counts as failed and the batch continues.
-        if fs::symlink_metadata(&dst).is_ok() {
+        let Some(dst) = resolve_destination(src, dest_dir, policy) else {
             failed += 1;
             let _ = tx.send(JobEvent::Progress {
                 id,
                 copied_bytes: bytes,
-                current: format!("SKIPPED (already exists): {}", dst.to_string_lossy()),
+                current: format!("SKIPPED (already exists): {}", p),
             });
             continue;
+        };
+        // Overwrite policy: replace the existing destination file before
+        // copying (create_new would otherwise refuse). Folders merge.
+        if policy == OverwritePolicy::Overwrite
+            && fs::symlink_metadata(&dst).is_ok_and(|m| !m.is_dir())
+        {
+            fs::remove_file(&dst)?;
         }
         let result = match kind {
             JobKind::Copy => copy_entry(src, &dst, control, id, tx, &mut bytes),
@@ -511,6 +577,7 @@ mod batch_tests {
         Job {
             id: 1,
             kind: JobKind::Copy,
+            overwrite: OverwritePolicy::AutoRename,
             paths,
             dest_dir: dest.to_string(),
             label: "batch".to_string(),
@@ -620,6 +687,7 @@ mod batch_tests {
         let (tx, rx) = mpsc::channel();
         let mut job = make_job(paths, base.join("dst").to_str().unwrap());
         job.kind = JobKind::Move;
+        job.overwrite = OverwritePolicy::SkipExisting;
         spawn_job(&job, tx);
         let (last, _) = wait_done(&rx);
 
@@ -641,6 +709,7 @@ mod batch_tests {
         let (tx, rx) = mpsc::channel();
         let mut job = make_job(paths, base.join("dst").to_str().unwrap());
         job.kind = JobKind::Move;
+        job.overwrite = OverwritePolicy::SkipExisting;
         spawn_job(&job, tx);
         let (last, _) = wait_done(&rx);
 
@@ -671,7 +740,8 @@ mod batch_tests {
 
         let paths = vec![base.join("src").join("b").to_string_lossy().into_owned()];
         let (tx, rx) = mpsc::channel();
-        let job = make_job(paths, base.join("dst").to_str().unwrap());
+        let mut job = make_job(paths, base.join("dst").to_str().unwrap());
+        job.overwrite = OverwritePolicy::SkipExisting;
         spawn_job(&job, tx);
         let (last, _) = wait_done(&rx);
 

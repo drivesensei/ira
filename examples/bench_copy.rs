@@ -1,5 +1,5 @@
 //! Benchmarks the real batch copy worker: N small files + one large file.
-use ira::services::transfer::{spawn_job, Job, JobControl, JobEvent, JobKind};
+use ira::services::transfer::{spawn_job, Job, JobControl, JobEvent, JobKind, OverwritePolicy};
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -24,6 +24,7 @@ fn main() {
     let job = Job {
         id: 1,
         kind: JobKind::Copy,
+        overwrite: OverwritePolicy::AutoRename,
         paths: paths.clone(),
         dest_dir: dst.clone(),
         label: "bench".into(),

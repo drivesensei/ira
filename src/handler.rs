@@ -118,9 +118,11 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         return Ok(());
     }
 
-    // Confirmation prompt (delete / copy / move).
+    // Confirmation prompt (delete / copy / move). `o` cycles the overwrite
+    // policy for copy/move.
     if app.confirming.is_some() {
         match key_event.code {
+            KeyCode::Char('o') => app.cycle_confirm_policy(),
             KeyCode::Char('y') | KeyCode::Enter => app.confirm_pending(),
             KeyCode::Char('n') | KeyCode::Esc => app.cancel_confirm(),
             _ => {}

@@ -21,7 +21,10 @@ use crate::{
         folders::list_common_folders,
         list_files::{list_files_bounded, list_files_chunked, FEntry, LISTING_CHUNK},
         state::{load_state, load_state_from, save_state, save_state_to, SessionState, SizeEntry},
-        transfer::{spawn_delete_job, spawn_job, Job, JobControl, JobEvent, JobKind, JobStatus},
+        transfer::{
+            spawn_delete_job, spawn_job, Job, JobControl, JobEvent, JobKind, JobStatus,
+            OverwritePolicy,
+        },
     },
     utils::{
         fuzzy::fuzzy_score,
@@ -146,6 +149,8 @@ pub struct NewEntryPrompt {
 pub struct Confirm {
     /// Which operation `y` confirms.
     pub action: ConfirmAction,
+    /// Overwrite policy for copy/move confirmations.
+    pub policy: OverwritePolicy,
     /// Prompt label, e.g. `'report.pdf'` or `3 items`.
     pub label: String,
     /// Full paths of the items the action would affect.
@@ -546,6 +551,10 @@ impl App {
         if pane_index >= self.panes.len() {
             return;
         }
+        // Any new listing request invalidates in-flight results (a stale
+        // async listing must never replace a newer sync/streamed one).
+        self.panes[pane_index].listing_generation =
+            self.panes[pane_index].listing_generation.wrapping_add(1);
         let Some(path) = self.panes[pane_index]
             .folder
             .as_ref()
@@ -567,10 +576,22 @@ impl App {
                 pane.selected = vec![false; len];
                 pane.render_scroll = 0;
                 pane.listing_settled = true;
-                // A just-created entry gets the cursor.
-                if let Some(sel) = pane.pending_select.take() {
-                    if let Some(i) = pane.files.iter().position(|f| f.path == sel) {
-                        pane.state.select(Some(i));
+                // A just-created entry gets the cursor; otherwise the
+                // cursor rests on the first entry (folder-open default).
+                match pane.pending_select.take() {
+                    Some(sel) => {
+                        if let Some(i) = pane.files.iter().position(|f| f.path == sel) {
+                            pane.state.select(Some(i));
+                        } else {
+                            pane.state.select(Some(0));
+                        }
+                    }
+                    None => {
+                        if pane.files.is_empty() {
+                            pane.state.select(None);
+                        } else {
+                            pane.state.select(Some(0));
+                        }
                     }
                 }
                 // Same-folder refresh: keep the confirmed filter applied.
@@ -658,9 +679,20 @@ impl App {
                 pane.selected = vec![false; pane.files.len()];
                 pane.render_scroll = 0;
                 pane.listing_settled = true;
-                if let Some(sel) = pane.pending_select.take() {
-                    if let Some(i) = pane.files.iter().position(|f| f.path == sel) {
-                        pane.state.select(Some(i));
+                match pane.pending_select.take() {
+                    Some(sel) => {
+                        if let Some(i) = pane.files.iter().position(|f| f.path == sel) {
+                            pane.state.select(Some(i));
+                        } else {
+                            pane.state.select(Some(0));
+                        }
+                    }
+                    None => {
+                        if pane.files.is_empty() {
+                            pane.state.select(None);
+                        } else {
+                            pane.state.select(Some(0));
+                        }
                     }
                 }
                 let query = pane.filter_query.clone();
@@ -1161,6 +1193,7 @@ impl App {
                 JobKind::Copy => ConfirmAction::Copy,
                 JobKind::Move => ConfirmAction::Move,
             },
+            policy: OverwritePolicy::AutoRename,
             label,
             paths: sources,
             dest_dir: Some(dest),
@@ -1175,7 +1208,19 @@ impl App {
         let Some(dest) = confirm.dest_dir else {
             return;
         };
-        self.spawn_transfer_jobs(kind, confirm.paths, dest);
+        self.spawn_transfer_jobs(kind, confirm.paths, dest, confirm.policy);
+    }
+
+    /// Cycles the confirmation dialog's overwrite policy:
+    /// auto-rename -> overwrite -> skip existing -> auto-rename.
+    pub fn cycle_confirm_policy(&mut self) {
+        if let Some(confirm) = self.confirming.as_mut() {
+            confirm.policy = match confirm.policy {
+                OverwritePolicy::AutoRename => OverwritePolicy::Overwrite,
+                OverwritePolicy::Overwrite => OverwritePolicy::SkipExisting,
+                OverwritePolicy::SkipExisting => OverwritePolicy::AutoRename,
+            };
+        }
     }
 
     // ---- Go to path (`[`) ----
@@ -1295,6 +1340,12 @@ impl App {
             ));
             if is_file {
                 pane.pending_select = Some(path.to_string_lossy().into_owned());
+                if std::env::var("IRA_DEBUG").is_ok() {
+                    eprintln!(
+                        "[ira-debug] goto_navigate: pending_select={:?}",
+                        pane.pending_select
+                    );
+                }
             } else {
                 pane.state.select(None);
             }
@@ -1896,7 +1947,13 @@ impl App {
             .unwrap_or_default()
     }
 
-    fn spawn_transfer_jobs(&mut self, kind: JobKind, sources: Vec<String>, dest: String) {
+    fn spawn_transfer_jobs(
+        &mut self,
+        kind: JobKind,
+        sources: Vec<String>,
+        dest: String,
+        policy: OverwritePolicy,
+    ) {
         let dest_path = std::path::Path::new(&dest);
         // One batch job for the whole selection: a single worker thread
         // processes the paths sequentially — never one thread per file.
@@ -1925,6 +1982,7 @@ impl App {
         self.jobs.push(Job {
             id,
             kind,
+            overwrite: policy,
             paths,
             dest_dir: dest.clone(),
             label,
@@ -2033,6 +2091,7 @@ impl App {
         };
         self.confirming = Some(Confirm {
             action: ConfirmAction::Delete,
+            policy: OverwritePolicy::AutoRename,
             label,
             paths,
             dest_dir: None,

@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use ira::app::{App, ConfirmAction};
 use ira::domain::data::Folder;
 use ira::services::list_files::FEntry;
-use ira::services::transfer::JobStatus;
+use ira::services::transfer::{JobStatus, OverwritePolicy};
 
 fn entry(path: &str) -> FEntry {
     FEntry {
@@ -1722,5 +1722,221 @@ fn creating_entry_refreshes_other_pane_showing_same_folder() {
         "other pane on a different folder must not change"
     );
 
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn overwrite_policy_autorenames_collisions() {
+    let base = std::env::temp_dir().join(format!("ira_ovr_ar_{}", std::process::id()));
+    std::fs::create_dir_all(base.join("src")).unwrap();
+    std::fs::create_dir_all(base.join("dst")).unwrap();
+    std::fs::write(base.join("src").join("a.txt"), "NEW").unwrap();
+    std::fs::write(base.join("dst").join("a.txt"), "OLD").unwrap();
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new(
+        "src".into(),
+        base.join("src").to_str().unwrap().into(),
+        '#',
+    ));
+    app.panes[1].folder = Some(Folder::new(
+        "dst".into(),
+        base.join("dst").to_str().unwrap().into(),
+        '#',
+    ));
+    app.panes[0].files = vec![entry(base.join("src").join("a.txt").to_str().unwrap())];
+    app.panes[0].state.select(Some(0));
+
+    app.request_copy();
+    app.confirming.as_mut().unwrap().policy = OverwritePolicy::AutoRename;
+    app.confirm_pending();
+    wait_for_jobs(&mut app);
+
+    // Old untouched, new content in the renamed sibling.
+    assert_eq!(
+        std::fs::read(base.join("dst").join("a.txt")).unwrap(),
+        b"OLD"
+    );
+    assert_eq!(
+        std::fs::read(base.join("dst").join("a (2).txt")).unwrap(),
+        b"NEW"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn overwrite_policy_overwrite_replaces_existing() {
+    let base = std::env::temp_dir().join(format!("ira_ovr_ow_{}", std::process::id()));
+    std::fs::create_dir_all(base.join("src")).unwrap();
+    std::fs::create_dir_all(base.join("dst")).unwrap();
+    std::fs::write(base.join("src").join("a.txt"), "NEW").unwrap();
+    std::fs::write(base.join("dst").join("a.txt"), "OLD").unwrap();
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new(
+        "src".into(),
+        base.join("src").to_str().unwrap().into(),
+        '#',
+    ));
+    app.panes[1].folder = Some(Folder::new(
+        "dst".into(),
+        base.join("dst").to_str().unwrap().into(),
+        '#',
+    ));
+    app.panes[0].files = vec![entry(base.join("src").join("a.txt").to_str().unwrap())];
+    app.panes[0].state.select(Some(0));
+
+    app.request_copy();
+    app.confirming.as_mut().unwrap().policy = OverwritePolicy::Overwrite;
+    app.confirm_pending();
+    wait_for_jobs(&mut app);
+
+    assert_eq!(
+        std::fs::read(base.join("dst").join("a.txt")).unwrap(),
+        b"NEW",
+        "overwrite replaces the destination content"
+    );
+    assert!(!base.join("dst").join("a (2).txt").exists());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn overwrite_policy_skip_existing_keeps_destination() {
+    let base = std::env::temp_dir().join(format!("ira_ovr_sk_{}", std::process::id()));
+    std::fs::create_dir_all(base.join("src")).unwrap();
+    std::fs::create_dir_all(base.join("dst")).unwrap();
+    std::fs::write(base.join("src").join("a.txt"), "NEW").unwrap();
+    std::fs::write(base.join("dst").join("a.txt"), "OLD").unwrap();
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new(
+        "src".into(),
+        base.join("src").to_str().unwrap().into(),
+        '#',
+    ));
+    app.panes[1].folder = Some(Folder::new(
+        "dst".into(),
+        base.join("dst").to_str().unwrap().into(),
+        '#',
+    ));
+    app.panes[0].files = vec![entry(base.join("src").join("a.txt").to_str().unwrap())];
+    app.panes[0].state.select(Some(0));
+
+    app.request_copy();
+    app.confirming.as_mut().unwrap().policy = OverwritePolicy::SkipExisting;
+    app.confirm_pending();
+    wait_for_jobs(&mut app);
+
+    assert_eq!(
+        std::fs::read(base.join("dst").join("a.txt")).unwrap(),
+        b"OLD"
+    );
+    assert!(!base.join("dst").join("a (2).txt").exists());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn policy_cycles_through_dialog_keys() {
+    use ira::handler::handle_key_events;
+    use ira::services::transfer::OverwritePolicy as P;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let base = std::env::temp_dir().join(format!("ira_ovr_cyc_{}", std::process::id()));
+    std::fs::create_dir_all(base.join("src")).unwrap();
+    std::fs::create_dir_all(base.join("dst")).unwrap();
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new(
+        "src".into(),
+        base.join("src").to_str().unwrap().into(),
+        '#',
+    ));
+    app.panes[1].folder = Some(Folder::new(
+        "dst".into(),
+        base.join("dst").to_str().unwrap().into(),
+        '#',
+    ));
+    app.panes[0].files = vec![entry(base.join("src").join("a.txt").to_str().unwrap())];
+    app.panes[0].state.select(Some(0));
+    let key = |code| KeyEvent::new(code, KeyModifiers::empty());
+
+    app.request_copy();
+    let policy = |app: &App| app.confirming.as_ref().unwrap().policy;
+    assert_eq!(policy(&app), P::AutoRename, "default is auto-rename");
+
+    handle_key_events(key(KeyCode::Char('o')), &mut app).unwrap();
+    assert_eq!(policy(&app), P::Overwrite);
+    handle_key_events(key(KeyCode::Char('o')), &mut app).unwrap();
+    assert_eq!(policy(&app), P::SkipExisting);
+    handle_key_events(key(KeyCode::Char('o')), &mut app).unwrap();
+    assert_eq!(policy(&app), P::AutoRename, "cycles back");
+
+    // The policy must survive into the spawned job.
+    handle_key_events(key(KeyCode::Char('o')), &mut app).unwrap();
+    handle_key_events(key(KeyCode::Enter), &mut app).unwrap();
+    assert_eq!(app.jobs[0].overwrite, P::Overwrite);
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn goto_navigation_then_select_and_copy_shows_confirm() {
+    use ira::handler::handle_key_events;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let base = std::env::temp_dir().join(format!("ira_goto_flow_{}", std::process::id()));
+    std::fs::create_dir_all(base.join("src")).unwrap();
+    std::fs::create_dir_all(base.join("dst")).unwrap();
+    std::fs::write(base.join("src").join("a.txt"), "NEW").unwrap();
+    std::fs::write(base.join("dst").join("a.txt"), "OLD").unwrap();
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new(
+        "t".into(),
+        std::env::temp_dir().to_string_lossy().into_owned(),
+        '#',
+    ));
+    app.panes[1].folder = Some(Folder::new(
+        "dst".into(),
+        base.join("dst").to_str().unwrap().into(),
+        '#',
+    ));
+    let key = |code| KeyEvent::new(code, KeyModifiers::empty());
+
+    handle_key_events(key(KeyCode::Char('[')), &mut app).unwrap();
+    for ch in base.join("src").to_str().unwrap().chars() {
+        handle_key_events(key(KeyCode::Char(ch)), &mut app).unwrap();
+    }
+    handle_key_events(key(KeyCode::Enter), &mut app).unwrap();
+    for _ in 0..200 {
+        app.tick();
+        if app.file_list_settled(0) && app.visible_count() == 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    eprintln!(
+        "DBG settled={} cursor={:?} goto={:?} searching={}",
+        app.file_list_settled(0),
+        app.panes[0].state.selected(),
+        app.goto_prompt,
+        app.is_searching()
+    );
+    handle_key_events(key(KeyCode::Char(' ')), &mut app).unwrap();
+    assert_eq!(app.panes[0].selected, vec![true]);
+    handle_key_events(key(KeyCode::Char('c')), &mut app).unwrap();
+    assert!(app.confirming.is_some());
+    app.confirm_pending();
+    wait_for_jobs(&mut app);
+    // Default policy is auto-rename: existing dst/a.txt stays, the copy
+    // lands as 'a (2).txt'.
+    assert_eq!(
+        std::fs::read(base.join("dst").join("a.txt")).unwrap(),
+        b"OLD"
+    );
+    assert_eq!(
+        std::fs::read(base.join("dst").join("a (2).txt")).unwrap(),
+        b"NEW"
+    );
     let _ = std::fs::remove_dir_all(&base);
 }
