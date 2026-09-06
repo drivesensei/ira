@@ -1340,12 +1340,6 @@ impl App {
             ));
             if is_file {
                 pane.pending_select = Some(path.to_string_lossy().into_owned());
-                if std::env::var("IRA_DEBUG").is_ok() {
-                    eprintln!(
-                        "[ira-debug] goto_navigate: pending_select={:?}",
-                        pane.pending_select
-                    );
-                }
             } else {
                 pane.state.select(None);
             }
