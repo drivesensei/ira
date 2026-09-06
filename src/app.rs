@@ -3419,6 +3419,7 @@ mod preview_tests {
         let mut app = app_with_selection(&png);
         app.confirming = Some(Confirm {
             action: ConfirmAction::Delete,
+            policy: OverwritePolicy::default(),
             label: "x".into(),
             paths: vec![],
             dest_dir: None,
