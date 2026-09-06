@@ -134,6 +134,12 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         return Ok(());
     }
 
+    // Keybindings help dialog (`*`): any key closes it.
+    if app.keybindings_visible {
+        app.close_keybindings();
+        return Ok(());
+    }
+
     // Info dialog: `x` cancels the folder's background size walk (keeping
     // the dialog open with the partial size), `r` restarts the measurement
     // from scratch; any other key dismisses it and leaves the walk running.
@@ -226,6 +232,10 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         }
 
         KeyCode::Char('z') => app.goto_top(),
+
+        // `*` opens the keybindings help dialog (closed by any key).
+        KeyCode::Char('*') => app.show_keybindings(),
+
         KeyCode::Char('x') => app.goto_bottom(),
 
         // `n` opens the create-new dialog (folder or file by extension).

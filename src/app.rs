@@ -328,6 +328,8 @@ pub struct App {
     pub goto_prompt: Option<String>,
     /// Live destination sync while a transfer writes into a folder.
     pub transfer_dest: Option<TransferDestSync>,
+    /// Keybindings help dialog (`*`); closed by any key.
+    pub keybindings_visible: bool,
 
     /// Transient status/error message shown in the bottom bar until it
     /// expires (or the next action replaces it).
@@ -452,6 +454,7 @@ impl Default for App {
             info: None,
             multi_info: None,
             status: None,
+            keybindings_visible: false,
             deletion: None,
             deletion_box_hidden: false,
             deleting_paths: HashSet::new(),
@@ -676,6 +679,16 @@ impl App {
     /// Set running to false to quit the application.
     pub fn quit(&mut self) {
         self.running = false;
+    }
+
+    /// Opens the keybindings help dialog (closed by any key).
+    pub fn show_keybindings(&mut self) {
+        self.keybindings_visible = true;
+    }
+
+    /// Closes the keybindings help dialog.
+    pub fn close_keybindings(&mut self) {
+        self.keybindings_visible = false;
     }
 
     pub fn set_terminal_size(&mut self, width: u16, height: u16) {

@@ -69,6 +69,26 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         }
     }
 
+    // Bottom-right "[*] Keybindings" button: always visible, even while a
+    // notice fills the bar. Rendered after the notice so it wins overlap.
+    let hint = " [*] Keybindings ";
+    let hint_w = hint.len() as u16;
+    if frame.area().width > hint_w {
+        let btn = Rect {
+            x: frame.area().x + frame.area().width - hint_w,
+            y: frame.area().y + frame.area().height - 1,
+            width: hint_w,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                hint,
+                Style::default().fg(Color::Black).bg(Color::Cyan),
+            )),
+            btn,
+        );
+    }
+
     // Bookmarks (left) and Actions (right) share the third row.
     let bookmarks_row = Layout::default()
         .direction(Direction::Horizontal)
@@ -332,6 +352,40 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         );
     }
 
+    // Keybindings help dialog (`*`): documents the keys that have no
+    // on-screen hint. Any key closes it (handler.rs).
+    if app.keybindings_visible {
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let lines: Vec<Line<'static>> = vec![
+            Line::styled(" Files & navigation", bold),
+            bind_pair("←→↑↓", "navigate; ←/→ open/leave", "z / x", "top / bottom"),
+            bind_pair("Space", "multi-select entry", "c", "copy to other pane"),
+            bind_pair("m", "move to other pane", "Enter", "rename entry"),
+            bind_pair("Del", "delete (with confirm)", "n", "new folder / file"),
+            bind_pair(".", "toggle hidden files", ",", "cycle sort mode"),
+            bind_pair("Ctrl+A", "select / clear all", "Alt+I", "invert selection"),
+            Line::styled(" Views & paths", bold),
+            bind_pair("+", "split pane", "`", "copy board"),
+            bind_pair("b", "bookmark this folder", "/", "fuzzy search"),
+            bind_pair("Esc", "clear search filter", "?", "entry info"),
+            bind_pair("[", "go to path", "]", "copy folder path"),
+            bind_pair("-", "eject drive", "0", "terminal here"),
+            bind_pair("*", "this help", "q", "quit"),
+        ];
+        let max_w = lines.iter().map(|l| l.width() as u16).max().unwrap_or(40);
+        let w = (max_w + 4).min(frame.area().width.saturating_sub(4));
+        let h = (lines.len() as u16 + 2).min(frame.area().height.saturating_sub(2));
+        let style = Style::default().fg(Color::Black).bg(Color::White);
+        let area = centered_rect(w, h, frame.area());
+        paint_bg(frame, area, style);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(Block::bordered().title(" Keybindings ").style(style))
+                .style(style),
+            area,
+        );
+    }
+
     // Info dialog: read-only metadata for the selected entry. The Size line
     // is dynamic: animated partial size while the background walk runs, an
     // honest lower bound after `x`, and the final line once done (drain
@@ -563,6 +617,61 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn status_bar_shows_keybindings_button_always() {
+        // No status: the button is still visible.
+        let mut app = App::default();
+        let text = rendered(&mut app);
+        assert!(text.contains("[*] Keybindings"), "{text}");
+
+        // A non-error notice shares the bar without hiding the button.
+        let mut app = App::default();
+        app.set_status("Copied 2 items", false);
+        let text = rendered(&mut app);
+        assert!(text.contains("Copied 2 items"), "{text}");
+        assert!(text.contains("[*] Keybindings"), "{text}");
+    }
+
+    #[test]
+    fn keybindings_dialog_lists_hidden_keys_and_closes_on_any_key() {
+        use crate::handler::handle_key_events;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let key_event = KeyEvent::new(KeyCode::Char('*'), KeyModifiers::empty());
+
+        // `*` opens the dialog; it documents the keys that have no on-screen
+        // hint (drive/common-folder/bookmark shortcuts and the Actions box
+        // are deliberately absent).
+        let mut app = App::default();
+        handle_key_events(key_event, &mut app).unwrap();
+        assert!(app.keybindings_visible, "`*` must open the dialog");
+        let text = rendered(&mut app);
+        assert!(text.contains("this help"), "dialog must render: {text}");
+        for binding in [
+            "multi-select entry",
+            "move to other pane",
+            "rename entry",
+            "toggle hidden files",
+            "cycle sort mode",
+            "go to path",
+            "copy folder path",
+            "fuzzy search",
+            "bookmark this folder",
+            "eject drive",
+            "select / clear all",
+            "invert selection",
+        ] {
+            assert!(text.contains(binding), "missing {binding:?}: {text}");
+        }
+        assert!(text.contains("terminal here"), "{text}");
+
+        // Any key closes it.
+        handle_key_events(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()), &mut app).unwrap();
+        assert!(!app.keybindings_visible);
+        let text = rendered(&mut app);
+        assert!(!text.contains("this help"), "{text}");
+    }
 }
 
 /// Paints a solid background (blank cells, `style`) across `area`, so modal
@@ -583,4 +692,16 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
         w,
         h,
     )
+}
+
+/// One keybindings-dialog row: two `[key] description` columns; the key
+/// cells are bold.
+fn bind_pair(k1: &str, d1: &str, k2: &str, d2: &str) -> Line<'static> {
+    let key = Style::default().add_modifier(Modifier::BOLD);
+    Line::from(vec![
+        Span::styled(format!(" {k1:<8}"), key),
+        Span::raw(format!("{d1:<30}")),
+        Span::styled(format!("{k2:<8}"), key),
+        Span::raw(d2.to_string()),
+    ])
 }
