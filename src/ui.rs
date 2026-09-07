@@ -69,6 +69,45 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         }
     }
 
+    // Bottom bar right side: the "[*] Keybindings" button, plus the
+    // contextual hint marquee on the remaining width. Both hide while a
+    // modal/text-input state owns the keyboard (app.hint_bar_blocked); the
+    // marquee also yields to transient status notices.
+    let btn_hint = " [*] Keybindings ";
+    let btn_w = btn_hint.len() as u16;
+    let bar_y = frame.area().y + frame.area().height - 1;
+    if !app.hint_bar_blocked() {
+        if frame.area().width > btn_w {
+            let btn = Rect {
+                x: frame.area().x + frame.area().width - btn_w,
+                y: bar_y,
+                width: btn_w,
+                height: 1,
+            };
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    btn_hint,
+                    Style::default().fg(Color::Black).bg(Color::Cyan),
+                )),
+                btn,
+            );
+        }
+        let hints = app.contextual_hints();
+        let bar_w = frame.area().width.saturating_sub(btn_w);
+        if !hints.is_empty() && bar_w > 2 {
+            let spans = marquee_spans(&hints, bar_w as usize, app.hint_offset);
+            frame.render_widget(
+                Paragraph::new(Line::from(spans)),
+                Rect {
+                    x: frame.area().x,
+                    y: bar_y,
+                    width: bar_w,
+                    height: 1,
+                },
+            );
+        }
+    }
+
     // Bookmarks (left) and Actions (right) share the third row.
     let bookmarks_row = Layout::default()
         .direction(Direction::Horizontal)
@@ -332,6 +371,45 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         );
     }
 
+    // Keybindings help dialog (`*`): documents the keys that have no
+    // on-screen hint. Any key closes it (handler.rs).
+    if app.keybindings_visible {
+        // One pair per row, no section headers: 13 rows + borders fit the
+        // minimum supported terminal (90x15) without clipping.
+        let lines: Vec<Line<'static>> = vec![
+            bind_pair(
+                "Arrows",
+                "navigate; ←/→ open/leave",
+                "z / x",
+                "top / bottom",
+            ),
+            bind_pair("Space", "multi-select entry", "c", "copy to other pane"),
+            bind_pair("m", "move to other pane", "Enter", "rename entry"),
+            bind_pair("Del", "delete (with confirm)", "n", "new folder / file"),
+            bind_pair(".", "toggle hidden files", ",", "cycle sort mode"),
+            bind_pair("v", "cycle image preview", "Tab", "switch pane"),
+            bind_pair("Ctrl+A", "select / clear all", "Alt+I", "invert selection"),
+            bind_pair("+", "split pane", "`", "copy board"),
+            bind_pair("b", "bookmark this folder", "/", "fuzzy search"),
+            bind_pair("Esc", "clear search filter", "?", "entry info"),
+            bind_pair("[", "go to path", "]", "copy folder path"),
+            bind_pair("-", "eject drive", "0", "terminal here"),
+            bind_pair("*", "this help", "q", "quit"),
+        ];
+        let max_w = lines.iter().map(|l| l.width() as u16).max().unwrap_or(40);
+        let w = (max_w + 4).min(frame.area().width.saturating_sub(4));
+        let h = (lines.len() as u16 + 2).min(frame.area().height);
+        let style = Style::default().fg(Color::Black).bg(Color::White);
+        let area = centered_rect(w, h, frame.area());
+        paint_bg(frame, area, style);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(Block::bordered().title(" Keybindings ").style(style))
+                .style(style),
+            area,
+        );
+    }
+
     // Info dialog: read-only metadata for the selected entry. The Size line
     // is dynamic: animated partial size while the background walk runs, an
     // honest lower bound after `x`, and the final line once done (drain
@@ -563,6 +641,165 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn status_bar_shows_keybindings_button_always() {
+        // No status: the button is still visible.
+        let mut app = App::default();
+        let text = rendered(&mut app);
+        assert!(text.contains("[*] Keybindings"), "{text}");
+
+        // A non-error notice shares the bar without hiding the button.
+        let mut app = App::default();
+        app.set_status("Copied 2 items", false);
+        let text = rendered(&mut app);
+        assert!(text.contains("Copied 2 items"), "{text}");
+        assert!(text.contains("[*] Keybindings"), "{text}");
+    }
+
+    #[test]
+    fn keybindings_dialog_lists_hidden_keys_and_closes_on_any_key() {
+        use crate::handler::handle_key_events;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let key_event = KeyEvent::new(KeyCode::Char('*'), KeyModifiers::empty());
+
+        // `*` opens the dialog; it documents every normal-mode binding that
+        // has no on-screen hint. Excluded: drive digits, common-folder and
+        // bookmark shortcuts (visible in their boxes) and dialog-internal
+        // keys (shown inside their own dialogs).
+        let mut app = App::default();
+        handle_key_events(key_event, &mut app).unwrap();
+        assert!(app.keybindings_visible, "`*` must open the dialog");
+        let text = rendered(&mut app);
+        assert!(text.contains("this help"), "dialog must render: {text}");
+        for binding in [
+            "multi-select entry",
+            "move to other pane",
+            "rename entry",
+            "toggle hidden files",
+            "cycle sort mode",
+            "go to path",
+            "copy folder path",
+            "fuzzy search",
+            "bookmark this folder",
+            "eject drive",
+            "select / clear all",
+            "invert selection",
+            "cycle image preview",
+            "switch pane",
+        ] {
+            assert!(text.contains(binding), "missing {binding:?}: {text}");
+        }
+        assert!(text.contains("terminal here"), "{text}");
+
+        // Any key closes it.
+        handle_key_events(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()), &mut app).unwrap();
+        assert!(!app.keybindings_visible);
+        let text = rendered(&mut app);
+        assert!(!text.contains("this help"), "{text}");
+    }
+
+    #[test]
+    fn keybindings_dialog_fits_minimum_supported_terminal() {
+        // 90x15 is the smallest terminal the app accepts
+        // (should_increase_size): 13 rows + borders must fit, so the quit
+        // and reopen hints are never clipped.
+        let mut app = App::default();
+        app.keybindings_visible = true;
+        let backend = TestBackend::new(90, 15);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| super::render(&mut app, f)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(text.contains("this help"), "{text}");
+        assert!(text.contains("quit"), "{text}");
+        assert!(text.contains("switch pane"), "{text}");
+    }
+
+    #[test]
+    fn contextual_hint_bar_hides_for_modals_and_notices() {
+        let mut app = App::default();
+        assert!(!app.hint_bar_blocked());
+        assert_eq!(app.contextual_hints().len(), 10);
+
+        // Any modal/text-input state owns the keyboard: bar (and button) hide.
+        app.start_goto();
+        assert!(app.hint_bar_blocked());
+        assert!(app.contextual_hints().is_empty());
+        app.cancel_goto();
+        assert!(!app.hint_bar_blocked());
+
+        // The focused preview text editor captures every key: bar hides.
+        app.edit_focus = true;
+        assert!(app.hint_bar_blocked());
+        assert!(app.contextual_hints().is_empty());
+        app.edit_focus = false;
+        assert!(!app.hint_bar_blocked());
+
+        // A transient notice owns the bar instead of the hints.
+        app.set_status("Copied 2 items", false);
+        assert!(!app.hint_bar_blocked(), "the button stays with a notice");
+        assert!(app.contextual_hints().is_empty());
+    }
+
+    #[test]
+    fn marquee_is_static_when_it_fits_and_scrolls_when_not() {
+        let text = |items: &[(&str, &str)], w: usize, off: usize| -> String {
+            marquee_spans(items, w, off)
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+
+        // Fits: the same line regardless of offset (no scrolling).
+        let short: Vec<(&str, &str)> = vec![("c", "copy")];
+        assert_eq!(text(&short, 100, 0).trim_end(), " c copy");
+
+        // Too long: a window of `width` chars, advancing with the offset,
+        // cyclically wrapping so every hint eventually shows.
+        let long: Vec<(&str, &str)> = vec![("a", "one"), ("b", "two")];
+        assert_eq!(text(&long, 4, 0).chars().count(), 4);
+        assert_ne!(text(&long, 4, 0), text(&long, 4, 2));
+        assert_eq!(text(&long, 4, 17), text(&long, 4, 0), "wraps at unit len");
+    }
+
+    #[test]
+    fn render_paints_no_hint_bar_while_a_modal_is_open() {
+        // Goto dialog open: neither the marquee hints nor the [*] button may
+        // occupy the bottom row.
+        let mut app = App::default();
+        app.start_goto();
+        let bottom_row: String = {
+            let buf = {
+                let backend = TestBackend::new(100, 30);
+                let mut terminal = Terminal::new(backend).unwrap();
+                terminal.draw(|f| super::render(&mut app, f)).unwrap();
+                terminal.backend().buffer().clone()
+            };
+            let y = 29;
+            (0..100)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<Vec<_>>()
+                .join("")
+        };
+        assert!(
+            !bottom_row.contains("copy") && !bottom_row.contains("Keybindings"),
+            "bottom row must be empty under a modal: {bottom_row:?}"
+        );
+
+        // Back to normal mode: the bar returns.
+        app.cancel_goto();
+        let text = rendered(&mut app);
+        assert!(text.contains("copy"), "{text}");
+        assert!(text.contains("[*] Keybindings"), "{text}");
+    }
 }
 
 /// Paints a solid background (blank cells, `style`) across `area`, so modal
@@ -583,4 +820,47 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
         w,
         h,
     )
+}
+
+/// One keybindings-dialog row: two `[key] description` columns; the key
+/// cells are bold.
+fn bind_pair(k1: &str, d1: &str, k2: &str, d2: &str) -> Line<'static> {
+    let key = Style::default().add_modifier(Modifier::BOLD);
+    Line::from(vec![
+        Span::styled(format!(" {k1:<8}"), key),
+        Span::raw(format!("{d1:<30}")),
+        Span::styled(format!("{k2:<8}"), key),
+        Span::raw(d2.to_string()),
+    ])
+}
+
+/// Builds the contextual hint bar as styled cells: bold keys, dim
+/// descriptions. When the joined line is wider than `width` it scrolls
+/// marquee-style: `offset` chars into the line, cyclically repeated, so
+/// narrow terminals still see every hint over time.
+fn marquee_spans(items: &[(&str, &str)], width: usize, offset: usize) -> Vec<Span<'static>> {
+    let key_style = Style::default().add_modifier(Modifier::BOLD);
+    let desc_style = Style::default().fg(Color::DarkGray);
+    let mut unit: Vec<(char, Style)> = vec![(' ', desc_style)];
+    for (key, desc) in items {
+        if unit.len() > 1 {
+            unit.extend(std::iter::repeat_n((' ', desc_style), 3));
+        }
+        unit.extend(key.chars().map(|c| (c, key_style)));
+        unit.push((' ', key_style));
+        unit.extend(desc.chars().map(|c| (c, desc_style)));
+    }
+    // Trailing separator: keeps a gap where the cycle wraps around.
+    unit.extend(std::iter::repeat_n((' ', desc_style), 3));
+    let n = unit.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let to_span = |(c, s): (char, Style)| Span::styled(c.to_string(), s);
+    if n <= width {
+        return unit.into_iter().map(to_span).collect();
+    }
+    (0..width)
+        .map(|i| to_span(unit[(offset.wrapping_add(i)) % n]))
+        .collect()
 }

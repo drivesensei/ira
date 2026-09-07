@@ -113,6 +113,13 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         return Ok(());
     }
 
+    // Keybindings help dialog (`*`): any key closes it — checked first so a
+    // background notice (transfer done, delete error) can't steal the key.
+    if app.keybindings_visible {
+        app.close_keybindings();
+        return Ok(());
+    }
+
     // Error dialog: any key dismisses it. Checked before the info dialog so
     // an eject failure's error box never swallows the next action.
     if app.status.is_some() {
@@ -197,6 +204,7 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
     if app.board_has_focus() {
         match key_event.code {
             KeyCode::Esc | KeyCode::Char('`') => app.toggle_copy_board(),
+            KeyCode::Char('*') => app.show_keybindings(),
             KeyCode::Char('v') => app.cycle_preview(),
             KeyCode::Up => app.copy_board_prev(),
             KeyCode::Down => app.copy_board_next(),
@@ -226,6 +234,10 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         }
 
         KeyCode::Char('z') => app.goto_top(),
+
+        // `*` opens the keybindings help dialog (closed by any key).
+        KeyCode::Char('*') => app.show_keybindings(),
+
         KeyCode::Char('x') => app.goto_bottom(),
 
         // `n` opens the create-new dialog (folder or file by extension).
@@ -249,10 +261,10 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         // `/` starts fuzzy search within the current folder.
         KeyCode::Char('/') => app.start_search(),
 
-        // `+` toggles the vertical split of the files pane.
-
         // `v` cycles the image preview: off → column → grid.
         KeyCode::Char('v') => app.cycle_preview(),
+
+        // `+` toggles the vertical split of the files pane.
         KeyCode::Char('+') => app.toggle_split(),
 
         // Backtick toggles the Copy Board sidebar.
