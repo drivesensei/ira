@@ -330,6 +330,9 @@ pub struct App {
     pub transfer_dest: Option<TransferDestSync>,
     /// Keybindings help dialog (`*`); closed by any key.
     pub keybindings_visible: bool,
+    /// Marquee scroll offset (chars) for the contextual hint bar; advanced
+    /// on every tick and wrapped modulo the rendered text length.
+    pub hint_offset: usize,
 
     /// Transient status/error message shown in the bottom bar until it
     /// expires (or the next action replaces it).
@@ -455,6 +458,7 @@ impl Default for App {
             multi_info: None,
             status: None,
             keybindings_visible: false,
+            hint_offset: 0,
             deletion: None,
             deletion_box_hidden: false,
             deleting_paths: HashSet::new(),
@@ -580,6 +584,7 @@ impl App {
 
     /// Handles the tick event of the terminal.
     pub fn tick(&mut self) {
+        self.hint_offset = self.hint_offset.wrapping_add(2);
         self.drain_jobs();
         self.drain_info_results();
         self.refresh_drives();
@@ -689,6 +694,44 @@ impl App {
     /// Closes the keybindings help dialog.
     pub fn close_keybindings(&mut self) {
         self.keybindings_visible = false;
+    }
+
+    /// Whether a modal or text-input state owns the keyboard right now, so
+    /// the contextual hint bar (and its `[*]` button) would only distract:
+    /// rename/goto/new editors, search typing, confirmations, dialogs, the
+    /// deletion box and the focused Copy Board.
+    pub fn hint_bar_blocked(&self) -> bool {
+        self.renaming.is_some()
+            || self.goto_prompt.is_some()
+            || self.new_entry.is_some()
+            || self.confirming.is_some()
+            || self.deletion_box_visible()
+            || self.multi_info.is_some()
+            || self.info.is_some()
+            || self.keybindings_visible
+            || self.is_searching()
+            || self.board_has_focus()
+    }
+
+    /// Key/description pairs for the contextual hint bar, for the state the
+    /// user is in. Empty while a transient status notice owns the bar or a
+    /// modal/input state blocks it.
+    pub fn contextual_hints(&self) -> Vec<(&'static str, &'static str)> {
+        if self.hint_bar_blocked() || self.status.is_some() {
+            return Vec::new();
+        }
+        vec![
+            ("↑/↓", "move"),
+            ("←/→", "open/leave"),
+            ("c", "copy"),
+            ("m", "move"),
+            (".", "hidden"),
+            (",", "sort"),
+            ("v", "preview"),
+            ("b", "bookmark"),
+            ("n", "new"),
+            ("/", "search"),
+        ]
     }
 
     pub fn set_terminal_size(&mut self, width: u16, height: u16) {

@@ -69,24 +69,43 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         }
     }
 
-    // Bottom-right "[*] Keybindings" button: always visible, even while a
-    // notice fills the bar. Rendered after the notice so it wins overlap.
-    let hint = " [*] Keybindings ";
-    let hint_w = hint.len() as u16;
-    if frame.area().width > hint_w {
-        let btn = Rect {
-            x: frame.area().x + frame.area().width - hint_w,
-            y: frame.area().y + frame.area().height - 1,
-            width: hint_w,
-            height: 1,
-        };
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                hint,
-                Style::default().fg(Color::Black).bg(Color::Cyan),
-            )),
-            btn,
-        );
+    // Bottom bar right side: the "[*] Keybindings" button, plus the
+    // contextual hint marquee on the remaining width. Both hide while a
+    // modal/text-input state owns the keyboard (app.hint_bar_blocked); the
+    // marquee also yields to transient status notices.
+    let btn_hint = " [*] Keybindings ";
+    let btn_w = btn_hint.len() as u16;
+    let bar_y = frame.area().y + frame.area().height - 1;
+    if !app.hint_bar_blocked() {
+        if frame.area().width > btn_w {
+            let btn = Rect {
+                x: frame.area().x + frame.area().width - btn_w,
+                y: bar_y,
+                width: btn_w,
+                height: 1,
+            };
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    btn_hint,
+                    Style::default().fg(Color::Black).bg(Color::Cyan),
+                )),
+                btn,
+            );
+        }
+        let hints = app.contextual_hints();
+        let bar_w = frame.area().width.saturating_sub(btn_w);
+        if !hints.is_empty() && bar_w > 2 {
+            let spans = marquee_spans(&hints, bar_w as usize, app.hint_offset);
+            frame.render_widget(
+                Paragraph::new(Line::from(spans)),
+                Rect {
+                    x: frame.area().x,
+                    y: bar_y,
+                    width: bar_w,
+                    height: 1,
+                },
+            );
+        }
     }
 
     // Bookmarks (left) and Actions (right) share the third row.
@@ -703,6 +722,77 @@ mod tests {
         assert!(text.contains("quit"), "{text}");
         assert!(text.contains("switch pane"), "{text}");
     }
+
+    #[test]
+    fn contextual_hint_bar_hides_for_modals_and_notices() {
+        let mut app = App::default();
+        assert!(!app.hint_bar_blocked());
+        assert_eq!(app.contextual_hints().len(), 10);
+
+        // Any modal/text-input state owns the keyboard: bar (and button) hide.
+        app.start_goto();
+        assert!(app.hint_bar_blocked());
+        assert!(app.contextual_hints().is_empty());
+        app.cancel_goto();
+        assert!(!app.hint_bar_blocked());
+
+        // A transient notice owns the bar instead of the hints.
+        app.set_status("Copied 2 items", false);
+        assert!(!app.hint_bar_blocked(), "the button stays with a notice");
+        assert!(app.contextual_hints().is_empty());
+    }
+
+    #[test]
+    fn marquee_is_static_when_it_fits_and_scrolls_when_not() {
+        let text = |items: &[(&str, &str)], w: usize, off: usize| -> String {
+            marquee_spans(items, w, off)
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+
+        // Fits: the same line regardless of offset (no scrolling).
+        let short: Vec<(&str, &str)> = vec![("c", "copy")];
+        assert_eq!(text(&short, 100, 0).trim_end(), " c copy");
+
+        // Too long: a window of `width` chars, advancing with the offset,
+        // cyclically wrapping so every hint eventually shows.
+        let long: Vec<(&str, &str)> = vec![("a", "one"), ("b", "two")];
+        assert_eq!(text(&long, 4, 0).chars().count(), 4);
+        assert_ne!(text(&long, 4, 0), text(&long, 4, 2));
+        assert_eq!(text(&long, 4, 17), text(&long, 4, 0), "wraps at unit len");
+    }
+
+    #[test]
+    fn render_paints_no_hint_bar_while_a_modal_is_open() {
+        // Goto dialog open: neither the marquee hints nor the [*] button may
+        // occupy the bottom row.
+        let mut app = App::default();
+        app.start_goto();
+        let bottom_row: String = {
+            let buf = {
+                let backend = TestBackend::new(100, 30);
+                let mut terminal = Terminal::new(backend).unwrap();
+                terminal.draw(|f| super::render(&mut app, f)).unwrap();
+                terminal.backend().buffer().clone()
+            };
+            let y = 29;
+            (0..100)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<Vec<_>>()
+                .join("")
+        };
+        assert!(
+            !bottom_row.contains("copy") && !bottom_row.contains("Keybindings"),
+            "bottom row must be empty under a modal: {bottom_row:?}"
+        );
+
+        // Back to normal mode: the bar returns.
+        app.cancel_goto();
+        let text = rendered(&mut app);
+        assert!(text.contains("copy"), "{text}");
+        assert!(text.contains("[*] Keybindings"), "{text}");
+    }
 }
 
 /// Paints a solid background (blank cells, `style`) across `area`, so modal
@@ -735,4 +825,35 @@ fn bind_pair(k1: &str, d1: &str, k2: &str, d2: &str) -> Line<'static> {
         Span::styled(format!("{k2:<8}"), key),
         Span::raw(d2.to_string()),
     ])
+}
+
+/// Builds the contextual hint bar as styled cells: bold keys, dim
+/// descriptions. When the joined line is wider than `width` it scrolls
+/// marquee-style: `offset` chars into the line, cyclically repeated, so
+/// narrow terminals still see every hint over time.
+fn marquee_spans(items: &[(&str, &str)], width: usize, offset: usize) -> Vec<Span<'static>> {
+    let key_style = Style::default().add_modifier(Modifier::BOLD);
+    let desc_style = Style::default().fg(Color::DarkGray);
+    let mut unit: Vec<(char, Style)> = vec![(' ', desc_style)];
+    for (key, desc) in items {
+        if unit.len() > 1 {
+            unit.extend(std::iter::repeat_n((' ', desc_style), 3));
+        }
+        unit.extend(key.chars().map(|c| (c, key_style)));
+        unit.push((' ', key_style));
+        unit.extend(desc.chars().map(|c| (c, desc_style)));
+    }
+    // Trailing separator: keeps a gap where the cycle wraps around.
+    unit.extend(std::iter::repeat_n((' ', desc_style), 3));
+    let n = unit.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let to_span = |(c, s): (char, Style)| Span::styled(c.to_string(), s);
+    if n <= width {
+        return unit.into_iter().map(to_span).collect();
+    }
+    (0..width)
+        .map(|i| to_span(unit[(offset.wrapping_add(i)) % n]))
+        .collect()
 }
