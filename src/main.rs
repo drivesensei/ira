@@ -4,7 +4,7 @@ use ira::handler::handle_key_events;
 use ira::tui::Tui;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use ratatui_image::picker::{Picker, ProtocolType};
+use ratatui_image::picker::{cap_parser::QueryStdioOptions, Picker, ProtocolType};
 use std::io;
 
 fn main() -> AppResult<()> {
@@ -23,7 +23,20 @@ fn main() -> AppResult<()> {
     // that would otherwise race crossterm's event reader (same class of stall
     // as the `terminal.clear()` note in `Tui::init`). Halfblocks renders in
     // every terminal and is the universal fallback.
-    let picker = match Picker::from_query_stdio() {
+    //
+    // iTerm2 3.5+ answers the kitty graphics-protocol query, but its kitty
+    // implementation does not render kitty's unicode placeholders (U+10EEEE):
+    // every preview cell shows up as "?" instead of pixels. Blacklisting
+    // kitty here makes the query fall through to the iTerm2 protocol, which
+    // iTerm2 renders correctly (same measure the crate itself applies to
+    // WezTerm and Konsole).
+    let in_iterm2 = std::env::var("TERM_PROGRAM").is_ok_and(|t| t.contains("iTerm"))
+        || std::env::var("LC_TERMINAL").is_ok_and(|t| t.contains("iTerm"));
+    let mut options = QueryStdioOptions::default();
+    if in_iterm2 {
+        options.blacklist_protocols.push(ProtocolType::Kitty);
+    }
+    let picker = match Picker::from_query_stdio_with_options(options) {
         Ok(picker) => picker,
         Err(_) => Picker::halfblocks(),
     };

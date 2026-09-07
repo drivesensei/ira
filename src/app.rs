@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::error;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+///vlads
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -1915,7 +1916,9 @@ impl App {
             self.set_status("No folder open to start a terminal in.", true);
             return;
         };
-        for (program, args) in terminal_candidates(&dir) {
+        let candidates = terminal_candidates(&dir);
+        let tried: Vec<String> = candidates.iter().map(|(p, _)| p.clone()).collect();
+        for (program, args) in candidates {
             if !which(&program) {
                 continue;
             }
@@ -1931,7 +1934,7 @@ impl App {
             }
         }
         self.set_status(
-            "No terminal emulator found (tried foot, alacritty, kitty, gnome-terminal, konsole, xfce4-terminal, xterm).",
+            format!("No terminal emulator found (tried {}).", tried.join(", ")),
             true,
         );
     }
@@ -3767,6 +3770,7 @@ mod tests {
 
 /// Terminal emulators to try for `0`, in preference order, with the args
 /// that make them open in `dir`. Pure so tests can inspect the table.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn terminal_candidates(dir: &str) -> Vec<(String, Vec<String>)> {
     vec![
         (
@@ -3789,6 +3793,103 @@ pub fn terminal_candidates(dir: &str) -> Vec<(String, Vec<String>)> {
         ),
         ("xterm".into(), vec![]),
     ]
+}
+
+/// Terminal emulators to try for `0` on macOS, in preference order.
+///
+/// GUI terminal apps are not on `PATH`, so they launch through `open`:
+/// `open -a <App> <dir>` asks LaunchServices to open the folder, which
+/// Terminal.app and iTerm2 honor by opening a new window already `cd`'d
+/// into it; `open -na <App> --args …` starts a fresh instance for
+/// terminals whose GUI launcher needs explicit CLI flags. `/usr/bin/open`
+/// always exists, so app presence must be decided here: the terminal ira
+/// itself runs in (via `TERM_PROGRAM`) is certainly installed, every
+/// other app-bundle entry is checked against /Applications (and
+/// ~/Applications) first.
+#[cfg(target_os = "macos")]
+pub fn terminal_candidates(dir: &str) -> Vec<(String, Vec<String>)> {
+    let mut v = Vec::new();
+    match std::env::var("TERM_PROGRAM").as_deref() {
+        Ok("Apple_Terminal") => v.push(open_in_app("Terminal", dir)),
+        Ok(t) if t.contains("iTerm") => v.push(open_in_app("iTerm", dir)),
+        Ok("ghostty") => v.push(open_new_app_args("Ghostty", &["--working-directory", dir])),
+        Ok("WezTerm") => v.push(open_new_app_args("WezTerm", &["start", "--cwd", dir])),
+        _ => {}
+    }
+    // Homebrew formula binaries that accept a working directory.
+    v.push(("kitty".into(), vec!["--directory".into(), dir.into()]));
+    v.push((
+        "alacritty".into(),
+        vec!["--working-directory".into(), dir.into()],
+    ));
+    v.push((
+        "wezterm".into(),
+        vec!["start".into(), "--cwd".into(), dir.into()],
+    ));
+    // Cask-installed app bundles (no CLI on PATH).
+    if mac_app_installed("iTerm") {
+        v.push(open_in_app("iTerm", dir));
+    }
+    if mac_app_installed("WezTerm") {
+        v.push(open_new_app_args("WezTerm", &["start", "--cwd", dir]));
+    }
+    if mac_app_installed("Ghostty") {
+        v.push(open_new_app_args("Ghostty", &["--working-directory", dir]));
+    }
+    // Terminal.app ships with every macOS install.
+    v.push(open_in_app("Terminal", dir));
+    v
+}
+
+/// Windows Terminal is the default console host on Windows 11 and exposes
+/// its app-execution alias on `PATH`; `-d` opens a new window in `dir`.
+/// The conhost fallback goes through `start`, whose `/D` flag sets the
+/// working directory of the new `cmd` window (the empty string is the
+/// window title `start` requires before a quoted path).
+#[cfg(target_os = "windows")]
+pub fn terminal_candidates(dir: &str) -> Vec<(String, Vec<String>)> {
+    vec![
+        ("wt".into(), vec!["-d".into(), dir.into()]),
+        (
+            "cmd".into(),
+            vec![
+                "/C".into(),
+                "start".into(),
+                String::new(),
+                "/D".into(),
+                dir.into(),
+                "cmd.exe".into(),
+            ],
+        ),
+    ]
+}
+
+/// `open -a <app> <dir>` on macOS: LaunchServices opens the folder with
+/// the app; terminal apps open a new window already cd'd into it.
+#[cfg(target_os = "macos")]
+fn open_in_app(app: &str, dir: &str) -> (String, Vec<String>) {
+    ("open".into(), vec!["-a".into(), app.into(), dir.into()])
+}
+
+/// `open -na <app> --args <args>` on macOS: launch a NEW app instance
+/// passing CLI arguments through to its binary.
+#[cfg(target_os = "macos")]
+fn open_new_app_args(app: &str, args: &[&str]) -> (String, Vec<String>) {
+    let mut v = vec!["-na".into(), app.into(), "--args".into()];
+    v.extend(args.iter().map(|a| (*a).into()));
+    ("open".into(), v)
+}
+
+/// True when an `.app` bundle for `app` exists in /Applications or
+/// ~/Applications — the places LaunchServices finds apps without PATH.
+#[cfg(target_os = "macos")]
+fn mac_app_installed(app: &str) -> bool {
+    let bundle = format!("{app}.app");
+    let mut dirs = vec![PathBuf::from("/Applications")];
+    if let Ok(home) = std::env::var("HOME") {
+        dirs.push(PathBuf::from(home).join("Applications"));
+    }
+    dirs.iter().any(|d| d.join(&bundle).is_dir())
 }
 
 /// True when `program` is an executable file found on `PATH`

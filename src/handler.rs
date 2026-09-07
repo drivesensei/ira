@@ -1,6 +1,6 @@
 use crate::app::{App, AppResult};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
+/// vlad lopez
 /// Keys that trigger the delete flow in normal mode. Windows/Linux have a
 /// dedicated Del key; on macOS the key labeled "delete" is Backspace (Del
 /// is fn+Backspace), so Backspace joins the delete keys there — matching

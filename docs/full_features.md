@@ -145,9 +145,11 @@ dialog.
 
 ## Comfort
 
-- **Native terminal on demand** — `0` spawns your own terminal emulator (foot, Alacritty,
-  kitty, GNOME Terminal, Konsole, xfce4-terminal, or xterm) directly in the active pane's
-  folder.
+- **Native terminal on demand** — `0` spawns your own terminal emulator directly in the
+  active pane's folder, preferring the one ira runs in. Linux tries foot, Alacritty, kitty,
+  GNOME Terminal, Konsole, xfce4-terminal, and xterm; macOS launches Terminal.app, iTerm2,
+  WezTerm, Ghostty, kitty, or Alacritty (via `open`, since GUI apps aren't on `PATH`);
+  Windows opens Windows Terminal, falling back to a `cmd` window.
 - **Hidden files** — `.` toggles dot-file visibility; the setting persists across restarts.
 - **Sortable listings** — `,` cycles the listing through name, size, modified, and kind.
 - **Scroll acceleration** — hold `↑`/`↓` and the cursor ramps up through long listings; change

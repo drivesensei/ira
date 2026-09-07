@@ -666,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "ira"
-version = "0.1.2"
+version = "0.1.4"
 dependencies = [
  "dirs-next",
  "image",
