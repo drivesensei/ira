@@ -261,10 +261,10 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         // `/` starts fuzzy search within the current folder.
         KeyCode::Char('/') => app.start_search(),
 
-        // `+` toggles the vertical split of the files pane.
-
         // `v` cycles the image preview: off → column → grid.
         KeyCode::Char('v') => app.cycle_preview(),
+
+        // `+` toggles the vertical split of the files pane.
         KeyCode::Char('+') => app.toggle_split(),
 
         // Backtick toggles the Copy Board sidebar.

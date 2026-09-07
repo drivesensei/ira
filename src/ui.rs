@@ -736,6 +736,13 @@ mod tests {
         app.cancel_goto();
         assert!(!app.hint_bar_blocked());
 
+        // The focused preview text editor captures every key: bar hides.
+        app.edit_focus = true;
+        assert!(app.hint_bar_blocked());
+        assert!(app.contextual_hints().is_empty());
+        app.edit_focus = false;
+        assert!(!app.hint_bar_blocked());
+
         // A transient notice owns the bar instead of the hints.
         app.set_status("Copied 2 items", false);
         assert!(!app.hint_bar_blocked(), "the button stays with a notice");

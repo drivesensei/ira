@@ -699,7 +699,8 @@ impl App {
     /// Whether a modal or text-input state owns the keyboard right now, so
     /// the contextual hint bar (and its `[*]` button) would only distract:
     /// rename/goto/new editors, search typing, confirmations, dialogs, the
-    /// deletion box and the focused Copy Board.
+    /// deletion box, the focused Copy Board and the focused preview text
+    /// editor (the buffer captures every key while it has focus).
     pub fn hint_bar_blocked(&self) -> bool {
         self.renaming.is_some()
             || self.goto_prompt.is_some()
@@ -711,6 +712,7 @@ impl App {
             || self.keybindings_visible
             || self.is_searching()
             || self.board_has_focus()
+            || self.edit_focus
     }
 
     /// Key/description pairs for the contextual hint bar, for the state the
