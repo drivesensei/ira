@@ -1,6 +1,6 @@
 [package]
 name = "ira"
-version = "0.1.4"
+version = "0.1.5"
 
 description = "A terminal file manager built with Ratatui and crossterm"
 repository = "https://github.com/drivesensei/ira"
