@@ -13,6 +13,17 @@ pub struct TermCaps {
     pub nerd_font: bool,
 }
 
+impl Default for TermCaps {
+    /// Optimistic defaults for tests / headless construction: truecolor
+    /// on, no Nerd Font. Real runs go through [`detect`].
+    fn default() -> Self {
+        TermCaps {
+            truecolor: true,
+            nerd_font: false,
+        }
+    }
+}
+
 /// Environment snapshot so detection is unit-testable without mutating
 /// process env.
 #[derive(Debug, Clone, Default)]

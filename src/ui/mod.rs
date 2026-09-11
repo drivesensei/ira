@@ -82,13 +82,15 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         }
     }
 
-    // Bottom bar right side: the "[*] Keybindings" button, plus the
+    // Bottom bar right side: the " * Keybindings " button, plus the
     // contextual hint marquee on the remaining width. Both hide while a
     // modal/text-input state owns the keyboard (app.hint_bar_blocked); the
     // marquee also yields to transient status notices (contextual_hints
     // returns nothing while one is up).
-    let btn_hint = " [*] Keybindings ";
-    let btn_w = btn_hint.len() as u16;
+    // Rendered as one pill (`* Keybindings`) so it matches the chips; the
+    // pill is always `label + 2` cells wide regardless of chip style.
+    let btn_label = "* Keybindings";
+    let btn_w = btn_label.len() as u16 + chrome::pill_extra(&theme);
     let bar_y = frame.area().y + frame.area().height - 1;
     if !app.hint_bar_blocked() {
         if frame.area().width > btn_w {
@@ -99,10 +101,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
                 height: 1,
             };
             frame.render_widget(
-                Paragraph::new(Span::styled(
-                    btn_hint,
-                    Style::default().fg(theme.key_fg).bg(theme.key_bg),
-                )),
+                Paragraph::new(Line::from(chrome::key_pill(btn_label, &theme))),
                 btn,
             );
         }
@@ -122,10 +121,17 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         }
     }
 
-    // Bookmarks (left) and Actions (right) share the third row.
+    // Bookmarks (left) and Actions (right) share the third row. The four
+    // action chips need 58 cols with square pills and 63 with rounded ones
+    // (wider pills, narrower gaps); plus the border.
+    let actions_w = if theme.chips == crate::theme::ChipStyle::Rounded {
+        66
+    } else {
+        60
+    };
     let bookmarks_row = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(48)])
+        .constraints([Constraint::Min(0), Constraint::Length(actions_w)])
         .split(rows[2]);
     crate::components::bookmarks_ui::render(frame, app, bookmarks_row[0]);
     crate::components::actions_ui::render(frame, app, bookmarks_row[1]);
@@ -510,6 +516,9 @@ mod tests {
     /// path (the only public way to start a walk / create a dialog).
     fn dialog_app(name: &str, is_dir: bool, dir: &std::path::Path) -> App {
         let mut app = App::default();
+        // Size walks persist state on completion; keep it off the real file.
+        app.state_path =
+            Some(std::env::temp_dir().join(format!("ira-ui-state-{}", std::process::id())));
         app.panes[0].files = vec![FEntry {
             path: dir.join(name).to_string_lossy().into_owned(),
             label: name.to_string(),
@@ -553,7 +562,7 @@ mod tests {
             text.contains("Failed to eject /dev/sdd2: target is busy"),
             "{text}"
         );
-        assert!(text.contains("[any key] dismiss"), "{text}");
+        assert!(text.contains(" any key  dismiss"), "{text}");
 
         // A non-error notice renders with the same dialog shape.
         let mut app = App::default();
@@ -575,9 +584,9 @@ mod tests {
         // A folder query starts a walk (or shows a cached size): hint shows.
         let mut app = dialog_app("folder", true, &dir);
         let text = rendered(&mut app);
-        assert!(text.contains("[r] recalculate"), "{text}");
-        assert!(text.contains("[x] cancel size walk"));
-        assert!(text.contains("[Esc] close"));
+        assert!(text.contains(" r  recalculate"), "{text}");
+        assert!(text.contains(" x  cancel size walk"));
+        assert!(text.contains(" Esc  close"));
 
         // A plain file gets no walk and no cache entry: no hint keys.
         let mut app = dialog_app("file.txt", false, &dir);
@@ -607,7 +616,7 @@ mod tests {
         // If the dialog were too narrow the Paragraph would truncate/wrap the
         // hint and the full string could not appear contiguously.
         assert!(
-            text.contains("[x] cancel size walk   [r] recalculate   [Esc] close"),
+            text.contains(" x  cancel size walk    r  recalculate    Esc  close"),
             "{text}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -643,14 +652,14 @@ mod tests {
         // No status: the button is still visible.
         let mut app = App::default();
         let text = rendered(&mut app);
-        assert!(text.contains("[*] Keybindings"), "{text}");
+        assert!(text.contains("* Keybindings"), "{text}");
 
         // A non-error notice shares the bar without hiding the button.
         let mut app = App::default();
         app.set_status("Copied 2 items", false);
         let text = rendered(&mut app);
         assert!(text.contains("Copied 2 items"), "{text}");
-        assert!(text.contains("[*] Keybindings"), "{text}");
+        assert!(text.contains("* Keybindings"), "{text}");
     }
 
     #[test]
@@ -694,6 +703,92 @@ mod tests {
         assert!(!app.keybindings_visible);
         let text = rendered(&mut app);
         assert!(!text.contains("this help"), "{text}");
+    }
+
+    #[test]
+    fn backslash_switches_theme_shows_banner_and_actions_chip() {
+        use crate::handler::handle_key_events;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let file = std::env::temp_dir().join(format!("ira-ui-theme-{}", std::process::id()));
+        let mut app = App::default();
+        app.state_path = Some(file.clone());
+        app.icons = IconSet::Unicode;
+
+        let text = rendered(&mut app);
+        assert!(
+            text.contains(" \\  Theme"),
+            "Actions must advertise `\\`: {text}"
+        );
+        assert!(
+            text.contains("Catppuccin Mocha"),
+            "title shows preset: {text}"
+        );
+
+        handle_key_events(
+            KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::empty()),
+            &mut app,
+        )
+        .unwrap();
+        let text = rendered(&mut app);
+        assert!(
+            text.contains("Switched to Cyberpunk 2077"),
+            "banner must announce the new theme: {text}"
+        );
+        assert!(text.contains("Cyberpunk 2077"), "{text}");
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn outline_chips_use_thin_caps_or_parentheses_at_square_width() {
+        use crate::theme::ChipStyle;
+        let (l, r) = (chrome::OUTLINE_LEFT, chrome::OUTLINE_RIGHT);
+        let mut app = App::default();
+        app.icons = IconSet::Unicode;
+        let square = rendered(&mut app);
+
+        // Nerd glyphs available: thin rounded caps, bold key, no padding.
+        app.theme.chips = ChipStyle::Outline;
+        app.theme.nerd_glyphs = true;
+        let outline = rendered(&mut app);
+        let row =
+            format!("{l}+{r} Split Pane   {l}`{r} Copy Board   {l}0{r} Terminal   {l}\\{r} Theme");
+        assert!(outline.contains(&row), "{outline}");
+        assert!(
+            outline.contains(&format!("{l}* Keybindings{r}")),
+            "{outline}"
+        );
+        // Same width as square: the label column does not move.
+        let col = |s: &str| s.find(" Split Pane").map(|b| s[..b].chars().count());
+        assert_eq!(col(&square), col(&outline));
+
+        // Without a Nerd Font the caps degrade to parentheses.
+        app.theme.nerd_glyphs = false;
+        let ascii = rendered(&mut app);
+        assert!(ascii.contains("(+) Split Pane   (`) Copy Board"), "{ascii}");
+        assert!(ascii.contains("(* Keybindings)"), "{ascii}");
+    }
+
+    #[test]
+    fn rounded_chips_keep_a_flat_body_between_the_caps() {
+        let (l, r) = (chrome::PILL_LEFT, chrome::PILL_RIGHT);
+        let mut app = App::default();
+        app.icons = IconSet::Unicode;
+        let square = rendered(&mut app);
+        assert!(square.contains(" +  Split Pane"), "{square}");
+
+        app.theme.chips = crate::theme::ChipStyle::Rounded;
+        let round = rendered(&mut app);
+        // Padding survives inside the caps (stadium, not a ball), and the
+        // whole Actions row still fits on one line at 100 cols.
+        let row = format!(
+            "{l} + {r} Split Pane  {l} ` {r} Copy Board  {l} 0 {r} Terminal  {l} \\ {r} Theme"
+        );
+        assert!(round.contains(&row), "{round}");
+        let btn = format!("{l} * Keybindings {r}");
+        assert!(round.contains(&btn), "{round}");
+        // Same cell count: the grid did not change size.
+        assert_eq!(square.chars().count(), round.chars().count());
     }
 
     #[test]
@@ -795,6 +890,6 @@ mod tests {
         app.cancel_goto();
         let text = rendered(&mut app);
         assert!(text.contains("copy"), "{text}");
-        assert!(text.contains("[*] Keybindings"), "{text}");
+        assert!(text.contains("* Keybindings"), "{text}");
     }
 }

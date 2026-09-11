@@ -44,6 +44,45 @@ pub struct Theme {
     pub document: Color,
     pub executable: Color,
     pub data: Color,
+    /// How shortcut keys are framed (see [`ChipStyle`]).
+    pub chips: ChipStyle,
+    /// Whether Nerd Font PUA glyphs (Powerline caps) may be emitted by
+    /// chrome; mirrors the active icon set.
+    pub nerd_glyphs: bool,
+}
+
+/// Visual style of the shortcut-key chips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChipStyle {
+    /// ` key ` in `key_fg` on a filled `key_bg` rectangle.
+    #[default]
+    Square,
+    /// Filled body plus thick half-circle caps (Nerd Font Powerline).
+    Rounded,
+    /// No fill: bold `accent` key between thin rounded caps drawn in
+    /// `border_active`, echoing the panels' rounded borders. Falls back to
+    /// `(key)` without a Nerd Font.
+    Outline,
+}
+
+impl ChipStyle {
+    /// Cells a chip adds around its key text.
+    pub fn extra_width(self) -> u16 {
+        match self {
+            ChipStyle::Square | ChipStyle::Outline => 2,
+            ChipStyle::Rounded => 4,
+        }
+    }
+
+    /// Accepts the `chips = "..."` values from `theme.toml`.
+    pub fn parse(raw: &str) -> Option<ChipStyle> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "square" | "plain" | "filled" => Some(ChipStyle::Square),
+            "rounded" | "pill" => Some(ChipStyle::Rounded),
+            "outline" | "outlined" | "border" => Some(ChipStyle::Outline),
+            _ => None,
+        }
+    }
 }
 
 impl Default for Theme {
@@ -85,6 +124,8 @@ impl Theme {
             document: rgb(0x89, 0xdc, 0xeb),
             executable: rgb(0xf3, 0x8b, 0xa8),
             data: rgb(0x94, 0xe2, 0xd5),
+            chips: ChipStyle::Square,
+            nerd_glyphs: false,
         }
     }
 
@@ -120,15 +161,239 @@ impl Theme {
             document: rgb(0xf5, 0xf0, 0xc8),
             executable: rgb(0xff, 0x00, 0x3c),
             data: rgb(0x00, 0xf0, 0xff),
+            chips: ChipStyle::Square,
+            nerd_glyphs: false,
+        }
+    }
+
+    /// Gruvbox Dark (medium contrast): warm retro palette.
+    pub fn gruvbox_dark() -> Self {
+        Self {
+            bg: rgb(0x28, 0x28, 0x28),
+            surface: rgb(0x3c, 0x38, 0x36),
+            surface_alt: rgb(0x50, 0x49, 0x45),
+            border: rgb(0x50, 0x49, 0x45),
+            border_active: rgb(0xfa, 0xbd, 0x2f),
+            text: rgb(0xeb, 0xdb, 0xb2),
+            text_muted: rgb(0x92, 0x83, 0x74),
+            accent: rgb(0xfa, 0xbd, 0x2f),
+            key_fg: rgb(0x28, 0x28, 0x28),
+            key_bg: rgb(0xfa, 0xbd, 0x2f),
+            success: rgb(0xb8, 0xbb, 0x26),
+            warning: rgb(0xfe, 0x80, 0x19),
+            error: rgb(0xfb, 0x49, 0x34),
+            info: rgb(0x83, 0xa5, 0x98),
+            cursor_bg: rgb(0x50, 0x49, 0x45),
+            cursor_fg: rgb(0xeb, 0xdb, 0xb2),
+            selection: rgb(0xd3, 0x86, 0x9b),
+            dir: rgb(0x83, 0xa5, 0x98),
+            hidden: rgb(0x92, 0x83, 0x74),
+            shadow: rgb(0x1d, 0x20, 0x21),
+            image: rgb(0xfa, 0xbd, 0x2f),
+            video: rgb(0xd3, 0x86, 0x9b),
+            audio: rgb(0x8e, 0xc0, 0x7c),
+            archive: rgb(0xfe, 0x80, 0x19),
+            code: rgb(0xb8, 0xbb, 0x26),
+            document: rgb(0x83, 0xa5, 0x98),
+            executable: rgb(0xfb, 0x49, 0x34),
+            data: rgb(0x8e, 0xc0, 0x7c),
+            chips: ChipStyle::Square,
+            nerd_glyphs: false,
+        }
+    }
+
+    /// Nord: arctic, bluish palette.
+    pub fn nord() -> Self {
+        Self {
+            bg: rgb(0x2e, 0x34, 0x40),
+            surface: rgb(0x3b, 0x42, 0x52),
+            surface_alt: rgb(0x43, 0x4c, 0x5e),
+            border: rgb(0x4c, 0x56, 0x6a),
+            border_active: rgb(0x88, 0xc0, 0xd0),
+            text: rgb(0xec, 0xef, 0xf4),
+            text_muted: rgb(0x7b, 0x88, 0xa1),
+            accent: rgb(0x88, 0xc0, 0xd0),
+            key_fg: rgb(0x2e, 0x34, 0x40),
+            key_bg: rgb(0x88, 0xc0, 0xd0),
+            success: rgb(0xa3, 0xbe, 0x8c),
+            warning: rgb(0xeb, 0xcb, 0x8b),
+            error: rgb(0xbf, 0x61, 0x6a),
+            info: rgb(0x81, 0xa1, 0xc1),
+            cursor_bg: rgb(0x43, 0x4c, 0x5e),
+            cursor_fg: rgb(0xec, 0xef, 0xf4),
+            selection: rgb(0xb4, 0x8e, 0xad),
+            dir: rgb(0x81, 0xa1, 0xc1),
+            hidden: rgb(0x7b, 0x88, 0xa1),
+            shadow: rgb(0x24, 0x29, 0x33),
+            image: rgb(0xeb, 0xcb, 0x8b),
+            video: rgb(0xb4, 0x8e, 0xad),
+            audio: rgb(0x8f, 0xbc, 0xbb),
+            archive: rgb(0xd0, 0x87, 0x70),
+            code: rgb(0xa3, 0xbe, 0x8c),
+            document: rgb(0x88, 0xc0, 0xd0),
+            executable: rgb(0xbf, 0x61, 0x6a),
+            data: rgb(0x8f, 0xbc, 0xbb),
+            chips: ChipStyle::Square,
+            nerd_glyphs: false,
+        }
+    }
+
+    /// Dracula: purple/pink on a deep indigo background.
+    pub fn dracula() -> Self {
+        Self {
+            bg: rgb(0x28, 0x2a, 0x36),
+            surface: rgb(0x34, 0x37, 0x46),
+            surface_alt: rgb(0x44, 0x47, 0x5a),
+            border: rgb(0x44, 0x47, 0x5a),
+            border_active: rgb(0xbd, 0x93, 0xf9),
+            text: rgb(0xf8, 0xf8, 0xf2),
+            text_muted: rgb(0x62, 0x72, 0xa4),
+            accent: rgb(0xbd, 0x93, 0xf9),
+            key_fg: rgb(0x28, 0x2a, 0x36),
+            key_bg: rgb(0xbd, 0x93, 0xf9),
+            success: rgb(0x50, 0xfa, 0x7b),
+            warning: rgb(0xf1, 0xfa, 0x8c),
+            error: rgb(0xff, 0x55, 0x55),
+            info: rgb(0x8b, 0xe9, 0xfd),
+            cursor_bg: rgb(0x44, 0x47, 0x5a),
+            cursor_fg: rgb(0xf8, 0xf8, 0xf2),
+            selection: rgb(0xff, 0x79, 0xc6),
+            dir: rgb(0x8b, 0xe9, 0xfd),
+            hidden: rgb(0x62, 0x72, 0xa4),
+            shadow: rgb(0x1e, 0x1f, 0x29),
+            image: rgb(0xf1, 0xfa, 0x8c),
+            video: rgb(0xff, 0x79, 0xc6),
+            audio: rgb(0xbd, 0x93, 0xf9),
+            archive: rgb(0xff, 0xb8, 0x6c),
+            code: rgb(0x50, 0xfa, 0x7b),
+            document: rgb(0x8b, 0xe9, 0xfd),
+            executable: rgb(0xff, 0x55, 0x55),
+            data: rgb(0x8b, 0xe9, 0xfd),
+            chips: ChipStyle::Square,
+            nerd_glyphs: false,
+        }
+    }
+
+    /// Tokyo Night: cool night-city blues and violets.
+    pub fn tokyo_night() -> Self {
+        Self {
+            bg: rgb(0x1a, 0x1b, 0x26),
+            surface: rgb(0x24, 0x28, 0x3b),
+            surface_alt: rgb(0x2f, 0x33, 0x4d),
+            border: rgb(0x3b, 0x40, 0x61),
+            border_active: rgb(0x7a, 0xa2, 0xf7),
+            text: rgb(0xc0, 0xca, 0xf5),
+            text_muted: rgb(0x56, 0x5f, 0x89),
+            accent: rgb(0x7a, 0xa2, 0xf7),
+            key_fg: rgb(0x1a, 0x1b, 0x26),
+            key_bg: rgb(0x7a, 0xa2, 0xf7),
+            success: rgb(0x9e, 0xce, 0x6a),
+            warning: rgb(0xe0, 0xaf, 0x68),
+            error: rgb(0xf7, 0x76, 0x8e),
+            info: rgb(0x7d, 0xcf, 0xff),
+            cursor_bg: rgb(0x2f, 0x33, 0x4d),
+            cursor_fg: rgb(0xc0, 0xca, 0xf5),
+            selection: rgb(0xbb, 0x9a, 0xf7),
+            dir: rgb(0x7a, 0xa2, 0xf7),
+            hidden: rgb(0x56, 0x5f, 0x89),
+            shadow: rgb(0x11, 0x12, 0x1b),
+            image: rgb(0xe0, 0xaf, 0x68),
+            video: rgb(0xbb, 0x9a, 0xf7),
+            audio: rgb(0xff, 0x9e, 0x64),
+            archive: rgb(0xff, 0x9e, 0x64),
+            code: rgb(0x9e, 0xce, 0x6a),
+            document: rgb(0x7d, 0xcf, 0xff),
+            executable: rgb(0xf7, 0x76, 0x8e),
+            data: rgb(0x2a, 0xc3, 0xde),
+            chips: ChipStyle::Square,
+            nerd_glyphs: false,
         }
     }
 
     /// Built-in preset from a `theme.toml` `preset = "..."` value.
     pub fn from_preset(name: &str) -> Option<Self> {
-        match name.trim().to_ascii_lowercase().as_str() {
-            "mocha" | "default" | "catppuccin" => Some(Self::mocha()),
-            "cyberpunk" | "cyberpunk2077" | "2077" | "nightcity" => Some(Self::cyberpunk2077()),
+        ThemePreset::parse(name).map(ThemePreset::theme)
+    }
+}
+
+/// Built-in palettes, in `\` cycle order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThemePreset {
+    #[default]
+    Mocha,
+    Cyberpunk2077,
+    GruvboxDark,
+    Nord,
+    Dracula,
+    TokyoNight,
+}
+
+impl ThemePreset {
+    /// Cycle order for the `\` action.
+    pub const ALL: &'static [ThemePreset] = &[
+        ThemePreset::Mocha,
+        ThemePreset::Cyberpunk2077,
+        ThemePreset::GruvboxDark,
+        ThemePreset::Nord,
+        ThemePreset::Dracula,
+        ThemePreset::TokyoNight,
+    ];
+
+    /// Stable key used in `theme.toml` (`preset = "..."`) and the session
+    /// state (`theme=...`).
+    pub fn id(self) -> &'static str {
+        match self {
+            ThemePreset::Mocha => "mocha",
+            ThemePreset::Cyberpunk2077 => "cyberpunk2077",
+            ThemePreset::GruvboxDark => "gruvbox-dark",
+            ThemePreset::Nord => "nord",
+            ThemePreset::Dracula => "dracula",
+            ThemePreset::TokyoNight => "tokyo-night",
+        }
+    }
+
+    /// Human label for banners and panel titles.
+    pub fn label(self) -> &'static str {
+        match self {
+            ThemePreset::Mocha => "Catppuccin Mocha",
+            ThemePreset::Cyberpunk2077 => "Cyberpunk 2077",
+            ThemePreset::GruvboxDark => "Gruvbox Dark",
+            ThemePreset::Nord => "Nord",
+            ThemePreset::Dracula => "Dracula",
+            ThemePreset::TokyoNight => "Tokyo Night",
+        }
+    }
+
+    /// The preset after `self` in [`ThemePreset::ALL`], wrapping around.
+    pub fn next(self) -> ThemePreset {
+        let idx = Self::ALL.iter().position(|p| *p == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+
+    /// Accepts ids plus a few friendly aliases; case-insensitive.
+    pub fn parse(name: &str) -> Option<ThemePreset> {
+        let key = name.trim().to_ascii_lowercase().replace('_', "-");
+        match key.as_str() {
+            "mocha" | "default" | "catppuccin" | "catppuccin-mocha" => Some(ThemePreset::Mocha),
+            "cyberpunk" | "cyberpunk2077" | "cyberpunk-2077" | "2077" | "nightcity"
+            | "night-city" => Some(ThemePreset::Cyberpunk2077),
+            "gruvbox" | "gruvbox-dark" | "gruvboxdark" => Some(ThemePreset::GruvboxDark),
+            "nord" => Some(ThemePreset::Nord),
+            "dracula" => Some(ThemePreset::Dracula),
+            "tokyo-night" | "tokyonight" | "tokyo" => Some(ThemePreset::TokyoNight),
             _ => None,
+        }
+    }
+
+    /// The preset's base palette (truecolor, before overrides/quantization).
+    pub fn theme(self) -> Theme {
+        match self {
+            ThemePreset::Mocha => Theme::mocha(),
+            ThemePreset::Cyberpunk2077 => Theme::cyberpunk2077(),
+            ThemePreset::GruvboxDark => Theme::gruvbox_dark(),
+            ThemePreset::Nord => Theme::nord(),
+            ThemePreset::Dracula => Theme::dracula(),
+            ThemePreset::TokyoNight => Theme::tokyo_night(),
         }
     }
 }
@@ -146,6 +411,8 @@ struct ThemeFile {
     /// still override individual slots.
     preset: Option<String>,
     icons: Option<String>,
+    /// `"outline"` | `"rounded"` | `"square"`; default follows the icon set.
+    chips: Option<String>,
     bg: Option<String>,
     surface: Option<String>,
     surface_alt: Option<String>,
@@ -183,49 +450,168 @@ struct ThemeFileFiles {
     data: Option<String>,
 }
 
+/// Where the active preset came from (for `--check-terminal`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresetSource {
+    /// `theme=` in the session state (last `\` press).
+    State,
+    /// `preset =` in `theme.toml`.
+    Toml,
+    /// Neither: the built-in default.
+    Default,
+}
+
+/// Everything needed to (re)build a [`Theme`] for any preset at runtime:
+/// the detected terminal caps and the user's `theme.toml` overrides.
+/// Held by `App` so `\` can switch presets without re-reading disk.
+#[derive(Debug, Default)]
+pub struct Loader {
+    caps: TermCaps,
+    overrides: ThemeFile,
+    /// Auto default for the chip style when `theme.toml` has no `chips`
+    /// key: `Outline` once the Nerd icon set is active (the caps are Nerd
+    /// Font Powerline glyphs), `Square` otherwise.
+    chips_auto: ChipStyle,
+    nerd_glyphs: bool,
+}
+
+impl Loader {
+    /// Reads `~/.config/ira/theme.toml` (once) and detects caps.
+    pub fn from_env() -> Self {
+        let env = EnvSnapshot::from_os();
+        let caps = detect_from_env(&env);
+        let file = theme_file_path().and_then(|p| fs::read_to_string(p).ok());
+        Self::from_toml(&file.unwrap_or_default(), caps)
+    }
+
+    /// Builds a loader from an explicit TOML body and caps (tests).
+    pub fn from_toml(toml_src: &str, caps: TermCaps) -> Self {
+        let overrides = if toml_src.trim().is_empty() {
+            ThemeFile::default()
+        } else {
+            toml::from_str::<ThemeFile>(toml_src).unwrap_or_default()
+        };
+        Self {
+            caps,
+            overrides,
+            chips_auto: ChipStyle::Square,
+            nerd_glyphs: false,
+        }
+    }
+
+    /// Ties the chip-style default (and glyph availability) to the
+    /// resolved icon set.
+    pub fn set_icon_set(&mut self, icons: IconSet) {
+        self.nerd_glyphs = icons == IconSet::Nerd;
+        self.chips_auto = match icons {
+            IconSet::Nerd => ChipStyle::Outline,
+            IconSet::Unicode => ChipStyle::Square,
+        };
+    }
+
+    /// `chips = "..."` from `theme.toml`, else the auto default.
+    pub fn chip_style(&self) -> ChipStyle {
+        self.overrides
+            .chips
+            .as_deref()
+            .and_then(ChipStyle::parse)
+            .unwrap_or(self.chips_auto)
+    }
+
+    /// Detected terminal caps.
+    pub fn caps(&self) -> &TermCaps {
+        &self.caps
+    }
+
+    /// `preset = "..."` from `theme.toml`, if valid.
+    pub fn toml_preset(&self) -> Option<ThemePreset> {
+        self.overrides
+            .preset
+            .as_deref()
+            .and_then(ThemePreset::parse)
+    }
+
+    /// `icons = "..."` from `theme.toml`.
+    pub fn icons_pref(&self) -> Option<&str> {
+        self.overrides.icons.as_deref()
+    }
+
+    /// Preset palette → TOML per-key overrides → quantization for caps.
+    pub fn theme_for(&self, preset: ThemePreset) -> Theme {
+        let mut theme = preset.theme();
+        theme.apply_overrides(&self.overrides);
+        theme.adapt(&self.caps);
+        theme.chips = self.chip_style();
+        theme.nerd_glyphs = self.nerd_glyphs;
+        theme
+    }
+
+    /// Startup preset: persisted session state > `theme.toml` > default.
+    pub fn resolve_preset(&self, persisted: Option<&str>) -> (ThemePreset, PresetSource) {
+        if let Some(p) = persisted.and_then(ThemePreset::parse) {
+            return (p, PresetSource::State);
+        }
+        if let Some(p) = self.toml_preset() {
+            return (p, PresetSource::Toml);
+        }
+        (ThemePreset::default(), PresetSource::Default)
+    }
+
+    /// Icon set: `IRA_ICONS` > `theme.toml` > persisted > auto.
+    pub fn resolve_icons(&self, ira_icons: Option<&str>, persisted: Option<&str>) -> IconSet {
+        resolve_icon_set(&self.caps, self.icons_pref(), ira_icons, persisted)
+    }
+}
+
+/// Result of startup theme resolution.
+#[derive(Debug)]
+pub struct Loaded {
+    pub theme: Theme,
+    pub icons: IconSet,
+    pub preset: ThemePreset,
+    pub source: PresetSource,
+    pub loader: Loader,
+}
+
 /// Loads the theme and icon set: defaults, then `~/.config/ira/theme.toml`,
 /// then `adapt()` for the detected terminal, then icon-set resolution
 /// (`IRA_ICONS` > toml `icons` > persisted session > auto).
 pub fn load() -> (Theme, IconSet) {
-    load_with_persisted(None)
+    let l = load_with_persisted(None, None);
+    (l.theme, l.icons)
 }
 
-/// Same as [`load`], using a previously persisted icon preference
-/// (`icons=nerd` in the session state) when env/toml do not override.
-pub fn load_with_persisted(persisted_icons: Option<&str>) -> (Theme, IconSet) {
+/// Full startup resolution using persisted session preferences
+/// (`icons=` / `theme=` in the state file) when env/toml do not override.
+pub fn load_with_persisted(persisted_icons: Option<&str>, persisted_theme: Option<&str>) -> Loaded {
     let env = EnvSnapshot::from_os();
-    let caps = detect_from_env(&env);
-    let file = theme_file_path().and_then(|p| fs::read_to_string(p).ok());
-    load_from(
-        &file.unwrap_or_default(),
-        &caps,
-        env.ira_icons.as_deref(),
-        persisted_icons,
-    )
+    let mut loader = Loader::from_env();
+    let (preset, source) = loader.resolve_preset(persisted_theme);
+    let icons = loader.resolve_icons(env.ira_icons.as_deref(), persisted_icons);
+    loader.set_icon_set(icons);
+    let theme = loader.theme_for(preset);
+    Loaded {
+        theme,
+        icons,
+        preset,
+        source,
+        loader,
+    }
 }
 
-/// Test / `--check-terminal` entry: parse an optional TOML body against
-/// already-detected caps.
-pub fn load_from(
+/// Test entry: parse an optional TOML body against already-detected caps.
+#[cfg(test)]
+fn load_from(
     toml_src: &str,
     caps: &TermCaps,
     ira_icons: Option<&str>,
     persisted_icons: Option<&str>,
 ) -> (Theme, IconSet) {
-    let parsed = if toml_src.trim().is_empty() {
-        ThemeFile::default()
-    } else {
-        toml::from_str::<ThemeFile>(toml_src).unwrap_or_default()
-    };
-    let mut theme = parsed
-        .preset
-        .as_deref()
-        .and_then(Theme::from_preset)
-        .unwrap_or_default();
-    theme.apply_overrides(&parsed);
-    theme.adapt(caps);
-    let icons = resolve_icon_set(caps, parsed.icons.as_deref(), ira_icons, persisted_icons);
-    (theme, icons)
+    let mut loader = Loader::from_toml(toml_src, *caps);
+    let (preset, _) = loader.resolve_preset(None);
+    let icons = loader.resolve_icons(ira_icons, persisted_icons);
+    loader.set_icon_set(icons);
+    (loader.theme_for(preset), icons)
 }
 
 /// Path to `~/.config/ira/theme.toml`.
@@ -528,5 +914,92 @@ mod tests {
         );
         assert_eq!(theme.accent, Color::Rgb(255, 255, 255));
         assert_eq!(theme.bg, Theme::cyberpunk2077().bg);
+    }
+
+    #[test]
+    fn preset_cycle_wraps_and_ids_roundtrip() {
+        let mut p = ThemePreset::ALL[0];
+        for _ in 0..ThemePreset::ALL.len() {
+            p = p.next();
+        }
+        assert_eq!(p, ThemePreset::ALL[0], "full cycle returns to the start");
+
+        for preset in ThemePreset::ALL {
+            assert_eq!(ThemePreset::parse(preset.id()), Some(*preset), "{preset:?}");
+            assert_eq!(
+                ThemePreset::parse(&preset.id().to_uppercase()),
+                Some(*preset)
+            );
+            assert!(!preset.label().is_empty());
+        }
+        assert_eq!(ThemePreset::parse("bogus"), None);
+    }
+
+    #[test]
+    fn chip_style_follows_icon_set_unless_toml_pins_it() {
+        let caps = TermCaps {
+            truecolor: true,
+            nerd_font: true,
+        };
+        // Auto: Nerd icons -> outline, Unicode -> square.
+        let (theme, icons) = load_from("", &caps, None, None);
+        assert_eq!(icons, IconSet::Nerd);
+        assert_eq!(theme.chips, ChipStyle::Outline);
+        let (theme, _) = load_from("", &caps, Some("unicode"), None);
+        assert_eq!(theme.chips, ChipStyle::Square);
+
+        // toml pins it regardless of icons; unknown values fall back to auto.
+        let (theme, _) = load_from("chips = \"square\"\n", &caps, None, None);
+        assert_eq!(theme.chips, ChipStyle::Square);
+        let (theme, _) = load_from("chips = \"rounded\"\n", &caps, Some("unicode"), None);
+        assert_eq!(theme.chips, ChipStyle::Rounded);
+        let (theme, _) = load_from("chips = \"Outline\"\n", &caps, Some("unicode"), None);
+        assert_eq!(theme.chips, ChipStyle::Outline);
+        let (theme, _) = load_from("chips = \"blob\"\n", &caps, None, None);
+        assert_eq!(theme.chips, ChipStyle::Outline);
+
+        // Every preset keeps the style when cycling.
+        let mut loader = Loader::from_toml("", caps);
+        loader.set_icon_set(IconSet::Nerd);
+        for p in ThemePreset::ALL {
+            assert_eq!(loader.theme_for(*p).chips, ChipStyle::Outline, "{p:?}");
+        }
+    }
+
+    #[test]
+    fn every_preset_is_readable() {
+        for preset in ThemePreset::ALL {
+            let t = preset.theme();
+            assert_ne!(t.bg, t.text, "{preset:?}: text must contrast bg");
+            assert_ne!(t.surface, t.text, "{preset:?}: text must contrast surface");
+            assert_ne!(t.key_bg, t.key_fg, "{preset:?}: chip must be legible");
+        }
+    }
+
+    #[test]
+    fn loader_applies_overrides_on_any_preset_and_resolves_precedence() {
+        let caps = TermCaps {
+            truecolor: true,
+            nerd_font: false,
+        };
+        let loader = Loader::from_toml("preset = \"nord\"\naccent = \"#123456\"\n", caps);
+        let t = loader.theme_for(ThemePreset::Dracula);
+        assert_eq!(t.accent, Color::Rgb(0x12, 0x34, 0x56));
+        assert_eq!(t.bg, Theme::dracula().bg);
+
+        // Persisted state beats toml, toml beats default.
+        assert_eq!(
+            loader.resolve_preset(Some("tokyo-night")),
+            (ThemePreset::TokyoNight, PresetSource::State)
+        );
+        assert_eq!(
+            loader.resolve_preset(Some("junk")),
+            (ThemePreset::Nord, PresetSource::Toml)
+        );
+        let plain = Loader::from_toml("", caps);
+        assert_eq!(
+            plain.resolve_preset(None),
+            (ThemePreset::Mocha, PresetSource::Default)
+        );
     }
 }

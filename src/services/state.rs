@@ -30,6 +30,9 @@ pub struct SessionState {
     /// Last-used icon set (`nerd` / `unicode`). `None` = never persisted;
     /// theme auto-detection still applies.
     pub icons: Option<String>,
+    /// Last-selected theme preset id (`\` cycles). `None` = never
+    /// persisted; `theme.toml` / default apply.
+    pub theme: Option<String>,
     pub sizes: Vec<SizeEntry>,
 }
 
@@ -83,6 +86,9 @@ fn serialize_state(state: &SessionState) -> String {
     if let Some(icons) = &state.icons {
         content.push_str(&format!("icons={icons}\n"));
     }
+    if let Some(theme) = &state.theme {
+        content.push_str(&format!("theme={theme}\n"));
+    }
     for (key, folder) in [("left", &state.left), ("right", &state.right)] {
         match folder {
             Some(f) => content.push_str(&format!("{}={}\t{}\n", key, f.label, f.path)),
@@ -119,6 +125,12 @@ fn parse_state(contents: &str) -> SessionState {
                 let v = value.trim().to_ascii_lowercase();
                 if v == "nerd" || v == "unicode" {
                     state.icons = Some(v);
+                }
+            }
+            "theme" => {
+                // Store the canonical id so aliases normalize on the next save.
+                if let Some(p) = crate::theme::ThemePreset::parse(value) {
+                    state.theme = Some(p.id().to_string());
                 }
             }
             "left" => state.left = parse_folder(value),
@@ -221,6 +233,7 @@ mod tests {
             )),
             preview: [1, 2],
             icons: Some("nerd".to_string()),
+            theme: Some("cyberpunk2077".to_string()),
             sizes: vec![
                 SizeEntry {
                     path: "/home/vlad/big folder".to_string(),
@@ -244,6 +257,15 @@ mod tests {
         assert!(state.show_hidden, "hidden flag must roundtrip");
         assert_eq!(state.preview, [1, 2], "preview modes must roundtrip");
         assert_eq!(state.icons.as_deref(), Some("nerd"));
+        assert_eq!(state.theme.as_deref(), Some("cyberpunk2077"));
+    }
+
+    #[test]
+    fn theme_key_normalizes_aliases_and_drops_unknown() {
+        let parsed = parse_state("theme=Tokyo_Night\n");
+        assert_eq!(parsed.theme.as_deref(), Some("tokyo-night"));
+        let parsed = parse_state("theme=not-a-theme\n");
+        assert_eq!(parsed.theme, None);
     }
 
     #[test]

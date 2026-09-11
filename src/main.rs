@@ -97,7 +97,10 @@ fn main() -> AppResult<()> {
 fn print_terminal_check() {
     let caps = ira::theme::caps();
     let env = ira::theme::caps::EnvSnapshot::from_os();
-    let (_, icons) = ira::theme::load_from("", &caps, env.ira_icons.as_deref(), None);
+    let persisted = ira::services::state::load_state();
+    let loaded =
+        ira::theme::load_with_persisted(persisted.icons.as_deref(), persisted.theme.as_deref());
+    let icons = loaded.icons;
     let in_iterm2 = std::env::var("TERM_PROGRAM").is_ok_and(|t| t.contains("iTerm"))
         || std::env::var("LC_TERMINAL").is_ok_and(|t| t.contains("iTerm"));
     let mut options = QueryStdioOptions::default();
@@ -125,10 +128,23 @@ fn print_terminal_check() {
         },
         if env.ira_icons.is_some() {
             "IRA_ICONS override"
+        } else if loaded.loader.icons_pref().is_some() {
+            "from theme.toml icons"
+        } else if persisted.icons.is_some() {
+            "from session state"
         } else if caps.nerd_font {
             "auto: nerd-capable terminal"
         } else {
             "auto: unicode fallback"
+        }
+    );
+    println!(
+        "theme: {} ({})",
+        loaded.preset.id(),
+        match loaded.source {
+            ira::theme::PresetSource::State => "from session state, last `\\` press",
+            ira::theme::PresetSource::Toml => "from theme.toml preset",
+            ira::theme::PresetSource::Default => "default",
         }
     );
     println!("image protocol: {protocol}");

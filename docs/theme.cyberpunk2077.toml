@@ -1,3 +1,9 @@
 # Copy to ~/.config/ira/theme.toml (or merge the keys you want).
+#
+# `preset` is the theme a fresh profile starts with. Pressing `\` in the app
+# cycles through all built-in presets (mocha, cyberpunk2077, gruvbox-dark,
+# nord, dracula, tokyo-night) and remembers the last one in
+# ~/.config/ira/state, which takes precedence over this line afterwards.
+# Any per-key color overrides below stay applied on every preset.
 preset = "cyberpunk2077"
 icons = "nerd"

@@ -433,6 +433,11 @@ pub struct App {
     /// Resolved color palette (truecolor or quantized). Tests use the
     /// default dark theme without reading `theme.toml`.
     pub theme: crate::theme::Theme,
+    /// Which built-in preset `theme` was built from (`\` cycles it).
+    pub theme_preset: crate::theme::ThemePreset,
+    /// Caps + `theme.toml` overrides, kept so `\` can rebuild any preset
+    /// without touching disk again.
+    theme_loader: crate::theme::Loader,
     /// Active icon set. Tests force Unicode so glyphs stay single-width.
     pub icons: crate::theme::icons::IconSet,
 }
@@ -509,6 +514,8 @@ impl Default for App {
             edit: None,
             edit_focus: false,
             theme: crate::theme::Theme::default(),
+            theme_preset: crate::theme::ThemePreset::default(),
+            theme_loader: crate::theme::Loader::default(),
             icons: crate::theme::icons::IconSet::Unicode,
         }
     }
@@ -587,10 +594,15 @@ impl App {
             }
             default.drives = Some(app_drives);
         }
-        let persisted_icons = default.restore_state();
-        let (theme, icons) = crate::theme::load_with_persisted(persisted_icons.as_deref());
-        default.theme = theme;
-        default.icons = icons;
+        let (persisted_icons, persisted_theme) = default.restore_state();
+        let loaded = crate::theme::load_with_persisted(
+            persisted_icons.as_deref(),
+            persisted_theme.as_deref(),
+        );
+        default.theme = loaded.theme;
+        default.theme_preset = loaded.preset;
+        default.theme_loader = loaded.loader;
+        default.icons = loaded.icons;
         default.start_drive_poller();
         // Startup pane listings run on the async chunked worker so a slow
         // drive can't block the first frame.
@@ -714,7 +726,7 @@ impl App {
     }
 
     /// Whether a modal or text-input state owns the keyboard right now, so
-    /// the contextual hint bar (and its `[*]` button) would only distract:
+    /// the contextual hint bar (and its `*` button) would only distract:
     /// rename/goto/new editors, search typing, confirmations, dialogs, the
     /// deletion box, the focused Copy Board and the focused preview text
     /// editor (the buffer captures every key while it has focus).
@@ -1772,6 +1784,16 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Switches to the next built-in theme preset (`\`), announces it in
+    /// the bottom banner, and persists the choice immediately so a crash
+    /// never loses it. `theme.toml` per-key overrides stay applied.
+    pub fn cycle_theme(&mut self) {
+        self.theme_preset = self.theme_preset.next();
+        self.theme = self.theme_loader.theme_for(self.theme_preset);
+        self.set_status(format!("Switched to {}", self.theme_preset.label()), false);
+        self.persist_state();
     }
 
     /// Cycles the active pane's sort mode (Name → Size → Modified → Kind),
@@ -3346,14 +3368,14 @@ impl App {
     }
 
     /// Restores the persisted session state (split layout and pane folders).
-    /// Returns a persisted icon preference, if any, so theme loading can
-    /// reuse it without `IRA_ICONS`.
-    pub fn restore_state(&mut self) -> Option<String> {
+    /// Returns the persisted `(icons, theme)` preferences, if any, so theme
+    /// loading can reuse them without `IRA_ICONS` / `theme.toml`.
+    pub fn restore_state(&mut self) -> (Option<String>, Option<String>) {
         let state = match &self.state_path {
             Some(p) => load_state_from(p),
             None => load_state(),
         };
-        let icons = state.icons.clone();
+        let prefs = (state.icons.clone(), state.theme.clone());
         self.split = state.split;
         self.active_pane = state.active_pane.min(1);
         self.show_hidden = state.show_hidden;
@@ -3371,7 +3393,7 @@ impl App {
         self.restore_sizes(state.sizes);
         // File lists are populated asynchronously from `App::new` via
         // `request_pane_listing`, so a slow drive doesn't block startup.
-        icons
+        prefs
     }
 
     /// Restores persisted size entries into the cache (epoch -> `SystemTime`).
@@ -3428,6 +3450,7 @@ impl App {
                 crate::theme::icons::IconSet::Nerd => "nerd".to_string(),
                 crate::theme::icons::IconSet::Unicode => "unicode".to_string(),
             }),
+            theme: Some(self.theme_preset.id().to_string()),
             sizes: self.size_entries(),
         };
         match &self.state_path {
@@ -3737,6 +3760,7 @@ mod tests {
                     app.panes[1].preview_mode.as_u8(),
                 ],
                 icons: None,
+                theme: None,
                 sizes: entries,
             },
         );
@@ -3751,6 +3775,42 @@ mod tests {
             SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
         );
     }
+
+    #[test]
+    fn cycle_theme_advances_announces_and_persists() {
+        use crate::theme::ThemePreset;
+
+        let file = std::env::temp_dir().join(format!("ira-test-theme-{}", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let mut app = App::default();
+        app.state_path = Some(file.clone());
+        assert_eq!(app.theme_preset, ThemePreset::Mocha);
+        let before = app.theme;
+
+        app.cycle_theme();
+        assert_eq!(app.theme_preset, ThemePreset::Cyberpunk2077);
+        assert_ne!(app.theme, before, "palette must actually change");
+        let status = app.status.as_ref().expect("banner set");
+        assert!(!status.is_error);
+        assert_eq!(status.text, "Switched to Cyberpunk 2077");
+
+        // The choice is written immediately and survives a restart.
+        let loaded = load_state_from(&file);
+        assert_eq!(loaded.theme.as_deref(), Some("cyberpunk2077"));
+        let mut app2 = App::default();
+        app2.state_path = Some(file.clone());
+        let (_, theme) = app2.restore_state();
+        assert_eq!(theme.as_deref(), Some("cyberpunk2077"));
+
+        // One press per preset walks the whole list and lands back home.
+        for _ in 1..ThemePreset::ALL.len() {
+            app.cycle_theme();
+        }
+        assert_eq!(app.theme_preset, ThemePreset::Mocha);
+        assert_eq!(app.theme, before);
+        let _ = std::fs::remove_file(&file);
+    }
+
     #[test]
     fn stale_listing_chunks_from_an_older_generation_are_dropped() {
         let mut app = App::default();
@@ -4095,6 +4155,8 @@ mod preview_tests {
     #[test]
     fn cycle_preview_walks_modes_per_pane() {
         let mut app = App::default();
+        app.state_path =
+            Some(std::env::temp_dir().join(format!("ira-preview-state-{}", std::process::id())));
         assert_eq!(app.panes[0].preview_mode, PreviewMode::Off);
         app.cycle_preview();
         assert_eq!(app.panes[0].preview_mode, PreviewMode::Column);
@@ -4177,6 +4239,8 @@ mod preview_tests {
     #[test]
     fn preview_modes_are_independent_per_pane() {
         let mut app = App::default();
+        app.state_path =
+            Some(std::env::temp_dir().join(format!("ira-preview-state-{}", std::process::id())));
         app.split = true; // Tab moves focus between panes only when split
         app.cycle_preview(); // pane 0 -> Column
         app.switch_pane(); // focus pane 1

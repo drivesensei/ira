@@ -210,6 +210,7 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
             KeyCode::Esc | KeyCode::Char('`') => app.toggle_copy_board(),
             KeyCode::Char('*') => app.show_keybindings(),
             KeyCode::Char('v') => app.cycle_preview(),
+            KeyCode::Char('\\') => app.cycle_theme(),
             KeyCode::Up => app.copy_board_prev(),
             KeyCode::Down => app.copy_board_next(),
             KeyCode::Char('p') | KeyCode::Char(' ') => app.toggle_selected_job_pause(),
@@ -273,6 +274,9 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
 
         // Backtick toggles the Copy Board sidebar.
         KeyCode::Char('`') => app.toggle_copy_board(),
+
+        // `\` cycles the built-in theme preset (banner shows the new name).
+        KeyCode::Char('\\') => app.cycle_theme(),
 
         // `c` copies the selected entry to the other pane; `m` moves it.
         KeyCode::Char('c') => app.request_copy(),

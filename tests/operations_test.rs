@@ -114,6 +114,9 @@ fn hidden_files_toggle() {
     std::fs::write(base.join("visible.txt"), "v").unwrap();
 
     let mut app = App::default();
+    // Never touch the real user config from tests.
+    app.state_path =
+        Some(std::env::temp_dir().join(format!("ira_state_test_{}", std::process::id())));
     app.panes[0].folder = Some(Folder::new("t".into(), base.to_str().unwrap().into(), '#'));
 
     // Listing is now async (chunked streaming + sorted final pass); wait
@@ -777,6 +780,9 @@ fn filter_reapplies_after_hidden_toggle() {
     std::fs::write(base.join(".beta-hidden"), "h").unwrap();
 
     let mut app = App::default();
+    // Never touch the real user config from tests.
+    app.state_path =
+        Some(std::env::temp_dir().join(format!("ira_state_test_{}", std::process::id())));
     app.panes[0].folder = Some(Folder::new("t".into(), base.to_str().unwrap().into(), '#'));
     // Seed only the visible file (hidden files are excluded by default).
     app.panes[0].files = vec![entry(base.join("beta.txt").to_str().unwrap())];
@@ -1013,6 +1019,9 @@ fn multi_selection_shows_aggregate_and_sums_walks() {
     std::fs::write(base.join("file2.txt"), "x".repeat(5)).unwrap();
 
     let mut app = App::default();
+    // Never touch the real user config from tests.
+    app.state_path =
+        Some(std::env::temp_dir().join(format!("ira_state_test_{}", std::process::id())));
     app.panes[0].folder = Some(Folder::new("t".into(), base.to_str().unwrap().into(), '#'));
     let dir1_entry = FEntry {
         path: d1.to_str().unwrap().to_string(),
@@ -1126,6 +1135,9 @@ fn single_selection_still_uses_single_info_dialog() {
     std::fs::write(base.join("only.txt"), "x").unwrap();
 
     let mut app = App::default();
+    // Never touch the real user config from tests.
+    app.state_path =
+        Some(std::env::temp_dir().join(format!("ira_state_test_{}", std::process::id())));
     app.panes[0].folder = Some(Folder::new("t".into(), base.to_str().unwrap().into(), '#'));
     app.panes[0].files = vec![entry(base.join("only.txt").to_str().unwrap())];
     app.panes[0].selected = vec![false];

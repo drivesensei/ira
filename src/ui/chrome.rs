@@ -8,7 +8,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::theme::Theme;
+use crate::theme::{ChipStyle, Theme};
 
 /// Rounded panel used by every chrome box.
 pub fn panel_block<'a>(title: Line<'a>, active: bool, theme: &Theme) -> Block<'a> {
@@ -25,31 +25,92 @@ pub fn panel_block<'a>(title: Line<'a>, active: bool, theme: &Theme) -> Block<'a
         .style(Style::default().fg(theme.text))
 }
 
-/// `[key]` chip (bold `key_fg` on `key_bg`) plus a muted label.
-///
-/// Concatenated text stays `[key]{label}` so existing buffer-text tests
-/// (`[y]es`, `[any key] dismiss`, …) keep matching.
+/// Nerd Font Powerline half circles used as chip end caps. Single-width
+/// in every Mono Nerd Font; drawn over whatever background is already in
+/// the cell. Thick = filled pill ends, thin = rounded outline ends.
+pub const PILL_LEFT: &str = "\u{e0b6}";
+pub const PILL_RIGHT: &str = "\u{e0b4}";
+pub const OUTLINE_LEFT: &str = "\u{e0b7}";
+pub const OUTLINE_RIGHT: &str = "\u{e0b5}";
+
+/// Extra cells a chip adds around its key text (see [`ChipStyle`]).
+pub fn pill_extra(theme: &Theme) -> u16 {
+    theme.chips.extra_width()
+}
+
+/// The framed part of a key chip, per `theme.chips`:
+/// - `Square`:  ` key ` in bold `key_fg` on a filled `key_bg` rectangle.
+/// - `Rounded`: the same body between thick half-circle caps. The padding
+///   stays on purpose: a bare key between two half circles reads as a
+///   ball, a flat body between them reads as a rounded rectangle.
+/// - `Outline`: no fill — bold `accent` key between thin rounded caps in
+///   `border_active`, matching the panels' rounded borders. The Unicode
+///   fallback (no Nerd Font) uses plain parentheses.
+pub fn key_pill(key: &str, theme: &Theme) -> Vec<Span<'static>> {
+    match theme.chips {
+        ChipStyle::Square => vec![Span::styled(format!(" {key} "), filled(theme))],
+        ChipStyle::Rounded => {
+            // No bg on the caps: they inherit the cell's existing background.
+            let cap = Style::default().fg(theme.key_bg);
+            vec![
+                Span::styled(PILL_LEFT, cap),
+                Span::styled(format!(" {key} "), filled(theme)),
+                Span::styled(PILL_RIGHT, cap),
+            ]
+        }
+        ChipStyle::Outline => {
+            let cap = Style::default().fg(theme.border_active);
+            let (l, r) = if theme.nerd_glyphs {
+                (OUTLINE_LEFT, OUTLINE_RIGHT)
+            } else {
+                ("(", ")")
+            };
+            vec![
+                Span::styled(l, cap),
+                Span::styled(
+                    key.to_string(),
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(r, cap),
+            ]
+        }
+    }
+}
+
+fn filled(theme: &Theme) -> Style {
+    Style::default()
+        .fg(theme.key_fg)
+        .bg(theme.key_bg)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// Key chip ([`key_pill`]) plus a muted label. Buffer text is
+/// ` key {label}` in square mode and `key{label}` in rounded mode.
 pub fn key_hint<'a>(key: &'a str, label: &'a str, theme: &Theme) -> Vec<Span<'a>> {
-    vec![
-        Span::styled(
-            format!("[{key}]"),
-            Style::default()
-                .fg(theme.key_fg)
-                .bg(theme.key_bg)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(label.to_string(), Style::default().fg(theme.text_muted)),
-    ]
+    let mut spans = key_pill(key, theme);
+    spans.push(Span::styled(
+        label.to_string(),
+        Style::default().fg(theme.text_muted),
+    ));
+    spans
 }
 
 /// Several key chips on one line, joined by three spaces so the hint
-/// string `[x] cancel size walk   [r] recalculate   [Esc] close` survives
-/// as contiguous buffer text.
+/// string ` x  cancel size walk    r  recalculate    Esc  close` survives
+/// as contiguous buffer text. Rounded pills are two cells wider and their
+/// caps already separate visually, so they get a two-space gap instead.
 pub fn hint_line<'a>(pairs: &[(&'a str, &'a str)], theme: &Theme) -> Line<'a> {
+    let gap = if theme.chips == ChipStyle::Rounded {
+        "  "
+    } else {
+        "   "
+    };
     let mut spans: Vec<Span<'a>> = Vec::new();
     for (i, (key, label)) in pairs.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::raw("   "));
+            spans.push(Span::raw(gap));
         }
         spans.extend(key_hint(key, label, theme));
     }

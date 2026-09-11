@@ -173,4 +173,6 @@ Linux, macOS, and Windows from a single static binary with no runtime dependenci
 detection adapts per platform (lsblk, `/Volumes`, drive-letter probing). File-type icons use a
 Nerd Font when the terminal can show them and fall back to single-width Unicode otherwise, so
 rows stay aligned on stock fonts. Colors are a semantic theme (truecolor, quantized to xterm-256
-on Terminal.app) overridable in `~/.config/ira/theme.toml`.
+on Terminal.app) with six built-in presets — Catppuccin Mocha, Cyberpunk 2077, Gruvbox Dark,
+Nord, Dracula, Tokyo Night — cycled live with `\` and remembered across sessions, and
+overridable key by key in `~/.config/ira/theme.toml`. See [themes.md](themes.md).
