@@ -1,0 +1,9 @@
+# Statically link the MSVC C runtime on Windows so ira.exe is self-contained
+# and does not require the Visual C++ Redistributable (VCRUNTIME140.dll,
+# api-ms-win-crt-*.dll) to be installed. Scoped to the msvc target only: Linux
+# (musl) and macOS builds are unaffected.
+#
+# Note: a RUSTFLAGS environment variable, even an empty one, overrides this
+# section. The release workflow therefore also passes the flag explicitly.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

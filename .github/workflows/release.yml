@@ -37,6 +37,11 @@ jobs:
             target: aarch64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            # Statically link the MSVC C runtime so ira.exe does not require
+            # the VC++ Redistributable (VCRUNTIME140.dll) on the user's machine.
+            # Must live here, not only in .cargo/config.toml: the Build step
+            # sets RUSTFLAGS (even to "") which overrides config-file rustflags.
+            rustflags: "-C target-feature=+crt-static"
     steps:
       - uses: actions/checkout@v4
 
@@ -49,7 +54,8 @@ jobs:
           key: ${{ matrix.target }}
 
       # Pure-Rust crate: musl targets link statically; aarch64-musl links via
-      # the bundled rust-lld (see matrix rustflags).
+      # the bundled rust-lld; windows-msvc links the CRT statically (see matrix
+      # rustflags). Every published binary is self-contained.
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
         env:
