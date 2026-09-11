@@ -27,9 +27,6 @@ pub struct SessionState {
     pub right: Option<Folder>,
     /// Per-pane image preview mode (0=off, 1=column, 2=grid, 3=details).
     pub preview: [u8; 2],
-    /// Last-used icon set (`nerd` / `unicode`). `None` = never persisted;
-    /// theme auto-detection still applies.
-    pub icons: Option<String>,
     /// Last-selected theme preset id (`\` cycles). `None` = never
     /// persisted; `theme.toml` / default apply.
     pub theme: Option<String>,
@@ -83,9 +80,6 @@ fn serialize_state(state: &SessionState) -> String {
     content.push_str(&format!("hidden={}\n", state.show_hidden as u8));
     content.push_str(&format!("preview0={}\n", state.preview[0]));
     content.push_str(&format!("preview1={}\n", state.preview[1]));
-    if let Some(icons) = &state.icons {
-        content.push_str(&format!("icons={icons}\n"));
-    }
     if let Some(theme) = &state.theme {
         content.push_str(&format!("theme={theme}\n"));
     }
@@ -121,12 +115,8 @@ fn parse_state(contents: &str) -> SessionState {
             "hidden" => state.show_hidden = value == "1",
             "preview0" => state.preview[0] = value.parse::<u8>().unwrap_or(0).min(3),
             "preview1" => state.preview[1] = value.parse::<u8>().unwrap_or(0).min(3),
-            "icons" => {
-                let v = value.trim().to_ascii_lowercase();
-                if v == "nerd" || v == "unicode" {
-                    state.icons = Some(v);
-                }
-            }
+            // `icons=` lines written by releases <= 0.1.7 fall through to the
+            // ignore arm: the icon set is re-detected from fonts each launch.
             "theme" => {
                 // Store the canonical id so aliases normalize on the next save.
                 if let Some(p) = crate::theme::ThemePreset::parse(value) {
@@ -232,7 +222,6 @@ mod tests {
                 '#',
             )),
             preview: [1, 2],
-            icons: Some("nerd".to_string()),
             theme: Some("cyberpunk2077".to_string()),
             sizes: vec![
                 SizeEntry {
@@ -256,8 +245,17 @@ mod tests {
         assert_eq!(parse_state(&serialize_state(&state)), state);
         assert!(state.show_hidden, "hidden flag must roundtrip");
         assert_eq!(state.preview, [1, 2], "preview modes must roundtrip");
-        assert_eq!(state.icons.as_deref(), Some("nerd"));
         assert_eq!(state.theme.as_deref(), Some("cyberpunk2077"));
+    }
+
+    #[test]
+    fn legacy_icons_line_is_ignored_and_not_rewritten() {
+        let parsed = parse_state("icons=unicode\ntheme=nord\n");
+        assert_eq!(parsed.theme.as_deref(), Some("nord"));
+        assert!(
+            !serialize_state(&parsed).contains("icons="),
+            "the icon set is never persisted anymore"
+        );
     }
 
     #[test]

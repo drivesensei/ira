@@ -1,7 +1,9 @@
 //! Semantic theme, terminal-capability detection, and file-type icons.
 
 pub mod caps;
+pub mod font_probe;
 pub mod icons;
+pub mod wt_font;
 
 use std::fs;
 use std::path::PathBuf;
@@ -476,9 +478,10 @@ pub struct Loader {
 }
 
 impl Loader {
-    /// Reads `~/.config/ira/theme.toml` (once) and detects caps.
+    /// Reads `~/.config/ira/theme.toml` (once), detects caps and runs the
+    /// font probe.
     pub fn from_env() -> Self {
-        let env = EnvSnapshot::from_os();
+        let env = EnvSnapshot::from_os_probed();
         let caps = detect_from_env(&env);
         let file = theme_file_path().and_then(|p| fs::read_to_string(p).ok());
         Self::from_toml(&file.unwrap_or_default(), caps)
@@ -557,9 +560,9 @@ impl Loader {
         (ThemePreset::default(), PresetSource::Default)
     }
 
-    /// Icon set: `IRA_ICONS` > `theme.toml` > persisted > auto.
-    pub fn resolve_icons(&self, ira_icons: Option<&str>, persisted: Option<&str>) -> IconSet {
-        resolve_icon_set(&self.caps, self.icons_pref(), ira_icons, persisted)
+    /// Icon set: `IRA_ICONS` > `theme.toml` > auto (font probe).
+    pub fn resolve_icons(&self, ira_icons: Option<&str>) -> IconSet {
+        resolve_icon_set(&self.caps, self.icons_pref(), ira_icons)
     }
 }
 
@@ -575,19 +578,20 @@ pub struct Loaded {
 
 /// Loads the theme and icon set: defaults, then `~/.config/ira/theme.toml`,
 /// then `adapt()` for the detected terminal, then icon-set resolution
-/// (`IRA_ICONS` > toml `icons` > persisted session > auto).
+/// (`IRA_ICONS` > toml `icons` > auto via the font probe).
 pub fn load() -> (Theme, IconSet) {
-    let l = load_with_persisted(None, None);
+    let l = load_with_persisted(None);
     (l.theme, l.icons)
 }
 
-/// Full startup resolution using persisted session preferences
-/// (`icons=` / `theme=` in the state file) when env/toml do not override.
-pub fn load_with_persisted(persisted_icons: Option<&str>, persisted_theme: Option<&str>) -> Loaded {
-    let env = EnvSnapshot::from_os();
+/// Full startup resolution using the persisted theme preference
+/// (`theme=` in the state file) when toml does not override. The icon set
+/// is never persisted: it is re-detected from the fonts on every launch.
+pub fn load_with_persisted(persisted_theme: Option<&str>) -> Loaded {
+    let ira_icons = std::env::var("IRA_ICONS").ok();
     let mut loader = Loader::from_env();
     let (preset, source) = loader.resolve_preset(persisted_theme);
-    let icons = loader.resolve_icons(env.ira_icons.as_deref(), persisted_icons);
+    let icons = loader.resolve_icons(ira_icons.as_deref());
     loader.set_icon_set(icons);
     let theme = loader.theme_for(preset);
     Loaded {
@@ -601,15 +605,10 @@ pub fn load_with_persisted(persisted_icons: Option<&str>, persisted_theme: Optio
 
 /// Test entry: parse an optional TOML body against already-detected caps.
 #[cfg(test)]
-fn load_from(
-    toml_src: &str,
-    caps: &TermCaps,
-    ira_icons: Option<&str>,
-    persisted_icons: Option<&str>,
-) -> (Theme, IconSet) {
-    let mut loader = Loader::from_toml(toml_src, *caps);
+fn load_from(toml_src: &str, caps: &TermCaps, ira_icons: Option<&str>) -> (Theme, IconSet) {
+    let mut loader = Loader::from_toml(toml_src, caps.clone());
     let (preset, _) = loader.resolve_preset(None);
-    let icons = loader.resolve_icons(ira_icons, persisted_icons);
+    let icons = loader.resolve_icons(ira_icons);
     loader.set_icon_set(icons);
     (loader.theme_for(preset), icons)
 }
@@ -772,21 +771,17 @@ fn quantize(color: Color) -> Color {
     }
 }
 
-/// `IRA_ICONS` env beats `theme.toml`, which beats a persisted session
-/// preference, which beats auto-detection.
+/// `IRA_ICONS` env beats `theme.toml`, which beats auto-detection (the
+/// font probe behind `caps.nerd_font`).
 pub fn resolve_icon_set(
     caps: &TermCaps,
     toml_icons: Option<&str>,
     ira_icons: Option<&str>,
-    persisted_icons: Option<&str>,
 ) -> IconSet {
     if let Some(set) = parse_icon_pref(ira_icons) {
         return set;
     }
     if let Some(set) = parse_icon_pref(toml_icons) {
-        return set;
-    }
-    if let Some(set) = parse_icon_pref(persisted_icons) {
         return set;
     }
     if caps.nerd_font {
@@ -809,19 +804,25 @@ fn parse_icon_pref(raw: Option<&str>) -> Option<IconSet> {
 mod tests {
     use super::*;
 
+    /// Truecolor caps with the given Nerd availability.
+    fn caps(nerd_font: bool) -> TermCaps {
+        TermCaps {
+            truecolor: true,
+            nerd_font,
+            ..TermCaps::default()
+        }
+    }
+
     #[test]
     fn partial_toml_overrides_only_given_keys() {
-        let caps = TermCaps {
-            truecolor: true,
-            nerd_font: false,
-        };
+        let caps = caps(false);
         let src = r##"
             accent = "#ff0000"
             error = "red"
             [files]
             image = "#00ff00"
         "##;
-        let (theme, icons) = load_from(src, &caps, None, None);
+        let (theme, icons) = load_from(src, &caps, None);
         assert_eq!(theme.accent, Color::Rgb(255, 0, 0));
         assert_eq!(theme.error, Color::Red);
         assert_eq!(theme.image, Color::Rgb(0, 255, 0));
@@ -832,14 +833,11 @@ mod tests {
 
     #[test]
     fn invalid_colors_and_bad_toml_are_ignored() {
-        let caps = TermCaps {
-            truecolor: true,
-            nerd_font: false,
-        };
-        let (theme, _) = load_from("accent = \"not-a-color\"\n", &caps, None, None);
+        let caps = caps(false);
+        let (theme, _) = load_from("accent = \"not-a-color\"\n", &caps, None);
         assert_eq!(theme.accent, Theme::default().accent);
 
-        let (theme, _) = load_from("this is not toml {{{", &caps, None, None);
+        let (theme, _) = load_from("this is not toml {{{", &caps, None);
         assert_eq!(theme, Theme::default());
     }
 
@@ -855,7 +853,7 @@ mod tests {
         );
         theme.adapt(&TermCaps {
             truecolor: false,
-            nerd_font: false,
+            ..TermCaps::default()
         });
         for c in theme.all_colors() {
             assert!(
@@ -869,39 +867,34 @@ mod tests {
     fn adapt_is_a_noop_when_truecolor_is_on() {
         let mut theme = Theme::default();
         let original = theme;
-        theme.adapt(&TermCaps {
-            truecolor: true,
-            nerd_font: false,
-        });
+        theme.adapt(&caps(true));
         assert_eq!(theme, original);
     }
 
     #[test]
     fn ira_icons_env_beats_toml_and_auto() {
-        let caps = TermCaps {
-            truecolor: true,
-            nerd_font: true,
-        };
-        let (_, icons) = load_from("icons = \"nerd\"\n", &caps, Some("unicode"), None);
+        let nerd = caps(true);
+        let (_, icons) = load_from("icons = \"nerd\"\n", &nerd, Some("unicode"));
         assert_eq!(icons, IconSet::Unicode);
 
-        let (_, icons) = load_from("icons = \"unicode\"\n", &caps, None, None);
+        let (_, icons) = load_from("icons = \"unicode\"\n", &nerd, None);
         assert_eq!(icons, IconSet::Unicode);
 
-        let (_, icons) = load_from("", &caps, None, Some("nerd"));
+        // Auto follows the probe in both directions.
+        let (_, icons) = load_from("", &nerd, None);
         assert_eq!(icons, IconSet::Nerd);
+        let (_, icons) = load_from("", &caps(false), None);
+        assert_eq!(icons, IconSet::Unicode);
 
-        let (_, icons) = load_from("", &caps, None, None);
+        // toml forces Nerd even when no font was found.
+        let (_, icons) = load_from("icons = \"nerd\"\n", &caps(false), None);
         assert_eq!(icons, IconSet::Nerd);
     }
 
     #[test]
     fn cyberpunk_preset_applies_and_allows_overrides() {
-        let caps = TermCaps {
-            truecolor: true,
-            nerd_font: false,
-        };
-        let (theme, _) = load_from("preset = \"cyberpunk2077\"\n", &caps, None, None);
+        let caps = caps(false);
+        let (theme, _) = load_from("preset = \"cyberpunk2077\"\n", &caps, None);
         assert_eq!(theme.accent, Theme::cyberpunk2077().accent);
         assert_eq!(theme.error, Theme::cyberpunk2077().error);
         assert_ne!(theme.bg, Theme::mocha().bg);
@@ -909,7 +902,6 @@ mod tests {
         let (theme, _) = load_from(
             "preset = \"cyberpunk2077\"\naccent = \"#ffffff\"\n",
             &caps,
-            None,
             None,
         );
         assert_eq!(theme.accent, Color::Rgb(255, 255, 255));
@@ -937,25 +929,22 @@ mod tests {
 
     #[test]
     fn chip_style_follows_icon_set_unless_toml_pins_it() {
-        let caps = TermCaps {
-            truecolor: true,
-            nerd_font: true,
-        };
+        let caps = caps(true);
         // Auto: Nerd icons -> outline, Unicode -> square.
-        let (theme, icons) = load_from("", &caps, None, None);
+        let (theme, icons) = load_from("", &caps, None);
         assert_eq!(icons, IconSet::Nerd);
         assert_eq!(theme.chips, ChipStyle::Outline);
-        let (theme, _) = load_from("", &caps, Some("unicode"), None);
+        let (theme, _) = load_from("", &caps, Some("unicode"));
         assert_eq!(theme.chips, ChipStyle::Square);
 
         // toml pins it regardless of icons; unknown values fall back to auto.
-        let (theme, _) = load_from("chips = \"square\"\n", &caps, None, None);
+        let (theme, _) = load_from("chips = \"square\"\n", &caps, None);
         assert_eq!(theme.chips, ChipStyle::Square);
-        let (theme, _) = load_from("chips = \"rounded\"\n", &caps, Some("unicode"), None);
+        let (theme, _) = load_from("chips = \"rounded\"\n", &caps, Some("unicode"));
         assert_eq!(theme.chips, ChipStyle::Rounded);
-        let (theme, _) = load_from("chips = \"Outline\"\n", &caps, Some("unicode"), None);
+        let (theme, _) = load_from("chips = \"Outline\"\n", &caps, Some("unicode"));
         assert_eq!(theme.chips, ChipStyle::Outline);
-        let (theme, _) = load_from("chips = \"blob\"\n", &caps, None, None);
+        let (theme, _) = load_from("chips = \"blob\"\n", &caps, None);
         assert_eq!(theme.chips, ChipStyle::Outline);
 
         // Every preset keeps the style when cycling.
@@ -978,11 +967,8 @@ mod tests {
 
     #[test]
     fn loader_applies_overrides_on_any_preset_and_resolves_precedence() {
-        let caps = TermCaps {
-            truecolor: true,
-            nerd_font: false,
-        };
-        let loader = Loader::from_toml("preset = \"nord\"\naccent = \"#123456\"\n", caps);
+        let caps = caps(false);
+        let loader = Loader::from_toml("preset = \"nord\"\naccent = \"#123456\"\n", caps.clone());
         let t = loader.theme_for(ThemePreset::Dracula);
         assert_eq!(t.accent, Color::Rgb(0x12, 0x34, 0x56));
         assert_eq!(t.bg, Theme::dracula().bg);

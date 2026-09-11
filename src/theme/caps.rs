@@ -1,16 +1,21 @@
 //! Terminal capability detection and RGB → xterm-256 quantization.
 
+use super::font_probe::{self, NerdSource};
+
 /// What the current terminal can render, detected once at startup.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TermCaps {
     /// 24-bit `Color::Rgb` is safe. When `false`, the theme is quantized
     /// to `Color::Indexed` so Terminal.app and other 256-color hosts do
     /// not fall back to the nearest named ANSI color.
     pub truecolor: bool,
-    /// Auto-heuristic: this terminal is likely to have Nerd Font symbols
-    /// (bundled fallback or a patched font). Overrides live in `IRA_ICONS`
-    /// and `theme.toml`.
+    /// A font with Nerd Font symbols is reachable by this terminal (see
+    /// [`font_probe`]) or `NERD_FONT` is set. Overrides live in
+    /// `IRA_ICONS` and `theme.toml`.
     pub nerd_font: bool,
+    /// Where the Nerd glyphs come from (or why they are unavailable), for
+    /// `--check-terminal`.
+    pub nerd_source: NerdSource,
 }
 
 impl Default for TermCaps {
@@ -20,6 +25,7 @@ impl Default for TermCaps {
         TermCaps {
             truecolor: true,
             nerd_font: false,
+            nerd_source: NerdSource::NotFound,
         }
     }
 }
@@ -32,31 +38,53 @@ pub struct EnvSnapshot {
     pub term_program: Option<String>,
     pub term: Option<String>,
     pub wt_session: bool,
+    /// `WT_PROFILE_ID`: GUID of the Windows Terminal profile in use.
+    pub wt_profile_id: Option<String>,
     pub kitty_window_id: bool,
     pub nerd_font_env: bool,
     pub ira_icons: Option<String>,
     pub is_windows: bool,
+    pub is_macos: bool,
+    /// Result of the font probe. `None` = not run (plain [`from_os`]);
+    /// [`from_os_probed`] fills it. Tests inject any value.
+    ///
+    /// [`from_os`]: EnvSnapshot::from_os
+    /// [`from_os_probed`]: EnvSnapshot::from_os_probed
+    pub probe: Option<NerdSource>,
 }
 
 impl EnvSnapshot {
-    /// Reads the real process environment.
+    /// Reads the real process environment. Cheap: env vars only, no
+    /// font probe.
     pub fn from_os() -> Self {
         Self {
             colorterm: std::env::var("COLORTERM").ok(),
             term_program: std::env::var("TERM_PROGRAM").ok(),
             term: std::env::var("TERM").ok(),
             wt_session: std::env::var("WT_SESSION").is_ok(),
+            wt_profile_id: std::env::var("WT_PROFILE_ID").ok(),
             kitty_window_id: std::env::var("KITTY_WINDOW_ID").is_ok(),
             nerd_font_env: std::env::var("NERD_FONT").is_ok(),
             ira_icons: std::env::var("IRA_ICONS").ok(),
             is_windows: cfg!(windows),
+            is_macos: cfg!(target_os = "macos"),
+            probe: None,
         }
+    }
+
+    /// [`from_os`](Self::from_os) plus the font probe (config-file reads,
+    /// one `fc-list` call or a font-directory scan). Run once at startup.
+    pub fn from_os_probed() -> Self {
+        let mut env = Self::from_os();
+        env.probe = Some(font_probe::probe(&env));
+        env
     }
 }
 
-/// Detects capabilities from the live environment.
+/// Detects capabilities from the live environment, including the font
+/// probe.
 pub fn detect() -> TermCaps {
-    detect_from_env(&EnvSnapshot::from_os())
+    detect_from_env(&EnvSnapshot::from_os_probed())
 }
 
 /// Detects capabilities from an explicit snapshot (tests + `--check-terminal`).
@@ -86,28 +114,17 @@ pub fn detect_from_env(env: &EnvSnapshot) -> TermCaps {
             || term.contains("alacritty")
     };
 
-    // Terminals that ship Nerd Font symbol fallbacks, or whose default
-    // distro configs (Omarchy, WezTerm, Ghostty, kitty, modern Alacritty
-    // / foot) almost always use a patched Mono font.
-    let nerd_font = env.nerd_font_env
-        || program.contains("wezterm")
-        || program.contains("ghostty")
-        || program.contains("alacritty")
-        || program.contains("vscode")
-        || program.contains("warp")
-        || env.kitty_window_id
-        || env.wt_session
-        || term.contains("xterm-kitty")
-        || term.contains("kitty")
-        || term.contains("alacritty")
-        || term.contains("wezterm")
-        || term.contains("ghostty")
-        || term.contains("foot")
-        || term.contains("warp");
+    // Nerd glyphs render only when a font carrying them is reachable:
+    // bundled by the terminal, set as its profile font, or installed where
+    // the OS falls back per glyph. The probe decides; `NERD_FONT` in the
+    // environment is the manual escape hatch.
+    let nerd_source = env.probe.clone().unwrap_or_default();
+    let nerd_font = env.nerd_font_env || nerd_source.has_nerd_glyphs();
 
     TermCaps {
         truecolor,
         nerd_font,
+        nerd_source,
     }
 }
 
@@ -209,33 +226,68 @@ mod tests {
     }
 
     #[test]
-    fn kitty_and_ghostty_enable_nerd_font_auto() {
-        let kitty = EnvSnapshot {
-            kitty_window_id: true,
+    fn nerd_font_follows_the_probe_not_the_terminal_name() {
+        // A known terminal name alone proves nothing about the font.
+        let alacritty_unprobed = EnvSnapshot {
+            term_program: Some("alacritty".into()),
             ..EnvSnapshot::default()
         };
-        assert!(detect_from_env(&kitty).nerd_font);
+        let caps = detect_from_env(&alacritty_unprobed);
+        assert!(!caps.nerd_font);
+        assert_eq!(caps.nerd_source, NerdSource::NotFound);
 
-        let ghostty = EnvSnapshot {
-            term_program: Some("ghostty".into()),
+        // Windows Terminal with the stock font: definitive no.
+        let wt_plain = EnvSnapshot {
+            wt_session: true,
+            is_windows: true,
+            probe: Some(NerdSource::PlainProfileFont("Cascadia Mono".into())),
             ..EnvSnapshot::default()
         };
-        assert!(detect_from_env(&ghostty).nerd_font);
+        assert!(!detect_from_env(&wt_plain).nerd_font);
 
-        let unknown = EnvSnapshot::default();
-        assert!(!detect_from_env(&unknown).nerd_font);
+        // Windows Terminal with an NF profile font.
+        let wt_nf = EnvSnapshot {
+            probe: Some(NerdSource::ProfileFont("Cascadia Mono NF".into())),
+            ..wt_plain.clone()
+        };
+        assert!(detect_from_env(&wt_nf).nerd_font);
 
+        // foot on Linux with a covering font installed.
         let foot = EnvSnapshot {
             term: Some("foot".into()),
+            probe: Some(NerdSource::InstalledFont("JetBrainsMono Nerd Font".into())),
             ..EnvSnapshot::default()
         };
         assert!(detect_from_env(&foot).nerd_font);
 
-        let alacritty = EnvSnapshot {
-            term_program: Some("alacritty".into()),
+        // Bundled symbols (kitty).
+        let kitty = EnvSnapshot {
+            kitty_window_id: true,
+            probe: Some(NerdSource::Bundled("kitty")),
             ..EnvSnapshot::default()
         };
-        assert!(detect_from_env(&alacritty).nerd_font);
+        assert!(detect_from_env(&kitty).nerd_font);
+    }
+
+    #[test]
+    fn nerd_font_env_overrides_a_negative_probe() {
+        let env = EnvSnapshot {
+            nerd_font_env: true,
+            probe: Some(NerdSource::NotFound),
+            ..EnvSnapshot::default()
+        };
+        assert!(detect_from_env(&env).nerd_font);
+    }
+
+    #[test]
+    fn probed_snapshot_runs_the_probe_once_and_is_consistent() {
+        // Smoke test against the real machine: whatever the probe says,
+        // detection must agree with it.
+        let env = EnvSnapshot::from_os_probed();
+        let src = env.probe.clone().expect("probe ran");
+        let caps = detect_from_env(&env);
+        assert_eq!(caps.nerd_source, src);
+        assert_eq!(caps.nerd_font, env.nerd_font_env || src.has_nerd_glyphs());
     }
 
     #[test]

@@ -594,11 +594,8 @@ impl App {
             }
             default.drives = Some(app_drives);
         }
-        let (persisted_icons, persisted_theme) = default.restore_state();
-        let loaded = crate::theme::load_with_persisted(
-            persisted_icons.as_deref(),
-            persisted_theme.as_deref(),
-        );
+        let persisted_theme = default.restore_state();
+        let loaded = crate::theme::load_with_persisted(persisted_theme.as_deref());
         default.theme = loaded.theme;
         default.theme_preset = loaded.preset;
         default.theme_loader = loaded.loader;
@@ -3368,14 +3365,15 @@ impl App {
     }
 
     /// Restores the persisted session state (split layout and pane folders).
-    /// Returns the persisted `(icons, theme)` preferences, if any, so theme
-    /// loading can reuse them without `IRA_ICONS` / `theme.toml`.
-    pub fn restore_state(&mut self) -> (Option<String>, Option<String>) {
+    /// Returns the persisted theme preset id, if any, so theme loading can
+    /// reuse it when `theme.toml` does not pin one. The icon set is not
+    /// persisted: it is re-detected from the available fonts every launch.
+    pub fn restore_state(&mut self) -> Option<String> {
         let state = match &self.state_path {
             Some(p) => load_state_from(p),
             None => load_state(),
         };
-        let prefs = (state.icons.clone(), state.theme.clone());
+        let prefs = state.theme.clone();
         self.split = state.split;
         self.active_pane = state.active_pane.min(1);
         self.show_hidden = state.show_hidden;
@@ -3446,10 +3444,6 @@ impl App {
                 self.panes[0].preview_mode.as_u8(),
                 self.panes[1].preview_mode.as_u8(),
             ],
-            icons: Some(match self.icons {
-                crate::theme::icons::IconSet::Nerd => "nerd".to_string(),
-                crate::theme::icons::IconSet::Unicode => "unicode".to_string(),
-            }),
             theme: Some(self.theme_preset.id().to_string()),
             sizes: self.size_entries(),
         };
@@ -3759,7 +3753,6 @@ mod tests {
                     app.panes[0].preview_mode.as_u8(),
                     app.panes[1].preview_mode.as_u8(),
                 ],
-                icons: None,
                 theme: None,
                 sizes: entries,
             },
@@ -3799,7 +3792,7 @@ mod tests {
         assert_eq!(loaded.theme.as_deref(), Some("cyberpunk2077"));
         let mut app2 = App::default();
         app2.state_path = Some(file.clone());
-        let (_, theme) = app2.restore_state();
+        let theme = app2.restore_state();
         assert_eq!(theme.as_deref(), Some("cyberpunk2077"));
 
         // One press per preset walks the whole list and lands back home.

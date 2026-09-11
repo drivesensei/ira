@@ -95,11 +95,13 @@ fn main() -> AppResult<()> {
 /// Prints detected terminal capabilities and exits. Useful when icons
 /// render as boxes or colors look wrong.
 fn print_terminal_check() {
-    let caps = ira::theme::caps();
+    use ira::theme::font_probe::NerdSource;
+
     let env = ira::theme::caps::EnvSnapshot::from_os();
     let persisted = ira::services::state::load_state();
-    let loaded =
-        ira::theme::load_with_persisted(persisted.icons.as_deref(), persisted.theme.as_deref());
+    // Runs the font probe once; `caps` below reuses its result.
+    let loaded = ira::theme::load_with_persisted(persisted.theme.as_deref());
+    let caps = loaded.loader.caps();
     let icons = loaded.icons;
     let in_iterm2 = std::env::var("TERM_PROGRAM").is_ok_and(|t| t.contains("iTerm"))
         || std::env::var("LC_TERMINAL").is_ok_and(|t| t.contains("iTerm"));
@@ -130,12 +132,27 @@ fn print_terminal_check() {
             "IRA_ICONS override"
         } else if loaded.loader.icons_pref().is_some() {
             "from theme.toml icons"
-        } else if persisted.icons.is_some() {
-            "from session state"
         } else if caps.nerd_font {
-            "auto: nerd-capable terminal"
+            "auto: a font with Nerd glyphs is available"
         } else {
             "auto: unicode fallback"
+        }
+    );
+    // Where the Nerd glyphs would come from, so a wrong auto result is
+    // explainable without guessing.
+    let nerd_line = match &caps.nerd_source {
+        NerdSource::Bundled(term) => format!("yes ({term} bundles them)"),
+        NerdSource::ProfileFont(face) => format!("yes (profile font \"{face}\")"),
+        NerdSource::InstalledFont(family) => format!("yes (installed font \"{family}\")"),
+        NerdSource::PlainProfileFont(face) => format!("no (profile font \"{face}\")"),
+        NerdSource::NotFound => "no (no covering font found)".to_string(),
+    };
+    println!(
+        "nerd glyphs: {nerd_line}{}",
+        if env.nerd_font_env {
+            "; forced on by NERD_FONT"
+        } else {
+            ""
         }
     );
     println!(

@@ -1,6 +1,6 @@
 [package]
 name = "ira"
-version = "0.1.7"
+version = "0.1.8"
 
 description = "A terminal file manager built with Ratatui and crossterm"
 repository = "https://github.com/drivesensei/ira"
@@ -36,5 +36,7 @@ winapi = { version = "0.3.9", features = [
 ] }
 ratatui-textarea = "0.9.2"
 serde = { version = "1", features = ["derive"] }
+# Windows Terminal / VS Code settings.json (font-face lookup for icon detection).
+serde_json = "1"
 toml = "0.8"
 unicode-width = "0.2"

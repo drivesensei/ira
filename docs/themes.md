@@ -112,22 +112,49 @@ between Linux, macOS and Windows terminals and would break the file list columns
 
 1. `IRA_ICONS=nerd|unicode` environment variable (one-shot override).
 2. `icons = "..."` in `theme.toml`.
-3. `icons=` in `~/.config/ira/state` — saved on every run, so once Nerd icons are on
-   they stay on without the env var.
-4. Auto-detect: Nerd when the terminal is one that ships or commonly pairs with a Nerd
-   Font — kitty, WezTerm, ghostty, Alacritty, foot, Warp, VS Code's terminal, Windows
-   Terminal — or when `NERD_FONT=1` is set. Otherwise Unicode.
+3. Auto-detect, re-run on every launch: Nerd only when a font that actually contains
+   the glyphs is reachable by the terminal (see below), or when `NERD_FONT=1` is set.
+   Otherwise Unicode.
 
-`auto` in either `IRA_ICONS` or `icons =` skips that step and falls through.
+`auto` in either `IRA_ICONS` or `icons =` skips that step and falls through. The icon
+set is never saved to the state file; change fonts or terminals and the next launch
+follows.
 
-If icons show as boxes (`▯`) you are in a terminal that auto-detected as Nerd-capable
-but has no Nerd Font selected: either pick one in the terminal's settings or run once
-with `IRA_ICONS=unicode` (which is then remembered).
+### How auto-detect finds a font
+
+A terminal app cannot pick or ship a font, so IRA checks where the terminal's glyph
+lookup will end up, in this order:
+
+1. **Terminals that bundle Symbols Nerd Font** — kitty (0.36+), WezTerm, Ghostty, Warp —
+   always render the glyphs, whatever font you selected.
+2. **Profile font from the terminal's own settings.** Windows Terminal
+   (`settings.json`, the profile named by `WT_PROFILE_ID`, else `profiles.defaults`)
+   and the VS Code / Cursor integrated terminal (`terminal.integrated.fontFamily`, else
+   `editor.fontFamily`). A face named like a Nerd Font (`… Nerd Font`, `… NF` / `NFM`
+   / `NFP`, `Caskaydia`, `Delugia`, or such a font in a comma-separated fallback list)
+   counts. Windows Terminal renders with DirectWrite, which does not reach other
+   installed fonts for these glyphs, so a plain profile font there — the stock
+   `Cascadia Mono` included — is a definitive "no".
+3. **Installed fonts (Linux, macOS).** These terminals fall back per glyph to any
+   installed font, so an installed `Symbols Nerd Font Mono` or any patched font is
+   enough even when the profile font is plain. Linux asks fontconfig for fonts covering
+   the sample glyphs (`fc-list ':charset=f07b e718 e0b6'`), falling back to a scan of
+   the font directories by file name when `fc-list` is missing; macOS scans
+   `~/Library/Fonts`, `/Library/Fonts` and `/System/Library/Fonts`.
+
+If icons still show as boxes (`▯`) or stray symbols, `ira --check-terminal` prints which
+of the three found (or did not find) a font; `IRA_ICONS=unicode` or `icons = "unicode"`
+forces the fallback set.
 
 ## Terminal notes
 
 - **Terminal.app (macOS)** is 256-color only and has no Nerd Font by default: expect the
-  quantized palette and Unicode icons unless you install a Nerd Font and select it.
+  quantized palette and Unicode icons unless a Nerd Font is installed (CoreText falls
+  back to it per glyph, so it does not have to be the selected font).
+- **Windows Terminal** ships Cascadia Mono, which has no Nerd glyphs, and does not fall
+  back to other installed fonts for them: Unicode icons until the profile font is one
+  with the glyphs (e.g. `Cascadia Mono NF`, or a fallback list such as
+  `Cascadia Mono, Symbols Nerd Font Mono`).
 - **iTerm2, WezTerm, kitty, ghostty, Alacritty, Windows Terminal** are truecolor; set
   `COLORTERM=truecolor` if your shell profile clears it.
 - **tmux / screen** pass truecolor only when configured (`set -g default-terminal
@@ -139,10 +166,25 @@ with `IRA_ICONS=unicode` (which is then remembered).
 Prints what was resolved without starting the UI:
 
 ```
-ira 0.1.6
+ira 0.1.8
 truecolor: yes
-icons: nerd (auto: nerd-capable terminal)
+icons: nerd (auto: a font with Nerd glyphs is available)
+nerd glyphs: yes (installed font "JetBrainsMono Nerd Font")
 theme: dracula (from session state, last `\` press)
 image protocol: Kitty
 theme file: /home/you/.config/ira/theme.toml (present)
 ```
+
+The `nerd glyphs` line names the source: `yes (kitty bundles them)`, `yes (profile font
+"Cascadia Mono NF")`, `yes (installed font "…")`, `no (profile font "Cascadia Mono")`
+or `no (no covering font found)`.
+
+## Config locations
+
+| OS | `theme.toml` and `state` live in |
+| --- | --- |
+| Linux | `~/.config/ira/` (`$XDG_CONFIG_HOME/ira/`) |
+| macOS | `~/Library/Application Support/ira/` |
+| Windows | `%APPDATA%\ira\` (`C:\Users\<you>\AppData\Roaming\ira\`) |
+
+The rest of this page writes `~/.config/ira/` for short.

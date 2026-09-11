@@ -67,7 +67,7 @@ See [docs/features.md](docs/features.md) for a full breakdown.
 
 IRA is a TUI: it cannot ship or select a font. The terminal you run it in owns the typeface.
 
-- **Icons.** Two sets only: **Nerd Font** glyphs (per-extension, the ones you are seeing) and a **Unicode** fallback (`□` folders, `≡` text, `▶` video, …) that stays aligned on stock fonts. There is no third set — emoji would break column widths on Windows/macOS. Auto-detects Nerd Fonts on kitty, WezTerm, ghostty, Alacritty, foot, Warp, VS Code, and Windows Terminal. Once you run with Nerd icons, the choice is saved in `~/.config/ira/state` so the next launch does not need `IRA_ICONS`. Pin it permanently with `icons = "nerd"` in the theme file, or `IRA_ICONS=nerd|unicode` for one shot.
+- **Icons.** Two sets only: **Nerd Font** glyphs (per-extension, the ones you are seeing) and a **Unicode** fallback (`□` folders, `≡` text, `▶` video, …) that stays aligned on stock fonts. There is no third set — emoji would break column widths on Windows/macOS. Auto-detection checks, on every launch, whether a font that actually has the glyphs is reachable: terminals that bundle them (kitty, WezTerm, Ghostty, Warp), the profile font in Windows Terminal / VS Code settings, or on Linux and macOS any installed Nerd Font the OS can fall back to. Pin it with `icons = "nerd"` in the theme file, or `IRA_ICONS=nerd|unicode` for one shot. Config lives in `~/.config/ira/` on Linux, `~/Library/Application Support/ira/` on macOS, `%APPDATA%\ira\` on Windows.
 - **Colors.** Truecolor (`Color::Rgb`) is used when the terminal advertises it (`COLORTERM=truecolor`, iTerm2, WezTerm, ghostty, Windows Terminal, modern conhost). **Terminal.app is 256-color only**; IRA quantizes the palette to xterm-256 there so colors do not collapse to named ANSI.
 - **Theme.** Six built-in presets — `mocha` (default, Catppuccin), `cyberpunk2077`, `gruvbox-dark`, `nord`, `dracula`, `tokyo-night`. Press `\` to cycle through them in that order; the bottom banner says `Switched to <name>` and the choice is remembered in `~/.config/ira/state`. Pick a starting preset and optional per-key overrides in `~/.config/ira/theme.toml` — partial files are fine, unknown keys and invalid colors are ignored, and overrides stay applied on every preset you cycle to:
 
@@ -81,7 +81,7 @@ icons = "nerd"
 image = "#ff9f1c"
 ```
 
-- **`--check-terminal`** prints the detected truecolor flag, icon set, active theme (and where it came from), image protocol, and whether a theme file was found. Use it when icons render as boxes or colors look washed out.
+- **`--check-terminal`** prints the detected truecolor flag, icon set, where the Nerd glyphs would come from (bundled, profile font, installed font, or none), active theme (and where it came from), image protocol, and whether a theme file was found. Use it when icons render as boxes or colors look washed out.
 
 Full list of themes with swatches, recommended Nerd Fonts, icon sets, and the exact precedence rules: [docs/themes.md](docs/themes.md).
 
