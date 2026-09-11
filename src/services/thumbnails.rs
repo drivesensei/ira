@@ -52,9 +52,11 @@ pub const JOB_POLL_INTERVAL: Duration = Duration::from_millis(5);
 pub const CACHE_MAX_FILES: usize = 512;
 
 /// Longest side of a stored disk-cache thumbnail in pixels. Big enough to
-/// stay sharp when re-fitted into a large preview column, small enough that
-/// a cache hit decodes in microseconds.
-pub const THUMB_MAX_PX: u32 = 512;
+/// stay sharp when re-fitted into a large preview column or a HiDPI grid
+/// cell (a 2× scaled 20×8-cell grid cell wants 320×288 px; a 2× 40-cell
+/// preview column wants 640 px wide), small enough that a cache hit decodes
+/// in microseconds.
+pub const THUMB_MAX_PX: u32 = 768;
 
 /// Wall-clock budget for one ffmpeg frame extraction. Long enough for a
 /// seek into a large network-hosted video; short enough that a hung process
@@ -706,7 +708,7 @@ mod tests {
         let thumb = load_thumbnail(src.to_str().unwrap(), mtime, size).unwrap();
         assert!(thumb.width() <= THUMB_MAX_PX);
         assert!(thumb.height() <= THUMB_MAX_PX);
-        assert_eq!((thumb.width(), thumb.height()), (512, 256)); // 2:1 source keeps aspect
+        assert_eq!((thumb.width(), thumb.height()), (768, 384)); // 2:1 source keeps aspect
 
         // Second load must come from the disk cache: delete the source and
         // verify the thumbnail still resolves.

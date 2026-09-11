@@ -1,0 +1,3 @@
+# Copy to ~/.config/ira/theme.toml (or merge the keys you want).
+preset = "cyberpunk2077"
+icons = "nerd"

@@ -1,8 +1,10 @@
+pub mod chrome;
+
 use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Clear, Paragraph},
+    widgets::Paragraph,
     Frame,
 };
 
@@ -10,6 +12,8 @@ use crate::app::App;
 use crate::services::file_info::{
     human, size_line_cancelled, size_line_partial, size_line_started, spinner_char,
 };
+use crate::theme::Theme;
+use chrome::{dialog_area, hint_line, panel_block, render_dialog, text_input_line, DialogKind};
 
 /// Renders the user interface widgets.
 pub fn render(app: &mut App, frame: &mut Frame) {
@@ -18,17 +22,26 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     // cover its working set (visible + prefetched cells).
     app.begin_thumb_cache_frame();
 
-    let app_title_block = Block::bordered()
-        .title("     IRA (Integrated Retro Archives)    ")
-        .title_alignment(Alignment::Center)
-        .title_style(Style::new().add_modifier(Modifier::BOLD))
-        .border_type(BorderType::Rounded);
+    let theme = app.theme;
+    let area = frame.area();
+    frame
+        .buffer_mut()
+        .set_style(area, Style::default().fg(theme.text).bg(theme.bg));
+
+    let app_title_block = panel_block(
+        Line::styled(
+            "     IRA (Integrated Retro Archives)    ",
+            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+        ),
+        true,
+        &theme,
+    );
 
     if app.should_increase_size(width, height) {
         frame.render_widget(
             Paragraph::new("Please increase the terminal's size")
                 .block(app_title_block)
-                .style(Style::default().fg(Color::Cyan).bg(Color::Black))
+                .style(Style::default().fg(theme.accent).bg(theme.bg))
                 .centered(),
             frame.area(),
         );
@@ -60,10 +73,10 @@ pub fn render(app: &mut App, frame: &mut Frame) {
             };
             frame.render_widget(
                 Paragraph::new(Span::styled(
-                    format!(" {} ", status.text),
-                    Style::default().fg(Color::Black).bg(Color::LightYellow),
+                    format!(" ●  {} ", status.text),
+                    Style::default().fg(theme.bg).bg(theme.info),
                 ))
-                .style(Style::default().fg(Color::Black).bg(Color::LightYellow)),
+                .style(Style::default().fg(theme.bg).bg(theme.info)),
                 bar,
             );
         }
@@ -72,7 +85,8 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     // Bottom bar right side: the "[*] Keybindings" button, plus the
     // contextual hint marquee on the remaining width. Both hide while a
     // modal/text-input state owns the keyboard (app.hint_bar_blocked); the
-    // marquee also yields to transient status notices.
+    // marquee also yields to transient status notices (contextual_hints
+    // returns nothing while one is up).
     let btn_hint = " [*] Keybindings ";
     let btn_w = btn_hint.len() as u16;
     let bar_y = frame.area().y + frame.area().height - 1;
@@ -87,7 +101,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
             frame.render_widget(
                 Paragraph::new(Span::styled(
                     btn_hint,
-                    Style::default().fg(Color::Black).bg(Color::Cyan),
+                    Style::default().fg(theme.key_fg).bg(theme.key_bg),
                 )),
                 btn,
             );
@@ -95,7 +109,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         let hints = app.contextual_hints();
         let bar_w = frame.area().width.saturating_sub(btn_w);
         if !hints.is_empty() && bar_w > 2 {
-            let spans = marquee_spans(&hints, bar_w as usize, app.hint_offset);
+            let spans = chrome::marquee_spans(&hints, bar_w as usize, app.hint_offset, &theme);
             frame.render_widget(
                 Paragraph::new(Line::from(spans)),
                 Rect {
@@ -139,6 +153,76 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         crate::components::tab1_files_ui::render(frame, app, files_area, 0, true);
     }
 
+    // Keybindings help dialog (`*`): documents the keys that have no
+    // on-screen hint. Any key closes it (handler.rs).
+    if app.keybindings_visible {
+        // One pair per row, no section headers: 13 rows + borders fit the
+        // minimum supported terminal (90x15) without clipping.
+        let lines: Vec<Line<'static>> = vec![
+            chrome::bind_pair(
+                "Arrows",
+                "navigate; ←/→ open/leave",
+                "z / x",
+                "top / bottom",
+                &theme,
+            ),
+            chrome::bind_pair(
+                "Space",
+                "multi-select entry",
+                "c",
+                "copy to other pane",
+                &theme,
+            ),
+            chrome::bind_pair("m", "move to other pane", "Enter", "rename entry", &theme),
+            chrome::bind_pair(
+                "Del",
+                "delete (with confirm)",
+                "n",
+                "new folder / file",
+                &theme,
+            ),
+            chrome::bind_pair(".", "toggle hidden files", ",", "cycle sort mode", &theme),
+            chrome::bind_pair("v", "cycle image preview", "Tab", "switch pane", &theme),
+            chrome::bind_pair(
+                "Ctrl+A",
+                "select / clear all",
+                "Alt+I",
+                "invert selection",
+                &theme,
+            ),
+            chrome::bind_pair("+", "split pane", "`", "copy board", &theme),
+            chrome::bind_pair("b", "bookmark this folder", "/", "fuzzy search", &theme),
+            chrome::bind_pair("Esc", "clear search filter", "?", "entry info", &theme),
+            chrome::bind_pair("[", "go to path", "]", "copy folder path", &theme),
+            chrome::bind_pair("-", "eject drive", "0", "terminal here", &theme),
+            chrome::bind_pair("*", "this help", "q", "quit", &theme),
+        ];
+        let max_w = lines.iter().map(|l| l.width() as u16).max().unwrap_or(40);
+        // Plain panel (no glass chrome): 13 rows + border must fit the
+        // minimum supported terminal (90x15) exactly, so the quit and
+        // reopen hints are never clipped.
+        let w = (max_w + 2).min(frame.area().width.saturating_sub(2));
+        let h = (lines.len() as u16 + 2).min(frame.area().height);
+        let area = chrome::centered_rect(w, h, frame.area());
+        chrome::paint_bg(
+            frame,
+            area,
+            Style::default().fg(theme.text).bg(theme.surface),
+        );
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(chrome::panel_block(
+                    Line::styled(
+                        " Keybindings ",
+                        Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+                    ),
+                    true,
+                    &theme,
+                ))
+                .style(Style::default().fg(theme.text).bg(theme.surface)),
+            area,
+        );
+    }
     // Deletion progress dialog: shown while the background delete worker
     // runs (unless dismissed with a key). Dismissing never cancels the job.
     if let Some(del) = &app.deletion {
@@ -148,137 +232,92 @@ pub fn render(app: &mut App, frame: &mut Frame) {
                 .as_deref()
                 .and_then(|p| p.rsplit('/').next())
                 .unwrap_or("");
-            let line = format!(" Deleting {}/{} — {} ", del.done, del.total, current);
-            let style = Style::default().fg(Color::Black).bg(Color::LightYellow);
-            let area = centered_rect(60, 3, frame.area());
-            paint_bg(frame, area, style);
-            let block = Block::bordered().title(" Deleting ").style(style);
-            frame.render_widget(
-                Paragraph::new(vec![
-                    Line::raw(line),
-                    Line::raw("  [any key] hide (deletion continues)  "),
-                ])
-                .block(block)
-                .style(style),
-                area,
-            );
+            let line = format!("Deleting {}/{} — {} ", del.done, del.total, current);
+            let lines = vec![
+                Line::raw(line),
+                hint_line(&[("any key", " hide (deletion continues)")], &theme),
+            ];
+            let w = lines
+                .iter()
+                .map(|l| l.width() as u16)
+                .max()
+                .unwrap_or(40)
+                .max(40);
+            let area = dialog_area(w, 2, frame.area());
+            render_dialog(frame, "Deleting", lines, DialogKind::Progress, &theme, area);
         }
     }
 
-    // Confirmation prompt overlay (delete): solid light background so it is
-    // readable over the file list.
+    // Confirmation prompt overlay (delete): glass dialog over the file list.
     if let Some(confirm) = &app.confirming {
         let verb = match confirm.action {
             crate::app::ConfirmAction::Delete => "Delete",
             crate::app::ConfirmAction::Copy => "Copy",
             crate::app::ConfirmAction::Move => "Move",
         };
-        let policy = match &confirm.action {
-            crate::app::ConfirmAction::Delete => String::new(),
-            _ => match confirm.policy {
+        let kind = match confirm.action {
+            crate::app::ConfirmAction::Delete => DialogKind::Danger,
+            _ => DialogKind::Confirm,
+        };
+        let mut pairs: Vec<(&str, &str)> = vec![("y", "es"), ("n", "o")];
+        let policy: Option<String> = match &confirm.action {
+            crate::app::ConfirmAction::Delete => None,
+            _ => Some(match confirm.policy {
                 crate::services::transfer::OverwritePolicy::AutoRename => {
-                    "  [o] if exists: auto-rename".to_string()
+                    " if exists: auto-rename".to_string()
                 }
                 crate::services::transfer::OverwritePolicy::Overwrite => {
-                    "  [o] if exists: overwrite".to_string()
+                    " if exists: overwrite".to_string()
                 }
                 crate::services::transfer::OverwritePolicy::SkipExisting => {
-                    "  [o] if exists: skip".to_string()
+                    " if exists: skip".to_string()
                 }
-            },
+            }),
         };
-        let prompt = match &confirm.dest_dir {
+        if policy.is_some() {
+            pairs.push(("o", policy.as_deref().unwrap()));
+        }
+        let subject = match &confirm.dest_dir {
             Some(dest) => {
                 let dest_name = std::path::Path::new(dest)
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| dest.clone());
-                format!(
-                    " {verb} {} → {dest_name}?  [y]es  [n]o {policy} ",
-                    confirm.label
-                )
+                format!(" {verb} {} → {dest_name}?  ", confirm.label)
             }
-            None => format!(" {verb} {}?  [y]es  [n]o ", confirm.label),
+            None => format!(" {verb} {}?  ", confirm.label),
         };
-        let style = Style::default().fg(Color::Black).bg(Color::White);
-        // Content-based width (capped) so the policy hint always fits.
-        let w = (prompt.len() as u16 + 4)
-            .max(40)
-            .min(frame.area().width.saturating_sub(4));
-        let area = centered_rect(w, 3, frame.area());
-        paint_bg(frame, area, style);
-        let block = Block::bordered().title(" Confirm ").style(style);
-        frame.render_widget(
-            Paragraph::new(prompt)
-                .block(block)
-                .alignment(Alignment::Center)
-                .style(style),
-            area,
-        );
+        let mut spans = vec![Span::styled(
+            subject,
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        )];
+        spans.extend(hint_line(&pairs, &theme).spans);
+        let prompt = Line::from(spans);
+        let w = (prompt.width() as u16).max(40);
+        let area = dialog_area(w, 1, frame.area());
+        render_dialog(frame, "Confirm", vec![prompt], kind, &theme, area);
     }
 
     // Rename dialog: in-place text editor with a visible cursor.
     if let Some(prompt) = &app.renaming {
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        let chars = prompt.text.clone();
-        for (i, c) in chars.iter().enumerate() {
-            let s = Span::raw(format!("{c}"));
-            spans.push(if i == prompt.cursor {
-                s.style(Style::default().add_modifier(Modifier::REVERSED))
-            } else {
-                s
-            });
-        }
-        if prompt.cursor >= chars.len() {
-            spans.push(Span::raw(" ").style(Style::default().add_modifier(Modifier::REVERSED)));
-        }
-        let text_line = Line::from(spans);
-        let hint = Line::raw("  [Enter] rename  [Esc] cancel  ");
-        let lines: Vec<Line<'static>> = vec![text_line, Line::raw(""), hint];
-        let w = (prompt.text.len() as u16 + 12)
-            .max(34)
-            .min(frame.area().width.saturating_sub(4));
-        let h = lines.len() as u16 + 2;
-        let style = Style::default().fg(Color::Black).bg(Color::White);
-        let area = centered_rect(w, h, frame.area());
-        paint_bg(frame, area, style);
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(Block::bordered().title(" Rename ").style(style))
-                .style(style),
-            area,
-        );
+        let text_line = text_input_line(&prompt.text, prompt.cursor, &theme);
+        let hint = hint_line(&[("Enter", " rename"), ("Esc", " cancel")], &theme);
+        let lines = vec![text_line, Line::raw(""), hint];
+        let w = (prompt.text.len() as u16 + 12).max(34);
+        let area = dialog_area(w, lines.len() as u16, frame.area());
+        render_dialog(frame, "Rename", lines, DialogKind::Input, &theme, area);
     }
 
     // Go-to-path dialog: paste (Ctrl+V) or type a path; Enter navigates to
     // it or creates the missing chain.
     if let Some(p) = &app.goto_prompt {
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        if p.is_empty() {
-            spans.push(Span::raw(" ").style(Style::default().add_modifier(Modifier::REVERSED)));
-        }
-        for c in p.chars() {
-            spans.push(Span::raw(format!("{c}")));
-        }
-        if !p.is_empty() {
-            spans.push(Span::raw(" ").style(Style::default().add_modifier(Modifier::REVERSED)));
-        }
-        let text_line = Line::from(spans);
-        let hint = Line::raw("  [Enter] go / create  [Esc] cancel  ");
-        let lines: Vec<Line<'static>> = vec![text_line, hint];
-        let w = (p.chars().count() as u16 + 20)
-            .max(52)
-            .min(frame.area().width.saturating_sub(4));
-        let h = lines.len() as u16 + 2;
-        let style = Style::default().fg(Color::Black).bg(Color::White);
-        let area = centered_rect(w, h, frame.area());
-        paint_bg(frame, area, style);
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(Block::bordered().title(" Go to path ").style(style))
-                .style(style),
-            area,
-        );
+        let chars: Vec<char> = p.chars().collect();
+        let text_line = text_input_line(&chars, chars.len(), &theme);
+        let hint = hint_line(&[("Enter", " go / create"), ("Esc", " cancel")], &theme);
+        let lines = vec![text_line, hint];
+        let w = (p.chars().count() as u16 + 20).max(52);
+        let area = dialog_area(w, lines.len() as u16, frame.area());
+        render_dialog(frame, "Go to path", lines, DialogKind::Input, &theme, area);
     }
 
     // Create-new dialog: live kind preview (folder vs file by extension).
@@ -291,39 +330,16 @@ pub fn render(app: &mut App, frame: &mut Frame) {
             _ if name.contains('/') => "nested folder(s) + file".to_string(),
             _ => "folder".to_string(),
         };
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        let chars = p.text.clone();
-        if chars.is_empty() {
-            spans.push(Span::raw(" ").style(Style::default().add_modifier(Modifier::REVERSED)));
-        }
-        for (i, c) in chars.iter().enumerate() {
-            let s = Span::raw(format!("{c}"));
-            spans.push(if i == p.cursor {
-                s.style(Style::default().add_modifier(Modifier::REVERSED))
-            } else {
-                s
-            });
-        }
-        if p.cursor >= chars.len() {
-            spans.push(Span::raw(" ").style(Style::default().add_modifier(Modifier::REVERSED)));
-        }
-        let text_line = Line::from(spans);
-        let kind_line = Line::raw(format!("  new {kind}  "));
-        let hint = Line::raw("  [Enter] create  [Esc] cancel  ");
-        let lines: Vec<Line<'static>> = vec![text_line, kind_line, hint];
-        let w = (name.len() as u16 + 16)
-            .max(34)
-            .min(frame.area().width.saturating_sub(4));
-        let h = lines.len() as u16 + 2;
-        let style = Style::default().fg(Color::Black).bg(Color::White);
-        let area = centered_rect(w, h, frame.area());
-        paint_bg(frame, area, style);
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(Block::bordered().title(" New ").style(style))
-                .style(style),
-            area,
+        let text_line = text_input_line(&p.text, p.cursor, &theme);
+        let kind_line = Line::styled(
+            format!("  new {kind}  "),
+            Style::default().fg(theme.text_muted),
         );
+        let hint = hint_line(&[("Enter", " create"), ("Esc", " cancel")], &theme);
+        let lines = vec![text_line, kind_line, hint];
+        let w = (name.len() as u16 + 16).max(34);
+        let area = dialog_area(w, lines.len() as u16, frame.area());
+        render_dialog(frame, "New", lines, DialogKind::Input, &theme, area);
     }
 
     // Multi-selection info dialog: aggregate sizes summed live from the
@@ -346,10 +362,13 @@ pub fn render(app: &mut App, frame: &mut Frame) {
             )
         };
         let lines: Vec<Line<'static>> = vec![
-            Line::styled(selection, Style::default().add_modifier(Modifier::BOLD)),
-            Line::raw(size_line),
+            Line::styled(
+                selection,
+                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+            ),
+            styled_info_line(&size_line, &theme),
             Line::raw(""),
-            Line::raw("  [any key] close  "),
+            hint_line(&[("any key", " close")], &theme),
         ];
         let max_w = lines
             .iter()
@@ -357,57 +376,8 @@ pub fn render(app: &mut App, frame: &mut Frame) {
             .max()
             .unwrap_or(30)
             .max(34);
-        let w = (max_w + 4).min(frame.area().width.saturating_sub(4));
-        let h = lines.len() as u16 + 2;
-        let style = Style::default().fg(Color::Black).bg(Color::White);
-        let area = centered_rect(w, h, frame.area());
-        paint_bg(frame, area, style);
-        frame.render_widget(
-            Paragraph::new(lines)
-                .wrap(ratatui::widgets::Wrap { trim: false })
-                .block(Block::bordered().title(" Info ").style(style))
-                .style(style),
-            area,
-        );
-    }
-
-    // Keybindings help dialog (`*`): documents the keys that have no
-    // on-screen hint. Any key closes it (handler.rs).
-    if app.keybindings_visible {
-        // One pair per row, no section headers: 13 rows + borders fit the
-        // minimum supported terminal (90x15) without clipping.
-        let lines: Vec<Line<'static>> = vec![
-            bind_pair(
-                "Arrows",
-                "navigate; ←/→ open/leave",
-                "z / x",
-                "top / bottom",
-            ),
-            bind_pair("Space", "multi-select entry", "c", "copy to other pane"),
-            bind_pair("m", "move to other pane", "Enter", "rename entry"),
-            bind_pair("Del", "delete (with confirm)", "n", "new folder / file"),
-            bind_pair(".", "toggle hidden files", ",", "cycle sort mode"),
-            bind_pair("v", "cycle image preview", "Tab", "switch pane"),
-            bind_pair("Ctrl+A", "select / clear all", "Alt+I", "invert selection"),
-            bind_pair("+", "split pane", "`", "copy board"),
-            bind_pair("b", "bookmark this folder", "/", "fuzzy search"),
-            bind_pair("Esc", "clear search filter", "?", "entry info"),
-            bind_pair("[", "go to path", "]", "copy folder path"),
-            bind_pair("-", "eject drive", "0", "terminal here"),
-            bind_pair("*", "this help", "q", "quit"),
-        ];
-        let max_w = lines.iter().map(|l| l.width() as u16).max().unwrap_or(40);
-        let w = (max_w + 4).min(frame.area().width.saturating_sub(4));
-        let h = (lines.len() as u16 + 2).min(frame.area().height);
-        let style = Style::default().fg(Color::Black).bg(Color::White);
-        let area = centered_rect(w, h, frame.area());
-        paint_bg(frame, area, style);
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(Block::bordered().title(" Keybindings ").style(style))
-                .style(style),
-            area,
-        );
+        let area = dialog_area(max_w, lines.len() as u16, frame.area());
+        render_dialog(frame, "Info", lines, DialogKind::Info, &theme, area);
     }
 
     // Info dialog: read-only metadata for the selected entry. The Size line
@@ -415,51 +385,39 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     // honest lower bound after `x`, and the final line once done (drain
     // inserts it into `lines`; the renderer only fills the gap).
     if let Some(info) = &app.info {
-        let mut lines: Vec<Line<'static>> =
-            info.lines.iter().map(|l| Line::raw(l.clone())).collect();
-        if !lines.iter().any(|l| {
-            l.spans
-                .first()
-                .is_some_and(|s| s.content.starts_with("Size:"))
-        }) {
+        let mut lines: Vec<Line<'static>> = info
+            .lines
+            .iter()
+            .map(|l| styled_info_line(l, &theme))
+            .collect();
+        if !info.lines.iter().any(|l| l.starts_with("Size:")) {
             let line = match (app.size_walk_started(&info.path), app.size_info(&info.path)) {
-                (Some(started), Some(si)) => {
-                    Line::raw(size_line_partial(si, spinner_char(started)))
-                }
-                (Some(started), None) => Line::raw(size_line_started(spinner_char(started))),
-                // Walk cancelled with `x`: show the partial lower bound.
-                (None, Some(si)) => Line::raw(size_line_cancelled(si)),
-                // Brief window before the walk's first progress tick (or a
-                // file's pending metadata stat).
-                (None, None) => Line::raw(size_line_started(spinner_char(info.started))),
+                (Some(started), Some(si)) => size_line_partial(si, spinner_char(started)),
+                (Some(started), None) => size_line_started(spinner_char(started)),
+                (None, Some(si)) => size_line_cancelled(si),
+                (None, None) => size_line_started(spinner_char(info.started)),
             };
-            lines.insert(4.min(lines.len()), line);
+            lines.insert(4.min(lines.len()), styled_info_line(&line, &theme));
         }
-        // Folder queries get a hint line (walk running or a cached
-        // measurement exists); plain files need none of these keys.
         let is_folder =
             app.size_walk_started(&info.path).is_some() || app.size_info(&info.path).is_some();
         if is_folder {
             lines.push(Line::raw(""));
-            lines.push(Line::raw(
-                "  [x] cancel size walk   [r] recalculate   [Esc] close  ",
+            lines.push(hint_line(
+                &[
+                    ("x", " cancel size walk"),
+                    ("r", " recalculate"),
+                    ("Esc", " close"),
+                ],
+                &theme,
             ));
         }
         let mut max_w: u16 = 10;
         for l in &lines {
             max_w = max_w.max(l.width() as u16);
         }
-        let w = (max_w + 4).min(frame.area().width.saturating_sub(4));
-        let h = lines.len() as u16 + 2;
-        let style = Style::default().fg(Color::Black).bg(Color::White);
-        let area = centered_rect(w, h, frame.area());
-        paint_bg(frame, area, style);
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(Block::bordered().title(" Info ").style(style))
-                .style(style),
-            area,
-        );
+        let area = dialog_area(max_w, lines.len() as u16, frame.area());
+        render_dialog(frame, "Info", lines, DialogKind::Info, &theme, area);
     }
 
     // Error dialog: dismissable modal for action failures (eject busy,
@@ -472,24 +430,22 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         let text: Vec<Line<'static>> = vec![
             Line::styled(
                 status.text.clone(),
-                Style::default().add_modifier(Modifier::BOLD),
+                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
             ),
             Line::raw(""),
-            Line::raw("  [any key] dismiss  "),
+            hint_line(&[("any key", " dismiss")], &theme),
         ];
-        // Cap the width at 80% of the screen and word-wrap long messages.
-        // `Paragraph` wraps on word boundaries when the text exceeds the
-        // widget width; the height must count every wrapped line.
-        let max_allowed = (frame.area().width * 4 / 5).max(30);
+        let max_allowed = (frame.area().width * 4 / 5)
+            .saturating_sub(chrome::DIALOG_CHROME)
+            .max(30);
         let content_w = text
             .iter()
             .map(|l| l.width() as u16)
             .max()
             .unwrap_or(20)
             .max(30)
-            .min(max_allowed.saturating_sub(4));
-        let w = (content_w + 4).min(frame.area().width.saturating_sub(4));
-        let inner_w = w.saturating_sub(2) as usize; // minus borders
+            .min(max_allowed);
+        let inner_w = content_w.max(1) as usize;
         let wrapped: usize = text
             .iter()
             .map(|l| {
@@ -501,24 +457,39 @@ pub fn render(app: &mut App, frame: &mut Frame) {
                 }
             })
             .sum();
-        let h = (wrapped as u16 + 2).min(frame.area().height.saturating_sub(2));
-        let style = Style::default().fg(Color::White).bg(Color::Red);
-        let area = centered_rect(w, h, frame.area());
-        paint_bg(frame, area, style);
-        frame.render_widget(
-            Paragraph::new(text)
-                .wrap(ratatui::widgets::Wrap { trim: false })
-                .block(Block::bordered().title(" Error ").style(style))
-                .style(style),
-            area,
-        );
+        let area = dialog_area(content_w, wrapped as u16, frame.area());
+        render_dialog(frame, "Error", text, DialogKind::Error, &theme, area);
     }
+}
+
+/// Styles `Label: value` info rows: muted label, accent value while a
+/// size walk is still running.
+fn styled_info_line(raw: &str, theme: &Theme) -> Line<'static> {
+    if let Some((label, value)) = raw.split_once(": ") {
+        let value_style = if label == "Size" && is_partial_size(value) {
+            Style::default().fg(theme.accent)
+        } else {
+            Style::default().fg(theme.text)
+        };
+        Line::from(vec![
+            Span::styled(format!("{label}: "), Style::default().fg(theme.text_muted)),
+            Span::styled(value.to_string(), value_style),
+        ])
+    } else {
+        Line::styled(raw.to_string(), Style::default().fg(theme.text))
+    }
+}
+
+fn is_partial_size(value: &str) -> bool {
+    const SPINNER: &str = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+    value.chars().any(|c| SPINNER.contains(c)) || value.contains("calculating")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::services::list_files::FEntry;
+    use crate::theme::icons::IconSet;
     use ratatui::{backend::TestBackend, Terminal};
 
     /// Renders on a 100x30 TestBackend and returns the whole screen text.
@@ -643,6 +614,31 @@ mod tests {
     }
 
     #[test]
+    fn dimmed_backdrop_keeps_file_list_text() {
+        let mut app = App::default();
+        app.theme = Theme::default();
+        app.icons = IconSet::Unicode;
+        app.panes[0].folder = Some(crate::domain::data::Folder::new(
+            "tmp".into(),
+            "/tmp".into(),
+            '#',
+        ));
+        app.panes[0].files = vec![FEntry {
+            path: "/tmp/backdrop-marker.txt".into(),
+            label: "backdrop-marker.txt".into(),
+            is_dir: false,
+            size: 0,
+            modified: None,
+        }];
+        app.panes[0].listing_settled = true;
+        app.set_status("Failed to eject /dev/sdd2: target is busy", true);
+
+        let text = rendered(&mut app);
+        assert!(text.contains("backdrop-marker.txt"), "{text}");
+        assert!(text.contains(" Error "), "{text}");
+    }
+
+    #[test]
     fn status_bar_shows_keybindings_button_always() {
         // No status: the button is still visible.
         let mut app = App::default();
@@ -709,7 +705,7 @@ mod tests {
         app.keybindings_visible = true;
         let backend = TestBackend::new(90, 15);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| super::render(&mut app, f)).unwrap();
+        terminal.draw(|f| render(&mut app, f)).unwrap();
         let text = terminal
             .backend()
             .buffer()
@@ -751,8 +747,9 @@ mod tests {
 
     #[test]
     fn marquee_is_static_when_it_fits_and_scrolls_when_not() {
+        use crate::theme::Theme;
         let text = |items: &[(&str, &str)], w: usize, off: usize| -> String {
-            marquee_spans(items, w, off)
+            chrome::marquee_spans(items, w, off, &Theme::default())
                 .iter()
                 .map(|s| s.content.as_ref())
                 .collect()
@@ -780,7 +777,7 @@ mod tests {
             let buf = {
                 let backend = TestBackend::new(100, 30);
                 let mut terminal = Terminal::new(backend).unwrap();
-                terminal.draw(|f| super::render(&mut app, f)).unwrap();
+                terminal.draw(|f| render(&mut app, f)).unwrap();
                 terminal.backend().buffer().clone()
             };
             let y = 29;
@@ -800,67 +797,4 @@ mod tests {
         assert!(text.contains("copy"), "{text}");
         assert!(text.contains("[*] Keybindings"), "{text}");
     }
-}
-
-/// Paints a solid background (blank cells, `style`) across `area`, so modal
-/// dialogs are opaque instead of letting the underlying file list show
-/// through in the unfilled padding around their text.
-fn paint_bg(frame: &mut Frame, area: Rect, style: Style) {
-    frame.render_widget(Clear, area);
-    frame.buffer_mut().set_style(area, style);
-}
-
-/// Returns a `width`x`height` rect centered within `area`.
-fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
-    let w = width.min(area.width);
-    let h = height.min(area.height);
-    Rect::new(
-        area.x + (area.width - w) / 2,
-        area.y + (area.height - h) / 2,
-        w,
-        h,
-    )
-}
-
-/// One keybindings-dialog row: two `[key] description` columns; the key
-/// cells are bold.
-fn bind_pair(k1: &str, d1: &str, k2: &str, d2: &str) -> Line<'static> {
-    let key = Style::default().add_modifier(Modifier::BOLD);
-    Line::from(vec![
-        Span::styled(format!(" {k1:<8}"), key),
-        Span::raw(format!("{d1:<30}")),
-        Span::styled(format!("{k2:<8}"), key),
-        Span::raw(d2.to_string()),
-    ])
-}
-
-/// Builds the contextual hint bar as styled cells: bold keys, dim
-/// descriptions. When the joined line is wider than `width` it scrolls
-/// marquee-style: `offset` chars into the line, cyclically repeated, so
-/// narrow terminals still see every hint over time.
-fn marquee_spans(items: &[(&str, &str)], width: usize, offset: usize) -> Vec<Span<'static>> {
-    let key_style = Style::default().add_modifier(Modifier::BOLD);
-    let desc_style = Style::default().fg(Color::DarkGray);
-    let mut unit: Vec<(char, Style)> = vec![(' ', desc_style)];
-    for (key, desc) in items {
-        if unit.len() > 1 {
-            unit.extend(std::iter::repeat_n((' ', desc_style), 3));
-        }
-        unit.extend(key.chars().map(|c| (c, key_style)));
-        unit.push((' ', key_style));
-        unit.extend(desc.chars().map(|c| (c, desc_style)));
-    }
-    // Trailing separator: keeps a gap where the cycle wraps around.
-    unit.extend(std::iter::repeat_n((' ', desc_style), 3));
-    let n = unit.len();
-    if n == 0 {
-        return Vec::new();
-    }
-    let to_span = |(c, s): (char, Style)| Span::styled(c.to_string(), s);
-    if n <= width {
-        return unit.into_iter().map(to_span).collect();
-    }
-    (0..width)
-        .map(|i| to_span(unit[(offset.wrapping_add(i)) % n]))
-        .collect()
 }

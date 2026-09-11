@@ -22,4 +22,7 @@ pub mod components;
 /// IRA Domain types and structs
 pub mod domain;
 
+/// Semantic theme, terminal caps, and file-type icons.
+pub mod theme;
+
 pub mod utils;

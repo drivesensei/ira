@@ -99,7 +99,7 @@ after a restart.
 
 | Key | Action |
 | --- | --- |
-| `v` | Cycle the active pane's image preview: off → column → grid (per pane, persisted) |
+| `v` | Cycle the active pane's image preview: off → column → grid → details (per pane, persisted) |
 | `Tab` | Focus the text editor when a text file is previewed |
 | `Ctrl+S` | Save (editor focused); plain letters type |
 | `Esc` | Exit the editor, back to the pane |
@@ -170,5 +170,7 @@ persisted and restored — quit anywhere, come back to everything where you left
 ## Cross-Platform by Construction
 
 Linux, macOS, and Windows from a single static binary with no runtime dependencies. Drive
-detection adapts per platform (lsblk, `/Volumes`, drive-letter probing), and every glyph in the
-UI is single-width Unicode that renders identically across terminal fonts.
+detection adapts per platform (lsblk, `/Volumes`, drive-letter probing). File-type icons use a
+Nerd Font when the terminal can show them and fall back to single-width Unicode otherwise, so
+rows stay aligned on stock fonts. Colors are a semantic theme (truecolor, quantized to xterm-256
+on Terminal.app) overridable in `~/.config/ira/theme.toml`.

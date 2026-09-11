@@ -1,12 +1,13 @@
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
-    text::Line,
-    widgets::{Block, Paragraph},
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::Paragraph,
     Frame,
 };
 
 use crate::app::App;
+use crate::ui::chrome::{key_hint, panel_block};
 
 /// Width of the preview column in terminal cells (upper bound; the column
 /// yields space to the panes on narrow terminals).
@@ -18,6 +19,7 @@ pub const PREVIEW_COLS: u16 = 40;
 /// Also prefetches the next images in the pane's visible order so scrolling
 /// shows already-decoded thumbnails.
 pub fn render(frame: &mut Frame, app: &mut App, area: Rect, pane_index: usize) {
+    let theme = app.theme;
     // Editing takes over the column while this pane's editor is focused.
     let editing = app.edit_focus
         && app
@@ -30,17 +32,31 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect, pane_index: usize) {
         .is_some_and(|e| e.pane_index == pane_index && e.read_only);
     let title = if editing {
         let dirty = app.edit.as_ref().is_some_and(|e| e.dirty);
+        let mut spans = Vec::new();
         if dirty {
-            " * Editing — Ctrl+S save · Esc exit ".to_string()
-        } else {
-            " Editing — Ctrl+S save · Esc exit ".to_string()
+            spans.push(Span::styled(
+                " *",
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
+            ));
         }
+        spans.push(Span::raw(" Editing — "));
+        spans.extend(key_hint("Ctrl+S", " save · ", &theme));
+        spans.extend(key_hint("Esc", " exit ", &theme));
+        Line::from(spans)
     } else if editing_ro {
-        " Preview (read-only) ".to_string()
+        Line::from(vec![
+            Span::raw(" Preview "),
+            Span::styled("(read-only)", Style::default().fg(theme.warning)),
+            Span::raw(" "),
+        ])
     } else {
-        " Preview (v) ".to_string()
+        let mut spans = vec![Span::raw(" Preview ")];
+        spans.extend(key_hint("v", " ", &theme));
+        Line::from(spans)
     };
-    let block = Block::bordered().title(title);
+    let block = panel_block(title, true, &theme);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -51,8 +67,12 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect, pane_index: usize) {
     }
     if editing_ro {
         frame.render_widget(
-            Paragraph::new(Line::raw(" read-only file "))
-                .style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new(Line::styled(
+                " read-only file ",
+                Style::default()
+                    .fg(theme.text_muted)
+                    .add_modifier(Modifier::ITALIC),
+            )),
             inner,
         );
         return;
@@ -68,8 +88,12 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect, pane_index: usize) {
         // graphics-protocol image (it lives above the cell grid), so
         // suspend the preview while any overlay is open.
         frame.render_widget(
-            Paragraph::new(Line::raw(" preview paused "))
-                .style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new(Line::styled(
+                " preview paused ",
+                Style::default()
+                    .fg(theme.text_muted)
+                    .add_modifier(Modifier::ITALIC),
+            )),
             inner,
         );
         return;
@@ -84,13 +108,21 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect, pane_index: usize) {
     if is_text {
         match app.text_preview(pane_index) {
             Some(preview) if preview.binary => frame.render_widget(
-                Paragraph::new(Line::raw(" binary file "))
-                    .style(Style::default().fg(Color::DarkGray)),
+                Paragraph::new(Line::styled(
+                    " binary file ",
+                    Style::default()
+                        .fg(theme.text_muted)
+                        .add_modifier(Modifier::ITALIC),
+                )),
                 inner,
             ),
             Some(preview) if preview.content.is_empty() => frame.render_widget(
-                Paragraph::new(Line::raw(" (empty file) "))
-                    .style(Style::default().fg(Color::DarkGray)),
+                Paragraph::new(Line::styled(
+                    " (empty file) ",
+                    Style::default()
+                        .fg(theme.text_muted)
+                        .add_modifier(Modifier::ITALIC),
+                )),
                 inner,
             ),
             Some(preview) => {
@@ -100,15 +132,21 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect, pane_index: usize) {
                     .map(|l| Line::raw(l.replace('\t', "    ")))
                     .collect();
                 if preview.truncated {
-                    lines.push(
-                        Line::raw(" … truncated").style(Style::default().fg(Color::DarkGray)),
-                    );
+                    lines.push(Line::styled(
+                        " … truncated",
+                        Style::default().fg(theme.text_muted),
+                    ));
                 }
                 lines.truncate(inner.height as usize);
                 frame.render_widget(Paragraph::new(lines), inner);
             }
             None => frame.render_widget(
-                Paragraph::new(Line::raw(" loading… ")).style(Style::default().fg(Color::DarkGray)),
+                Paragraph::new(Line::styled(
+                    " loading… ",
+                    Style::default()
+                        .fg(theme.text_muted)
+                        .add_modifier(Modifier::ITALIC),
+                )),
                 inner,
             ),
         }
@@ -127,8 +165,12 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect, pane_index: usize) {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 frame.render_widget(
-                    Paragraph::new(Line::raw(format!(" loading {label}… ")))
-                        .style(Style::default().fg(Color::DarkGray)),
+                    Paragraph::new(Line::styled(
+                        format!(" loading {label}… "),
+                        Style::default()
+                            .fg(theme.text_muted)
+                            .add_modifier(Modifier::ITALIC),
+                    )),
                     inner,
                 );
             }
@@ -151,11 +193,12 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect, pane_index: usize) {
                 },
             };
             frame.render_widget(
-                Paragraph::new(Line::raw(reason)).style(
+                Paragraph::new(Line::styled(
+                    reason,
                     Style::default()
-                        .fg(Color::DarkGray)
+                        .fg(theme.text_muted)
                         .add_modifier(Modifier::ITALIC),
-                ),
+                )),
                 inner,
             );
         }

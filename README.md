@@ -62,6 +62,26 @@ cargo build --release
 
 See [docs/features.md](docs/features.md) for a full breakdown.
 
+## Fonts, icons & theme
+
+IRA is a TUI: it cannot ship or select a font. The terminal you run it in owns the typeface.
+
+- **Icons.** Two sets only: **Nerd Font** glyphs (per-extension, the ones you are seeing) and a **Unicode** fallback (`□` folders, `≡` text, `▶` video, …) that stays aligned on stock fonts. There is no third set — emoji would break column widths on Windows/macOS. Auto-detects Nerd Fonts on kitty, WezTerm, ghostty, Alacritty, foot, Warp, VS Code, and Windows Terminal. Once you run with Nerd icons, the choice is saved in `~/.config/ira/state` so the next launch does not need `IRA_ICONS`. Pin it permanently with `icons = "nerd"` in the theme file, or `IRA_ICONS=nerd|unicode` for one shot.
+- **Colors.** Truecolor (`Color::Rgb`) is used when the terminal advertises it (`COLORTERM=truecolor`, iTerm2, WezTerm, ghostty, Windows Terminal, modern conhost). **Terminal.app is 256-color only**; IRA quantizes the palette to xterm-256 there so colors do not collapse to named ANSI.
+- **Theme.** Built-in presets: `mocha` (default, Catppuccin) and `cyberpunk2077` (Night City yellow / cyan / trauma-team red). Optional overrides live in `~/.config/ira/theme.toml` — partial files are fine, unknown keys and invalid colors are ignored:
+
+```toml
+preset = "cyberpunk2077"
+icons = "nerd"
+
+# optional per-key overrides on top of the preset
+# accent = "#fcee0a"
+[files]
+image = "#ff9f1c"
+```
+
+- **`--check-terminal`** prints the detected truecolor flag, icon set, image protocol, and whether a theme file was found. Use it when icons render as boxes or colors look washed out.
+
 ## Project structure
 
 ```
@@ -71,7 +91,8 @@ src/
 ├── event.rs           # terminal event handler (tick/key/mouse/resize)
 ├── handler.rs         # key → action dispatch
 ├── tui.rs             # terminal setup/teardown (raw mode, alt screen)
-├── ui.rs              # layout composition
+├── ui/                # layout composition + shared chrome (chips, glass dialogs)
+├── theme/             # palette, terminal caps, file-type icons
 ├── domain/            # core types (Folder)
 ├── services/          # drives, folders, bookmarks, file listing
 ├── components/        # per-panel widgets

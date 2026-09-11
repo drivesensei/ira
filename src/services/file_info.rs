@@ -249,44 +249,7 @@ pub fn build_info_full(entry: &FEntry, dir_size: Option<DirSize>) -> Vec<String>
 }
 
 fn kind_of(entry: &FEntry) -> String {
-    if entry.is_dir {
-        return "Folder".to_string();
-    }
-    let ext = extension(&entry.label).to_lowercase();
-    let kind: &str = match ext.as_str() {
-        "txt" | "md" | "rst" | "log" | "conf" | "ini" | "toml" | "yml" | "yaml" => "Text file",
-        "rs" => "Rust source",
-        "py" => "Python source",
-        "js" | "ts" | "mjs" | "cjs" => "JavaScript/TS source",
-        "json" => "JSON document",
-        "html" | "htm" | "css" => "Web document",
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "avif" | "ico" => "Image",
-        "mp4" | "mkv" | "avi" | "mov" | "webm" => "Video",
-        "mp3" | "flac" | "ogg" | "wav" | "m4a" | "aac" => "Audio",
-        "zip" | "tar" | "gz" | "bz2" | "xz" | "7z" | "rar" | "zst" => "Archive",
-        "pdf" => "PDF document",
-        "doc" | "docx" | "odt" | "rtf" => "Word document",
-        "xls" | "xlsx" | "ods" | "csv" | "tsv" => "Spreadsheet",
-        "iso" | "img" => "Disk image",
-        "exe" | "msi" | "bin" | "dmg" | "sh" => "Executable",
-        "sqlite" | "db" | "sqlite3" => "Database",
-        "git" => "Git repository",
-        _ => "File",
-    };
-    kind.to_string()
-}
-
-fn extension(name: &str) -> &str {
-    let mut dot: Option<usize> = None;
-    for (i, c) in name.chars().enumerate() {
-        if c == '.' {
-            dot = Some(i);
-        }
-    }
-    match dot {
-        Some(i) if i + 1 < name.chars().count() => &name[i + 1..],
-        _ => "",
-    }
+    crate::theme::icons::kind_label(entry.is_dir, &entry.label).to_string()
 }
 
 /// "Added": creation time when the platform reports it (Windows/macOS), else

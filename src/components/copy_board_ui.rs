@@ -1,16 +1,19 @@
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::Line,
-    widgets::{Block, List, ListState, Paragraph},
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::{List, ListState, Paragraph},
     Frame,
 };
 
 use crate::app::App;
 use crate::services::transfer::{Job, JobKind, JobStatus};
+use crate::theme::Theme;
+use crate::ui::chrome::{hint_line, panel_block};
 
 /// Renders the Copy Board sidebar: one row per transfer job with progress.
 pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
+    let theme = app.theme;
     let focused = app.board_has_focus();
 
     let vertical = Layout::default()
@@ -18,20 +21,16 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
         .constraints([Constraint::Min(0), Constraint::Length(1)])
         .split(area);
 
-    let rows: Vec<Line<'static>> = app.jobs.iter().map(job_line).collect();
-    let border_style = if focused {
-        Style::default()
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
+    let rows: Vec<Line<'static>> = app.jobs.iter().map(|j| job_line(j, &theme)).collect();
     let list = List::new(rows)
-        .block(
-            Block::bordered()
-                .title(" Copy Board ")
-                .border_style(border_style),
+        .block(panel_block(Line::raw(" Copy Board "), focused, &theme))
+        .highlight_style(
+            Style::new()
+                .fg(theme.cursor_fg)
+                .bg(theme.cursor_bg)
+                .add_modifier(Modifier::BOLD),
         )
-        .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
-        .highlight_symbol("▸");
+        .highlight_symbol("▌");
     if focused {
         f.render_stateful_widget(list, vertical[0], &mut app.copy_board_state);
     } else {
@@ -41,41 +40,74 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     let hint = if focused {
-        " p/Space pause  x cancel  Esc close "
+        hint_line(
+            &[("p/Space", " pause"), ("x", " cancel"), ("Esc", " close")],
+            &theme,
+        )
     } else {
-        " Tab to focus board "
+        hint_line(&[("Tab", " to focus board")], &theme)
     };
-    f.render_widget(
-        Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
-        vertical[1],
-    );
+    f.render_widget(Paragraph::new(hint), vertical[1]);
 }
 
-fn job_line(job: &Job) -> Line<'static> {
-    let icon = match job.status {
-        JobStatus::Running => ">",
-        JobStatus::Paused => "||",
-        JobStatus::Cancelled => "x",
-        JobStatus::Done => "d",
-        JobStatus::Failed(_) => "!",
-        JobStatus::Queued => "-",
+fn job_line(job: &Job, theme: &Theme) -> Line<'static> {
+    let (icon, color) = match job.status {
+        JobStatus::Running => ("▶", theme.accent),
+        JobStatus::Paused => ("⏸", theme.warning),
+        JobStatus::Cancelled => ("✕", theme.text_muted),
+        JobStatus::Done => ("✓", theme.success),
+        JobStatus::Failed(_) => ("!", theme.error),
+        JobStatus::Queued => ("·", theme.text_muted),
     };
     let kind = match job.kind {
         JobKind::Copy => "C",
         JobKind::Move => "M",
     };
     let label: String = job.label.chars().take(10).collect();
+    let icon_span = Span::styled(format!("[{icon}]"), Style::default().fg(color));
+    let kind_span = Span::styled(format!(" {kind} "), Style::default().fg(theme.text_muted));
+    let label_span = Span::styled(format!("{label:10}"), Style::default().fg(theme.text));
 
     match &job.status {
-        JobStatus::Done => Line::raw(format!("[{icon}] {kind} {label:10} done")),
-        JobStatus::Cancelled => Line::raw(format!("[{icon}] {kind} {label:10} cancelled")),
-        JobStatus::Failed(_) => Line::raw(format!("[{icon}] {kind} {label:10} error")),
+        JobStatus::Done => Line::from(vec![
+            icon_span,
+            kind_span,
+            label_span,
+            Span::styled(" done", Style::default().fg(theme.success)),
+        ]),
+        JobStatus::Cancelled => Line::from(vec![
+            icon_span,
+            kind_span,
+            label_span,
+            Span::styled(" cancelled", Style::default().fg(theme.text_muted)),
+        ]),
+        JobStatus::Failed(_) => Line::from(vec![
+            icon_span,
+            kind_span,
+            label_span,
+            Span::styled(" error", Style::default().fg(theme.error)),
+        ]),
         _ => {
             let pct = job
                 .total_bytes
                 .filter(|t| *t > 0)
                 .map(|t| (job.copied_bytes as f64 / t as f64) * 100.0)
                 .unwrap_or(0.0);
+            let filled = ((pct / 100.0) * 8.0).round() as usize;
+            let filled = filled.min(8);
+            let mut bar_spans = Vec::new();
+            if filled > 0 {
+                bar_spans.push(Span::styled(
+                    "━".repeat(filled),
+                    Style::default().fg(theme.accent),
+                ));
+            }
+            if filled < 8 {
+                bar_spans.push(Span::styled(
+                    "─".repeat(8 - filled),
+                    Style::default().fg(theme.border),
+                ));
+            }
             let bytes = format!(
                 "{}/{}",
                 human(job.copied_bytes),
@@ -83,9 +115,13 @@ fn job_line(job: &Job) -> Line<'static> {
                     .map(human)
                     .unwrap_or_else(|| "?".to_string())
             );
-            // Keep the row within the fixed 36-column panel: no unicode bar,
-            // tight padding, right-aligned byte counter.
-            Line::raw(format!("[{icon}] {kind} {label:10} {pct:3.0}% {bytes:>12}"))
+            let mut spans = vec![icon_span, kind_span, label_span, Span::raw(" ")];
+            spans.extend(bar_spans);
+            spans.push(Span::styled(
+                format!(" {pct:3.0}% {bytes:>12}"),
+                Style::default().fg(theme.text_muted),
+            ));
+            Line::from(spans)
         }
     }
 }

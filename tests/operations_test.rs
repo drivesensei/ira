@@ -2228,3 +2228,37 @@ fn transfer_reveals_folder_live_in_destination_pane() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn transient_banner_does_not_swallow_the_next_preview_cycle() {
+    use ira::app::PreviewMode;
+    use ira::handler::handle_key_events;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let mut app = App::default();
+    let key = |code| KeyEvent::new(code, KeyModifiers::empty());
+
+    handle_key_events(key(KeyCode::Char('v')), &mut app).unwrap();
+    assert_eq!(app.panes[0].preview_mode, PreviewMode::Column);
+    assert!(app
+        .status
+        .as_ref()
+        .is_some_and(|s| s.text.contains("column")));
+
+    // Second press while the banner is up: the mode must cycle again AND
+    // the banner update in the same press.
+    handle_key_events(key(KeyCode::Char('v')), &mut app).unwrap();
+    assert_eq!(app.panes[0].preview_mode, PreviewMode::Grid);
+    assert!(app.status.as_ref().is_some_and(|s| s.text.contains("grid")));
+
+    // Error dialogs stay modal: the error banner is dismissed by a key
+    // press, and that press is consumed by the dismissal.
+    app.set_status("Failed to eject /dev/sdd2: target is busy", true);
+    handle_key_events(key(KeyCode::Char('v')), &mut app).unwrap();
+    assert!(app.status.is_none(), "error dialog must be dismissed");
+    assert_eq!(
+        app.panes[0].preview_mode,
+        PreviewMode::Grid,
+        "the dismissing press must not also act"
+    );
+}

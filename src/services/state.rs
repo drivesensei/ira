@@ -25,8 +25,11 @@ pub struct SessionState {
     pub show_hidden: bool,
     pub left: Option<Folder>,
     pub right: Option<Folder>,
-    /// Per-pane image preview mode (0=off, 1=column, 2=grid).
+    /// Per-pane image preview mode (0=off, 1=column, 2=grid, 3=details).
     pub preview: [u8; 2],
+    /// Last-used icon set (`nerd` / `unicode`). `None` = never persisted;
+    /// theme auto-detection still applies.
+    pub icons: Option<String>,
     pub sizes: Vec<SizeEntry>,
 }
 
@@ -77,6 +80,9 @@ fn serialize_state(state: &SessionState) -> String {
     content.push_str(&format!("hidden={}\n", state.show_hidden as u8));
     content.push_str(&format!("preview0={}\n", state.preview[0]));
     content.push_str(&format!("preview1={}\n", state.preview[1]));
+    if let Some(icons) = &state.icons {
+        content.push_str(&format!("icons={icons}\n"));
+    }
     for (key, folder) in [("left", &state.left), ("right", &state.right)] {
         match folder {
             Some(f) => content.push_str(&format!("{}={}\t{}\n", key, f.label, f.path)),
@@ -107,8 +113,14 @@ fn parse_state(contents: &str) -> SessionState {
             "split" => state.split = value == "1",
             "active" => state.active_pane = value.parse::<usize>().unwrap_or(0).min(1),
             "hidden" => state.show_hidden = value == "1",
-            "preview0" => state.preview[0] = value.parse::<u8>().unwrap_or(0).min(2),
-            "preview1" => state.preview[1] = value.parse::<u8>().unwrap_or(0).min(2),
+            "preview0" => state.preview[0] = value.parse::<u8>().unwrap_or(0).min(3),
+            "preview1" => state.preview[1] = value.parse::<u8>().unwrap_or(0).min(3),
+            "icons" => {
+                let v = value.trim().to_ascii_lowercase();
+                if v == "nerd" || v == "unicode" {
+                    state.icons = Some(v);
+                }
+            }
             "left" => state.left = parse_folder(value),
             "right" => state.right = parse_folder(value),
             "size" => {
@@ -208,6 +220,7 @@ mod tests {
                 '#',
             )),
             preview: [1, 2],
+            icons: Some("nerd".to_string()),
             sizes: vec![
                 SizeEntry {
                     path: "/home/vlad/big folder".to_string(),
@@ -230,6 +243,7 @@ mod tests {
         assert_eq!(parse_state(&serialize_state(&state)), state);
         assert!(state.show_hidden, "hidden flag must roundtrip");
         assert_eq!(state.preview, [1, 2], "preview modes must roundtrip");
+        assert_eq!(state.icons.as_deref(), Some("nerd"));
     }
 
     #[test]

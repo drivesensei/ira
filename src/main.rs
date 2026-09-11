@@ -17,6 +17,10 @@ fn main() -> AppResult<()> {
         println!("ira {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    if std::env::args().skip(1).any(|a| a == "--check-terminal") {
+        print_terminal_check();
+        return Ok(());
+    }
 
     // Probe the terminal for image-protocol support and font size BEFORE raw
     // mode and the alternate screen: the probe runs blocking stdin queries
@@ -86,4 +90,57 @@ fn main() -> AppResult<()> {
     // Exit the user interface.
     tui.exit()?;
     Ok(())
+}
+
+/// Prints detected terminal capabilities and exits. Useful when icons
+/// render as boxes or colors look wrong.
+fn print_terminal_check() {
+    let caps = ira::theme::caps();
+    let env = ira::theme::caps::EnvSnapshot::from_os();
+    let (_, icons) = ira::theme::load_from("", &caps, env.ira_icons.as_deref(), None);
+    let in_iterm2 = std::env::var("TERM_PROGRAM").is_ok_and(|t| t.contains("iTerm"))
+        || std::env::var("LC_TERMINAL").is_ok_and(|t| t.contains("iTerm"));
+    let mut options = QueryStdioOptions::default();
+    if in_iterm2 {
+        options.blacklist_protocols.push(ProtocolType::Kitty);
+    }
+    let protocol = match Picker::from_query_stdio_with_options(options) {
+        Ok(picker) => format!("{:?}", picker.protocol_type()),
+        Err(_) => "Halfblocks (fallback)".to_string(),
+    };
+    println!("ira {}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "truecolor: {}",
+        if caps.truecolor {
+            "yes"
+        } else {
+            "no (256-color fallback)"
+        }
+    );
+    println!(
+        "icons: {} ({})",
+        match icons {
+            ira::theme::icons::IconSet::Nerd => "nerd",
+            ira::theme::icons::IconSet::Unicode => "unicode",
+        },
+        if env.ira_icons.is_some() {
+            "IRA_ICONS override"
+        } else if caps.nerd_font {
+            "auto: nerd-capable terminal"
+        } else {
+            "auto: unicode fallback"
+        }
+    );
+    println!("image protocol: {protocol}");
+    if let Some(path) = ira::theme::theme_file_path() {
+        println!(
+            "theme file: {} ({})",
+            path.display(),
+            if path.exists() {
+                "present"
+            } else {
+                "not found"
+            }
+        );
+    }
 }

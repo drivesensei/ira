@@ -120,9 +120,13 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         return Ok(());
     }
 
-    // Error dialog: any key dismisses it. Checked before the info dialog so
-    // an eject failure's error box never swallows the next action.
-    if app.status.is_some() {
+    // Error dialogs are modal: any key dismisses them (checked before the
+    // info dialog so an eject failure's error box never swallows the next
+    // action). Transient notices — the bottom banner `v` raises, saves,
+    // clipboard copies, sort notices — must NOT swallow the key: a second
+    // `v` has to cycle the mode again, replacing the banner in the same
+    // press. They also expire on their own TTL.
+    if app.status.as_ref().is_some_and(|s| s.is_error) {
         app.clear_status();
         return Ok(());
     }

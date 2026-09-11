@@ -91,15 +91,20 @@ pub enum PreviewMode {
     Column,
     /// Thumbnail grid replacing the file list.
     Grid,
+    /// List with size and relative-modified columns for the files; folders
+    /// carry no size (recursive measurement is not triggered here).
+    Details,
 }
 
 impl PreviewMode {
-    /// Persisted representation (state file `preview<N>=`).
+    /// In persisted representation (state file `preview<N>=`) and cycle
+    /// order: 0=off, 1=column, 2=grid, 3=details.
     pub fn as_u8(self) -> u8 {
         match self {
             PreviewMode::Off => 0,
             PreviewMode::Column => 1,
             PreviewMode::Grid => 2,
+            PreviewMode::Details => 3,
         }
     }
 
@@ -108,6 +113,7 @@ impl PreviewMode {
         match v {
             1 => PreviewMode::Column,
             2 => PreviewMode::Grid,
+            3 => PreviewMode::Details,
             _ => PreviewMode::Off,
         }
     }
@@ -423,6 +429,12 @@ pub struct App {
     /// State file location override; `None` = the real `~/.config/ira/state`.
     /// Integration tests set this so their walks never touch user config.
     pub state_path: Option<PathBuf>,
+
+    /// Resolved color palette (truecolor or quantized). Tests use the
+    /// default dark theme without reading `theme.toml`.
+    pub theme: crate::theme::Theme,
+    /// Active icon set. Tests force Unicode so glyphs stay single-width.
+    pub icons: crate::theme::icons::IconSet,
 }
 
 impl Default for App {
@@ -496,6 +508,8 @@ impl Default for App {
             text_cache: HashMap::new(),
             edit: None,
             edit_focus: false,
+            theme: crate::theme::Theme::default(),
+            icons: crate::theme::icons::IconSet::Unicode,
         }
     }
 }
@@ -573,7 +587,10 @@ impl App {
             }
             default.drives = Some(app_drives);
         }
-        default.restore_state();
+        let persisted_icons = default.restore_state();
+        let (theme, icons) = crate::theme::load_with_persisted(persisted_icons.as_deref());
+        default.theme = theme;
+        default.icons = icons;
         default.start_drive_poller();
         // Startup pane listings run on the async chunked worker so a slow
         // drive can't block the first frame.
@@ -1397,19 +1414,21 @@ impl App {
     }
 
     /// Cycles the image preview presentation of the ACTIVE pane (`v`):
-    /// off → column → grid. Modes are per pane — switching panes with Tab
-    /// never changes either pane's mode.
+    /// off → column → grid → details. Modes are per pane — switching panes
+    /// with Tab never changes either pane's mode.
     pub fn cycle_preview(&mut self) {
         let next = match self.pane().preview_mode {
             PreviewMode::Off => PreviewMode::Column,
             PreviewMode::Column => PreviewMode::Grid,
-            PreviewMode::Grid => PreviewMode::Off,
+            PreviewMode::Grid => PreviewMode::Details,
+            PreviewMode::Details => PreviewMode::Off,
         };
         self.pane_mut().preview_mode = next;
         let label = match next {
             PreviewMode::Off => "off",
             PreviewMode::Column => "column",
             PreviewMode::Grid => "grid",
+            PreviewMode::Details => "details",
         };
         self.set_status(format!("Preview: {label}"), false);
     }
@@ -3327,11 +3346,14 @@ impl App {
     }
 
     /// Restores the persisted session state (split layout and pane folders).
-    pub fn restore_state(&mut self) {
+    /// Returns a persisted icon preference, if any, so theme loading can
+    /// reuse it without `IRA_ICONS`.
+    pub fn restore_state(&mut self) -> Option<String> {
         let state = match &self.state_path {
             Some(p) => load_state_from(p),
             None => load_state(),
         };
+        let icons = state.icons.clone();
         self.split = state.split;
         self.active_pane = state.active_pane.min(1);
         self.show_hidden = state.show_hidden;
@@ -3349,6 +3371,7 @@ impl App {
         self.restore_sizes(state.sizes);
         // File lists are populated asynchronously from `App::new` via
         // `request_pane_listing`, so a slow drive doesn't block startup.
+        icons
     }
 
     /// Restores persisted size entries into the cache (epoch -> `SystemTime`).
@@ -3401,6 +3424,10 @@ impl App {
                 self.panes[0].preview_mode.as_u8(),
                 self.panes[1].preview_mode.as_u8(),
             ],
+            icons: Some(match self.icons {
+                crate::theme::icons::IconSet::Nerd => "nerd".to_string(),
+                crate::theme::icons::IconSet::Unicode => "unicode".to_string(),
+            }),
             sizes: self.size_entries(),
         };
         match &self.state_path {
@@ -3709,6 +3736,7 @@ mod tests {
                     app.panes[0].preview_mode.as_u8(),
                     app.panes[1].preview_mode.as_u8(),
                 ],
+                icons: None,
                 sizes: entries,
             },
         );
@@ -4073,6 +4101,8 @@ mod preview_tests {
         app.cycle_preview();
         assert_eq!(app.panes[0].preview_mode, PreviewMode::Grid);
         app.cycle_preview();
+        assert_eq!(app.panes[0].preview_mode, PreviewMode::Details);
+        app.cycle_preview();
         assert_eq!(app.panes[0].preview_mode, PreviewMode::Off);
     }
 
@@ -4109,7 +4139,7 @@ mod preview_tests {
         terminal
             .draw(|f| crate::components::tab1_files_ui::render(f, &mut app, f.area(), 0, true))
             .unwrap();
-        let per_screen = 5 * 4; // 78/14 cols x 22/5 rows on an 80x24 backend
+        let per_screen = 3 * 2; // 78/20 cols x 22/9 rows on an 80x24 backend
         assert!(
             app.thumb_cache_cap >= 3 * per_screen + 16,
             "cache cap {} does not cover grid working set {}",
