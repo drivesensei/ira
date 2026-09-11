@@ -100,21 +100,32 @@ that can push columns out of alignment on some terminals (notably on Windows).
 
 ## Icon sets
 
-There are exactly two sets. Emoji were deliberately not added: their cell width differs
-between Linux, macOS and Windows terminals and would break the file list columns.
+There are three sets.
 
 | Set | `icons =` / `IRA_ICONS` | Needs | What you see |
 | --- | --- | --- | --- |
-| Nerd | `nerd` | A Nerd Font in the terminal | Per-extension glyphs (Rust gear, Python, PDF, archive, …), drive / bookmark / common-folder icons |
+| Nerd | `nerd` | A Nerd Font reachable by the terminal | Per-extension glyphs (Rust gear, Python, PDF, archive, …), drive / bookmark / common-folder icons, Powerline key chips |
+| Emoji | `emoji` | A terminal that renders color emoji two cells wide (its own fallback font does the drawing — nothing to install) | 📁 folders (🏠 💻 📚 📥 🎵 🎬 for the common ones, 🌿 `.git`, 📦 `node_modules`), 🦀 Rust, 🐍 Python, 🟨 JS, 🟦 TS, 🌐 HTML, 🎨 CSS, 🐹 Go, ☕ Java, 💎 Ruby, 🔩 C/C++, 📝 Markdown, 🧾 JSON, 🔧 config, 📄 text, 📷 image, 🎬 video, 🎵 audio, 📦 archive, 📕 PDF, 📘 document, 📊 spreadsheet, 🚀 executable, 📇 data, 💿 disk image, 📃 other |
 | Unicode | `unicode` | Nothing — stock fonts | `□` folder, `≡` text, `λ` code, `▦` image, `▶` video, `♪` audio, `▣` archive, `▤` document/PDF, `▥` spreadsheet, `▸` executable, `◈` data, `◉` disk image, `·` other; every glyph is asserted single-width |
+
+The emoji set is restricted to codepoints Unicode classes as wide (`East_Asian_Width=W`,
+single scalars, no variation selectors or ZWJ sequences), so every terminal that follows
+the standard gives them exactly two cells — the same two cells the Nerd set reserves
+(glyph + pad space) — and the name column never shifts. Ambiguous-width symbols such as
+⚙ 🖼 🗄 🖥 are deliberately excluded because terminals disagree on their width; a test
+asserts the whole set.
 
 ### Which icon set is used
 
-1. `IRA_ICONS=nerd|unicode` environment variable (one-shot override).
+1. `IRA_ICONS=nerd|emoji|unicode` environment variable (one-shot override).
 2. `icons = "..."` in `theme.toml`.
-3. Auto-detect, re-run on every launch: Nerd only when a font that actually contains
-   the glyphs is reachable by the terminal (see below), or when `NERD_FONT=1` is set.
-   Otherwise Unicode.
+3. Auto-detect, re-run on every launch, richest set the terminal can draw:
+   - **Nerd** when a font that actually contains the glyphs is reachable by the terminal
+     (see below), or when `NERD_FONT=1` is set;
+   - else **Emoji** when the terminal is known to render wide color emoji: Windows
+     Terminal, every macOS terminal, VS Code / Cursor, GNOME Terminal and other VTE
+     hosts (`VTE_VERSION`), Konsole, kitty, WezTerm, Ghostty, Alacritty, foot, Warp;
+   - else **Unicode** (legacy Windows console, Linux console, unrecognized hosts).
 
 `auto` in either `IRA_ICONS` or `icons =` skips that step and falls through. The icon
 set is never saved to the state file; change fonts or terminals and the next launch
@@ -144,7 +155,7 @@ lookup will end up, in this order:
 
 If icons still show as boxes (`▯`) or stray symbols, `ira --check-terminal` prints which
 of the three found (or did not find) a font; `IRA_ICONS=unicode` or `icons = "unicode"`
-forces the fallback set.
+forces the fallback set, `icons = "emoji"` forces emoji on a host the list above misses.
 
 ## Terminal notes
 
@@ -152,8 +163,9 @@ forces the fallback set.
   quantized palette and Unicode icons unless a Nerd Font is installed (CoreText falls
   back to it per glyph, so it does not have to be the selected font).
 - **Windows Terminal** ships Cascadia Mono, which has no Nerd glyphs, and does not fall
-  back to other installed fonts for them: Unicode icons until the profile font is one
-  with the glyphs (e.g. `Cascadia Mono NF`, or a fallback list such as
+  back to other installed fonts for them, so the default is the emoji set (Segoe UI
+  Emoji, in color). It switches to Nerd glyphs as soon as the profile font is one that
+  has them (e.g. `Cascadia Mono NF`, or a fallback list such as
   `Cascadia Mono, Symbols Nerd Font Mono`).
 - **iTerm2, WezTerm, kitty, ghostty, Alacritty, Windows Terminal** are truecolor; set
   `COLORTERM=truecolor` if your shell profile clears it.

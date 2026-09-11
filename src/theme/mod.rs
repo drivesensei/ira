@@ -508,7 +508,8 @@ impl Loader {
         self.nerd_glyphs = icons == IconSet::Nerd;
         self.chips_auto = match icons {
             IconSet::Nerd => ChipStyle::Outline,
-            IconSet::Unicode => ChipStyle::Square,
+            // Emoji come from a fallback font; the Powerline caps do not.
+            IconSet::Emoji | IconSet::Unicode => ChipStyle::Square,
         };
     }
 
@@ -784,8 +785,11 @@ pub fn resolve_icon_set(
     if let Some(set) = parse_icon_pref(toml_icons) {
         return set;
     }
+    // Auto: the richest set the terminal can actually draw.
     if caps.nerd_font {
         IconSet::Nerd
+    } else if caps.wide_emoji {
+        IconSet::Emoji
     } else {
         IconSet::Unicode
     }
@@ -794,6 +798,7 @@ pub fn resolve_icon_set(
 fn parse_icon_pref(raw: Option<&str>) -> Option<IconSet> {
     match raw?.trim().to_ascii_lowercase().as_str() {
         "nerd" => Some(IconSet::Nerd),
+        "emoji" => Some(IconSet::Emoji),
         "unicode" => Some(IconSet::Unicode),
         "auto" => None,
         _ => None,
@@ -889,6 +894,37 @@ mod tests {
         // toml forces Nerd even when no font was found.
         let (_, icons) = load_from("icons = \"nerd\"\n", &caps(false), None);
         assert_eq!(icons, IconSet::Nerd);
+    }
+
+    #[test]
+    fn auto_picks_emoji_when_nerd_is_missing_but_emoji_render_wide() {
+        let emoji_host = TermCaps {
+            wide_emoji: true,
+            ..caps(false)
+        };
+        let (theme, icons) = load_from("", &emoji_host, None);
+        assert_eq!(icons, IconSet::Emoji);
+        assert_eq!(
+            theme.chips,
+            ChipStyle::Square,
+            "no Powerline caps without a Nerd Font"
+        );
+        assert!(!theme.nerd_glyphs);
+
+        // Nerd still wins when both are possible.
+        let both = TermCaps {
+            wide_emoji: true,
+            ..caps(true)
+        };
+        assert_eq!(load_from("", &both, None).1, IconSet::Nerd);
+
+        // Explicit choices override in either direction.
+        assert_eq!(
+            load_from("icons = \"unicode\"\n", &emoji_host, None).1,
+            IconSet::Unicode
+        );
+        assert_eq!(load_from("", &caps(false), Some("emoji")).1, IconSet::Emoji);
+        assert_eq!(load_from("", &both, Some("EMOJI")).1, IconSet::Emoji);
     }
 
     #[test]

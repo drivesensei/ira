@@ -16,16 +16,21 @@ pub struct TermCaps {
     /// Where the Nerd glyphs come from (or why they are unavailable), for
     /// `--check-terminal`.
     pub nerd_source: NerdSource,
+    /// This terminal renders color emoji at the standard two cells, so the
+    /// emoji icon set keeps columns aligned. False on the legacy Windows
+    /// console, the Linux console and unrecognized hosts.
+    pub wide_emoji: bool,
 }
 
 impl Default for TermCaps {
     /// Optimistic defaults for tests / headless construction: truecolor
-    /// on, no Nerd Font. Real runs go through [`detect`].
+    /// on, no Nerd Font, no emoji. Real runs go through [`detect`].
     fn default() -> Self {
         TermCaps {
             truecolor: true,
             nerd_font: false,
             nerd_source: NerdSource::NotFound,
+            wide_emoji: false,
         }
     }
 }
@@ -41,6 +46,10 @@ pub struct EnvSnapshot {
     /// `WT_PROFILE_ID`: GUID of the Windows Terminal profile in use.
     pub wt_profile_id: Option<String>,
     pub kitty_window_id: bool,
+    /// `VTE_VERSION`: GNOME Terminal, Tilix, Xfce Terminal and other VTE hosts.
+    pub vte_version: bool,
+    /// `KONSOLE_VERSION`.
+    pub konsole_version: bool,
     pub nerd_font_env: bool,
     pub ira_icons: Option<String>,
     pub is_windows: bool,
@@ -64,6 +73,8 @@ impl EnvSnapshot {
             wt_session: std::env::var("WT_SESSION").is_ok(),
             wt_profile_id: std::env::var("WT_PROFILE_ID").ok(),
             kitty_window_id: std::env::var("KITTY_WINDOW_ID").is_ok(),
+            vte_version: std::env::var("VTE_VERSION").is_ok(),
+            konsole_version: std::env::var("KONSOLE_VERSION").is_ok(),
             nerd_font_env: std::env::var("NERD_FONT").is_ok(),
             ira_icons: std::env::var("IRA_ICONS").ok(),
             is_windows: cfg!(windows),
@@ -121,10 +132,32 @@ pub fn detect_from_env(env: &EnvSnapshot) -> TermCaps {
     let nerd_source = env.probe.clone().unwrap_or_default();
     let nerd_font = env.nerd_font_env || nerd_source.has_nerd_glyphs();
 
+    // Hosts known to render color emoji at two cells: every macOS terminal
+    // (Apple Color Emoji), Windows Terminal (Segoe UI Emoji), and the
+    // mainstream Linux emulators. Not the legacy Windows console, the Linux
+    // console, `dumb`, or hosts we cannot identify.
+    let known_gui_terminal = program.contains("iterm")
+        || program.contains("vscode")
+        || program.contains("wezterm")
+        || program.contains("ghostty")
+        || program.contains("alacritty")
+        || program.contains("warp")
+        || env.kitty_window_id
+        || env.vte_version
+        || env.konsole_version
+        || term.contains("kitty")
+        || term.contains("alacritty")
+        || term.contains("wezterm")
+        || term.contains("ghostty")
+        || term.contains("foot");
+    let wide_emoji = !matches!(term.as_str(), "linux" | "dumb")
+        && (env.wt_session || env.is_macos || known_gui_terminal);
+
     TermCaps {
         truecolor,
         nerd_font,
         nerd_source,
+        wide_emoji,
     }
 }
 
@@ -267,6 +300,49 @@ mod tests {
             ..EnvSnapshot::default()
         };
         assert!(detect_from_env(&kitty).nerd_font);
+    }
+
+    #[test]
+    fn wide_emoji_is_limited_to_known_gui_terminals() {
+        let wt = EnvSnapshot {
+            wt_session: true,
+            is_windows: true,
+            ..EnvSnapshot::default()
+        };
+        assert!(detect_from_env(&wt).wide_emoji);
+
+        let conhost = EnvSnapshot {
+            is_windows: true,
+            ..EnvSnapshot::default()
+        };
+        assert!(!detect_from_env(&conhost).wide_emoji);
+
+        let mac = EnvSnapshot {
+            term_program: Some("Apple_Terminal".into()),
+            is_macos: true,
+            ..EnvSnapshot::default()
+        };
+        assert!(detect_from_env(&mac).wide_emoji);
+
+        let gnome = EnvSnapshot {
+            vte_version: true,
+            term: Some("xterm-256color".into()),
+            ..EnvSnapshot::default()
+        };
+        assert!(detect_from_env(&gnome).wide_emoji);
+
+        let bare_xterm = EnvSnapshot {
+            term: Some("xterm-256color".into()),
+            ..EnvSnapshot::default()
+        };
+        assert!(!detect_from_env(&bare_xterm).wide_emoji);
+
+        let console = EnvSnapshot {
+            term: Some("linux".into()),
+            vte_version: true,
+            ..EnvSnapshot::default()
+        };
+        assert!(!detect_from_env(&console).wide_emoji);
     }
 
     #[test]

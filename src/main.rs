@@ -126,6 +126,7 @@ fn print_terminal_check() {
         "icons: {} ({})",
         match icons {
             ira::theme::icons::IconSet::Nerd => "nerd",
+            ira::theme::icons::IconSet::Emoji => "emoji",
             ira::theme::icons::IconSet::Unicode => "unicode",
         },
         if env.ira_icons.is_some() {
@@ -134,6 +135,8 @@ fn print_terminal_check() {
             "from theme.toml icons"
         } else if caps.nerd_font {
             "auto: a font with Nerd glyphs is available"
+        } else if caps.wide_emoji {
+            "auto: no Nerd font, terminal renders wide color emoji"
         } else {
             "auto: unicode fallback"
         }

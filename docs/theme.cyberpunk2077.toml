@@ -6,4 +6,6 @@
 # ~/.config/ira/state, which takes precedence over this line afterwards.
 # Any per-key color overrides below stay applied on every preset.
 preset = "cyberpunk2077"
+# "nerd" | "emoji" | "unicode"; omit the line to auto-detect from the fonts
+# available to the terminal (Nerd > Emoji > Unicode).
 icons = "nerd"

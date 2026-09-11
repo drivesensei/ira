@@ -1,4 +1,5 @@
-//! File-type icons: Nerd Font glyphs with a single-width Unicode fallback.
+//! File-type icons: Nerd Font glyphs, a color-emoji set for terminals
+//! without a Nerd Font, and a single-width Unicode fallback.
 
 use crate::services::list_files::FEntry;
 
@@ -8,6 +9,12 @@ pub enum IconSet {
     /// Nerd Fonts v3 Private-Use-Area glyphs (plus a trailing pad space
     /// at the call site so wide fallbacks do not shift the name).
     Nerd,
+    /// Color emoji, restricted to codepoints Unicode classes as wide
+    /// (`East_Asian_Width=W`): exactly two cells on every terminal that
+    /// follows the standard, no variation selectors or ZWJ sequences.
+    /// Rendered by the terminal's emoji fallback font (Segoe UI Emoji,
+    /// Apple Color Emoji, Noto Color Emoji), so it needs nothing installed.
+    Emoji,
     /// Built-in single-width geometric Unicode. Safe on every stock
     /// terminal font (DejaVu, Menlo, Consolas, Cascadia).
     Unicode,
@@ -33,20 +40,21 @@ pub enum FileCategory {
     Other,
 }
 
-/// Columns an icon occupies in a list row (Nerd = glyph + pad space).
+/// Columns an icon occupies in a list row (Nerd = glyph + pad space,
+/// Emoji = one wide glyph).
 pub fn icon_cols(set: IconSet) -> usize {
     match set {
-        IconSet::Nerd => 2,
+        IconSet::Nerd | IconSet::Emoji => 2,
         IconSet::Unicode => 1,
     }
 }
 
 /// Pads a Nerd glyph with a trailing space so a double-width fallback
-/// cannot collide with the file name.
+/// cannot collide with the file name. Emoji are already two cells wide.
 pub fn pad_icon(glyph: &str, set: IconSet) -> String {
     match set {
         IconSet::Nerd => format!("{glyph} "),
-        IconSet::Unicode => glyph.to_string(),
+        IconSet::Emoji | IconSet::Unicode => glyph.to_string(),
     }
 }
 
@@ -95,6 +103,7 @@ pub fn kind_label(is_dir: bool, name: &str) -> &'static str {
 pub fn drive_icon(set: IconSet) -> &'static str {
     match set {
         IconSet::Nerd => "\u{f0a0}", // nf-fa-hdd
+        IconSet::Emoji => emoji::DRIVE,
         IconSet::Unicode => "▣",
     }
 }
@@ -103,12 +112,16 @@ pub fn drive_icon(set: IconSet) -> &'static str {
 pub fn bookmark_icon(set: IconSet) -> &'static str {
     match set {
         IconSet::Nerd => "\u{f02e}", // nf-fa-bookmark
+        IconSet::Emoji => emoji::BOOKMARK,
         IconSet::Unicode => "▸",
     }
 }
 
 /// Common-folder glyph keyed by the folder's display label.
 pub fn common_folder_icon(label: &str, set: IconSet) -> &'static str {
+    if set == IconSet::Emoji {
+        return emoji::common_folder(label);
+    }
     match (label, set) {
         ("Home", IconSet::Nerd) => "\u{f015}",
         ("Desktop", IconSet::Nerd) => "\u{f108}",
@@ -125,12 +138,16 @@ pub fn common_folder_icon(label: &str, set: IconSet) -> &'static str {
         ("Videos", IconSet::Unicode) => "▶",
         ("Public", IconSet::Unicode) => "○",
         (_, IconSet::Nerd) => "\u{f07b}",
+        (_, IconSet::Emoji) => emoji::FOLDER, // handled above; keeps the match total
         (_, IconSet::Unicode) => "□",
     }
 }
 
 fn dir_icon(name: &str, set: IconSet) -> &'static str {
     let lower = name.to_ascii_lowercase();
+    if set == IconSet::Emoji {
+        return emoji::dir(&lower);
+    }
     match (lower.as_str(), set) {
         (".git", IconSet::Nerd) => "\u{e702}",
         ("node_modules", IconSet::Nerd) => "\u{e718}",
@@ -143,12 +160,16 @@ fn dir_icon(name: &str, set: IconSet) -> &'static str {
         ("videos" | "movies", IconSet::Nerd) => "\u{f03d}",
         ("pictures" | "photos", IconSet::Nerd) => "\u{f1c5}",
         (_, IconSet::Nerd) => "\u{f07b}",
+        (_, IconSet::Emoji) => emoji::FOLDER, // handled above; keeps the match total
         (_, IconSet::Unicode) => "□",
     }
 }
 
 fn special_file_icon(name: &str, set: IconSet) -> Option<(&'static str, FileCategory)> {
     let lower = name.to_ascii_lowercase();
+    if set == IconSet::Emoji {
+        return emoji::special_file(&lower);
+    }
     let (glyph, cat) = match (lower.as_str(), set) {
         ("cargo.toml" | "cargo.lock", IconSet::Nerd) => ("\u{e7a8}", FileCategory::Code),
         ("cargo.toml" | "cargo.lock", IconSet::Unicode) => ("λ", FileCategory::Code),
@@ -172,6 +193,7 @@ fn special_file_icon(name: &str, set: IconSet) -> Option<(&'static str, FileCate
         ("license" | "licence" | "copying", IconSet::Unicode) => ("≡", FileCategory::Text),
         _ if is_readme(&lower) => match set {
             IconSet::Nerd => ("\u{e73e}", FileCategory::Text),
+            IconSet::Emoji => (emoji::README, FileCategory::Text), // handled above
             IconSet::Unicode => ("≡", FileCategory::Text),
         },
         _ => return None,
@@ -184,8 +206,10 @@ fn is_readme(lower: &str) -> bool {
 }
 
 fn file_icon(cat: FileCategory, name: &str, set: IconSet) -> &'static str {
-    if set == IconSet::Nerd {
-        return nerd_file_icon(cat, name);
+    match set {
+        IconSet::Nerd => return nerd_file_icon(cat, name),
+        IconSet::Emoji => return emoji::file(cat, name),
+        IconSet::Unicode => {}
     }
     match cat {
         FileCategory::Folder => "□",
@@ -238,6 +262,182 @@ fn nerd_file_icon(cat: FileCategory, name: &str) -> &'static str {
         FileCategory::Data => "\u{f1c0}",
         FileCategory::DiskImage => "\u{f0a0}",
         FileCategory::Other => "\u{f15b}",
+    }
+}
+
+/// The emoji set. Every glyph is one scalar with `East_Asian_Width=W`
+/// (asserted by `emoji_glyphs_are_single_scalars_two_cells_wide`), so it
+/// occupies exactly two cells and needs no variation selector. Glyphs in
+/// the ambiguous/neutral class (⚙ 🖼 🗄 🖥 …) are deliberately absent:
+/// terminals disagree on their width.
+mod emoji {
+    use super::{extension, FileCategory};
+
+    pub const FOLDER: &str = "📁"; // U+1F4C1
+    pub const DRIVE: &str = "💾"; // U+1F4BE
+    pub const BOOKMARK: &str = "🔖"; // U+1F516
+    pub const README: &str = "📖"; // U+1F4D6
+
+    const TEXT: &str = "📄"; // U+1F4C4
+    const CODE: &str = "🧩"; // U+1F9E9
+    const CONFIG: &str = "🔧"; // U+1F527
+    const PACKAGE: &str = "📦"; // U+1F4E6
+    const GIT: &str = "🌿"; // U+1F33F
+    const RUST: &str = "🦀"; // U+1F980
+    const GO: &str = "🐹"; // U+1F439
+    const WEB: &str = "🌐"; // U+1F310
+    const MUSIC: &str = "🎵"; // U+1F3B5
+    const VIDEO: &str = "🎬"; // U+1F3AC
+    const PICTURES: &str = "🌄"; // U+1F304
+    const DOCUMENTS: &str = "📚"; // U+1F4DA
+    const DOWNLOADS: &str = "📥"; // U+1F4E5
+
+    pub fn common_folder(label: &str) -> &'static str {
+        match label {
+            "Home" => "🏠",    // U+1F3E0
+            "Desktop" => "💻", // U+1F4BB
+            "Documents" => DOCUMENTS,
+            "Downloads" => DOWNLOADS,
+            "Music" => MUSIC,
+            "Videos" => VIDEO,
+            "Public" => WEB,
+            _ => FOLDER,
+        }
+    }
+
+    pub fn dir(lower: &str) -> &'static str {
+        match lower {
+            ".git" => GIT,
+            "node_modules" => PACKAGE,
+            "src" => CODE,
+            "target" => "🎯", // U+1F3AF
+            "downloads" => DOWNLOADS,
+            "documents" => DOCUMENTS,
+            "desktop" => "💻",
+            "music" => MUSIC,
+            "videos" | "movies" => VIDEO,
+            "pictures" | "photos" => PICTURES,
+            _ => FOLDER,
+        }
+    }
+
+    pub fn special_file(lower: &str) -> Option<(&'static str, FileCategory)> {
+        Some(match lower {
+            "cargo.toml" | "cargo.lock" => (RUST, FileCategory::Code),
+            "dockerfile" | "containerfile" => ("🐳", FileCategory::Code), // U+1F433
+            "makefile" | "gnumakefile" | "cmakelists.txt" => (CONFIG, FileCategory::Code),
+            ".gitignore" | ".gitattributes" | ".gitmodules" => (GIT, FileCategory::Code),
+            "package.json" | "package-lock.json" => (PACKAGE, FileCategory::Code),
+            "go.mod" | "go.sum" => (GO, FileCategory::Code),
+            "license" | "licence" | "copying" => ("📜", FileCategory::Text), // U+1F4DC
+            _ if super::is_readme(lower) => (README, FileCategory::Text),
+            _ => return None,
+        })
+    }
+
+    pub fn file(cat: FileCategory, name: &str) -> &'static str {
+        match extension(name).as_str() {
+            "rs" => return RUST,
+            "py" => return "🐍",                 // U+1F40D
+            "js" | "mjs" | "cjs" => return "🟨", // U+1F7E8
+            "ts" | "tsx" | "jsx" => return "🟦", // U+1F7E6
+            "html" | "htm" => return WEB,
+            "css" | "scss" | "less" => return "🎨", // U+1F3A8
+            "go" => return GO,
+            "java" => return "☕",                           // U+2615 (wide)
+            "rb" => return "💎",                             // U+1F48E
+            "c" | "h" | "cpp" | "hpp" | "cc" => return "🔩", // U+1F529
+            "md" | "markdown" => return "📝",                // U+1F4DD
+            "json" => return "🧾",                           // U+1F9FE
+            "toml" | "yml" | "yaml" => return CONFIG,
+            _ => {}
+        }
+        match cat {
+            FileCategory::Folder => FOLDER,
+            FileCategory::Text => TEXT,
+            FileCategory::Code => CODE,
+            FileCategory::Image => "📷", // U+1F4F7
+            FileCategory::Video => VIDEO,
+            FileCategory::Audio => MUSIC,
+            FileCategory::Archive => PACKAGE,
+            FileCategory::Pdf => "📕",         // U+1F4D5
+            FileCategory::Document => "📘",    // U+1F4D8
+            FileCategory::Spreadsheet => "📊", // U+1F4CA
+            FileCategory::Executable => "🚀",  // U+1F680
+            FileCategory::Data => "📇",        // U+1F4C7
+            FileCategory::DiskImage => "💿",   // U+1F4BF
+            FileCategory::Other => "📃",       // U+1F4C3
+        }
+    }
+
+    /// Every glyph this module can emit (for the width test).
+    #[cfg(test)]
+    pub fn all() -> Vec<&'static str> {
+        let mut v = vec![FOLDER, DRIVE, BOOKMARK, README];
+        for label in [
+            "Home",
+            "Desktop",
+            "Documents",
+            "Downloads",
+            "Music",
+            "Videos",
+            "Public",
+            "x",
+        ] {
+            v.push(common_folder(label));
+        }
+        for d in [
+            ".git",
+            "node_modules",
+            "src",
+            "target",
+            "downloads",
+            "documents",
+            "desktop",
+            "music",
+            "videos",
+            "pictures",
+            "x",
+        ] {
+            v.push(dir(d));
+        }
+        for f in [
+            "cargo.toml",
+            "dockerfile",
+            "makefile",
+            ".gitignore",
+            "package.json",
+            "go.mod",
+            "license",
+            "readme.md",
+        ] {
+            v.push(special_file(f).unwrap().0);
+        }
+        for f in [
+            "a.rs", "a.py", "a.js", "a.ts", "a.html", "a.css", "a.go", "a.java", "a.rb", "a.c",
+            "a.md", "a.json", "a.toml",
+        ] {
+            v.push(file(FileCategory::Other, f));
+        }
+        for cat in [
+            FileCategory::Folder,
+            FileCategory::Text,
+            FileCategory::Code,
+            FileCategory::Image,
+            FileCategory::Video,
+            FileCategory::Audio,
+            FileCategory::Archive,
+            FileCategory::Pdf,
+            FileCategory::Document,
+            FileCategory::Spreadsheet,
+            FileCategory::Executable,
+            FileCategory::Data,
+            FileCategory::DiskImage,
+            FileCategory::Other,
+        ] {
+            v.push(file(cat, "noext"));
+        }
+        v
     }
 }
 
@@ -335,6 +535,43 @@ mod tests {
     }
 
     #[test]
+    fn emoji_glyphs_are_single_scalars_two_cells_wide() {
+        for g in emoji::all() {
+            assert_eq!(
+                g.chars().count(),
+                1,
+                "emoji {g:?} must be one scalar (no VS16 / ZWJ sequences)"
+            );
+            assert_eq!(
+                UnicodeWidthStr::width(g),
+                2,
+                "emoji {g:?} must be East_Asian_Width=W (two cells)"
+            );
+        }
+        assert_eq!(icon_cols(IconSet::Emoji), 2);
+        assert_eq!(pad_icon(emoji::FOLDER, IconSet::Emoji), emoji::FOLDER);
+    }
+
+    #[test]
+    fn emoji_set_distinguishes_languages_like_the_nerd_set() {
+        let rs = icon_for(&entry("main.rs", false), IconSet::Emoji).0;
+        let py = icon_for(&entry("app.py", false), IconSet::Emoji).0;
+        let txt = icon_for(&entry("notes.txt", false), IconSet::Emoji).0;
+        assert_ne!(rs, py);
+        assert_ne!(rs, txt);
+        // Special names win over the extension, as in the other sets.
+        assert_eq!(
+            icon_for(&entry("Cargo.toml", false), IconSet::Emoji).0,
+            rs,
+            "Cargo.toml shares the Rust glyph"
+        );
+        assert_eq!(
+            icon_for(&entry("config.toml", false), IconSet::Emoji).1,
+            FileCategory::Text
+        );
+    }
+
+    #[test]
     fn both_sets_cover_the_same_categories() {
         let samples = [
             ("src", true),
@@ -356,10 +593,13 @@ mod tests {
         ];
         for (name, is_dir) in samples {
             let (n_glyph, n_cat) = icon_for(&entry(name, is_dir), IconSet::Nerd);
+            let (e_glyph, e_cat) = icon_for(&entry(name, is_dir), IconSet::Emoji);
             let (u_glyph, u_cat) = icon_for(&entry(name, is_dir), IconSet::Unicode);
             assert!(!n_glyph.is_empty(), "nerd icon missing for {name}");
+            assert!(!e_glyph.is_empty(), "emoji icon missing for {name}");
             assert!(!u_glyph.is_empty(), "unicode icon missing for {name}");
             assert_eq!(n_cat, u_cat, "categories must agree for {name}");
+            assert_eq!(n_cat, e_cat, "categories must agree for {name}");
         }
     }
 

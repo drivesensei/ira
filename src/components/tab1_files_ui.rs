@@ -735,6 +735,34 @@ mod tests {
     }
 
     #[test]
+    fn emoji_rows_occupy_the_same_cells_as_nerd_rows() {
+        // A two-cell emoji must land the name column exactly where the
+        // Nerd glyph + pad space does, so switching sets never shifts text.
+        use unicode_width::UnicodeWidthStr;
+        let file = FEntry {
+            path: "/x/main.rs".to_string(),
+            label: "main.rs".to_string(),
+            is_dir: false,
+            size: 4096,
+            modified: None,
+        };
+        let name_w = 30usize;
+        let expect = |set: IconSet| {
+            let prefix = 6 + crate::theme::icons::icon_cols(set);
+            name_w + prefix + 2 + super::DETAIL_SIZE_W + 2 + super::DETAIL_AGO_W
+        };
+        for set in [IconSet::Nerd, IconSet::Emoji, IconSet::Unicode] {
+            let text = line_text(&detail_row(false, &file, name_w, None, &theme(), set));
+            assert_eq!(
+                UnicodeWidthStr::width(text.as_str()),
+                expect(set),
+                "{set:?} row must fill its cell budget: {text:?}"
+            );
+        }
+        assert_eq!(expect(IconSet::Nerd), expect(IconSet::Emoji));
+    }
+
+    #[test]
     fn details_rows_fit_the_pane_width_budget() {
         // The clipped "1403 days ag" bug: the span must fit the per-row
         // budget — highlight symbol (1) + borders (2) + this span = width.
