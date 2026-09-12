@@ -113,7 +113,9 @@ unsaved changes are discarded on `Esc`/`Tab` (a `*` in the border marks them).
 list with a thumbnail grid — image thumbnails, glyphs for folders and unsupported formats, the
 cursor highlighted, filtered (`/`) views included. Select an image (PNG, JPEG, GIF, BMP, WebP)
 and ira renders it with full graphics in terminals that support the kitty, iTerm2, or Sixel
-protocols, Unicode half-blocks everywhere else. Decoding happens on a bounded background worker
+protocols (Windows Terminal ≥ 1.22 is assumed Sixel when the probe is silent;
+`IRA_IMAGES` overrides). Protocol-less hosts such as Terminal.app get 2×2 Unicode
+quadrant blocks instead of half-blocks. Decoding happens on a bounded background worker
 pool and is cached in memory and on disk, so scrolling through a folder of photos stays instant
 and the UI never blocks.
 

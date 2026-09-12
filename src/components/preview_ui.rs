@@ -155,8 +155,8 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect, pane_index: usize) {
 
     match app.preview_request_for(pane_index) {
         Some(req) => {
-            if let Some(protocol) = app.preview_protocol(&req) {
-                frame.render_widget(ratatui_image::Image::new(protocol), inner);
+            if let Some(rendered) = app.preview_image(&req) {
+                rendered.render(inner, frame.buffer_mut());
             } else {
                 // First sight dispatched a background job; the thumbnail
                 // appears on a later frame. Never block the render thread.

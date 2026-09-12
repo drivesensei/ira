@@ -391,8 +391,8 @@ fn modified_ago(modified: Option<i64>) -> String {
 /// 9pt) a cell is a 140×136 px thumbnail, which keeps real photographs
 /// recognizable. The previous 14×4 cell produced 98×68 px images — simple
 /// shapes survived, but photos degraded to unrecognizable mush (and on
-/// half-block-only terminals like Terminal.app, 2 px per cell turns even
-/// the larger cell into just 20×16 px).
+/// quadrant-block terminals like Terminal.app, 4 px per cell turns even
+/// the larger cell into just 40×16 px).
 const GRID_CELL_W: u16 = 20;
 const GRID_IMG_H: u16 = 8;
 const GRID_NAME_H: u16 = 1;
@@ -492,8 +492,8 @@ fn render_grid(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, acti
                 cols: GRID_CELL_W,
                 rows: GRID_IMG_H,
             };
-            match app.preview_protocol(&req) {
-                Some(protocol) => f.render_widget(ratatui_image::Image::new(protocol), img_area),
+            match app.preview_image(&req) {
+                Some(rendered) => rendered.render(img_area, f.buffer_mut()),
                 None => f.render_widget(Paragraph::new(Span::raw(" …").style(dim)), img_area),
             }
         } else {

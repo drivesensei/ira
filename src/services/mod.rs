@@ -1,9 +1,11 @@
+pub mod blocks;
 pub mod bookmarks;
 pub mod clipboard;
 pub mod drives;
 pub mod file_info;
 pub mod folders;
 pub mod list_files;
+pub mod picker_probe;
 pub mod state;
 pub mod thumbnails;
 pub mod transfer;

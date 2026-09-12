@@ -4,7 +4,7 @@
 //! [`spawn_workers`]) consumes queued [`ThumbRequest`]s and delivers
 //! [`ThumbEvent`]s over a channel, picked up on the next tick, mirroring the
 //! pane-listing and drive-poller patterns. The UI thread only ever renders a
-//! finished [`ratatui_image::protocol::Protocol`].
+//! finished [`Rendered`] (a graphics protocol or our quadrant blocks).
 
 use std::fs;
 use std::io::BufReader;
@@ -15,10 +15,14 @@ use std::time::Duration;
 
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageReader};
-use ratatui::layout::Size;
-use ratatui_image::picker::Picker;
+use ratatui::buffer::Buffer;
+use ratatui::layout::{Rect, Size};
+use ratatui::widgets::Widget;
+use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::Protocol;
 use ratatui_image::Resize;
+
+use super::blocks::BlockImage;
 
 /// Decode budget per image. Caps decompression-bomb allocation (the limit
 /// applies to the decoded buffer): anything bigger fails cleanly and shows
@@ -382,8 +386,14 @@ pub struct WorkerQueues {
 /// Runs the decode worker pool: `n ≤ MAX_DECODE_THREADS` threads consuming
 /// the shared job queues until they close, delivering results on `tx`.
 /// Workers own a `Picker` clone once, so protocol re-encoding per job is the
-/// only per-request setup.
-pub fn spawn_workers(picker: Picker, queues: WorkerQueues, tx: Sender<ThumbEvent>) {
+/// only per-request setup. `truecolor` selects 24-bit vs xterm-256 colors
+/// for the quadrant-block fallback.
+pub fn spawn_workers(
+    picker: Picker,
+    truecolor: bool,
+    queues: WorkerQueues,
+    tx: Sender<ThumbEvent>,
+) {
     let n = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2)
@@ -437,9 +447,9 @@ pub fn spawn_workers(picker: Picker, queues: WorkerQueues, tx: Sender<ThumbEvent
                 _ => {
                     match load_thumbnail(&req.path, req.mtime, req.size)
                         .ok()
-                        .and_then(|img| build_protocol(&picker, img, req.cols, req.rows).ok())
+                        .map(|img| build_rendered(&picker, truecolor, img, req.cols, req.rows))
                     {
-                        Some(protocol) => ThumbEvent::Ready(req.clone(), protocol),
+                        Some(rendered) => ThumbEvent::Ready(req.clone(), rendered),
                         None => ThumbEvent::Failed(req.clone()),
                     }
                 }
@@ -500,10 +510,28 @@ impl ThumbRequest {
     }
 }
 
+/// A finished preview, either a terminal graphics protocol or our
+/// quadrant-block fallback (used wherever the picker is Halfblocks).
+pub enum Rendered {
+    Protocol(Protocol),
+    Blocks(BlockImage),
+}
+
+impl Rendered {
+    pub fn render(&self, area: Rect, buf: &mut Buffer) {
+        match self {
+            Self::Protocol(protocol) => {
+                ratatui_image::Image::new(protocol).render(area, buf);
+            }
+            Self::Blocks(blocks) => blocks.render(area, buf),
+        }
+    }
+}
+
 /// Result of a background thumbnail job.
 pub enum ThumbEvent {
-    /// Ready to render; the protocol is terminal-agnostic until drawn.
-    Ready(ThumbRequest, Protocol),
+    /// Ready to render; encoding is terminal-agnostic until drawn.
+    Ready(ThumbRequest, Rendered),
     /// Undecodable/unreadable file — the UI shows a placeholder.
     Failed(ThumbRequest),
     /// Head of a text file (`read_text_preview`), rendered natively as cells.
@@ -515,17 +543,25 @@ pub enum ThumbEvent {
     },
 }
 
-/// Builds the terminal-protocol representation for a preview area of
-/// `cols × rows` cells. This is the expensive encoding step (PNG re-encode
-/// for iTerm2, escape-sequence payload for kitty) and must stay off the UI
-/// thread.
-pub fn build_protocol(
+/// Builds the drawable representation for a preview area of `cols × rows`
+/// cells. Graphics protocols stay on the crate path; Halfblocks is replaced
+/// by our 2×2 quadrant renderer. Encoding stays off the UI thread.
+pub fn build_rendered(
     picker: &Picker,
+    truecolor: bool,
     img: DynamicImage,
     cols: u16,
     rows: u16,
-) -> Result<Protocol, ratatui_image::errors::Errors> {
-    picker.new_protocol(img, Size::new(cols, rows), Resize::Fit(None))
+) -> Rendered {
+    if matches!(picker.protocol_type(), ProtocolType::Halfblocks) {
+        return Rendered::Blocks(BlockImage::from_image(&img, cols, rows, truecolor));
+    }
+    match picker.new_protocol(img.clone(), Size::new(cols, rows), Resize::Fit(None)) {
+        Ok(protocol) => Rendered::Protocol(protocol),
+        // A protocol encode failure still has pixels; show them as blocks
+        // rather than a failed placeholder.
+        Err(_) => Rendered::Blocks(BlockImage::from_image(&img, cols, rows, truecolor)),
+    }
 }
 
 #[cfg(test)]
@@ -731,20 +767,21 @@ mod tests {
         assert!(load_thumbnail(path.to_str().unwrap(), Some(1), 19).is_err());
     }
     #[test]
-    fn builds_halfblocks_protocol_for_area() {
+    fn builds_blocks_rendered_for_halfblocks_picker() {
         let picker = Picker::halfblocks();
         assert!(matches!(
             picker.protocol_type(),
             ratatui_image::picker::ProtocolType::Halfblocks
         ));
         let img = DynamicImage::ImageRgb8(image::RgbImage::new(100, 100));
-        let protocol = build_protocol(&picker, img, 10, 5).unwrap();
-        // End-to-end: the protocol must render into a 12×7 grid without
-        // panicking (halfblocks draws as plain cells).
+        let rendered = build_rendered(&picker, true, img, 10, 5);
+        assert!(matches!(rendered, Rendered::Blocks(_)));
+        // End-to-end: the quadrant renderer must fill a 12×7 grid without
+        // panicking (plain cells, no graphics protocol).
         let backend = ratatui::backend::TestBackend::new(12, 7);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| f.render_widget(ratatui_image::Image::new(&protocol), f.area()))
+            .draw(|f| rendered.render(f.area(), f.buffer_mut()))
             .unwrap();
     }
 }

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use open::that_detached;
 use ratatui::widgets::ListState;
-use ratatui_image::{picker::Picker, protocol::Protocol};
+use ratatui_image::picker::Picker;
 
 use crate::{
     domain::data::Folder,
@@ -25,8 +25,8 @@ use crate::{
         list_files::{list_files_bounded, list_files_chunked, FEntry, LISTING_CHUNK},
         state::{load_state, load_state_from, save_state, save_state_to, SessionState, SizeEntry},
         thumbnails::{
-            preview_kind, prune_cache, spawn_workers, PreviewKind, ThumbEvent, ThumbRequest,
-            WorkerQueues, JOB_QUEUE_HI_CAP, JOB_QUEUE_LO_CAP,
+            preview_kind, prune_cache, spawn_workers, PreviewKind, Rendered, ThumbEvent,
+            ThumbRequest, WorkerQueues, JOB_QUEUE_HI_CAP, JOB_QUEUE_LO_CAP,
         },
         transfer::{
             spawn_delete_job, spawn_job, Job, JobControl, JobEvent, JobKind, JobStatus,
@@ -396,8 +396,8 @@ pub struct App {
     /// Prefetch queue: screens adjacent to the viewport.
     thumb_jobs_lo: mpsc::SyncSender<ThumbRequest>,
     thumb_jobs_lo_rx: Option<mpsc::Receiver<ThumbRequest>>,
-    /// Rendered protocols keyed by [`ThumbRequest::mem_key`].
-    thumb_cache: HashMap<String, Protocol>,
+    /// Rendered previews keyed by [`ThumbRequest::mem_key`].
+    thumb_cache: HashMap<String, Rendered>,
     /// Effective eviction cap for `thumb_cache` this frame: at least
     /// [`THUMB_CACHE_CAP_MIN`], raised by the grid renderer to cover its
     /// working set. Reset every frame by `ui::render`.
@@ -985,8 +985,9 @@ impl App {
 
     /// Installs the terminal image picker probed at startup (before raw
     /// mode); see `main`. Also starts the bounded decode worker pool and a
-    /// one-shot disk-cache prune.
-    pub fn set_picker(&mut self, picker: Picker) {
+    /// one-shot disk-cache prune. `truecolor` is forwarded to the quadrant
+    /// fallback so Terminal.app gets xterm-256 instead of 24-bit SGR.
+    pub fn set_picker(&mut self, picker: Picker, truecolor: bool) {
         self.picker = Some(picker.clone());
         if self.thumb_workers_started {
             return;
@@ -1002,6 +1003,7 @@ impl App {
             .expect("thumb workers started twice");
         spawn_workers(
             picker,
+            truecolor,
             WorkerQueues {
                 hi: Arc::new(Mutex::new(hi)),
                 lo: Arc::new(Mutex::new(lo)),
@@ -1361,7 +1363,7 @@ impl App {
                 cols,
                 rows,
             };
-            let _ = self.preview_protocol(&req);
+            let _ = self.preview_image(&req);
         }
     }
 
@@ -1378,7 +1380,7 @@ impl App {
         }
         let sel = sel.unwrap_or(0);
         // Materialize the prefetch candidates (owned) before dispatching:
-        // `preview_protocol` takes `&mut self`.
+        // `preview_image` takes `&mut self`.
         let candidates: Vec<FEntry> = {
             let vis = self.pane_visible_rows(pane_index);
             let start = sel.saturating_sub(2);
@@ -1492,16 +1494,16 @@ impl App {
         })
     }
 
-    /// Returns the rendered protocol for `req`, dispatching a background
+    /// Returns the rendered preview for `req`, dispatching a background
     /// decode+encode job on first sight. `None` means still loading — the
     /// UI shows a placeholder until a later frame. Draining the result
     /// channel here (not only on ticks) makes a finished thumbnail appear
     /// on the next redraw instead of up to a tick later.
-    pub fn preview_protocol(&mut self, req: &ThumbRequest) -> Option<&Protocol> {
+    pub fn preview_image(&mut self, req: &ThumbRequest) -> Option<&Rendered> {
         self.pick_up_thumbnails();
         let key = req.mem_key();
-        if let Some(protocol) = self.thumb_cache.get(&key) {
-            return Some(protocol);
+        if let Some(rendered) = self.thumb_cache.get(&key) {
+            return Some(rendered);
         }
         if self.picker.is_none()
             || self.thumb_failed.contains(&key)
@@ -1524,9 +1526,9 @@ impl App {
     fn pick_up_thumbnails(&mut self) {
         while let Ok(event) = self.thumb_rx.try_recv() {
             match event {
-                ThumbEvent::Ready(req, protocol) => {
+                ThumbEvent::Ready(req, rendered) => {
                     self.thumb_pending.remove(&req.mem_key());
-                    self.insert_thumb(req.mem_key(), protocol);
+                    self.insert_thumb(req.mem_key(), rendered);
                 }
                 ThumbEvent::Failed(req) => {
                     self.thumb_pending.remove(&req.mem_key());
@@ -1552,18 +1554,18 @@ impl App {
             }
         }
     }
-    /// Inserts a finished protocol with FIFO eviction. Protocols are heavy
+    /// Inserts a finished preview with FIFO eviction. Protocols are heavy
     /// (kitty payloads are full escape sequences), so the cache is bounded;
     /// the currently displayed entry survives eviction to avoid a visible
     /// re-decode flicker.
-    fn insert_thumb(&mut self, key: String, protocol: Protocol) {
+    fn insert_thumb(&mut self, key: String, rendered: Rendered) {
         while self.thumb_order.len() >= self.thumb_cache_cap {
             let Some(oldest) = self.thumb_order.pop_front() else {
                 break;
             };
             self.thumb_cache.remove(&oldest);
         }
-        self.thumb_cache.insert(key.clone(), protocol);
+        self.thumb_cache.insert(key.clone(), rendered);
         self.thumb_order.push_back(key);
     }
 
@@ -4131,7 +4133,7 @@ mod preview_tests {
 
     fn app_with_selection(path: &str) -> App {
         let mut app = App::default();
-        app.set_picker(ratatui_image::picker::Picker::halfblocks());
+        app.set_picker(ratatui_image::picker::Picker::halfblocks(), true);
         app.panes[0].preview_mode = PreviewMode::Column;
         app.panes[0].preview_area = (38, 10);
         app.panes[0].files = vec![FEntry {
@@ -4169,7 +4171,7 @@ mod preview_tests {
         // re-decoded every frame.
         let paths: Vec<String> = (0..12).map(|i| png_at(&format!("cap{i}.png"))).collect();
         let mut app = App::default();
-        app.set_picker(ratatui_image::picker::Picker::halfblocks());
+        app.set_picker(ratatui_image::picker::Picker::halfblocks(), true);
         app.panes[0].preview_mode = PreviewMode::Grid;
         app.panes[0].folder = Some(Folder::new(
             "cap".into(),
@@ -4207,9 +4209,9 @@ mod preview_tests {
     fn failed_thumbnails_stay_blacklisted_for_the_session() {
         let mut app = app_with_selection("/nonexistent/missing.png");
         let req = app.preview_request().unwrap();
-        assert!(app.preview_protocol(&req).is_none());
+        assert!(app.preview_image(&req).is_none());
         for _ in 0..500 {
-            let _ = app.preview_protocol(&req);
+            let _ = app.preview_image(&req);
             if app.thumb_failed.contains(&req.mem_key()) {
                 break;
             }
@@ -4221,7 +4223,7 @@ mod preview_tests {
         );
         // No cooldown retry: the broken file must never re-dispatch.
         for _ in 0..20 {
-            let _ = app.preview_protocol(&req);
+            let _ = app.preview_image(&req);
         }
         assert!(
             !app.thumb_pending.contains(&req.mem_key()),
@@ -4283,7 +4285,7 @@ mod preview_tests {
         let png_a = png_at("filter_a.png");
         let png_b = png_at("filter_b.png");
         let mut app = App::default();
-        app.set_picker(ratatui_image::picker::Picker::halfblocks());
+        app.set_picker(ratatui_image::picker::Picker::halfblocks(), true);
         app.panes[0].preview_mode = PreviewMode::Column;
         app.panes[0].preview_area = (38, 10);
         app.panes[0].files = vec![
@@ -4330,16 +4332,16 @@ mod preview_tests {
     }
 
     #[test]
-    fn preview_protocol_dispatches_and_becomes_ready() {
+    fn preview_image_dispatches_and_becomes_ready() {
         let png = png_at("roundtrip.png");
         let mut app = app_with_selection(&png);
         let req = app.preview_request().unwrap();
 
         // First call dispatches a worker; "loading" until it finishes.
-        assert!(app.preview_protocol(&req).is_none());
+        assert!(app.preview_image(&req).is_none());
         let mut ready = false;
         for _ in 0..500 {
-            if app.preview_protocol(&req).is_some() {
+            if app.preview_image(&req).is_some() {
                 ready = true;
                 break;
             }
@@ -4352,12 +4354,12 @@ mod preview_tests {
     fn failed_decode_does_not_stick_pending() {
         let mut app = app_with_selection("/nonexistent/missing.png");
         let req = app.preview_request().unwrap();
-        assert!(app.preview_protocol(&req).is_none());
-        // preview_protocol drains finished jobs; failure must clear pending
+        assert!(app.preview_image(&req).is_none());
+        // preview_image drains finished jobs; failure must clear pending
         // and keep reporting "loading" (None) without re-dispatching.
         let mut settled = false;
         for _ in 0..500 {
-            let _ = app.preview_protocol(&req);
+            let _ = app.preview_image(&req);
             if app.thumb_pending.is_empty() {
                 settled = true;
                 break;
@@ -4365,13 +4367,13 @@ mod preview_tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(settled, "failed job stayed pending");
-        assert!(app.preview_protocol(&req).is_none());
+        assert!(app.preview_image(&req).is_none());
     }
 
     #[test]
     fn queued_requests_all_resolve_through_the_pool() {
         let mut app = App::default();
-        app.set_picker(ratatui_image::picker::Picker::halfblocks());
+        app.set_picker(ratatui_image::picker::Picker::halfblocks(), true);
         let reqs: Vec<ThumbRequest> = (0..6)
             .map(|i| ThumbRequest {
                 path: png_at(&format!("pool{i}.png")),
@@ -4382,13 +4384,13 @@ mod preview_tests {
             })
             .collect();
         for req in &reqs {
-            let _ = app.preview_protocol(req);
+            let _ = app.preview_image(req);
         }
         // The pool drains the queue even though only ≤4 workers exist.
         let mut done = 0;
         for _ in 0..1000 {
             for r in &reqs {
-                let _ = app.preview_protocol(r);
+                let _ = app.preview_image(r);
             }
             done = reqs
                 .iter()
@@ -4411,7 +4413,7 @@ mod preview_tests {
         fs::write(&path, "first line\nsecond line\n").unwrap();
 
         let mut app = App::default();
-        app.set_picker(ratatui_image::picker::Picker::halfblocks());
+        app.set_picker(ratatui_image::picker::Picker::halfblocks(), true);
         app.panes[0].preview_mode = PreviewMode::Column;
         app.panes[0].preview_area = (38, 10);
         app.panes[0].files = vec![FEntry {
@@ -4448,7 +4450,7 @@ mod preview_tests {
         fs::write(&path, "hello\n").unwrap();
 
         let mut app = App::default();
-        app.set_picker(ratatui_image::picker::Picker::halfblocks());
+        app.set_picker(ratatui_image::picker::Picker::halfblocks(), true);
         app.panes[0].preview_mode = PreviewMode::Column;
         app.panes[0].preview_area = (38, 10);
         app.panes[0].files = vec![FEntry {
@@ -4511,7 +4513,7 @@ mod preview_tests {
         fs::write(&path, "line\n").unwrap();
 
         let mut app = App::default();
-        app.set_picker(ratatui_image::picker::Picker::halfblocks());
+        app.set_picker(ratatui_image::picker::Picker::halfblocks(), true);
         app.panes[0].preview_mode = PreviewMode::Column;
         app.panes[0].preview_area = (38, 10);
         app.panes[0].files = vec![FEntry {
@@ -4571,7 +4573,7 @@ mod preview_tests {
         fs::set_permissions(&path, perms.clone()).unwrap();
 
         let mut app = App::default();
-        app.set_picker(ratatui_image::picker::Picker::halfblocks());
+        app.set_picker(ratatui_image::picker::Picker::halfblocks(), true);
         app.panes[0].preview_mode = PreviewMode::Column;
         app.panes[0].preview_area = (38, 10);
         app.panes[0].files = vec![FEntry {
@@ -4601,7 +4603,7 @@ mod preview_tests {
         let dir = std::env::temp_dir().join("ira_preview_tests");
         let png = png_at("nofocus.png");
         let mut app = App::default();
-        app.set_picker(ratatui_image::picker::Picker::halfblocks());
+        app.set_picker(ratatui_image::picker::Picker::halfblocks(), true);
         app.panes[0].preview_mode = PreviewMode::Column;
         app.panes[0].preview_area = (38, 10);
         app.panes[0].files = vec![FEntry {
@@ -4628,7 +4630,7 @@ mod preview_tests {
         fs::write(&path, "keep\n").unwrap();
 
         let mut app = App::default();
-        app.set_picker(ratatui_image::picker::Picker::halfblocks());
+        app.set_picker(ratatui_image::picker::Picker::halfblocks(), true);
         app.panes[0].preview_mode = PreviewMode::Column;
         app.panes[0].preview_area = (38, 10);
         app.panes[0].files = vec![FEntry {
@@ -4668,7 +4670,7 @@ mod preview_tests {
         fs::write(&path, "mine\n").unwrap();
 
         let mut app = App::default();
-        app.set_picker(ratatui_image::picker::Picker::halfblocks());
+        app.set_picker(ratatui_image::picker::Picker::halfblocks(), true);
         app.panes[0].preview_mode = PreviewMode::Column;
         app.panes[0].preview_area = (38, 10);
         app.panes[0].files = vec![FEntry {
@@ -4703,7 +4705,7 @@ mod preview_tests {
         fs::write(&path, "start\n").unwrap();
 
         let mut app = App::default();
-        app.set_picker(ratatui_image::picker::Picker::halfblocks());
+        app.set_picker(ratatui_image::picker::Picker::halfblocks(), true);
         app.panes[0].preview_mode = PreviewMode::Column;
         app.panes[0].preview_area = (38, 10);
         app.panes[0].files = vec![FEntry {
@@ -4734,7 +4736,7 @@ mod preview_tests {
         fs::write(&path, "buf\n").unwrap();
 
         let mut app = App::default();
-        app.set_picker(ratatui_image::picker::Picker::halfblocks());
+        app.set_picker(ratatui_image::picker::Picker::halfblocks(), true);
         app.panes[0].preview_mode = PreviewMode::Column;
         app.panes[0].preview_area = (38, 10);
         app.panes[0].files = vec![FEntry {
@@ -4774,7 +4776,7 @@ mod preview_tests {
         fs::write(&path, "a\r\nb\r\n").unwrap();
 
         let mut app = App::default();
-        app.set_picker(ratatui_image::picker::Picker::halfblocks());
+        app.set_picker(ratatui_image::picker::Picker::halfblocks(), true);
         app.panes[0].preview_mode = PreviewMode::Column;
         app.panes[0].preview_area = (38, 10);
         app.panes[0].files = vec![FEntry {
@@ -4812,7 +4814,7 @@ mod preview_tests {
         symlink(&target, &link).unwrap();
 
         let mut app = App::default();
-        app.set_picker(ratatui_image::picker::Picker::halfblocks());
+        app.set_picker(ratatui_image::picker::Picker::halfblocks(), true);
         app.panes[0].preview_mode = PreviewMode::Column;
         app.panes[0].preview_area = (38, 10);
         app.panes[0].files = vec![FEntry {
@@ -4879,7 +4881,7 @@ mod preview_tests {
     fn grid_mode_dispatches_visible_cells() {
         let paths: Vec<String> = (0..12).map(|i| png_at(&format!("grid{i}.png"))).collect();
         let mut app = App::default();
-        app.set_picker(ratatui_image::picker::Picker::halfblocks());
+        app.set_picker(ratatui_image::picker::Picker::halfblocks(), true);
         app.panes[0].preview_mode = PreviewMode::Grid;
         app.panes[0].folder = Some(Folder::new(
             "grid".into(),

@@ -1,10 +1,11 @@
 use ira::app::{App, AppResult};
 use ira::event::{Event, EventHandler};
 use ira::handler::handle_key_events;
+use ira::services::picker_probe;
 use ira::tui::Tui;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use ratatui_image::picker::{cap_parser::QueryStdioOptions, Picker, ProtocolType};
+use ratatui_image::picker::ProtocolType;
 use std::io;
 
 fn main() -> AppResult<()> {
@@ -25,29 +26,14 @@ fn main() -> AppResult<()> {
     // Probe the terminal for image-protocol support and font size BEFORE raw
     // mode and the alternate screen: the probe runs blocking stdin queries
     // that would otherwise race crossterm's event reader (same class of stall
-    // as the `terminal.clear()` note in `Tui::init`). Halfblocks renders in
-    // every terminal and is the universal fallback.
-    //
-    // iTerm2 3.5+ answers the kitty graphics-protocol query, but its kitty
-    // implementation does not render kitty's unicode placeholders (U+10EEEE):
-    // every preview cell shows up as "?" instead of pixels. Blacklisting
-    // kitty here makes the query fall through to the iTerm2 protocol, which
-    // iTerm2 renders correctly (same measure the crate itself applies to
-    // WezTerm and Konsole).
-    let in_iterm2 = std::env::var("TERM_PROGRAM").is_ok_and(|t| t.contains("iTerm"))
-        || std::env::var("LC_TERMINAL").is_ok_and(|t| t.contains("iTerm"));
-    let mut options = QueryStdioOptions::default();
-    if in_iterm2 {
-        options.blacklist_protocols.push(ProtocolType::Kitty);
-    }
-    let picker = match Picker::from_query_stdio_with_options(options) {
-        Ok(picker) => picker,
-        Err(_) => Picker::halfblocks(),
-    };
+    // as the `terminal.clear()` note in `Tui::init`). Quadrant blocks render
+    // in every terminal and are the universal fallback.
+    let probed = picker_probe::probe();
 
     // Create the application and install the probed picker.
     let mut app = App::new();
-    app.set_picker(picker);
+    let truecolor = ira::theme::caps().truecolor;
+    app.set_picker(probed.picker, truecolor);
 
     // Initialize the terminal user interface.
     let backend = CrosstermBackend::new(io::stderr());
@@ -103,16 +89,8 @@ fn print_terminal_check() {
     let loaded = ira::theme::load_with_persisted(persisted.theme.as_deref());
     let caps = loaded.loader.caps();
     let icons = loaded.icons;
-    let in_iterm2 = std::env::var("TERM_PROGRAM").is_ok_and(|t| t.contains("iTerm"))
-        || std::env::var("LC_TERMINAL").is_ok_and(|t| t.contains("iTerm"));
-    let mut options = QueryStdioOptions::default();
-    if in_iterm2 {
-        options.blacklist_protocols.push(ProtocolType::Kitty);
-    }
-    let protocol = match Picker::from_query_stdio_with_options(options) {
-        Ok(picker) => format!("{:?}", picker.protocol_type()),
-        Err(_) => "Halfblocks (fallback)".to_string(),
-    };
+    let probed = picker_probe::probe();
+    let fs = probed.picker.font_size();
     println!("ira {}", env!("CARGO_PKG_VERSION"));
     println!(
         "truecolor: {}",
@@ -167,7 +145,12 @@ fn print_terminal_check() {
             ira::theme::PresetSource::Default => "default",
         }
     );
-    println!("image protocol: {protocol}");
+    println!(
+        "image protocol: {} ({})",
+        probed.protocol_name(),
+        probed.source_reason()
+    );
+    println!("cell size: {}x{} px", fs.width, fs.height);
     if let Some(path) = ira::theme::theme_file_path() {
         println!(
             "theme file: {} ({})",
