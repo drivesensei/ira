@@ -26,6 +26,9 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
                 pad_icon(common_folder_icon(&folder.label, icons), icons),
                 Style::default().fg(theme.dir),
             ));
+            // Same icon/name gap as the file list; pad_icon alone only adds
+            // one for the Nerd set.
+            folder_spans.push(Span::raw(" "));
             folder_spans.push(Span::styled(
                 folder.label.clone(),
                 Style::default().fg(theme.text),

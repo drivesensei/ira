@@ -26,6 +26,9 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
                 pad_icon(drive_icon(icons), icons),
                 Style::default().fg(theme.dir),
             ));
+            // Same icon/name gap as the file list; pad_icon alone only adds
+            // one for the Nerd set.
+            drive_spans.push(Span::raw(" "));
             drive_spans.push(Span::styled(
                 drive.label.clone(),
                 Style::default().fg(theme.text),
