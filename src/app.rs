@@ -463,6 +463,11 @@ pub enum OverlayJob {
     },
 }
 
+enum OverlayJobKind {
+    Column,
+    Grid,
+}
+
 impl Default for App {
     fn default() -> Self {
         let (job_tx, job_rx) = mpsc::channel();
@@ -1376,7 +1381,7 @@ impl App {
             self.overlay.hide();
             return;
         }
-        let Some(window) = self.overlay.front_window_cached((cols, rows)) else {
+        let Some(window) = overlay::front_window() else {
             self.overlay.hide();
             return;
         };
@@ -1387,29 +1392,25 @@ impl App {
         match job {
             OverlayJob::Column { area, req } => {
                 let key = req.mem_key();
-                let Some(_) = self.thumb_cache.get(&key).and_then(Rendered::pixels) else {
-                    self.overlay.hide();
-                    return;
-                };
-                let fp = overlay::placement_hash(
-                    window,
-                    cell,
-                    (cols, rows),
-                    *area,
-                    &[(*area, key.as_str())],
-                );
-                if self.overlay.is_current(fp) {
-                    return;
-                }
-                let img = self
+                let tiles = [(*area, key.as_str())];
+                if self
                     .thumb_cache
                     .get(&key)
                     .and_then(Rendered::pixels)
-                    .expect("pixels still present");
-                let screen = overlay::preview_screen_rect(window, origin, cell, *area);
-                let fitted = overlay::fit_pixels(img, screen.width, screen.height);
-                self.overlay.show(&fitted, screen);
-                self.overlay.mark_current(fp);
+                    .is_none()
+                {
+                    self.overlay.hide();
+                    return;
+                }
+                self.present_overlay_image(
+                    window,
+                    origin,
+                    cell,
+                    (cols, rows),
+                    *area,
+                    &tiles,
+                    OverlayJobKind::Column,
+                );
             }
             OverlayJob::Grid { area, tiles } => {
                 let ready_meta: Vec<(ratatui::layout::Rect, String)> = tiles
@@ -1430,30 +1431,69 @@ impl App {
                     .iter()
                     .map(|(tile, key)| (*tile, key.as_str()))
                     .collect();
-                let fp = overlay::placement_hash(window, cell, (cols, rows), *area, &ready_refs);
-                if self.overlay.is_current(fp) {
+                self.present_overlay_image(
+                    window,
+                    origin,
+                    cell,
+                    (cols, rows),
+                    *area,
+                    &ready_refs,
+                    OverlayJobKind::Grid,
+                );
+            }
+        }
+    }
+
+    fn present_overlay_image(
+        &mut self,
+        window: overlay::WindowGeom,
+        origin: (u32, u32),
+        cell: overlay::CellPx,
+        term: (u16, u16),
+        area: ratatui::layout::Rect,
+        tiles: &[(ratatui::layout::Rect, &str)],
+        kind: OverlayJobKind,
+    ) {
+        let content_fp = overlay::content_hash(cell, term, area, tiles);
+        let place_fp = overlay::placement_hash(window, cell, term, area, tiles);
+        let screen = overlay::preview_screen_rect(window, origin, cell, area);
+        if self.overlay.is_current(place_fp) {
+            return;
+        }
+        if self.overlay.same_content(content_fp) {
+            self.overlay.move_to(screen);
+            self.overlay.mark_current(place_fp, content_fp);
+            return;
+        }
+        match kind {
+            OverlayJobKind::Column => {
+                let Some(img) = self.thumb_cache.get(tiles[0].1).and_then(Rendered::pixels) else {
+                    self.overlay.hide();
                     return;
-                }
-                let refs: Vec<(ratatui::layout::Rect, &DynamicImage)> = ready_meta
+                };
+                let fitted = overlay::fit_pixels(img, screen.width, screen.height);
+                self.overlay.show(&fitted, screen);
+            }
+            OverlayJobKind::Grid => {
+                let refs: Vec<(ratatui::layout::Rect, &DynamicImage)> = tiles
                     .iter()
                     .filter_map(|(tile, key)| {
                         self.thumb_cache
-                            .get(key)
+                            .get(*key)
                             .and_then(Rendered::pixels)
                             .map(|img| (*tile, img))
                     })
                     .collect();
                 let Some(composed) =
-                    overlay::composite_grid(*area, cell, &refs, overlay::GRID_FILL_PERCENT)
+                    overlay::composite_grid(area, cell, &refs, overlay::GRID_FILL_PERCENT)
                 else {
                     self.overlay.hide();
                     return;
                 };
-                let screen = overlay::preview_screen_rect(window, origin, cell, *area);
                 self.overlay.show(&composed, screen);
-                self.overlay.mark_current(fp);
             }
         }
+        self.overlay.mark_current(place_fp, content_fp);
     }
 
     pub fn close_overlay(&mut self) {
@@ -1578,6 +1618,9 @@ impl App {
             PreviewMode::Details => PreviewMode::Off,
         };
         self.pane_mut().preview_mode = next;
+        if !matches!(next, PreviewMode::Column | PreviewMode::Grid) {
+            self.overlay.hide();
+        }
         let label = match next {
             PreviewMode::Off => "off",
             PreviewMode::Column => "column",

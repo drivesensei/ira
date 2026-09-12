@@ -48,15 +48,15 @@ impl MacOverlay {
                 false,
             );
             panel.setFloatingPanel(true);
-            panel.setHidesOnDeactivate(false);
+            panel.setHidesOnDeactivate(true);
             panel.setOpaque(false);
             panel.setBackgroundColor(Some(&NSColor::clearColor()));
             panel.setIgnoresMouseEvents(true);
             panel.setHasShadow(false);
+            // Above Terminal only while it is front; we hide when it is not.
             panel.setLevel(NSFloatingWindowLevel);
             panel.setCollectionBehavior(
-                NSWindowCollectionBehavior::CanJoinAllSpaces
-                    .union(NSWindowCollectionBehavior::Transient)
+                NSWindowCollectionBehavior::Transient
                     .union(NSWindowCollectionBehavior::IgnoresCycle)
                     .union(NSWindowCollectionBehavior::Stationary),
             );
@@ -96,18 +96,28 @@ impl MacOverlay {
         let cocoa = to_cocoa_rect(rect);
         if let Some(panel) = &self.panel {
             panel.setFrame_display(cocoa, true);
-            panel.orderFrontRegardless();
+            panel.orderFront(None);
         }
         self.visible = true;
         self.pump();
     }
 
-    pub fn hide(&mut self) {
-        if !self.visible {
+    pub fn move_to(&mut self, rect: ScreenRect) {
+        if rect.width == 0 || rect.height == 0 {
+            self.hide();
             return;
         }
         if let Some(panel) = &self.panel {
+            panel.setFrame_display(to_cocoa_rect(rect), true);
+        }
+    }
+
+    pub fn hide(&mut self) {
+        if let Some(panel) = &self.panel {
             panel.orderOut(None);
+            if let Some(view) = &self.image_view {
+                view.setImage(None);
+            }
         }
         self.visible = false;
     }
@@ -171,17 +181,55 @@ fn main_screen_height() -> f64 {
 
 pub fn front_window() -> Option<WindowGeom> {
     let program = std::env::var("TERM_PROGRAM").unwrap_or_default();
-    if program.contains("iTerm") {
-        return parse_bounds(&osascript(
-            r#"tell application "iTerm" to get the bounds of the first window"#,
-        ));
+    let expected = if program.contains("iTerm") {
+        "iTerm2"
+    } else if program.contains("ghostty") || program.contains("Ghostty") {
+        "Ghostty"
+    } else if program == "Apple_Terminal" || program.contains("Terminal") {
+        "Terminal"
+    } else {
+        ""
+    };
+    let script = if expected.is_empty() {
+        r#"tell application "System Events"
+            set n to name of first process whose frontmost is true
+            if n is not in {"Terminal", "iTerm2", "iTerm", "Ghostty", "kitty", "WezTerm", "Alacritty", "Warp"} then
+                return "HIDE"
+            end if
+            tell (first process whose frontmost is true)
+                set p to position of first window
+                set s to size of first window
+                return (item 1 of p as text) & "," & (item 2 of p as text) & "," & (item 1 of s as text) & "," & (item 2 of s as text)
+            end tell
+        end tell"#
+            .to_string()
+    } else if expected == "iTerm2" {
+        r#"tell application "System Events" to set n to name of first process whose frontmost is true
+if n does not contain "iTerm" then return "HIDE"
+tell application "iTerm" to get the bounds of the first window"#
+            .to_string()
+    } else if expected == "Ghostty" {
+        r#"tell application "System Events" to set n to name of first process whose frontmost is true
+if n does not contain "Ghostty" and n is not "ghostty" then return "HIDE"
+tell application "System Events"
+    tell (first process whose frontmost is true)
+        set p to position of first window
+        set s to size of first window
+        return (item 1 of p as text) & "," & (item 2 of p as text) & "," & (item 1 of s as text) & "," & (item 2 of s as text)
+    end tell
+end tell"#
+            .to_string()
+    } else {
+        r#"tell application "System Events" to set n to name of first process whose frontmost is true
+if n is not "Terminal" then return "HIDE"
+tell application "Terminal" to get the bounds of the front window"#
+            .to_string()
+    };
+    let raw = osascript(&script)?;
+    if raw.trim() == "HIDE" {
+        return None;
     }
-    if program == "Apple_Terminal" || program.contains("Terminal") {
-        return parse_bounds(&osascript(
-            r#"tell application "Terminal" to get the bounds of the front window"#,
-        ));
-    }
-    parse_system_events()
+    parse_bounds(&Some(raw))
 }
 
 fn osascript(src: &str) -> Option<String> {
@@ -210,30 +258,5 @@ fn parse_bounds(raw: &Option<String>) -> Option<WindowGeom> {
         y: t,
         width: (r - l).max(0) as u32,
         height: (b - t).max(0) as u32,
-    })
-}
-
-fn parse_system_events() -> Option<WindowGeom> {
-    let raw = osascript(
-        r#"tell application "System Events"
-            tell (first process whose frontmost is true)
-                set p to position of first window
-                set s to size of first window
-                return (item 1 of p as text) & "," & (item 2 of p as text) & "," & (item 1 of s as text) & "," & (item 2 of s as text)
-            end tell
-        end tell"#,
-    )?;
-    let parts: Vec<i32> = raw
-        .split(',')
-        .filter_map(|p| p.trim().parse().ok())
-        .collect();
-    if parts.len() != 4 {
-        return None;
-    }
-    Some(WindowGeom {
-        x: parts[0],
-        y: parts[1],
-        width: parts[2].max(0) as u32,
-        height: parts[3].max(0) as u32,
     })
 }

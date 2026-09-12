@@ -5,7 +5,6 @@
 //! window frame, the text-area origin, the cell size and a cell rect.
 
 use std::hash::{Hash, Hasher};
-use std::time::{Duration, Instant};
 
 use image::DynamicImage;
 use ratatui::layout::Rect;
@@ -170,8 +169,21 @@ pub fn placement_hash(
     hasher.finish()
 }
 
-/// How often to re-read the terminal window (AppleScript is ~50–200 ms).
-const WINDOW_CACHE_TTL: Duration = Duration::from_millis(200);
+/// Hash of which thumbs are drawn (not where the terminal window sits).
+pub fn content_hash(cell: CellPx, term: (u16, u16), area: Rect, tiles: &[(Rect, &str)]) -> u64 {
+    placement_hash(
+        WindowGeom {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        },
+        cell,
+        term,
+        area,
+        tiles,
+    )
+}
 
 /// Native overlay window. No-op except on macOS and Windows.
 pub struct Overlay {
@@ -179,9 +191,8 @@ pub struct Overlay {
     inner: macos::MacOverlay,
     #[cfg(windows)]
     inner: windows::WinOverlay,
-    window_cache: Option<(Instant, WindowGeom)>,
-    cache_term: (u16, u16),
     shown_fp: Option<u64>,
+    content_fp: Option<u64>,
 }
 
 impl Overlay {
@@ -191,34 +202,22 @@ impl Overlay {
             inner: macos::MacOverlay::new(),
             #[cfg(windows)]
             inner: windows::WinOverlay::new(),
-            window_cache: None,
-            cache_term: (0, 0),
             shown_fp: None,
+            content_fp: None,
         }
-    }
-
-    /// Window bounds, reused for [`WINDOW_CACHE_TTL`] unless the cell grid changed.
-    pub fn front_window_cached(&mut self, term: (u16, u16)) -> Option<WindowGeom> {
-        if term != self.cache_term {
-            self.window_cache = None;
-        }
-        if let Some((at, geom)) = self.window_cache {
-            if at.elapsed() < WINDOW_CACHE_TTL {
-                return Some(geom);
-            }
-        }
-        let geom = front_window()?;
-        self.window_cache = Some((Instant::now(), geom));
-        self.cache_term = term;
-        Some(geom)
     }
 
     pub fn is_current(&self, fp: u64) -> bool {
         self.shown_fp == Some(fp)
     }
 
-    pub fn mark_current(&mut self, fp: u64) {
-        self.shown_fp = Some(fp);
+    pub fn same_content(&self, fp: u64) -> bool {
+        self.content_fp == Some(fp)
+    }
+
+    pub fn mark_current(&mut self, place_fp: u64, content_fp: u64) {
+        self.shown_fp = Some(place_fp);
+        self.content_fp = Some(content_fp);
     }
 
     pub fn show(&mut self, img: &DynamicImage, rect: ScreenRect) {
@@ -228,15 +227,23 @@ impl Overlay {
         let _ = (img, rect);
     }
 
+    pub fn move_to(&mut self, rect: ScreenRect) {
+        #[cfg(any(target_os = "macos", windows))]
+        self.inner.move_to(rect);
+        #[cfg(not(any(target_os = "macos", windows)))]
+        let _ = rect;
+    }
+
     pub fn hide(&mut self) {
         self.shown_fp = None;
+        self.content_fp = None;
         #[cfg(any(target_os = "macos", windows))]
         self.inner.hide();
     }
 
     pub fn close(&mut self) {
         self.shown_fp = None;
-        self.window_cache = None;
+        self.content_fp = None;
         #[cfg(any(target_os = "macos", windows))]
         self.inner.close();
     }
@@ -412,5 +419,47 @@ mod tests {
         assert_eq!(rgba.get_pixel(0, 0), &image::Rgba([0, 0, 0, 0]));
         assert_eq!(rgba.get_pixel(5, 5)[0], 255);
         assert_eq!(rgba.get_pixel(5, 5)[3], 255);
+    }
+
+    #[test]
+    fn content_hash_ignores_window_origin() {
+        let area = Rect {
+            x: 10,
+            y: 2,
+            width: 8,
+            height: 6,
+        };
+        let cell = CellPx {
+            width: 10,
+            height: 20,
+        };
+        let tiles = [(area, "img")];
+        let a = content_hash(cell, (80, 24), area, &tiles);
+        let b = placement_hash(
+            WindowGeom {
+                x: 50,
+                y: 80,
+                width: 800,
+                height: 600,
+            },
+            cell,
+            (80, 24),
+            area,
+            &tiles,
+        );
+        let c = placement_hash(
+            WindowGeom {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+            cell,
+            (80, 24),
+            area,
+            &tiles,
+        );
+        assert_eq!(a, content_hash(cell, (80, 24), area, &tiles));
+        assert_ne!(b, c);
     }
 }

@@ -14,10 +14,11 @@ use winapi::um::wingdi::{
     AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS,
 };
 use winapi::um::winuser::{
-    ClientToScreen, CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetDC,
-    GetForegroundWindow, RegisterClassW, ReleaseDC, ShowWindow, UpdateLayeredWindow, CS_HREDRAW,
-    CS_VREDRAW, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    ClientToScreen, CreateWindowExW, DefWindowProcW, DestroyWindow, GetClassNameW, GetClientRect,
+    GetDC, GetForegroundWindow, RegisterClassW, ReleaseDC, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW, GWLP_HWNDPARENT, HWND_TOP,
+    SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, WNDCLASSW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 use super::{ScreenRect, WindowGeom};
@@ -46,11 +47,7 @@ impl WinOverlay {
         let hwnd = unsafe {
             let instance = GetModuleHandleW(ptr::null());
             CreateWindowExW(
-                WS_EX_LAYERED
-                    | WS_EX_TRANSPARENT
-                    | WS_EX_NOACTIVATE
-                    | WS_EX_TOOLWINDOW
-                    | WS_EX_TOPMOST,
+                WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
                 class_wide().as_ptr(),
                 title.as_ptr(),
                 WS_POPUP,
@@ -84,15 +81,35 @@ impl WinOverlay {
             return;
         }
         unsafe {
+            attach_to_terminal(hwnd);
             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
         self.visible = true;
     }
 
-    pub fn hide(&mut self) {
-        if !self.visible {
+    pub fn move_to(&mut self, rect: ScreenRect) {
+        if rect.width == 0 || rect.height == 0 {
+            self.hide();
             return;
         }
+        let Some(hwnd) = self.hwnd else {
+            return;
+        };
+        unsafe {
+            attach_to_terminal(hwnd);
+            SetWindowPos(
+                hwnd,
+                HWND_TOP,
+                rect.x,
+                rect.y,
+                rect.width as i32,
+                rect.height as i32,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            );
+        }
+    }
+
+    pub fn hide(&mut self) {
         if let Some(hwnd) = self.hwnd {
             unsafe {
                 ShowWindow(hwnd, SW_HIDE);
@@ -111,10 +128,31 @@ impl WinOverlay {
     }
 }
 
+fn is_terminal_hwnd(hwnd: HWND) -> bool {
+    if hwnd.is_null() {
+        return false;
+    }
+    let mut buf = [0u16; 256];
+    let n = unsafe { GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+    if n <= 0 {
+        return false;
+    }
+    let class = String::from_utf16_lossy(&buf[..n as usize]);
+    class == "CASCADIA_HOSTING_WINDOW_CLASS" || class == "ConsoleWindowClass"
+}
+
+unsafe fn attach_to_terminal(overlay: HWND) {
+    let host = GetForegroundWindow();
+    if !is_terminal_hwnd(host) {
+        return;
+    }
+    SetWindowLongPtrW(overlay, GWLP_HWNDPARENT, host as isize);
+}
+
 pub fn front_window() -> Option<WindowGeom> {
     unsafe {
         let hwnd = GetForegroundWindow();
-        if hwnd.is_null() {
+        if !is_terminal_hwnd(hwnd) {
             return None;
         }
         let mut rc = RECT {

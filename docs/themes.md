@@ -183,7 +183,7 @@ forces the fallback set, `icons = "emoji"` forces emoji on a host the list above
 Prints what was resolved without starting the UI:
 
 ```
-ira 0.1.14
+ira 0.1.15
 truecolor: yes
 icons: nerd (auto: a font with Nerd glyphs is available)
 nerd glyphs: yes (installed font "JetBrainsMono Nerd Font")
