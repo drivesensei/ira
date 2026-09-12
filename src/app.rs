@@ -24,7 +24,7 @@ use crate::{
         },
         folders::list_common_folders,
         list_files::{list_files_bounded, list_files_chunked, FEntry, LISTING_CHUNK},
-        overlay::{self, CellPx, Overlay},
+        overlay::{self, Overlay},
         state::{load_state, load_state_from, save_state, save_state_to, SessionState, SizeEntry},
         thumbnails::{
             preview_kind, prune_cache, spawn_workers, PreviewKind, Rendered, ThumbEvent,
@@ -1351,7 +1351,7 @@ impl App {
     }
 
     fn needs_native_overlay(&self) -> bool {
-        cfg!(target_os = "macos")
+        (cfg!(target_os = "macos") || cfg!(windows))
             && self.picker.as_ref().is_some_and(|p| {
                 matches!(
                     p.protocol_type(),
@@ -1375,22 +1375,14 @@ impl App {
             self.overlay.hide();
             return;
         };
-        let cell = overlay::ioctl_cell_px().unwrap_or_else(|| {
-            let fs = self
-                .picker
-                .as_ref()
-                .map(|p| p.font_size())
-                .unwrap_or(ratatui_image::FontSize::new(10, 20));
-            CellPx {
-                width: fs.width,
-                height: fs.height,
-            }
-        });
         let (cols, rows) = self.overlay_term;
         if cols == 0 || rows == 0 {
             self.overlay.hide();
             return;
         }
+        let cell = overlay::ioctl_cell_px()
+            .filter(|c| c.width > 0 && c.height > 0)
+            .unwrap_or_else(|| overlay::cell_px_from_window(window, cols, rows));
         let origin = overlay::content_origin(window, cols, rows, cell);
         match job {
             OverlayJob::Column { area, req } => {

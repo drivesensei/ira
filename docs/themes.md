@@ -166,12 +166,12 @@ forces the fallback set, `icons = "emoji"` forces emoji on a host the list above
   back to other installed fonts for them, so the default is the emoji set (Segoe UI
   Emoji, in color). It switches to Nerd glyphs as soon as the profile font is one that
   has them (e.g. `Cascadia Mono NF`, or a fallback list such as
-  `Cascadia Mono, Symbols Nerd Font Mono`). Image previews use Sixel on
-  stdout (assumed at 10×20 when the query is silent and `WT_SESSION` is set;
-  `IRA_IMAGES=blocks` forces braille).
-- **Terminal.app** has no image protocol. Previews use a native AppKit overlay
-  over the preview cells (2×4 braille underlay if the window cannot be located).
-  iTerm2, Ghostty, kitty and WezTerm keep their in-terminal protocols.
+  `Cascadia Mono, Symbols Nerd Font Mono`). Image previews use a transparent
+  Win32 overlay (silent probe + `WT_SESSION`); `IRA_IMAGES=sixel` forces Sixel.
+- **Terminal.app** has no image protocol. Previews use a transparent AppKit
+  overlay over the thumbnail cells (2×4 braille underlay if the window cannot
+  be located). iTerm2, Ghostty, kitty and WezTerm keep their in-terminal
+  protocols.
 - **iTerm2, WezTerm, kitty, ghostty, Alacritty, Windows Terminal** are truecolor; set
   `COLORTERM=truecolor` if your shell profile clears it.
 - **tmux / screen** pass truecolor only when configured (`set -g default-terminal
@@ -183,7 +183,7 @@ forces the fallback set, `icons = "emoji"` forces emoji on a host the list above
 Prints what was resolved without starting the UI:
 
 ```
-ira 0.1.12
+ira 0.1.13
 truecolor: yes
 icons: nerd (auto: a font with Nerd glyphs is available)
 nerd glyphs: yes (installed font "JetBrainsMono Nerd Font")

@@ -1,12 +1,11 @@
 //! Startup image-protocol probe with Windows Terminal and override fallbacks.
 //!
 //! `ratatui-image`'s stdin query is authoritative when it returns a real
-//! graphics protocol. On native Windows the query is often silent (ConPTY),
-//! but Windows Terminal ≥ 1.22 does render Sixel at a fixed virtual cell of
-//! 10×20 px. A silent probe plus `WT_SESSION` therefore assumes Sixel.
-//! Graphics protocols are drawn on **stdout** (ConPTY only parses DCS on
-//! the primary stream); `--version` / `--check-terminal` stay on stdout
-//! as plain text.
+//! graphics protocol. On native Windows the query is often silent (ConPTY);
+//! assumed Sixel still paints nothing in this TUI, so a silent probe plus
+//! `WT_SESSION` uses the native overlay (Halfblocks + Win32 layered window).
+//! `IRA_IMAGES=sixel` still forces the protocol. Graphics protocols paint
+//! on **stdout**; `--version` / `--check-terminal` stay on stdout as text.
 //!
 //! `IRA_IMAGES=auto|sixel|kitty|iterm2|blocks` overrides the decision.
 
@@ -37,7 +36,7 @@ impl ProbeEnv {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PickerSource {
     Query,
-    WindowsTerminalAssumed,
+    NativeOverlay,
     EnvOverride(String),
     Fallback,
 }
@@ -63,7 +62,7 @@ impl Probed {
     pub fn source_reason(&self) -> String {
         match &self.source {
             PickerSource::Query => "from terminal query".into(),
-            PickerSource::WindowsTerminalAssumed => "Windows Terminal assumed, stdout".into(),
+            PickerSource::NativeOverlay => "native overlay".into(),
             PickerSource::EnvOverride(_) => "IRA_IMAGES override".into(),
             PickerSource::Fallback => "no graphics protocol".into(),
         }
@@ -105,11 +104,9 @@ pub fn decide(query: Result<Picker, ()>, env: &ProbeEnv) -> Probed {
         },
         query => {
             if env.is_windows && env.wt_session {
-                let mut picker = picker_or_halfblocks(query);
-                picker.set_protocol_type(ProtocolType::Sixel);
                 return Probed {
-                    picker,
-                    source: PickerSource::WindowsTerminalAssumed,
+                    picker: picker_or_halfblocks(query),
+                    source: PickerSource::NativeOverlay,
                 };
             }
             Probed {
@@ -244,12 +241,13 @@ mod tests {
     }
 
     #[test]
-    fn silent_probe_on_windows_terminal_assumes_sixel() {
+    fn silent_probe_on_windows_terminal_uses_overlay() {
         let probed = decide(Ok(Picker::halfblocks()), &env(true, true, None));
-        assert_eq!(probed.source, PickerSource::WindowsTerminalAssumed);
-        assert!(matches!(probed.picker.protocol_type(), ProtocolType::Sixel));
-        let fs = probed.picker.font_size();
-        assert_eq!((fs.width, fs.height), (10, 20));
+        assert_eq!(probed.source, PickerSource::NativeOverlay);
+        assert!(matches!(
+            probed.picker.protocol_type(),
+            ProtocolType::Halfblocks
+        ));
         assert!(uses_stdout_backend(&probed.picker, true));
 
         let mut sixel = Picker::halfblocks();
@@ -267,7 +265,7 @@ mod tests {
             probed.picker.protocol_type(),
             ProtocolType::Halfblocks
         ));
-        // WT_SESSION leaked into WSL must not assume Sixel on a Linux binary.
+        // WT_SESSION leaked into WSL must not take the Windows overlay path.
         let probed = decide(Ok(Picker::halfblocks()), &env(true, false, None));
         assert_eq!(probed.source, PickerSource::Fallback);
         assert!(!uses_stdout_backend(&probed.picker, false));
@@ -292,7 +290,7 @@ mod tests {
     #[test]
     fn auto_and_unknown_overrides_are_ignored() {
         let probed = decide(Ok(Picker::halfblocks()), &env(true, true, Some("auto")));
-        assert_eq!(probed.source, PickerSource::WindowsTerminalAssumed);
+        assert_eq!(probed.source, PickerSource::NativeOverlay);
         let probed = decide(Ok(Picker::halfblocks()), &env(false, false, Some("nope")));
         assert_eq!(probed.source, PickerSource::Fallback);
     }

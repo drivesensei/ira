@@ -567,13 +567,13 @@ pub fn build_rendered(
 ) -> Rendered {
     if matches!(picker.protocol_type(), ProtocolType::Halfblocks) {
         let fallback = BlockImage::from_image(&img, cols, rows, truecolor);
-        // macOS Terminal.app has no protocol; keep the pixels for the
-        // native overlay and the braille underlay if placement fails.
-        #[cfg(target_os = "macos")]
+        // Terminal.app / Windows Terminal: keep pixels for the native
+        // overlay and braille as the underlay if placement fails.
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             return Rendered::Pixels { img, fallback };
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             return Rendered::Blocks(fallback);
         }
@@ -797,9 +797,9 @@ mod tests {
         ));
         let img = DynamicImage::ImageRgb8(image::RgbImage::new(100, 100));
         let rendered = build_rendered(&picker, true, img, 10, 5);
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         assert!(matches!(rendered, Rendered::Pixels { .. }));
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         assert!(matches!(rendered, Rendered::Blocks(_)));
         // End-to-end: the braille renderer must fill a 12×7 grid without
         // panicking (plain cells, no graphics protocol).

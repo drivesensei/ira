@@ -9,6 +9,8 @@ use ratatui::layout::Rect;
 
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(windows)]
+mod windows;
 
 /// Global screen rectangle in top-left, y-down pixels (AppleScript /
 /// Windows convention). Converted to Cocoa bottom-left when showing.
@@ -61,19 +63,41 @@ pub fn preview_screen_rect(
     }
 }
 
-/// Fit `img` into `w × h` pixels, aspect preserved, centered on black.
+/// Estimate cell pixels from the window frame and the terminal grid.
+/// Width fills the client; leftover height after a 1:2 cell guess is title/tab chrome.
+pub fn cell_px_from_window(window: WindowGeom, cols: u16, rows: u16) -> CellPx {
+    let cols = u32::from(cols.max(1));
+    let rows = u32::from(rows.max(1));
+    let width = (window.width / cols).max(1);
+    const MIN_CHROME: u32 = 22;
+    const MAX_CHROME: u32 = 72;
+    let guessed_text_h = rows.saturating_mul(width.saturating_mul(2));
+    let leftover = window.height.saturating_sub(guessed_text_h);
+    let chrome = leftover.clamp(
+        MIN_CHROME,
+        MAX_CHROME.min(window.height.saturating_sub(rows)),
+    );
+    let height = (window.height.saturating_sub(chrome) / rows).max(1);
+    CellPx {
+        width: width.min(u32::from(u16::MAX)) as u16,
+        height: height.min(u32::from(u16::MAX)) as u16,
+    }
+}
+
+/// Fit `img` into `w × h` pixels, aspect preserved, centered on transparent.
 pub fn fit_pixels(img: &DynamicImage, w: u32, h: u32) -> DynamicImage {
     if w == 0 || h == 0 {
-        return DynamicImage::new_rgb8(1, 1);
+        return DynamicImage::new_rgba8(1, 1);
     }
     let resized = img.resize(w, h, image::imageops::FilterType::Triangle);
-    let mut canvas = image::RgbImage::from_pixel(w, h, image::Rgb([0, 0, 0]));
-    let nw = resized.width().min(w);
-    let nh = resized.height().min(h);
+    let mut canvas = image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 0]));
+    let rgba = resized.to_rgba8();
+    let nw = rgba.width().min(w);
+    let nh = rgba.height().min(h);
     let ox = (w - nw) / 2;
     let oy = (h - nh) / 2;
-    image::imageops::overlay(&mut canvas, &resized.to_rgb8(), ox.into(), oy.into());
-    DynamicImage::ImageRgb8(canvas)
+    image::imageops::overlay(&mut canvas, &rgba, ox.into(), oy.into());
+    DynamicImage::ImageRgba8(canvas)
 }
 
 /// Composite tiles (cell-rect + image) onto one bitmap covering `area`.
@@ -87,25 +111,27 @@ pub fn composite_grid(
     if w == 0 || h == 0 {
         return None;
     }
-    let mut canvas = image::RgbImage::from_pixel(w, h, image::Rgb([0, 0, 0]));
+    let mut canvas = image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 0]));
     for (tile, img) in tiles {
         let tw = u32::from(tile.width) * u32::from(cell.width);
         let th = u32::from(tile.height) * u32::from(cell.height);
         if tw == 0 || th == 0 {
             continue;
         }
-        let fitted = fit_pixels(img, tw, th).to_rgb8();
+        let fitted = fit_pixels(img, tw, th).to_rgba8();
         let dx = i64::from(tile.x.saturating_sub(area.x)) * i64::from(cell.width);
         let dy = i64::from(tile.y.saturating_sub(area.y)) * i64::from(cell.height);
         image::imageops::overlay(&mut canvas, &fitted, dx, dy);
     }
-    Some(DynamicImage::ImageRgb8(canvas))
+    Some(DynamicImage::ImageRgba8(canvas))
 }
 
-/// Native overlay window. No-op on platforms other than macOS.
+/// Native overlay window. No-op except on macOS and Windows.
 pub struct Overlay {
     #[cfg(target_os = "macos")]
     inner: macos::MacOverlay,
+    #[cfg(windows)]
+    inner: windows::WinOverlay,
 }
 
 impl Overlay {
@@ -113,23 +139,25 @@ impl Overlay {
         Self {
             #[cfg(target_os = "macos")]
             inner: macos::MacOverlay::new(),
+            #[cfg(windows)]
+            inner: windows::WinOverlay::new(),
         }
     }
 
     pub fn show(&mut self, img: &DynamicImage, rect: ScreenRect) {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         self.inner.show(img, rect);
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         let _ = (img, rect);
     }
 
     pub fn hide(&mut self) {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         self.inner.hide();
     }
 
     pub fn close(&mut self) {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         self.inner.close();
     }
 
@@ -151,7 +179,11 @@ pub fn front_window() -> Option<WindowGeom> {
     {
         return macos::front_window();
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        return windows::front_window();
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     None
 }
 
@@ -248,9 +280,39 @@ mod tests {
         let out = composite_grid(area, cell, &[(tile, &red)]).unwrap();
         assert_eq!(out.width(), 8);
         assert_eq!(out.height(), 4);
-        // Left half stays black; a pixel inside the right tile is red.
-        let rgb = out.to_rgb8();
-        assert_eq!(rgb.get_pixel(1, 1), &image::Rgb([0, 0, 0]));
-        assert_eq!(rgb.get_pixel(6, 1), &image::Rgb([255, 0, 0]));
+        // Left half stays transparent; a pixel inside the right tile is red.
+        let rgba = out.to_rgba8();
+        assert_eq!(rgba.get_pixel(1, 1), &image::Rgba([0, 0, 0, 0]));
+        assert_eq!(rgba.get_pixel(6, 1)[0], 255);
+        assert_eq!(rgba.get_pixel(6, 1)[3], 255);
+    }
+
+    #[test]
+    fn resize_changes_overlay_rect() {
+        let area = Rect {
+            x: 10,
+            y: 2,
+            width: 20,
+            height: 8,
+        };
+        let small = WindowGeom {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        };
+        let large = WindowGeom {
+            x: 0,
+            y: 0,
+            width: 1600,
+            height: 900,
+        };
+        let c1 = cell_px_from_window(small, 80, 25);
+        let c2 = cell_px_from_window(large, 80, 25);
+        assert!(c1.width > 0 && c1.height > 0);
+        assert_ne!(c1, c2);
+        let r1 = preview_screen_rect(small, content_origin(small, 80, 25, c1), c1, area);
+        let r2 = preview_screen_rect(large, content_origin(large, 80, 25, c2), c2, area);
+        assert_ne!((r1.width, r1.height), (r2.width, r2.height));
     }
 }

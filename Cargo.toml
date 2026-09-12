@@ -1,6 +1,6 @@
 [package]
 name = "ira"
-version = "0.1.12"
+version = "0.1.13"
 
 description = "A terminal file manager built with Ratatui and crossterm"
 repository = "https://github.com/drivesensei/ira"
@@ -36,6 +36,9 @@ winapi = { version = "0.3.9", features = [
     "consoleapi",
     "wincon",
     "processenv",
+    "winuser",
+    "wingdi",
+    "libloaderapi",
 ] }
 ratatui-textarea = "0.9.2"
 serde = { version = "1", features = ["derive"] }
@@ -64,4 +67,5 @@ objc2-app-kit = { version = "0.3", features = [
     "NSControl",
     "NSCell",
     "NSEvent",
+    "NSImageCell",
 ] }

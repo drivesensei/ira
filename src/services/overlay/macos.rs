@@ -8,8 +8,8 @@ use objc2::rc::Retained;
 use objc2::{AnyThread, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor, NSEventMask,
-    NSImage, NSImageScaling, NSImageView, NSPanel, NSScreen, NSStatusWindowLevel,
-    NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSFloatingWindowLevel, NSImage, NSImageFrameStyle, NSImageScaling, NSImageView, NSPanel,
+    NSScreen, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_foundation::{NSData, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize};
 
@@ -53,7 +53,7 @@ impl MacOverlay {
             panel.setBackgroundColor(Some(&NSColor::clearColor()));
             panel.setIgnoresMouseEvents(true);
             panel.setHasShadow(false);
-            panel.setLevel(NSStatusWindowLevel);
+            panel.setLevel(NSFloatingWindowLevel);
             panel.setCollectionBehavior(
                 NSWindowCollectionBehavior::CanJoinAllSpaces
                     .union(NSWindowCollectionBehavior::Transient)
@@ -67,6 +67,8 @@ impl MacOverlay {
 
             let view = NSImageView::initWithFrame(NSImageView::alloc(mtm), frame);
             view.setImageScaling(NSImageScaling::ScaleAxesIndependently);
+            view.setImageFrameStyle(NSImageFrameStyle::None);
+            view.setWantsLayer(true);
             panel.setContentView(Some(&view));
 
             self.image_view = Some(view);
