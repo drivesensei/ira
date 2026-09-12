@@ -391,8 +391,8 @@ fn modified_ago(modified: Option<i64>) -> String {
 /// 9pt) a cell is a 140×136 px thumbnail, which keeps real photographs
 /// recognizable. The previous 14×4 cell produced 98×68 px images — simple
 /// shapes survived, but photos degraded to unrecognizable mush (and on
-/// quadrant-block terminals like Terminal.app, 4 px per cell turns even
-/// the larger cell into just 40×16 px).
+/// braille-block terminals like Terminal.app, 8 px per cell turns even
+/// the larger cell into just 40×32 px).
 const GRID_CELL_W: u16 = 20;
 const GRID_IMG_H: u16 = 8;
 const GRID_NAME_H: u16 = 1;

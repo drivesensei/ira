@@ -27,7 +27,8 @@ fn main() -> AppResult<()> {
     // mode and the alternate screen: the probe runs blocking stdin queries
     // that would otherwise race crossterm's event reader (same class of stall
     // as the `terminal.clear()` note in `Tui::init`). Quadrant blocks render
-    // in every terminal and are the universal fallback.
+    // in every terminal and are the universal fallback. Sixel is skipped
+    // automatically on native Windows (blank cells); see picker_probe.
     let probed = picker_probe::probe();
 
     // Create the application and install the probed picker.

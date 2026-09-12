@@ -985,8 +985,8 @@ impl App {
 
     /// Installs the terminal image picker probed at startup (before raw
     /// mode); see `main`. Also starts the bounded decode worker pool and a
-    /// one-shot disk-cache prune. `truecolor` is forwarded to the quadrant
-    /// fallback so Terminal.app gets xterm-256 instead of 24-bit SGR.
+    /// one-shot disk-cache prune. `truecolor` is forwarded to the braille
+    /// fallback so Terminal.app / Windows get xterm-256 instead of 24-bit SGR.
     pub fn set_picker(&mut self, picker: Picker, truecolor: bool) {
         self.picker = Some(picker.clone());
         if self.thumb_workers_started {

@@ -4,7 +4,7 @@
 //! [`spawn_workers`]) consumes queued [`ThumbRequest`]s and delivers
 //! [`ThumbEvent`]s over a channel, picked up on the next tick, mirroring the
 //! pane-listing and drive-poller patterns. The UI thread only ever renders a
-//! finished [`Rendered`] (a graphics protocol or our quadrant blocks).
+//! finished [`Rendered`] (a graphics protocol or our braille blocks).
 
 use std::fs;
 use std::io::BufReader;
@@ -387,7 +387,7 @@ pub struct WorkerQueues {
 /// the shared job queues until they close, delivering results on `tx`.
 /// Workers own a `Picker` clone once, so protocol re-encoding per job is the
 /// only per-request setup. `truecolor` selects 24-bit vs xterm-256 colors
-/// for the quadrant-block fallback.
+/// for the braille-block fallback.
 pub fn spawn_workers(
     picker: Picker,
     truecolor: bool,
@@ -511,7 +511,7 @@ impl ThumbRequest {
 }
 
 /// A finished preview, either a terminal graphics protocol or our
-/// quadrant-block fallback (used wherever the picker is Halfblocks).
+/// braille-block fallback (used wherever the picker is Halfblocks).
 pub enum Rendered {
     Protocol(Protocol),
     Blocks(BlockImage),
@@ -545,7 +545,7 @@ pub enum ThumbEvent {
 
 /// Builds the drawable representation for a preview area of `cols × rows`
 /// cells. Graphics protocols stay on the crate path; Halfblocks is replaced
-/// by our 2×2 quadrant renderer. Encoding stays off the UI thread.
+/// by our 2×4 braille renderer. Encoding stays off the UI thread.
 pub fn build_rendered(
     picker: &Picker,
     truecolor: bool,
@@ -776,7 +776,7 @@ mod tests {
         let img = DynamicImage::ImageRgb8(image::RgbImage::new(100, 100));
         let rendered = build_rendered(&picker, true, img, 10, 5);
         assert!(matches!(rendered, Rendered::Blocks(_)));
-        // End-to-end: the quadrant renderer must fill a 12×7 grid without
+        // End-to-end: the braille renderer must fill a 12×7 grid without
         // panicking (plain cells, no graphics protocol).
         let backend = ratatui::backend::TestBackend::new(12, 7);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();

@@ -1,12 +1,11 @@
-//! Startup image-protocol probe with Windows Terminal and override fallbacks.
+//! Startup image-protocol probe with Windows and override fallbacks.
 //!
 //! `ratatui-image`'s stdin query is authoritative when it returns a real
-//! graphics protocol. On native Windows it often does not: ConPTY may drop
-//! the DA1 / `CSI 16 t` replies, and the crate's `font_size_fallback` is
-//! hard-coded to `None`, which forces Halfblocks even when Sixel was seen.
-//! Windows Terminal ≥ 1.22 does render Sixel at a fixed virtual cell of
-//! 10×20 px — the same size `Picker::halfblocks()` already carries — so a
-//! silent probe plus `WT_SESSION` is enough to assume Sixel.
+//! graphics protocol *except Sixel on native Windows*. WT's Sixel support
+//! exists, but the crate's stateless `Image` widget leaves the cell grid
+//! empty there — the preview column goes blank. Automatic Sixel on Windows
+//! is therefore skipped; the braille renderer always paints cells.
+//! `IRA_IMAGES=sixel` still forces it for experiments.
 //!
 //! `IRA_IMAGES=auto|sixel|kitty|iterm2|blocks` overrides the decision.
 
@@ -37,7 +36,6 @@ impl ProbeEnv {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PickerSource {
     Query,
-    WindowsTerminalAssumed,
     EnvOverride(String),
     Fallback,
 }
@@ -50,7 +48,7 @@ pub struct Probed {
 
 impl Probed {
     /// Short protocol name for `--check-terminal` (`Blocks` is our
-    /// quadrant renderer, which replaces the crate's Halfblocks path).
+    /// braille renderer, which replaces the crate's Halfblocks path).
     pub fn protocol_name(&self) -> &'static str {
         match self.picker.protocol_type() {
             ProtocolType::Kitty => "Kitty",
@@ -63,9 +61,6 @@ impl Probed {
     pub fn source_reason(&self) -> String {
         match &self.source {
             PickerSource::Query => "from terminal query".into(),
-            PickerSource::WindowsTerminalAssumed => {
-                "Windows Terminal assumed: probe got no answer".into()
-            }
             PickerSource::EnvOverride(_) => "IRA_IMAGES override".into(),
             PickerSource::Fallback => "no graphics protocol".into(),
         }
@@ -92,21 +87,19 @@ pub fn decide(query: Result<Picker, ()>, env: &ProbeEnv) -> Probed {
         }
     }
     match query {
-        Ok(picker) if is_graphics(&picker) => Probed {
+        Ok(picker) if is_graphics(&picker) && !reject_windows_sixel(&picker, env) => Probed {
             picker,
             source: PickerSource::Query,
         },
         query => {
-            if env.is_windows && env.wt_session {
-                let mut picker = picker_or_halfblocks(query);
-                picker.set_protocol_type(ProtocolType::Sixel);
-                return Probed {
-                    picker,
-                    source: PickerSource::WindowsTerminalAssumed,
-                };
+            let mut picker = picker_or_halfblocks(query);
+            // A Windows Sixel query result must not leak into the fallback
+            // picker — `build_rendered` would still emit a blank graphic.
+            if reject_windows_sixel(&picker, env) {
+                picker.set_protocol_type(ProtocolType::Halfblocks);
             }
             Probed {
-                picker: picker_or_halfblocks(query),
+                picker,
                 source: PickerSource::Fallback,
             }
         }
@@ -136,6 +129,14 @@ fn parse_override(raw: &str) -> Option<ProtocolType> {
 
 fn is_graphics(picker: &Picker) -> bool {
     !matches!(picker.protocol_type(), ProtocolType::Halfblocks)
+}
+
+/// WT advertises Sixel and may even answer the query, but the encoded
+/// graphic does not appear in our stderr/alternate-screen TUI — the
+/// cells stay empty. Prefer the braille fallback unless the user asked
+/// for Sixel.
+fn reject_windows_sixel(picker: &Picker, env: &ProbeEnv) -> bool {
+    env.is_windows && matches!(picker.protocol_type(), ProtocolType::Sixel)
 }
 
 fn picker_or_halfblocks(query: Result<Picker, ()>) -> Picker {
@@ -208,22 +209,38 @@ mod tests {
     fn query_graphics_wins() {
         let mut picker = Picker::halfblocks();
         picker.set_protocol_type(ProtocolType::Sixel);
-        let probed = decide(Ok(picker), &env(true, true, None));
+        let probed = decide(Ok(picker), &env(false, false, None));
         assert_eq!(probed.source, PickerSource::Query);
         assert!(matches!(probed.picker.protocol_type(), ProtocolType::Sixel));
+
+        // Kitty / iTerm2 on Windows (WezTerm) is still accepted.
+        let mut kitty = Picker::halfblocks();
+        kitty.set_protocol_type(ProtocolType::Kitty);
+        let probed = decide(Ok(kitty), &env(true, true, None));
+        assert_eq!(probed.source, PickerSource::Query);
+        assert!(matches!(probed.picker.protocol_type(), ProtocolType::Kitty));
     }
 
     #[test]
-    fn silent_probe_on_windows_terminal_assumes_sixel() {
+    fn windows_sixel_is_rejected_in_favor_of_blocks() {
+        // Silent probe: stay on blocks (never assume Sixel).
         let probed = decide(Ok(Picker::halfblocks()), &env(true, true, None));
-        assert_eq!(probed.source, PickerSource::WindowsTerminalAssumed);
-        assert!(matches!(probed.picker.protocol_type(), ProtocolType::Sixel));
-        let fs = probed.picker.font_size();
-        assert_eq!((fs.width, fs.height), (10, 20));
+        assert_eq!(probed.source, PickerSource::Fallback);
+        assert!(matches!(
+            probed.picker.protocol_type(),
+            ProtocolType::Halfblocks
+        ));
 
-        let probed = decide(Err(()), &env(true, true, None));
-        assert_eq!(probed.source, PickerSource::WindowsTerminalAssumed);
-        assert!(matches!(probed.picker.protocol_type(), ProtocolType::Sixel));
+        // Query that "succeeded" with Sixel still becomes blocks — WT
+        // leaves those cells empty in our TUI.
+        let mut sixel = Picker::halfblocks();
+        sixel.set_protocol_type(ProtocolType::Sixel);
+        let probed = decide(Ok(sixel), &env(true, true, None));
+        assert_eq!(probed.source, PickerSource::Fallback);
+        assert!(matches!(
+            probed.picker.protocol_type(),
+            ProtocolType::Halfblocks
+        ));
     }
 
     #[test]
@@ -253,12 +270,17 @@ mod tests {
         let probed = decide(Ok(kitty), &env(false, false, Some("SIXEL")));
         assert_eq!(probed.source, PickerSource::EnvOverride("SIXEL".into()));
         assert!(matches!(probed.picker.protocol_type(), ProtocolType::Sixel));
+
+        // Explicit override is the only way to get Sixel on Windows.
+        let probed = decide(Ok(Picker::halfblocks()), &env(true, true, Some("sixel")));
+        assert_eq!(probed.source, PickerSource::EnvOverride("sixel".into()));
+        assert!(matches!(probed.picker.protocol_type(), ProtocolType::Sixel));
     }
 
     #[test]
     fn auto_and_unknown_overrides_are_ignored() {
         let probed = decide(Ok(Picker::halfblocks()), &env(true, true, Some("auto")));
-        assert_eq!(probed.source, PickerSource::WindowsTerminalAssumed);
+        assert_eq!(probed.source, PickerSource::Fallback);
         let probed = decide(Ok(Picker::halfblocks()), &env(false, false, Some("nope")));
         assert_eq!(probed.source, PickerSource::Fallback);
     }

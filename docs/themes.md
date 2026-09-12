@@ -166,10 +166,10 @@ forces the fallback set, `icons = "emoji"` forces emoji on a host the list above
   back to other installed fonts for them, so the default is the emoji set (Segoe UI
   Emoji, in color). It switches to Nerd glyphs as soon as the profile font is one that
   has them (e.g. `Cascadia Mono NF`, or a fallback list such as
-  `Cascadia Mono, Symbols Nerd Font Mono`). Image previews use Sixel on WT ≥ 1.22
-  (assumed when the capability probe is silent; `IRA_IMAGES=blocks` forces
-  quadrant blocks on older builds).
-- **Terminal.app** has no image protocol. Previews are 2×2 quadrant blocks in 256
+  `Cascadia Mono, Symbols Nerd Font Mono`). Image previews use 2×4 braille
+  blocks (Sixel is skipped automatically because it paints nothing in this
+  TUI; `IRA_IMAGES=sixel` forces it).
+- **Terminal.app** has no image protocol. Previews are 2×4 braille blocks in 256
   colors. For real images use iTerm2, Ghostty, kitty or WezTerm.
 - **iTerm2, WezTerm, kitty, ghostty, Alacritty, Windows Terminal** are truecolor; set
   `COLORTERM=truecolor` if your shell profile clears it.
@@ -182,7 +182,7 @@ forces the fallback set, `icons = "emoji"` forces emoji on a host the list above
 Prints what was resolved without starting the UI:
 
 ```
-ira 0.1.10
+ira 0.1.11
 truecolor: yes
 icons: nerd (auto: a font with Nerd glyphs is available)
 nerd glyphs: yes (installed font "JetBrainsMono Nerd Font")
