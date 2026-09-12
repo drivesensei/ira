@@ -4,6 +4,9 @@
 //! surface (Finder does the same). Placement is a pure function of the
 //! window frame, the text-area origin, the cell size and a cell rect.
 
+use std::hash::{Hash, Hasher};
+use std::time::{Duration, Instant};
+
 use image::DynamicImage;
 use ratatui::layout::Rect;
 
@@ -100,17 +103,23 @@ pub fn fit_pixels(img: &DynamicImage, w: u32, h: u32) -> DynamicImage {
     DynamicImage::ImageRgba8(canvas)
 }
 
+/// Grid overlay fill: leave a margin so names stay visible under the panel.
+pub const GRID_FILL_PERCENT: u32 = 80;
+
 /// Composite tiles (cell-rect + image) onto one bitmap covering `area`.
+/// `fill_percent` shrinks each tile (centered) so 80 leaves a gap above the name.
 pub fn composite_grid(
     area: Rect,
     cell: CellPx,
     tiles: &[(Rect, &DynamicImage)],
+    fill_percent: u32,
 ) -> Option<DynamicImage> {
     let w = u32::from(area.width) * u32::from(cell.width);
     let h = u32::from(area.height) * u32::from(cell.height);
     if w == 0 || h == 0 {
         return None;
     }
+    let fill = fill_percent.clamp(1, 100);
     let mut canvas = image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 0]));
     for (tile, img) in tiles {
         let tw = u32::from(tile.width) * u32::from(cell.width);
@@ -118,13 +127,51 @@ pub fn composite_grid(
         if tw == 0 || th == 0 {
             continue;
         }
-        let fitted = fit_pixels(img, tw, th).to_rgba8();
-        let dx = i64::from(tile.x.saturating_sub(area.x)) * i64::from(cell.width);
-        let dy = i64::from(tile.y.saturating_sub(area.y)) * i64::from(cell.height);
+        let fw = (tw * fill / 100).max(1);
+        let fh = (th * fill / 100).max(1);
+        let fitted = fit_pixels(img, fw, fh).to_rgba8();
+        let dx = i64::from(tile.x.saturating_sub(area.x)) * i64::from(cell.width)
+            + i64::from((tw - fw) / 2);
+        let dy = i64::from(tile.y.saturating_sub(area.y)) * i64::from(cell.height)
+            + i64::from((th - fh) / 2);
         image::imageops::overlay(&mut canvas, &fitted, dx, dy);
     }
     Some(DynamicImage::ImageRgba8(canvas))
 }
+
+/// Stable hash of overlay placement + which thumbs are on screen.
+pub fn placement_hash(
+    window: WindowGeom,
+    cell: CellPx,
+    term: (u16, u16),
+    area: Rect,
+    tiles: &[(Rect, &str)],
+) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    window.x.hash(&mut hasher);
+    window.y.hash(&mut hasher);
+    window.width.hash(&mut hasher);
+    window.height.hash(&mut hasher);
+    cell.width.hash(&mut hasher);
+    cell.height.hash(&mut hasher);
+    term.hash(&mut hasher);
+    area.x.hash(&mut hasher);
+    area.y.hash(&mut hasher);
+    area.width.hash(&mut hasher);
+    area.height.hash(&mut hasher);
+    tiles.len().hash(&mut hasher);
+    for (tile, key) in tiles {
+        tile.x.hash(&mut hasher);
+        tile.y.hash(&mut hasher);
+        tile.width.hash(&mut hasher);
+        tile.height.hash(&mut hasher);
+        key.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// How often to re-read the terminal window (AppleScript is ~50–200 ms).
+const WINDOW_CACHE_TTL: Duration = Duration::from_millis(200);
 
 /// Native overlay window. No-op except on macOS and Windows.
 pub struct Overlay {
@@ -132,6 +179,9 @@ pub struct Overlay {
     inner: macos::MacOverlay,
     #[cfg(windows)]
     inner: windows::WinOverlay,
+    window_cache: Option<(Instant, WindowGeom)>,
+    cache_term: (u16, u16),
+    shown_fp: Option<u64>,
 }
 
 impl Overlay {
@@ -141,7 +191,34 @@ impl Overlay {
             inner: macos::MacOverlay::new(),
             #[cfg(windows)]
             inner: windows::WinOverlay::new(),
+            window_cache: None,
+            cache_term: (0, 0),
+            shown_fp: None,
         }
+    }
+
+    /// Window bounds, reused for [`WINDOW_CACHE_TTL`] unless the cell grid changed.
+    pub fn front_window_cached(&mut self, term: (u16, u16)) -> Option<WindowGeom> {
+        if term != self.cache_term {
+            self.window_cache = None;
+        }
+        if let Some((at, geom)) = self.window_cache {
+            if at.elapsed() < WINDOW_CACHE_TTL {
+                return Some(geom);
+            }
+        }
+        let geom = front_window()?;
+        self.window_cache = Some((Instant::now(), geom));
+        self.cache_term = term;
+        Some(geom)
+    }
+
+    pub fn is_current(&self, fp: u64) -> bool {
+        self.shown_fp == Some(fp)
+    }
+
+    pub fn mark_current(&mut self, fp: u64) {
+        self.shown_fp = Some(fp);
     }
 
     pub fn show(&mut self, img: &DynamicImage, rect: ScreenRect) {
@@ -152,18 +229,16 @@ impl Overlay {
     }
 
     pub fn hide(&mut self) {
+        self.shown_fp = None;
         #[cfg(any(target_os = "macos", windows))]
         self.inner.hide();
     }
 
     pub fn close(&mut self) {
+        self.shown_fp = None;
+        self.window_cache = None;
         #[cfg(any(target_os = "macos", windows))]
         self.inner.close();
-    }
-
-    pub fn pump(&mut self) {
-        #[cfg(target_os = "macos")]
-        self.inner.pump();
     }
 }
 
@@ -277,7 +352,7 @@ mod tests {
             width: 2,
             height: 2,
         };
-        let out = composite_grid(area, cell, &[(tile, &red)]).unwrap();
+        let out = composite_grid(area, cell, &[(tile, &red)], 100).unwrap();
         assert_eq!(out.width(), 8);
         assert_eq!(out.height(), 4);
         // Left half stays transparent; a pixel inside the right tile is red.
@@ -314,5 +389,28 @@ mod tests {
         let r1 = preview_screen_rect(small, content_origin(small, 80, 25, c1), c1, area);
         let r2 = preview_screen_rect(large, content_origin(large, 80, 25, c2), c2, area);
         assert_ne!((r1.width, r1.height), (r2.width, r2.height));
+    }
+
+    #[test]
+    fn grid_fill_leaves_a_margin() {
+        let red =
+            DynamicImage::ImageRgb8(image::RgbImage::from_pixel(8, 8, image::Rgb([255, 0, 0])));
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+        };
+        let tile = area;
+        let cell = CellPx {
+            width: 5,
+            height: 5,
+        };
+        let out = composite_grid(area, cell, &[(tile, &red)], GRID_FILL_PERCENT).unwrap();
+        let rgba = out.to_rgba8();
+        // 10×10 tile at 80% is 8×8 centered → 1 px margin.
+        assert_eq!(rgba.get_pixel(0, 0), &image::Rgba([0, 0, 0, 0]));
+        assert_eq!(rgba.get_pixel(5, 5)[0], 255);
+        assert_eq!(rgba.get_pixel(5, 5)[3], 255);
     }
 }
