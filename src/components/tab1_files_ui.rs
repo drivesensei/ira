@@ -449,6 +449,7 @@ fn render_grid(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, acti
     f.render_widget(block, area);
 
     let selected = app.panes[pane_index].state.selected();
+    let mut overlay_tiles: Vec<(Rect, crate::services::thumbnails::ThumbRequest)> = Vec::new();
     for (k, (file_idx, entry)) in window.iter().enumerate() {
         let col = (k % cols) as u16;
         let row = (k / cols) as u16;
@@ -493,7 +494,10 @@ fn render_grid(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, acti
                 rows: GRID_IMG_H,
             };
             match app.preview_image(&req) {
-                Some(rendered) => rendered.render(img_area, f.buffer_mut()),
+                Some(rendered) => {
+                    rendered.render(img_area, f.buffer_mut());
+                    overlay_tiles.push((img_area, req));
+                }
                 None => f.render_widget(Paragraph::new(Span::raw(" …").style(dim)), img_area),
             }
         } else {
@@ -525,6 +529,13 @@ fn render_grid(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, acti
             Paragraph::new(Span::styled(format!("{marker}{}", entry.label), name_style)),
             name_area,
         );
+    }
+
+    if !overlay_tiles.is_empty() {
+        app.set_overlay_job(crate::app::OverlayJob::Grid {
+            area: inner,
+            tiles: overlay_tiles,
+        });
     }
 
     // Prefetch the screens adjacent to the viewport (no-ops for cached

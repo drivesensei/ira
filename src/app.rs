@@ -8,6 +8,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
+use image::DynamicImage;
 use open::that_detached;
 use ratatui::widgets::ListState;
 use ratatui_image::picker::Picker;
@@ -23,6 +24,7 @@ use crate::{
         },
         folders::list_common_folders,
         list_files::{list_files_bounded, list_files_chunked, FEntry, LISTING_CHUNK},
+        overlay::{self, CellPx, Overlay},
         state::{load_state, load_state_from, save_state, save_state_to, SessionState, SizeEntry},
         thumbnails::{
             preview_kind, prune_cache, spawn_workers, PreviewKind, Rendered, ThumbEvent,
@@ -440,6 +442,25 @@ pub struct App {
     theme_loader: crate::theme::Loader,
     /// Active icon set. Tests force Unicode so glyphs stay single-width.
     pub icons: crate::theme::icons::IconSet,
+    /// Native overlay (macOS Terminal.app). No-op on other hosts.
+    overlay: Overlay,
+    /// Preview / grid cell rects for this frame; consumed by [`Self::present_overlay`].
+    overlay_job: Option<OverlayJob>,
+    /// Terminal size in cells, written every frame for overlay placement.
+    overlay_term: (u16, u16),
+}
+
+/// What the native overlay should cover this frame.
+#[derive(Debug, Clone)]
+pub enum OverlayJob {
+    Column {
+        area: ratatui::layout::Rect,
+        req: ThumbRequest,
+    },
+    Grid {
+        area: ratatui::layout::Rect,
+        tiles: Vec<(ratatui::layout::Rect, ThumbRequest)>,
+    },
 }
 
 impl Default for App {
@@ -517,6 +538,9 @@ impl Default for App {
             theme_preset: crate::theme::ThemePreset::default(),
             theme_loader: crate::theme::Loader::default(),
             icons: crate::theme::icons::IconSet::Unicode,
+            overlay: Overlay::new(),
+            overlay_job: None,
+            overlay_term: (0, 0),
         }
     }
 }
@@ -1315,6 +1339,104 @@ impl App {
     /// its working set (visible + prefetched cells).
     pub fn begin_thumb_cache_frame(&mut self) {
         self.thumb_cache_cap = THUMB_CACHE_CAP_MIN;
+        self.overlay_job = None;
+    }
+
+    pub fn set_overlay_term(&mut self, cols: u16, rows: u16) {
+        self.overlay_term = (cols, rows);
+    }
+
+    pub fn set_overlay_job(&mut self, job: OverlayJob) {
+        self.overlay_job = Some(job);
+    }
+
+    fn needs_native_overlay(&self) -> bool {
+        cfg!(target_os = "macos")
+            && self.picker.as_ref().is_some_and(|p| {
+                matches!(
+                    p.protocol_type(),
+                    ratatui_image::picker::ProtocolType::Halfblocks
+                )
+            })
+    }
+
+    /// Place or hide the native overlay after a frame. Braille stays in
+    /// the cell grid as an underlay when placement fails.
+    pub fn present_overlay(&mut self) {
+        if !self.needs_native_overlay() || self.overlay_covers_preview() {
+            self.overlay.hide();
+            return;
+        }
+        let Some(job) = self.overlay_job.clone() else {
+            self.overlay.hide();
+            return;
+        };
+        let Some(window) = overlay::front_window() else {
+            self.overlay.hide();
+            return;
+        };
+        let cell = overlay::ioctl_cell_px().unwrap_or_else(|| {
+            let fs = self
+                .picker
+                .as_ref()
+                .map(|p| p.font_size())
+                .unwrap_or(ratatui_image::FontSize::new(10, 20));
+            CellPx {
+                width: fs.width,
+                height: fs.height,
+            }
+        });
+        let (cols, rows) = self.overlay_term;
+        if cols == 0 || rows == 0 {
+            self.overlay.hide();
+            return;
+        }
+        let origin = overlay::content_origin(window, cols, rows, cell);
+        match job {
+            OverlayJob::Column { area, req } => {
+                let Some(img) = self
+                    .thumb_cache
+                    .get(&req.mem_key())
+                    .and_then(Rendered::pixels)
+                    .cloned()
+                else {
+                    self.overlay.hide();
+                    return;
+                };
+                let screen = overlay::preview_screen_rect(window, origin, cell, area);
+                let fitted = overlay::fit_pixels(&img, screen.width, screen.height);
+                self.overlay.show(&fitted, screen);
+            }
+            OverlayJob::Grid { area, tiles } => {
+                let mut ready: Vec<(ratatui::layout::Rect, DynamicImage)> = Vec::new();
+                for (tile, req) in tiles {
+                    if let Some(img) = self
+                        .thumb_cache
+                        .get(&req.mem_key())
+                        .and_then(Rendered::pixels)
+                    {
+                        ready.push((tile, img.clone()));
+                    }
+                }
+                if ready.is_empty() {
+                    self.overlay.hide();
+                    return;
+                }
+                let refs: Vec<(ratatui::layout::Rect, &DynamicImage)> =
+                    ready.iter().map(|(r, i)| (*r, i)).collect();
+                let Some(composed) = overlay::composite_grid(area, cell, &refs) else {
+                    self.overlay.hide();
+                    return;
+                };
+                let screen = overlay::preview_screen_rect(window, origin, cell, area);
+                self.overlay.show(&composed, screen);
+            }
+        }
+        self.overlay.pump();
+    }
+
+    pub fn close_overlay(&mut self) {
+        self.overlay.close();
     }
 
     /// Raises the effective eviction cap if `min` is larger (never shrinks

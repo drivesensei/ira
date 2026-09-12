@@ -21,6 +21,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     // Frame-scoped thumbnail-cache cap: the grid renderer raises it to
     // cover its working set (visible + prefetched cells).
     app.begin_thumb_cache_frame();
+    app.set_overlay_term(width, height);
 
     let theme = app.theme;
     let area = frame.area();

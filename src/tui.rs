@@ -7,8 +7,31 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::Terminal;
-use std::io;
+use std::io::{self, Write};
 use std::panic;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// When true, alternate-screen / draw / reset go to stdout so Sixel DCS
+/// and kitty APC reach ConPTY (stderr is not parsed as a graphics stream).
+static TUI_ON_STDOUT: AtomicBool = AtomicBool::new(false);
+
+/// Select the TTY stream used by [`Tui::init`] / [`Tui::exit`]. Must be
+/// set before `init` and match the `CrosstermBackend` writer.
+pub fn set_tui_on_stdout(on: bool) {
+    TUI_ON_STDOUT.store(on, Ordering::SeqCst);
+}
+
+pub fn tui_on_stdout() -> bool {
+    TUI_ON_STDOUT.load(Ordering::SeqCst)
+}
+
+fn tui_out() -> impl Write {
+    if tui_on_stdout() {
+        Box::new(io::stdout()) as Box<dyn Write>
+    } else {
+        Box::new(io::stderr()) as Box<dyn Write>
+    }
+}
 
 /// Representation of a terminal user interface.
 ///
@@ -37,7 +60,7 @@ impl<B: Backend> Tui<B> {
     {
         terminal::enable_raw_mode()?;
         ratatui::crossterm::execute!(
-            io::stderr(),
+            tui_out(),
             EnterAlternateScreen,
             EnableMouseCapture,
             EnableBracketedPaste
@@ -69,6 +92,7 @@ impl<B: Backend> Tui<B> {
         <B as Backend>::Error: 'static,
     {
         self.terminal.draw(|frame| ui::render(app, frame))?;
+        app.present_overlay();
         Ok(())
     }
 
@@ -79,7 +103,7 @@ impl<B: Backend> Tui<B> {
     fn reset() -> AppResult<()> {
         terminal::disable_raw_mode()?;
         ratatui::crossterm::execute!(
-            io::stderr(),
+            tui_out(),
             LeaveAlternateScreen,
             DisableMouseCapture,
             DisableBracketedPaste

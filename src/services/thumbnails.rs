@@ -510,11 +510,15 @@ impl ThumbRequest {
     }
 }
 
-/// A finished preview, either a terminal graphics protocol or our
-/// braille-block fallback (used wherever the picker is Halfblocks).
+/// A finished preview: a terminal graphics protocol, braille cells, or
+/// raw pixels for the macOS overlay (with braille as the underlay).
 pub enum Rendered {
     Protocol(Protocol),
     Blocks(BlockImage),
+    Pixels {
+        img: DynamicImage,
+        fallback: BlockImage,
+    },
 }
 
 impl Rendered {
@@ -524,6 +528,14 @@ impl Rendered {
                 ratatui_image::Image::new(protocol).render(area, buf);
             }
             Self::Blocks(blocks) => blocks.render(area, buf),
+            Self::Pixels { fallback, .. } => fallback.render(area, buf),
+        }
+    }
+
+    pub fn pixels(&self) -> Option<&DynamicImage> {
+        match self {
+            Self::Pixels { img, .. } => Some(img),
+            _ => None,
         }
     }
 }
@@ -554,7 +566,17 @@ pub fn build_rendered(
     rows: u16,
 ) -> Rendered {
     if matches!(picker.protocol_type(), ProtocolType::Halfblocks) {
-        return Rendered::Blocks(BlockImage::from_image(&img, cols, rows, truecolor));
+        let fallback = BlockImage::from_image(&img, cols, rows, truecolor);
+        // macOS Terminal.app has no protocol; keep the pixels for the
+        // native overlay and the braille underlay if placement fails.
+        #[cfg(target_os = "macos")]
+        {
+            return Rendered::Pixels { img, fallback };
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            return Rendered::Blocks(fallback);
+        }
     }
     match picker.new_protocol(img.clone(), Size::new(cols, rows), Resize::Fit(None)) {
         Ok(protocol) => Rendered::Protocol(protocol),
@@ -775,6 +797,9 @@ mod tests {
         ));
         let img = DynamicImage::ImageRgb8(image::RgbImage::new(100, 100));
         let rendered = build_rendered(&picker, true, img, 10, 5);
+        #[cfg(target_os = "macos")]
+        assert!(matches!(rendered, Rendered::Pixels { .. }));
+        #[cfg(not(target_os = "macos"))]
         assert!(matches!(rendered, Rendered::Blocks(_)));
         // End-to-end: the braille renderer must fill a 12×7 grid without
         // panicking (plain cells, no graphics protocol).

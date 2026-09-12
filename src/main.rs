@@ -6,7 +6,7 @@ use ira::tui::Tui;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use ratatui_image::picker::ProtocolType;
-use std::io;
+use std::io::{self, Write};
 
 fn main() -> AppResult<()> {
     // Package-manager entry point: `--version` / `-V` prints and exits before
@@ -25,19 +25,25 @@ fn main() -> AppResult<()> {
 
     // Probe the terminal for image-protocol support and font size BEFORE raw
     // mode and the alternate screen: the probe runs blocking stdin queries
-    // that would otherwise race crossterm's event reader (same class of stall
-    // as the `terminal.clear()` note in `Tui::init`). Quadrant blocks render
-    // in every terminal and are the universal fallback. Sixel is skipped
-    // automatically on native Windows (blank cells); see picker_probe.
+    // that would otherwise race crossterm's event reader.
     let probed = picker_probe::probe();
+    let use_stdout = picker_probe::uses_stdout_backend(&probed.picker, cfg!(windows));
+    ira::tui::set_tui_on_stdout(use_stdout);
 
     // Create the application and install the probed picker.
     let mut app = App::new();
     let truecolor = ira::theme::caps().truecolor;
     app.set_picker(probed.picker, truecolor);
 
-    // Initialize the terminal user interface.
-    let backend = CrosstermBackend::new(io::stderr());
+    // Graphics protocols (Sixel DCS) must share the primary output stream
+    // on Windows ConPTY. `--version` / `--check-terminal` already returned.
+    // Box the writer so stdout/stderr unify as one CrosstermBackend type.
+    let writer: Box<dyn Write> = if use_stdout {
+        Box::new(io::stdout())
+    } else {
+        Box::new(io::stderr())
+    };
+    let backend = CrosstermBackend::new(writer);
     let terminal = Terminal::new(backend)?;
     // Short tick so async results (drive list, initial file listings) reach
     // the UI promptly instead of straggling behind a 2 s cadence.
@@ -64,15 +70,20 @@ fn main() -> AppResult<()> {
     }
     // Persist session state (split layout and pane folders) on exit.
     app.persist_state();
+    app.close_overlay();
     // Graphics-protocol cleanup: transmitted kitty images persist in the
     // terminal beyond the program's lifetime unless explicitly deleted.
     if matches!(
         app.picker.as_ref().map(|p| p.protocol_type()),
         Some(ProtocolType::Kitty)
     ) {
-        use std::io::Write as _;
-        let _ = write!(io::stderr(), "\x1b_Ga=d,d=e\x1b\\");
-        let _ = io::stderr().flush();
+        let mut out: Box<dyn Write> = if use_stdout {
+            Box::new(io::stdout())
+        } else {
+            Box::new(io::stderr())
+        };
+        let _ = write!(out, "\x1b_Ga=d,d=e\x1b\\");
+        let _ = out.flush();
     }
     // Exit the user interface.
     tui.exit()?;
