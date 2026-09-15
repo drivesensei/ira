@@ -150,9 +150,17 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     // Preview columns (per-pane `v` column mode) are drawn inside each
     // pane's own renderer; the files area itself is untouched here.
     if app.split {
+        // A pane editing/viewing text takes two thirds of the app width so
+        // the text column stays readable even with both panes open.
+        let text_pane = (0..2).find(|&pane| app.pane_shows_text_preview(pane));
+        let constraints = match text_pane {
+            Some(0) => [Constraint::Percentage(66), Constraint::Percentage(34)],
+            Some(_) => [Constraint::Percentage(34), Constraint::Percentage(66)],
+            None => [Constraint::Percentage(50), Constraint::Percentage(50)],
+        };
         let files = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .constraints(constraints)
             .split(files_area);
         crate::components::tab1_files_ui::render(frame, app, files[0], 0, app.active_pane == 0);
         crate::components::tab1_files_ui::render(frame, app, files[1], 1, app.active_pane == 1);
@@ -646,6 +654,43 @@ mod tests {
         let text = rendered(&mut app);
         assert!(text.contains("backdrop-marker.txt"), "{text}");
         assert!(text.contains(" Error "), "{text}");
+    }
+
+    /// With both panes open, the pane showing a text preview takes two thirds of
+    /// the app width, so the text column stays readable (the ask: "2/3 of the
+    /// full app's width even if the second panel is open").
+    #[test]
+    fn split_gives_two_thirds_to_the_text_pane() {
+        use crate::domain::data::Folder;
+        use crate::services::list_files::FEntry;
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut app = App::default();
+        app.split = true;
+        for pane in 0..2 {
+            app.panes[pane].folder = Some(Folder::new("t".into(), "/tmp".into(), '#'));
+            app.panes[pane].files = vec![FEntry {
+                path: "/tmp/notes.txt".into(),
+                label: "notes.txt".into(),
+                is_dir: false,
+                size: 12,
+                modified: None,
+            }];
+            app.panes[pane].selected = vec![false];
+            app.panes[pane].state.select(Some(0));
+            app.panes[pane].listing_settled = true;
+            app.panes[pane].preview_mode = crate::app::PreviewMode::Column;
+        }
+
+        let width = 140u16;
+        let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
+        terminal.draw(|f| render(&mut app, f)).unwrap();
+        let preview_w = app.panes[0].preview_area.0;
+        assert!(
+            preview_w * 5 >= width * 2,
+            "split: text column {preview_w} of {width} must be >= 40% of the app \
+             (50/50 gave ~27%)"
+        );
     }
 
     #[test]

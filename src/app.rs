@@ -86,21 +86,23 @@ pub struct Pane {
 /// Image preview presentation, cycled with `v`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PreviewMode {
-    /// No preview.
+    /// List with size and relative-modified columns for the files; folders
+    /// carry no size (recursive measurement is not triggered here). The
+    /// default: a fresh session opens with useful columns, not a bare list.
     #[default]
-    Off,
+    Details,
     /// Side column rendering the selected entry.
     Column,
     /// Thumbnail grid replacing the file list.
     Grid,
-    /// List with size and relative-modified columns for the files; folders
-    /// carry no size (recursive measurement is not triggered here).
-    Details,
+    /// No preview. Last in the cycle.
+    Off,
 }
 
 impl PreviewMode {
-    /// In persisted representation (state file `preview<N>=`) and cycle
-    /// order: 0=off, 1=column, 2=grid, 3=details.
+    /// In persisted representation (state file `preview<N>=`): 0=off,
+    /// 1=column, 2=grid, 3=details. Cycle order is details -> column -> grid
+    /// -> off (see [`App::cycle_preview`]).
     pub fn as_u8(self) -> u8 {
         match self {
             PreviewMode::Off => 0,
@@ -1193,13 +1195,19 @@ impl App {
         });
     }
 
-    /// Whether the active pane's preview can offer the text editor via Tab:
-    /// Column mode with a text file selected.
-    fn active_pane_offers_edit(&self) -> bool {
-        self.pane().preview_mode == PreviewMode::Column
+    /// True when `pane_index` is showing the side column for a text-like
+    /// entry: the layout gives such a column most of the width (see
+    /// `tab1_files_ui`) because text needs room, unlike a thumbnail. Also the
+    /// gate for the Tab editor.
+    pub fn pane_shows_text_preview(&self, pane_index: usize) -> bool {
+        self.panes[pane_index].preview_mode == PreviewMode::Column
             && self
-                .selected_visible_entry()
+                .selected_visible_entry_for(pane_index)
                 .is_some_and(|e| !e.is_dir && preview_kind(&e.path) == Some(PreviewKind::Text))
+    }
+
+    fn active_pane_offers_edit(&self) -> bool {
+        self.pane_shows_text_preview(self.active_pane)
     }
 
     /// Opens the editor for the active pane's selected text file. All
@@ -1839,14 +1847,14 @@ impl App {
     }
 
     /// Cycles the image preview presentation of the ACTIVE pane (`v`):
-    /// off → column → grid → details. Modes are per pane — switching panes
+    /// details → column → grid → off. Modes are per pane — switching panes
     /// with Tab never changes either pane's mode.
     pub fn cycle_preview(&mut self) {
         let next = match self.pane().preview_mode {
-            PreviewMode::Off => PreviewMode::Column,
+            PreviewMode::Details => PreviewMode::Column,
             PreviewMode::Column => PreviewMode::Grid,
-            PreviewMode::Grid => PreviewMode::Details,
-            PreviewMode::Details => PreviewMode::Off,
+            PreviewMode::Grid => PreviewMode::Off,
+            PreviewMode::Off => PreviewMode::Details,
         };
         self.pane_mut().preview_mode = next;
         if !matches!(next, PreviewMode::Column | PreviewMode::Grid) {
@@ -4590,15 +4598,16 @@ mod preview_tests {
         let mut app = App::default();
         app.state_path =
             Some(std::env::temp_dir().join(format!("ira-preview-state-{}", std::process::id())));
-        assert_eq!(app.panes[0].preview_mode, PreviewMode::Off);
+        // Details is the default; the cycle ends on off.
+        assert_eq!(app.panes[0].preview_mode, PreviewMode::Details);
         app.cycle_preview();
         assert_eq!(app.panes[0].preview_mode, PreviewMode::Column);
         app.cycle_preview();
         assert_eq!(app.panes[0].preview_mode, PreviewMode::Grid);
         app.cycle_preview();
-        assert_eq!(app.panes[0].preview_mode, PreviewMode::Details);
-        app.cycle_preview();
         assert_eq!(app.panes[0].preview_mode, PreviewMode::Off);
+        app.cycle_preview();
+        assert_eq!(app.panes[0].preview_mode, PreviewMode::Details);
     }
 
     #[test]

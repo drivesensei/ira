@@ -17,7 +17,7 @@ pub struct SizeEntry {
 
 /// The persisted session state: split layout, each pane's folder, and the
 /// folder-size cache (complete measurements only).
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SessionState {
     pub split: bool,
     pub active_pane: usize,
@@ -25,12 +25,30 @@ pub struct SessionState {
     pub show_hidden: bool,
     pub left: Option<Folder>,
     pub right: Option<Folder>,
-    /// Per-pane image preview mode (0=off, 1=column, 2=grid, 3=details).
+    /// Per-pane preview mode (0=off, 1=column, 2=grid, 3=details).
     pub preview: [u8; 2],
     /// Last-selected theme preset id (`\` cycles). `None` = never
     /// persisted; `theme.toml` / default apply.
     pub theme: Option<String>,
     pub sizes: Vec<SizeEntry>,
+}
+
+impl Default for SessionState {
+    fn default() -> Self {
+        Self {
+            split: false,
+            active_pane: 0,
+            show_hidden: false,
+            left: None,
+            right: None,
+            // Details (3) is the default mode: a fresh session — and a state
+            // file written before `preview=` existed — opens with the size /
+            // modified columns rather than the bare list.
+            preview: [3, 3],
+            theme: None,
+            sizes: Vec::new(),
+        }
+    }
 }
 
 /// Path to the session-state file (`~/.config/ira/state`).
@@ -190,6 +208,18 @@ mod tests {
         parse_folder, parse_size_entry, parse_state, serialize_state, SessionState, SizeEntry,
     };
     use crate::domain::data::Folder;
+
+    #[test]
+    fn default_state_opens_in_details_mode() {
+        // A fresh install (no state file) opens with the details columns.
+        assert_eq!(SessionState::default().preview, [3, 3]);
+        // So does a state file written before `preview=` existed.
+        let parsed = parse_state("split=0\nhidden=0\n");
+        assert_eq!(parsed.preview, [3, 3]);
+        // An explicit choice is preserved: 0 = off, 2 = grid.
+        let parsed = parse_state("preview0=0\npreview1=2\n");
+        assert_eq!(parsed.preview, [0, 2]);
+    }
 
     #[test]
     fn parses_label_path_pairs_and_bare_paths() {

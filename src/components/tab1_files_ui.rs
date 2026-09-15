@@ -24,12 +24,17 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, activ
             render_grid(f, app, area, pane_index, active);
         }
         crate::app::PreviewMode::Column => {
+            // Text needs room: give the column two thirds of the pane (the
+            // split layout separately widens the pane itself, see `ui`).
+            // Thumbnails keep the narrow fixed column.
+            let preview = if app.pane_shows_text_preview(pane_index) {
+                Constraint::Percentage(66)
+            } else {
+                Constraint::Max(crate::components::preview_ui::PREVIEW_COLS)
+            };
             let with_preview = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Min(24),
-                    Constraint::Max(crate::components::preview_ui::PREVIEW_COLS),
-                ])
+                .constraints([Constraint::Min(24), preview])
                 .split(area);
             render_list(f, app, with_preview[0], pane_index, active);
             crate::components::preview_ui::render(f, app, with_preview[1], pane_index);
@@ -706,6 +711,59 @@ mod tests {
 
     fn theme() -> Theme {
         Theme::default()
+    }
+
+    /// A text preview must dominate the pane (2/3), unlike the narrow fixed
+    /// column a thumbnail uses.
+    #[test]
+    fn text_previews_take_two_thirds_of_the_pane() {
+        use super::render;
+        use crate::app::App;
+        use crate::domain::data::Folder;
+        use crate::services::list_files::FEntry;
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut app = App::default();
+        app.panes[0].folder = Some(Folder::new("t".into(), "/tmp".into(), '#'));
+        app.panes[0].files = vec![FEntry {
+            path: "/tmp/notes.txt".into(),
+            label: "notes.txt".into(),
+            is_dir: false,
+            size: 12,
+            modified: None,
+        }];
+        app.panes[0].selected = vec![false];
+        app.panes[0].state.select(Some(0));
+        app.panes[0].listing_settled = true;
+        app.panes[0].preview_mode = crate::app::PreviewMode::Column;
+        assert!(app.pane_shows_text_preview(0), "text file in column mode");
+
+        let width = 120u16;
+        let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
+        terminal
+            .draw(|f| render(f, &mut app, f.area(), 0, true))
+            .unwrap();
+        let preview_w = app.panes[0].preview_area.0;
+        assert!(
+            preview_w >= width * 3 / 5,
+            "text column {preview_w} of {width} must take ~2/3 (was 40 cells)"
+        );
+
+        // The same pane with an image keeps the narrow fixed column.
+        app.panes[0].files[0].path = "/tmp/photo.png".into();
+        app.panes[0].files[0].label = "photo.png".into();
+        assert!(
+            !app.pane_shows_text_preview(0),
+            "image is not a text preview"
+        );
+        terminal
+            .draw(|f| render(f, &mut app, f.area(), 0, true))
+            .unwrap();
+        let image_w = app.panes[0].preview_area.0;
+        assert!(
+            image_w <= crate::components::preview_ui::PREVIEW_COLS,
+            "image column stays capped at PREVIEW_COLS ({image_w})"
+        );
     }
 
     #[test]

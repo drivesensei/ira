@@ -99,7 +99,7 @@ after a restart.
 
 | Key | Action |
 | --- | --- |
-| `v` | Cycle the active pane's image preview: off → column → grid → details (per pane, persisted) |
+| `v` | Cycle the active pane's preview: details → column → grid → off (details is the default; per pane, persisted) |
 | `Tab` | Focus the text editor when a text file is previewed |
 | `Ctrl+S` | Save (editor focused); plain letters type |
 | `Esc` | Exit the editor, back to the pane |
@@ -115,7 +115,7 @@ cursor highlighted, filtered (`/`) views included. Select an image (PNG, JPEG, G
 and ira renders it with full graphics in terminals that support the kitty, iTerm2, or Sixel
 protocols. Native Windows and Terminal.app use a transparent overlay over the thumbnail
 cells (`IRA_IMAGES=sixel` still forces Sixel). VS Code's integrated terminal on Windows
-has no overlay (braille only). 2×4 Unicode braille is the last resort.
+has no overlay (braille only). 2×4 Unicode braille is the last resort. Text-like files preview natively as text: by extension, and also extensionless names (`Makefile`, `LICENSE`, …) and dotfiles (`.env`, `.env.local`, `.gitignore`), with binaries falling back to a placeholder.
 Decoding happens on a bounded background worker
 pool and is cached in memory and on disk, so scrolling through a folder of photos stays instant
 and the UI never blocks.

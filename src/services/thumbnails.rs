@@ -105,26 +105,89 @@ pub enum PreviewKind {
     Text,
 }
 
-/// Classifies a path by extension. `None` = no preview at all.
+/// Classifies a path by extension, then by name. `None` = no preview at all.
+///
+/// Extensionless files and dotfiles (`.env`, `.env.local`, `.gitignore`,
+/// `Makefile`, `LICENSE`, …) count as text: the reader NUL-sniffs the head and
+/// shows a "binary file" placeholder, so a mislabelled binary degrades
+/// gracefully instead of being unopenable.
 pub fn preview_kind(path: &str) -> Option<PreviewKind> {
-    let ext = std::path::Path::new(path)
+    let p = std::path::Path::new(path);
+    let ext = p
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase());
-    match ext.as_deref() {
-        Some("png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp") => Some(PreviewKind::Image),
-        Some("mp4" | "mov" | "m4v" | "webm" | "mkv" | "avi") => Some(PreviewKind::Video),
-        Some("heic" | "heif") => Some(PreviewKind::Heic),
-        Some("pdf") => Some(PreviewKind::Pdf),
-        Some(
-            "txt" | "md" | "markdown" | "rst" | "log" | "csv" | "tsv" | "json" | "toml" | "yaml"
-            | "yml" | "xml" | "ini" | "conf" | "cfg" | "properties" | "env" | "sh" | "bash" | "zsh"
-            | "fish" | "ps1" | "bat" | "py" | "rb" | "pl" | "js" | "ts" | "jsx" | "tsx" | "rs"
-            | "go" | "c" | "h" | "cpp" | "hpp" | "cc" | "java" | "kt" | "swift" | "sql" | "html"
-            | "htm" | "css" | "scss" | "less" | "lua" | "vim" | "service" | "desktop",
-        ) => Some(PreviewKind::Text),
+    if let Some(kind) = ext.as_deref().and_then(kind_from_ext) {
+        return Some(kind);
+    }
+    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    if is_text_like_name(name) {
+        return Some(PreviewKind::Text);
+    }
+    None
+}
+
+/// Preview kind for a known file extension.
+fn kind_from_ext(ext: &str) -> Option<PreviewKind> {
+    match ext {
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" => Some(PreviewKind::Image),
+        "mp4" | "mov" | "m4v" | "webm" | "mkv" | "avi" => Some(PreviewKind::Video),
+        "heic" | "heif" => Some(PreviewKind::Heic),
+        "pdf" => Some(PreviewKind::Pdf),
+        "txt" | "md" | "markdown" | "rst" | "log" | "csv" | "tsv" | "json" | "toml" | "yaml"
+        | "yml" | "xml" | "ini" | "conf" | "cfg" | "properties" | "env" | "sh" | "bash" | "zsh"
+        | "fish" | "ps1" | "bat" | "py" | "rb" | "pl" | "js" | "ts" | "jsx" | "tsx" | "rs"
+        | "go" | "c" | "h" | "cpp" | "hpp" | "cc" | "java" | "kt" | "swift" | "sql" | "html"
+        | "htm" | "css" | "scss" | "less" | "lua" | "vim" | "service" | "desktop" => {
+            Some(PreviewKind::Text)
+        }
         _ => None,
     }
+}
+
+/// Extensionless or dotfile names that are text: well-known build/doc files
+/// (by full name or stem), every dotfile (`.env`, `.env.local`, `.bashrc`,
+/// `.gitignore`, …), and anything with no dot at all (`Makefile`, `LICENSE`,
+/// `configure`, an extensionless script).
+fn is_text_like_name(name: &str) -> bool {
+    const NAMES: &[&str] = &[
+        "makefile",
+        "dockerfile",
+        "containerfile",
+        "justfile",
+        "rakefile",
+        "gemfile",
+        "procfile",
+        "vagrantfile",
+        "cmakelists.txt",
+        "license",
+        "licence",
+        "copying",
+        "readme",
+        "changelog",
+        "authors",
+        "notice",
+        "install",
+        "todo",
+    ];
+    let lower = name.to_ascii_lowercase();
+    if NAMES.contains(&lower.as_str()) {
+        return true;
+    }
+    // `Makefile.am`, `Dockerfile.dev`, `README.old`: a known stem whose
+    // trailing part the extension table did not recognise still reads as text.
+    let stem = lower.split('.').next().unwrap_or_default();
+    if !stem.is_empty() && NAMES.contains(&stem) {
+        return true;
+    }
+    // Dotfiles — including ones whose trailing part looks like an extension
+    // (`.env.local`, `.env.production`).
+    if lower.starts_with('.') {
+        return true;
+    }
+    // No dot at all: `Makefile`, `LICENSE`, `configure`. Binaries mislabelled
+    // here render as the "binary file" placeholder, not as garbage.
+    !lower.contains('.')
 }
 
 /// FNV-1a 64-bit — a stable, dependency-free hash for cache file names.
@@ -713,6 +776,33 @@ mod tests {
         assert_eq!(k1, cache_key("/a.png", Some(100), 5));
     }
 
+    /// Extensionless and dotfile names now read as text (the reader sniffs
+    /// binaries and shows the placeholder), while unknown extensions stay
+    /// unclassified.
+    #[test]
+    fn preview_kind_classifies_extensionless_and_dotfiles() {
+        for name in [
+            ".env",
+            ".env.local",
+            ".env.production",
+            ".gitignore",
+            ".bashrc",
+            "Makefile",
+            "Makefile.am",
+            "Dockerfile",
+            "Dockerfile.dev",
+            "LICENSE",
+            "README.old",
+            "configure",
+            "desktop.ini",
+        ] {
+            assert_eq!(preview_kind(name), Some(PreviewKind::Text), "{name}");
+        }
+        for name in ["a.bin", "a.zip", "a.xyz", "data.out", "archive.tar"] {
+            assert_eq!(preview_kind(name), None, "{name}");
+        }
+    }
+
     #[test]
     fn preview_kind_classifies_extensions() {
         for name in ["a.png", "a.JPG", "a.jpeg", "a.gif", "a.bmp", "a.webp"] {
@@ -730,7 +820,9 @@ mod tests {
         ] {
             assert_eq!(preview_kind(name), Some(PreviewKind::Text), "{name}");
         }
-        for name in ["a.tar.gz", "a", "a.pdfx"] {
+        // Extensionless names are text now (see the test above); genuinely
+        // unknown extensions still do not preview.
+        for name in ["a.tar.gz", "a.pdfx", "a.bin", "a.zip"] {
             assert_eq!(preview_kind(name), None, "{name} must not preview");
         }
     }
