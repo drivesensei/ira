@@ -21,6 +21,23 @@ pub fn windows_terminal_font_face(profile_id: Option<&str>) -> Option<String> {
         .find_map(|src| wt_profile_font_face(&src, profile_id))
 }
 
+/// Point size of the Windows Terminal profile font (`font.size` / `fontSize`).
+pub fn windows_terminal_font_size(profile_id: Option<&str>) -> Option<f64> {
+    windows_terminal_settings_paths()
+        .into_iter()
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .find_map(|src| wt_profile_font_size(&src, profile_id))
+}
+
+/// Line-box multiplier from `font.lineHeight` / `font.cellHeight` when the
+/// value is a simple number or percent. `None` for missing or exotic units.
+pub fn windows_terminal_line_height(profile_id: Option<&str>) -> Option<f64> {
+    windows_terminal_settings_paths()
+        .into_iter()
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .find_map(|src| wt_profile_line_height(&src, profile_id))
+}
+
 /// Candidate `settings.json` locations for Windows Terminal.
 fn windows_terminal_settings_paths() -> Vec<PathBuf> {
     const REL: [&str; 3] = [
@@ -80,6 +97,101 @@ pub fn wt_profile_font_face(jsonc: &str, profile_id: Option<&str>) -> Option<Str
         }
     }
     defaults.and_then(face_of)
+}
+
+/// `font.size` (1.10+) or legacy `fontSize`, profile then `profiles.defaults`.
+pub fn wt_profile_font_size(jsonc: &str, profile_id: Option<&str>) -> Option<f64> {
+    let v: Value = serde_json::from_str(&strip_jsonc(jsonc)).ok()?;
+    let profiles = v.get("profiles")?;
+    let (list, defaults) = match profiles {
+        Value::Array(list) => (Some(list), None),
+        Value::Object(_) => (
+            profiles.get("list").and_then(Value::as_array),
+            profiles.get("defaults"),
+        ),
+        _ => (None, None),
+    };
+    let size_of = |p: &Value| -> Option<f64> {
+        p.get("font")
+            .and_then(|f| f.get("size"))
+            .and_then(Value::as_f64)
+            .or_else(|| p.get("fontSize").and_then(Value::as_f64))
+            .filter(|s| *s > 0.0)
+    };
+    if let (Some(list), Some(id)) = (list, profile_id) {
+        let hit = list.iter().find(|p| {
+            p.get("guid")
+                .and_then(Value::as_str)
+                .is_some_and(|g| g.eq_ignore_ascii_case(id))
+        });
+        if let Some(size) = hit.and_then(size_of) {
+            return Some(size);
+        }
+    }
+    defaults.and_then(size_of)
+}
+
+/// Simple line-box multiplier from `font.lineHeight` or `font.cellHeight`.
+/// JSON number, numeric string ("1.2"), or percent ("120%") only — px/pt/ch
+/// and keywords ("leading") are ignored rather than guessed.
+pub fn parse_wt_line_height(v: &Value) -> Option<f64> {
+    match v {
+        Value::Number(n) => n.as_f64().filter(|x| *x > 0.0 && *x < 10.0),
+        Value::String(s) => parse_wt_line_height_str(s),
+        _ => None,
+    }
+}
+
+fn parse_wt_line_height_str(s: &str) -> Option<f64> {
+    let s = s.trim();
+    if s.is_empty()
+        || s.eq_ignore_ascii_case("leading")
+        || s.eq_ignore_ascii_case("default")
+        || s.eq_ignore_ascii_case("none")
+    {
+        return None;
+    }
+    if let Some(pct) = s.strip_suffix('%') {
+        let n: f64 = pct.trim().parse().ok()?;
+        let m = n / 100.0;
+        return (m > 0.0 && m < 10.0).then_some(m);
+    }
+    if s.chars().any(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let n: f64 = s.parse().ok()?;
+    (n > 0.0 && n < 10.0).then_some(n)
+}
+
+/// `font.lineHeight` then `font.cellHeight`, profile then `profiles.defaults`.
+pub fn wt_profile_line_height(jsonc: &str, profile_id: Option<&str>) -> Option<f64> {
+    let v: Value = serde_json::from_str(&strip_jsonc(jsonc)).ok()?;
+    let profiles = v.get("profiles")?;
+    let (list, defaults) = match profiles {
+        Value::Array(list) => (Some(list), None),
+        Value::Object(_) => (
+            profiles.get("list").and_then(Value::as_array),
+            profiles.get("defaults"),
+        ),
+        _ => (None, None),
+    };
+    let height_of = |p: &Value| -> Option<f64> {
+        let font = p.get("font")?;
+        font.get("lineHeight")
+            .and_then(parse_wt_line_height)
+            .or_else(|| font.get("cellHeight").and_then(parse_wt_line_height))
+    };
+    if let (Some(list), Some(id)) = (list, profile_id) {
+        let hit = list.iter().find(|p| {
+            p.get("guid")
+                .and_then(Value::as_str)
+                .is_some_and(|g| g.eq_ignore_ascii_case(id))
+        });
+        if let Some(h) = hit.and_then(height_of) {
+            return Some(h);
+        }
+    }
+    defaults.and_then(height_of)
 }
 
 /// Font family of the VS Code-family integrated terminal hosting this
@@ -285,6 +397,36 @@ mod tests {
             None
         );
         assert_eq!(wt_profile_font_face("not json", None), None);
+    }
+
+    #[test]
+    fn wt_size_prefers_the_active_profile_then_defaults() {
+        // Profile font object has no size → defaults 11.
+        assert_eq!(
+            wt_profile_font_size(WT_SETTINGS, Some("{61C54BBD-C2C6-5271-96E7-009A87FF44BF}")),
+            Some(11.0)
+        );
+        assert_eq!(wt_profile_font_size(WT_SETTINGS, None), Some(11.0));
+        let sized = r#"{"profiles":{"defaults":{"font":{"size":12}},"list":[{"guid":"{a}","font":{"size":14}}]}}"#;
+        assert_eq!(wt_profile_font_size(sized, Some("{a}")), Some(14.0));
+        let legacy = r#"{"profiles":[{"guid":"{a}","fontSize":16}]}"#;
+        assert_eq!(wt_profile_font_size(legacy, Some("{a}")), Some(16.0));
+        assert_eq!(wt_profile_font_size("not json", None), None);
+    }
+
+    #[test]
+    fn wt_line_height_parses_simple_values_only() {
+        assert_eq!(parse_wt_line_height(&serde_json::json!(1.2)), Some(1.2));
+        assert_eq!(parse_wt_line_height(&serde_json::json!("1.2")), Some(1.2));
+        assert_eq!(parse_wt_line_height(&serde_json::json!("120%")), Some(1.2));
+        assert_eq!(parse_wt_line_height(&serde_json::json!("leading")), None);
+        assert_eq!(parse_wt_line_height(&serde_json::json!("12px")), None);
+        assert_eq!(parse_wt_line_height(&serde_json::json!("12pt")), None);
+        assert_eq!(parse_wt_line_height(&serde_json::json!("1ch")), None);
+        let profile = r#"{"profiles":{"defaults":{"font":{"size":12,"cellHeight":"1.0"}},"list":[{"guid":"{a}","font":{"lineHeight":1.4}}]}}"#;
+        assert_eq!(wt_profile_line_height(profile, Some("{a}")), Some(1.4));
+        assert_eq!(wt_profile_line_height(profile, None), Some(1.0));
+        assert_eq!(wt_profile_line_height(WT_SETTINGS, None), None);
     }
 
     #[test]

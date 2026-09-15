@@ -11,14 +11,14 @@ use objc2_app_kit::{
     NSFloatingWindowLevel, NSImage, NSImageFrameStyle, NSImageScaling, NSImageView, NSPanel,
     NSScreen, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
-use objc2_foundation::{NSData, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize};
+use objc2_foundation::{NSData, NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize};
 
 use super::{ScreenRect, WindowGeom};
 
 pub struct MacOverlay {
     panel: Option<Retained<NSPanel>>,
     image_view: Option<Retained<NSImageView>>,
-    visible: bool,
+    pub visible: bool,
 }
 
 impl MacOverlay {
@@ -34,10 +34,11 @@ impl MacOverlay {
         let Some(mtm) = MainThreadMarker::new() else {
             return false;
         };
-        let app = NSApplication::sharedApplication(mtm);
-        app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
         if self.panel.is_none() {
+            let app = NSApplication::sharedApplication(mtm);
+            app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+
             let style = NSWindowStyleMask::Borderless.union(NSWindowStyleMask::NonactivatingPanel);
             let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(8.0, 8.0));
             let panel = NSPanel::initWithContentRect_styleMask_backing_defer(
@@ -77,16 +78,15 @@ impl MacOverlay {
         true
     }
 
-    pub fn show(&mut self, img: &DynamicImage, rect: ScreenRect) {
-        if rect.width == 0 || rect.height == 0 {
+    pub fn show_png(&mut self, png: &[u8], rect: ScreenRect) {
+        if rect.width == 0 || rect.height == 0 || png.is_empty() {
             self.hide();
             return;
         }
-        let png = encode_png(img);
         if !self.ensure() {
             return;
         }
-        let data = NSData::from_vec(png);
+        let data = NSData::from_vec(png.to_vec());
         let Some(nsimg) = NSImage::initWithData(NSImage::alloc(), &data) else {
             return;
         };
@@ -104,22 +104,35 @@ impl MacOverlay {
 
     pub fn move_to(&mut self, rect: ScreenRect) {
         if rect.width == 0 || rect.height == 0 {
-            self.hide();
+            self.order_out();
             return;
         }
         if let Some(panel) = &self.panel {
             panel.setFrame_display(to_cocoa_rect(rect), true);
+            if !self.visible {
+                panel.orderFront(None);
+                self.visible = true;
+                self.pump();
+            }
         }
     }
 
-    pub fn hide(&mut self) {
+    /// Hide the panel without dropping the image (modal / wrong-window).
+    pub fn order_out(&mut self) {
+        if !self.visible {
+            return;
+        }
         if let Some(panel) = &self.panel {
             panel.orderOut(None);
-            if let Some(view) = &self.image_view {
-                view.setImage(None);
-            }
         }
         self.visible = false;
+    }
+
+    pub fn hide(&mut self) {
+        self.order_out();
+        if let Some(view) = &self.image_view {
+            view.setImage(None);
+        }
     }
 
     pub fn close(&mut self) {
@@ -135,13 +148,15 @@ impl MacOverlay {
             return;
         };
         let app = NSApplication::sharedApplication(mtm);
-        // Drain pending AppKit events so the panel actually paints without
-        // taking focus from the terminal.
-        loop {
+        // Non-blocking drain: nil untilDate can wait forever. Bound the
+        // loop so a busy queue cannot stall the render thread.
+        const MAX_EVENTS: usize = 8;
+        let until = NSDate::distantPast();
+        for _ in 0..MAX_EVENTS {
             let event = unsafe {
                 app.nextEventMatchingMask_untilDate_inMode_dequeue(
                     NSEventMask::Any,
-                    None,
+                    Some(&until),
                     NSDefaultRunLoopMode,
                     true,
                 )
@@ -154,7 +169,7 @@ impl MacOverlay {
     }
 }
 
-fn encode_png(img: &DynamicImage) -> Vec<u8> {
+pub(super) fn encode_png(img: &DynamicImage) -> Vec<u8> {
     let mut buf = Vec::new();
     let _ = img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png);
     buf
@@ -179,7 +194,20 @@ fn main_screen_height() -> f64 {
         .unwrap_or(1080.0)
 }
 
-pub fn front_window() -> Option<WindowGeom> {
+fn stdin_tty() -> Option<String> {
+    unsafe {
+        let p = libc::ttyname(libc::STDIN_FILENO);
+        if p.is_null() {
+            return None;
+        }
+        std::ffi::CStr::from_ptr(p)
+            .to_str()
+            .ok()
+            .map(str::to_string)
+    }
+}
+
+pub fn query_front_window() -> Option<WindowGeom> {
     let program = std::env::var("TERM_PROGRAM").unwrap_or_default();
     let expected = if program.contains("iTerm") {
         "iTerm2"
@@ -190,6 +218,7 @@ pub fn front_window() -> Option<WindowGeom> {
     } else {
         ""
     };
+    let tty = stdin_tty().filter(|t| !t.is_empty() && !t.contains('"') && !t.contains('\\'));
     let script = if expected.is_empty() {
         r#"tell application "System Events"
             set n to name of first process whose frontmost is true
@@ -204,10 +233,7 @@ pub fn front_window() -> Option<WindowGeom> {
         end tell"#
             .to_string()
     } else if expected == "iTerm2" {
-        r#"tell application "System Events" to set n to name of first process whose frontmost is true
-if n does not contain "iTerm" then return "HIDE"
-tell application "iTerm" to get the bounds of the first window"#
-            .to_string()
+        iterm_bounds_script(tty.as_deref())
     } else if expected == "Ghostty" {
         r#"tell application "System Events" to set n to name of first process whose frontmost is true
 if n does not contain "Ghostty" and n is not "ghostty" then return "HIDE"
@@ -220,16 +246,63 @@ tell application "System Events"
 end tell"#
             .to_string()
     } else {
-        r#"tell application "System Events" to set n to name of first process whose frontmost is true
-if n is not "Terminal" then return "HIDE"
-tell application "Terminal" to get the bounds of the front window"#
-            .to_string()
+        terminal_app_bounds_script(tty.as_deref())
     };
     let raw = osascript(&script)?;
     if raw.trim() == "HIDE" {
         return None;
     }
     parse_bounds(&Some(raw))
+}
+
+fn terminal_app_bounds_script(tty: Option<&str>) -> String {
+    let Some(tty) = tty else {
+        return r#"tell application "System Events" to set n to name of first process whose frontmost is true
+if n is not "Terminal" then return "HIDE"
+tell application "Terminal" to get the bounds of the front window"#
+            .to_string();
+    };
+    format!(
+        r#"tell application "System Events" to set n to name of first process whose frontmost is true
+if n is not "Terminal" then return "HIDE"
+tell application "Terminal"
+    set targetTty to "{tty}"
+    repeat with w in windows
+        try
+            if tty of selected tab of w is targetTty then
+                return bounds of w
+            end if
+        end try
+    end repeat
+    return "HIDE"
+end tell"#
+    )
+}
+
+fn iterm_bounds_script(tty: Option<&str>) -> String {
+    let Some(tty) = tty else {
+        return r#"tell application "System Events" to set n to name of first process whose frontmost is true
+if n does not contain "iTerm" then return "HIDE"
+tell application "iTerm" to get the bounds of the first window"#
+            .to_string();
+    };
+    format!(
+        r#"tell application "System Events" to set n to name of first process whose frontmost is true
+if n does not contain "iTerm" then return "HIDE"
+tell application "iTerm"
+    set targetTty to "{tty}"
+    repeat with w in windows
+        repeat with t in tabs of w
+            repeat with s in sessions of t
+                try
+                    if tty of s is targetTty then return bounds of w
+                end try
+            end repeat
+        end repeat
+    end repeat
+    return "HIDE"
+end tell"#
+    )
 }
 
 fn osascript(src: &str) -> Option<String> {

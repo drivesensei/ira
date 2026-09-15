@@ -168,6 +168,8 @@ forces the fallback set, `icons = "emoji"` forces emoji on a host the list above
   has them (e.g. `Cascadia Mono NF`, or a fallback list such as
   `Cascadia Mono, Symbols Nerd Font Mono`). Image previews use a transparent
   Win32 overlay (silent probe + `WT_SESSION`); `IRA_IMAGES=sixel` forces Sixel.
+  VS Code's integrated terminal on Windows is not a console HWND — overlay
+  placement is skipped and previews stay on the braille underlay.
 - **Terminal.app** has no image protocol. Previews use a transparent AppKit
   overlay over the thumbnail cells (2×4 braille underlay if the window cannot
   be located). iTerm2, Ghostty, kitty and WezTerm keep their in-terminal

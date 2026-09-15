@@ -103,7 +103,8 @@ While searching, typed characters filter the file list by fuzzy subsequence matc
   On iTerm2 — whose kitty implementation does not render kitty's unicode placeholders and
   would show "?" glyphs — kitty is skipped at detection and the iTerm2 protocol is used
   instead. iTerm2, Ghostty, kitty and WezTerm keep their in-terminal protocols; Terminal.app
-  and Windows Terminal use the overlay.
+  and Windows Terminal use the overlay. VS Code's integrated terminal on Windows has no
+  overlay (braille only): the host HWND is not a Windows Console / Terminal window.
 
 ## Domain model
 

@@ -154,6 +154,11 @@ pub const STATUS_TTL: Duration = Duration::from_secs(8);
 /// visible entries and they would re-decode every frame — visible as
 /// endless thumbnail flashing on large monitors.
 const THUMB_CACHE_CAP_MIN: usize = 256;
+/// Off-screen *grid* tiles kept fitted for scroll-back. Bounded by count and
+/// by total bytes: one HiDPI tile can exceed 500 KB, so the byte budget — not
+/// a pixel-count heuristic — is what actually bounds memory.
+const OVERLAY_FITTED_LRU: usize = 96;
+const OVERLAY_FITTED_LRU_BYTES: usize = 24 * 1024 * 1024;
 
 /// Gap between navigation keys under which they count as "held down"
 /// (OS key-repeat fires at ~30 Hz; anything slower is a fresh press).
@@ -442,10 +447,17 @@ pub struct App {
     theme_loader: crate::theme::Loader,
     /// Active icon set. Tests force Unicode so glyphs stay single-width.
     pub icons: crate::theme::icons::IconSet,
-    /// Native overlay (macOS Terminal.app). No-op on other hosts.
+    /// Native overlay (macOS Terminal.app / Windows). No-op on other hosts.
     overlay: Overlay,
-    /// Preview / grid cell rects for this frame; consumed by [`Self::present_overlay`].
-    overlay_job: Option<OverlayJob>,
+    /// One job per pane (slot = pane index). None = that pane has no overlay.
+    overlay_jobs: [Option<OverlayJob>; overlay::OVERLAY_SLOTS],
+    /// Keys on-screen last/this frame; eviction must not drop these.
+    overlay_protect: HashSet<String>,
+    /// Grid tiles that scrolled off recently, newest first. Keys enter only
+    /// when they leave the on-screen set (`rebuild_overlay_protect`), so a key
+    /// that stays visible costs nothing here; a tile that scrolls off keeps its
+    /// fitted bitmap for the round trip. Bounded by count and bytes.
+    overlay_fitted_lru: FittedLru,
     /// Terminal size in cells, written every frame for overlay placement.
     overlay_term: (u16, u16),
 }
@@ -455,17 +467,136 @@ pub struct App {
 pub enum OverlayJob {
     Column {
         area: ratatui::layout::Rect,
-        req: ThumbRequest,
+        key: String,
     },
     Grid {
         area: ratatui::layout::Rect,
-        tiles: Vec<(ratatui::layout::Rect, ThumbRequest)>,
+        tiles: Vec<(ratatui::layout::Rect, String)>,
     },
 }
 
 enum OverlayJobKind {
     Column,
     Grid,
+}
+
+/// Recently scrolled-away grid tiles, newest first, with a byte budget so a
+/// HiDPI tile cannot blow up retention. Maintained incrementally: `touch` on
+/// leaving the screen, `forget` when the cache entry is evicted, `contains` in
+/// the prune. The deque and the set are always in sync.
+#[derive(Default)]
+struct FittedLru {
+    order: VecDeque<(String, usize)>,
+    set: HashSet<String>,
+    bytes: usize,
+}
+
+impl FittedLru {
+    /// Remember `key` as the most recent off-screen tile, `bytes` being its
+    /// fitted bitmap size. Re-touching moves it to the back.
+    fn touch(&mut self, key: &str, bytes: usize) {
+        self.forget(key);
+        self.set.insert(key.to_string());
+        self.order.push_back((key.to_string(), bytes));
+        self.bytes = self.bytes.saturating_add(bytes);
+        while self.order.len() > OVERLAY_FITTED_LRU
+            || (self.bytes > OVERLAY_FITTED_LRU_BYTES && self.order.len() > 1)
+        {
+            self.pop_front();
+        }
+    }
+
+    fn forget(&mut self, key: &str) {
+        if self.set.remove(key) {
+            if let Some(pos) = self.order.iter().position(|(k, _)| k == key) {
+                if let Some((_, bytes)) = self.order.remove(pos) {
+                    self.bytes = self.bytes.saturating_sub(bytes);
+                }
+            }
+        }
+    }
+
+    /// Drop keys that are on screen again. The LRU holds strictly off-screen
+    /// tiles: a key that scrolls back into view leaves it, and re-enters with
+    /// fresh byte accounting the next time it goes away (a refit while it was
+    /// visible would otherwise leave stale bytes behind). Probes the on-screen
+    /// set, so the cost is O(visible keys), not an LRU scan.
+    fn retain_off_screen(&mut self, protect: &HashSet<String>) {
+        if self.set.is_empty() {
+            return;
+        }
+        for key in protect {
+            if self.set.contains(key) {
+                self.forget(key);
+            }
+        }
+    }
+
+    fn contains(&self, key: &str) -> bool {
+        self.set.contains(key)
+    }
+
+    fn pop_front(&mut self) {
+        if let Some((key, bytes)) = self.order.pop_front() {
+            // The set must follow the deque, or `contains` would keep
+            // reporting trimmed keys (and the prune would retain their
+            // bitmaps) forever.
+            self.set.remove(&key);
+            self.bytes = self.bytes.saturating_sub(bytes);
+        }
+    }
+
+    #[cfg(test)]
+    fn keys(&self) -> impl Iterator<Item = &String> {
+        self.order.iter().map(|(k, _)| k)
+    }
+}
+
+/// Keep a dest-sized fitted bitmap only if it is on-screen, or a tile that
+/// scrolled off recently (the LRU). The LRU admits any departed key, large
+/// column bitmaps included — the byte budget, not a size test, is what keeps
+/// that safe (`OVERLAY_FITTED_LRU_BYTES`).
+fn should_keep_fitted(key: &str, protect: &HashSet<String>, lru: &FittedLru) -> bool {
+    protect.contains(key) || lru.contains(key)
+}
+
+fn overlay_job_fps(
+    job: &OverlayJob,
+    cache: &HashMap<String, Rendered>,
+    window: overlay::WindowGeom,
+    cell: overlay::CellPx,
+    term: (u16, u16),
+) -> Option<(ratatui::layout::Rect, OverlayJobKind, u64, u64)> {
+    match job {
+        OverlayJob::Column { area, key } => {
+            if cache.get(key).and_then(Rendered::pixels).is_none() {
+                return None;
+            }
+            let tiles = [(*area, key.as_str())];
+            Some((
+                *area,
+                OverlayJobKind::Column,
+                overlay::content_hash(cell, term, *area, &tiles),
+                overlay::placement_hash(window, cell, term, *area, &tiles),
+            ))
+        }
+        OverlayJob::Grid { area, tiles } => {
+            let ready: Vec<(ratatui::layout::Rect, &str)> = tiles
+                .iter()
+                .filter(|(_, key)| cache.get(key).and_then(Rendered::pixels).is_some())
+                .map(|(tile, key)| (*tile, key.as_str()))
+                .collect();
+            if ready.is_empty() {
+                return None;
+            }
+            Some((
+                *area,
+                OverlayJobKind::Grid,
+                overlay::content_hash(cell, term, *area, &ready),
+                overlay::placement_hash(window, cell, term, *area, &ready),
+            ))
+        }
+    }
 }
 
 impl Default for App {
@@ -544,7 +675,9 @@ impl Default for App {
             theme_loader: crate::theme::Loader::default(),
             icons: crate::theme::icons::IconSet::Unicode,
             overlay: Overlay::new(),
-            overlay_job: None,
+            overlay_jobs: std::array::from_fn(|_| None),
+            overlay_protect: HashSet::new(),
+            overlay_fitted_lru: FittedLru::default(),
             overlay_term: (0, 0),
         }
     }
@@ -1344,15 +1477,36 @@ impl App {
     /// its working set (visible + prefetched cells).
     pub fn begin_thumb_cache_frame(&mut self) {
         self.thumb_cache_cap = THUMB_CACHE_CAP_MIN;
-        self.overlay_job = None;
+        self.overlay_jobs = std::array::from_fn(|_| None);
     }
 
     pub fn set_overlay_term(&mut self, cols: u16, rows: u16) {
         self.overlay_term = (cols, rows);
     }
 
-    pub fn set_overlay_job(&mut self, job: OverlayJob) {
-        self.overlay_job = Some(job);
+    pub fn set_overlay_job(&mut self, pane: usize, job: OverlayJob) {
+        if pane >= overlay::OVERLAY_SLOTS {
+            return;
+        }
+        self.protect_overlay_job(&job);
+        self.overlay_jobs[pane] = Some(job);
+    }
+
+    pub fn protect_overlay_key(&mut self, key: &str) {
+        self.overlay_protect.insert(key.to_string());
+    }
+
+    fn protect_overlay_job(&mut self, job: &OverlayJob) {
+        match job {
+            OverlayJob::Column { key, .. } => {
+                self.overlay_protect.insert(key.clone());
+            }
+            OverlayJob::Grid { tiles, .. } => {
+                for (_, key) in tiles {
+                    self.overlay_protect.insert(key.clone());
+                }
+            }
+        }
     }
 
     fn needs_native_overlay(&self) -> bool {
@@ -1368,132 +1522,209 @@ impl App {
     /// Place or hide the native overlay after a frame. Braille stays in
     /// the cell grid as an underlay when placement fails.
     pub fn present_overlay(&mut self) {
-        if !self.needs_native_overlay() || self.overlay_covers_preview() {
-            self.overlay.hide();
+        if !self.needs_native_overlay() {
+            overlay::set_geom_wanted(false);
+            self.overlay.hide_all();
+            // No native overlay: skip rebuild/prune (nothing to pin or fit).
+            // Drop protect so Linux/protocol paths cannot grow it forever.
+            self.overlay_protect.clear();
             return;
         }
-        let Some(job) = self.overlay_job.as_ref() else {
-            self.overlay.hide();
+        if self.overlay_covers_preview() {
+            // Leave polling off while a dialog is open (no osascript
+            // while help sits). Closing it sets wanted true, which
+            // stamps Pending so a stale Ready is not Hidden; the first
+            // resume frame leaves the overlay as-is then move_to.
+            overlay::set_geom_wanted(false);
+            self.overlay.suspend_all();
+            // Column jobs were not recorded this frame; keep the last
+            // protect set so FIFO eviction still skips on-screen keys.
+            self.prune_unprotected_fitted();
             return;
-        };
+        }
         let (cols, rows) = self.overlay_term;
-        if cols == 0 || rows == 0 {
-            self.overlay.hide();
+        let any_job = self.overlay_jobs.iter().any(|j| j.is_some());
+        if cols == 0 || rows == 0 || !any_job {
+            overlay::set_geom_wanted(false);
+            self.overlay.hide_all();
+            self.rebuild_overlay_protect();
             return;
         }
-        let Some(window) = overlay::front_window() else {
-            self.overlay.hide();
-            return;
-        };
-        let cell = overlay::ioctl_cell_px()
-            .filter(|c| c.width > 0 && c.height > 0)
-            .unwrap_or_else(|| overlay::cell_px_from_window(window, cols, rows));
-        let origin = overlay::content_origin(window, cols, rows, cell);
-        match job {
-            OverlayJob::Column { area, req } => {
-                let key = req.mem_key();
-                let tiles = [(*area, key.as_str())];
-                if self
-                    .thumb_cache
-                    .get(&key)
-                    .and_then(Rendered::pixels)
-                    .is_none()
-                {
-                    self.overlay.hide();
-                    return;
-                }
-                self.present_overlay_image(
-                    window,
-                    origin,
-                    cell,
-                    (cols, rows),
-                    *area,
-                    &tiles,
-                    OverlayJobKind::Column,
-                );
+        overlay::set_geom_wanted(true);
+        let window = match overlay::front_window() {
+            // Leave as-is (suspended but content_fp kept). A one-frame
+            // wait for the tracker sample is cheaper than polling during
+            // a dialog; Pending is stamped fresh so it is not Hidden.
+            overlay::FrontWindow::Pending => {
+                self.rebuild_overlay_protect();
+                return;
             }
-            OverlayJob::Grid { area, tiles } => {
-                let ready_meta: Vec<(ratatui::layout::Rect, String)> = tiles
-                    .iter()
-                    .filter(|(_, req)| {
-                        self.thumb_cache
-                            .get(&req.mem_key())
-                            .and_then(Rendered::pixels)
-                            .is_some()
-                    })
-                    .map(|(tile, req)| (*tile, req.mem_key()))
-                    .collect();
-                if ready_meta.is_empty() {
-                    self.overlay.hide();
-                    return;
+            overlay::FrontWindow::Hidden => {
+                self.overlay.suspend_all();
+                self.rebuild_overlay_protect();
+                return;
+            }
+            overlay::FrontWindow::Ready(w) => w,
+        };
+        let cell = overlay::resolve_cell_px(window, cols, rows);
+        let origin = overlay::content_origin(window, cols, rows, cell);
+        for slot in 0..overlay::OVERLAY_SLOTS {
+            if self.overlay_jobs[slot].is_none() {
+                self.overlay.hide_slot(slot);
+                continue;
+            }
+            self.present_overlay_job(slot, window, origin, cell, (cols, rows));
+        }
+        self.rebuild_overlay_protect();
+    }
+
+    fn rebuild_overlay_protect(&mut self) {
+        let previous = std::mem::take(&mut self.overlay_protect);
+        for slot in 0..overlay::OVERLAY_SLOTS {
+            match &self.overlay_jobs[slot] {
+                Some(OverlayJob::Column { key, .. }) => {
+                    self.overlay_protect.insert(key.clone());
                 }
-                let ready_refs: Vec<(ratatui::layout::Rect, &str)> = ready_meta
-                    .iter()
-                    .map(|(tile, key)| (*tile, key.as_str()))
-                    .collect();
-                self.present_overlay_image(
-                    window,
-                    origin,
-                    cell,
-                    (cols, rows),
-                    *area,
-                    &ready_refs,
-                    OverlayJobKind::Grid,
-                );
+                Some(OverlayJob::Grid { tiles, .. }) => {
+                    for (_, key) in tiles {
+                        self.overlay_protect.insert(key.clone());
+                    }
+                }
+                None => {}
+            }
+        }
+        // Keys that just left the screen are the only LRU entrants: their
+        // fitted bitmap stays for the scroll-back round trip (count + byte
+        // bounded). Keys that are on screen are covered by `overlay_protect`
+        // and must not linger in the LRU (see `retain_off_screen`).
+        self.overlay_fitted_lru
+            .retain_off_screen(&self.overlay_protect);
+        let retired: Vec<String> = previous
+            .into_iter()
+            .filter(|key| !self.overlay_protect.contains(key))
+            .collect();
+        for key in retired {
+            if let Some(bytes) = self.thumb_cache.get(&key).and_then(Rendered::fitted_bytes) {
+                self.overlay_fitted_lru.touch(&key, bytes);
+            }
+        }
+        self.prune_unprotected_fitted();
+    }
+
+    /// Drop dest-sized fitted bitmaps that are neither on-screen nor in the
+    /// scroll-back LRU. Off-screen thumbs keep `overlay_store_img` (≤256 px).
+    fn prune_unprotected_fitted(&mut self) {
+        let lru = &self.overlay_fitted_lru;
+        for (key, rendered) in &mut self.thumb_cache {
+            if !should_keep_fitted(key, &self.overlay_protect, lru) {
+                rendered.clear_fitted();
             }
         }
     }
 
-    fn present_overlay_image(
+    fn present_overlay_job(
         &mut self,
+        slot: usize,
         window: overlay::WindowGeom,
         origin: (u32, u32),
         cell: overlay::CellPx,
         term: (u16, u16),
-        area: ratatui::layout::Rect,
-        tiles: &[(ratatui::layout::Rect, &str)],
-        kind: OverlayJobKind,
     ) {
-        let content_fp = overlay::content_hash(cell, term, area, tiles);
-        let place_fp = overlay::placement_hash(window, cell, term, area, tiles);
+        let Some((area, kind, content_fp, place_fp)) = ({
+            self.overlay_jobs[slot]
+                .as_ref()
+                .and_then(|job| overlay_job_fps(job, &self.thumb_cache, window, cell, term))
+        }) else {
+            self.overlay.hide_slot(slot);
+            return;
+        };
         let screen = overlay::preview_screen_rect(window, origin, cell, area);
-        if self.overlay.is_current(place_fp) {
+        if self.overlay.is_current(slot, place_fp) {
             return;
         }
-        if self.overlay.same_content(content_fp) {
-            self.overlay.move_to(screen);
-            self.overlay.mark_current(place_fp, content_fp);
+        if self.overlay.same_content(slot, content_fp) {
+            self.overlay.move_to(slot, screen);
+            self.overlay.mark_current(slot, place_fp, content_fp);
             return;
         }
         match kind {
             OverlayJobKind::Column => {
-                let Some(img) = self.thumb_cache.get(tiles[0].1).and_then(Rendered::pixels) else {
-                    self.overlay.hide();
-                    return;
+                let key = {
+                    let Some(OverlayJob::Column { key, .. }) = self.overlay_jobs[slot].as_ref()
+                    else {
+                        self.overlay.hide_slot(slot);
+                        return;
+                    };
+                    key.clone()
                 };
-                let fitted = overlay::fit_pixels(img, screen.width, screen.height);
-                self.overlay.show(&fitted, screen);
+                {
+                    let Some(fitted) = self
+                        .thumb_cache
+                        .get_mut(&key)
+                        .and_then(|r| r.ensure_fitted(screen.width, screen.height))
+                    else {
+                        self.overlay.hide_slot(slot);
+                        return;
+                    };
+                    self.overlay.show(slot, fitted, screen, content_fp);
+                }
             }
             OverlayJobKind::Grid => {
-                let refs: Vec<(ratatui::layout::Rect, &DynamicImage)> = tiles
-                    .iter()
-                    .filter_map(|(tile, key)| {
-                        self.thumb_cache
-                            .get(*key)
-                            .and_then(Rendered::pixels)
-                            .map(|img| (*tile, img))
-                    })
-                    .collect();
-                let Some(composed) =
-                    overlay::composite_grid(area, cell, &refs, overlay::GRID_FILL_PERCENT)
-                else {
-                    self.overlay.hide();
+                self.ensure_fitted_grid_tiles(slot, cell);
+                let composed = {
+                    let Some(OverlayJob::Grid { area, tiles }) = self.overlay_jobs[slot].as_ref()
+                    else {
+                        self.overlay.hide_slot(slot);
+                        return;
+                    };
+                    let refs: Vec<(ratatui::layout::Rect, &DynamicImage)> = tiles
+                        .iter()
+                        .filter_map(|(tile, key)| {
+                            let (fw, fh) =
+                                overlay::grid_tile_px(*tile, cell, overlay::GRID_FILL_PERCENT);
+                            self.thumb_cache
+                                .get(key)
+                                .and_then(|r| r.fitted_at(fw, fh))
+                                .map(|img| (*tile, img))
+                        })
+                        .collect();
+                    overlay::composite_grid(*area, cell, &refs, overlay::GRID_FILL_PERCENT)
+                };
+                let Some(composed) = composed else {
+                    self.overlay.hide_slot(slot);
                     return;
                 };
-                self.overlay.show(&composed, screen);
+                self.overlay.show(slot, &composed, screen, content_fp);
             }
         }
-        self.overlay.mark_current(place_fp, content_fp);
+        self.overlay.mark_current(slot, place_fp, content_fp);
+    }
+
+    fn ensure_fitted_grid_tiles(&mut self, slot: usize, cell: overlay::CellPx) {
+        let needed: Vec<(String, u32, u32)> = {
+            let Some(OverlayJob::Grid { tiles, .. }) = self.overlay_jobs[slot].as_ref() else {
+                return;
+            };
+            tiles
+                .iter()
+                .filter_map(|(tile, key)| {
+                    let (fw, fh) = overlay::grid_tile_px(*tile, cell, overlay::GRID_FILL_PERCENT);
+                    match self.thumb_cache.get(key) {
+                        // Already fitted at this size: nothing to do, and no
+                        // per-frame LRU bookkeeping (keys enter the LRU when
+                        // they leave the screen, not while they are on it).
+                        Some(r) if r.fitted_at(fw, fh).is_some() => None,
+                        Some(r) if r.pixels().is_some() => Some((key.clone(), fw, fh)),
+                        _ => None,
+                    }
+                })
+                .collect()
+        };
+        for (key, fw, fh) in needed {
+            if let Some(rendered) = self.thumb_cache.get_mut(&key) {
+                rendered.ensure_fitted(fw, fh);
+            }
+        }
     }
 
     pub fn close_overlay(&mut self) {
@@ -1619,7 +1850,7 @@ impl App {
         };
         self.pane_mut().preview_mode = next;
         if !matches!(next, PreviewMode::Column | PreviewMode::Grid) {
-            self.overlay.hide();
+            self.overlay.hide_all();
         }
         let label = match next {
             PreviewMode::Off => "off",
@@ -1742,14 +1973,35 @@ impl App {
     }
     /// Inserts a finished preview with FIFO eviction. Protocols are heavy
     /// (kitty payloads are full escape sequences), so the cache is bounded;
-    /// the currently displayed entry survives eviction to avoid a visible
-    /// re-decode flicker.
+    /// keys currently on the overlay are never evicted, and `thumb_order`
+    /// stays duplicate-free so the cap matches live entries.
     fn insert_thumb(&mut self, key: String, rendered: Rendered) {
+        if self.thumb_cache.contains_key(&key) {
+            // The fresh decode has no fitted bitmap, so any LRU entry for this
+            // key would describe a bitmap that no longer exists (stale byte
+            // accounting). Drop it; the key re-enters on its next retirement.
+            self.overlay_fitted_lru.forget(&key);
+            self.thumb_order.retain(|k| k != &key);
+            self.thumb_cache.insert(key.clone(), rendered);
+            self.thumb_order.push_back(key);
+            return;
+        }
+        let mut scanned = 0usize;
+        let guard = self.thumb_order.len().max(1);
         while self.thumb_order.len() >= self.thumb_cache_cap {
             let Some(oldest) = self.thumb_order.pop_front() else {
                 break;
             };
+            if self.overlay_protect.contains(&oldest) {
+                self.thumb_order.push_back(oldest);
+                scanned += 1;
+                if scanned >= guard {
+                    break;
+                }
+                continue;
+            }
             self.thumb_cache.remove(&oldest);
+            self.overlay_fitted_lru.forget(&oldest);
         }
         self.thumb_cache.insert(key.clone(), rendered);
         self.thumb_order.push_back(key);
@@ -5095,6 +5347,387 @@ mod preview_tests {
         assert!(
             !app.thumb_pending.is_empty(),
             "grid mode dispatched no thumbnails"
+        );
+    }
+
+    #[test]
+    fn grid_modal_skips_overlay_job() {
+        let paths: Vec<String> = (0..12).map(|i| png_at(&format!("gmodal{i}.png"))).collect();
+        let mut app = App::default();
+        app.set_picker(ratatui_image::picker::Picker::halfblocks(), true);
+        app.panes[0].preview_mode = PreviewMode::Grid;
+        app.panes[0].folder = Some(Folder::new(
+            "grid".into(),
+            std::env::temp_dir().to_string_lossy().into_owned(),
+            '1',
+        ));
+        app.panes[0].files = paths
+            .iter()
+            .map(|p| FEntry {
+                path: p.clone(),
+                label: p.rsplit('/').next().unwrap_or(p).to_string(),
+                is_dir: false,
+                size: 0,
+                modified: None,
+            })
+            .collect();
+        app.panes[0].listing_settled = true;
+        app.panes[0].state.select(Some(0));
+        app.keybindings_visible = true;
+        assert!(app.overlay_covers_preview());
+
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| crate::components::tab1_files_ui::render(f, &mut app, f.area(), 0, true))
+            .unwrap();
+        assert!(
+            app.overlay_jobs.iter().all(|j| j.is_none()),
+            "grid must not set an overlay job while a modal is open"
+        );
+        assert!(
+            app.overlay_protect.is_empty(),
+            "grid must not pin overlay keys while a modal is open"
+        );
+    }
+
+    #[test]
+    fn insert_thumb_is_duplicate_free_and_skips_overlay_keys() {
+        let mut app = App::default();
+        app.thumb_cache_cap = 2;
+        let dummy = || {
+            let img = DynamicImage::ImageRgb8(image::RgbImage::new(2, 2));
+            Rendered::Blocks(crate::services::blocks::BlockImage::from_image(
+                &img, 1, 1, true,
+            ))
+        };
+        app.insert_thumb("a".into(), dummy());
+        app.insert_thumb("a".into(), dummy());
+        assert_eq!(app.thumb_order.iter().filter(|k| *k == "a").count(), 1);
+        app.overlay_protect.insert("keep".into());
+        app.insert_thumb("keep".into(), dummy());
+        app.insert_thumb("b".into(), dummy());
+        app.insert_thumb("c".into(), dummy());
+        assert!(
+            app.thumb_cache.contains_key("keep"),
+            "overlay key was evicted"
+        );
+        assert_eq!(
+            app.thumb_order.iter().filter(|k| *k == "keep").count(),
+            1,
+            "protected key duplicated in order"
+        );
+    }
+
+    #[test]
+    fn two_overlay_jobs_are_kept_in_split() {
+        let mut app = App::default();
+        app.set_overlay_job(
+            0,
+            OverlayJob::Column {
+                area: ratatui::layout::Rect::new(0, 0, 4, 4),
+                key: "pane0".into(),
+            },
+        );
+        app.set_overlay_job(
+            1,
+            OverlayJob::Grid {
+                area: ratatui::layout::Rect::new(10, 0, 8, 8),
+                tiles: vec![(ratatui::layout::Rect::new(10, 0, 2, 2), "pane1".into())],
+            },
+        );
+        app.set_overlay_job(
+            0,
+            OverlayJob::Column {
+                area: ratatui::layout::Rect::new(0, 0, 1, 1),
+                key: "pane0b".into(),
+            },
+        );
+        match &app.overlay_jobs[0] {
+            Some(OverlayJob::Column { key, .. }) => assert_eq!(key, "pane0b"),
+            _ => panic!("slot 0"),
+        }
+        match &app.overlay_jobs[1] {
+            Some(OverlayJob::Grid { .. }) => {}
+            _ => panic!("slot 1 must stay pane 1's job"),
+        }
+    }
+
+    #[test]
+    fn begin_thumb_cache_frame_keeps_overlay_protect() {
+        let mut app = App::default();
+        app.overlay_protect.insert("keep".into());
+        app.begin_thumb_cache_frame();
+        assert!(app.overlay_protect.contains("keep"));
+        assert!(app.overlay_jobs.iter().all(|j| j.is_none()));
+    }
+
+    fn pixels_with_fitted() -> Rendered {
+        pixels_with_fitted_at(20, 16)
+    }
+
+    fn pixels_with_fitted_at(w: u32, h: u32) -> Rendered {
+        let img = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(8, 6, image::Rgb([1, 2, 3])));
+        let fallback = crate::services::blocks::BlockImage::from_image(&img, 2, 2, true);
+        let mut rendered = Rendered::Pixels {
+            img,
+            fitted: None,
+            fallback,
+        };
+        assert!(rendered.ensure_fitted(w, h).is_some());
+        rendered
+    }
+
+    #[test]
+    fn should_keep_fitted_only_for_on_screen_or_lru() {
+        let mut protect = HashSet::new();
+        protect.insert("on".into());
+        let mut lru = FittedLru::default();
+        lru.touch("recent", 4 * 20 * 16);
+        assert!(should_keep_fitted("on", &protect, &lru));
+        assert!(should_keep_fitted("recent", &protect, &lru));
+        assert!(!should_keep_fitted("gone", &protect, &lru));
+        // A column-sized bitmap is only kept while it is on-screen: it never
+        // enters the LRU, so no size heuristic is needed.
+        assert!(!should_keep_fitted("col", &protect, &lru));
+    }
+
+    #[test]
+    fn fitted_lru_is_bounded_by_count_and_bytes() {
+        let mut lru = FittedLru::default();
+        for i in 0..(OVERLAY_FITTED_LRU + 10) {
+            lru.touch(&format!("k{i}"), 4 * 112 * 102);
+        }
+        assert_eq!(lru.order.len(), OVERLAY_FITTED_LRU, "count cap");
+        assert!(lru.contains(&format!("k{}", OVERLAY_FITTED_LRU + 9)));
+        assert!(!lru.contains("k0"), "oldest evicted");
+
+        // HiDPI-sized tiles: the byte budget trims before the count cap.
+        let mut big = FittedLru::default();
+        let per_tile = 4 * 600 * 600; // 1.4 MB, a 300%-scaled grid tile
+        big.touch("first", per_tile);
+        for i in 0..40 {
+            big.touch(&format!("b{i}"), per_tile);
+        }
+        assert!(
+            big.bytes <= OVERLAY_FITTED_LRU_BYTES,
+            "byte budget enforced: {}",
+            big.bytes
+        );
+        assert!(big.order.len() < OVERLAY_FITTED_LRU);
+
+        // forget keeps the byte accounting in sync.
+        let before = big.bytes;
+        let victim = big.keys().next().cloned().unwrap();
+        big.forget(&victim);
+        assert!(big.bytes < before);
+        assert!(!big.contains(&victim));
+    }
+
+    #[test]
+    fn leaving_the_screen_retires_a_key_into_the_lru() {
+        let mut app = App::default();
+        app.insert_thumb("tile".into(), pixels_with_fitted());
+        // Frame 1: the tile is on screen.
+        app.set_overlay_job(
+            0,
+            OverlayJob::Grid {
+                area: ratatui::layout::Rect::new(0, 0, 8, 8),
+                tiles: vec![(ratatui::layout::Rect::new(0, 0, 2, 2), "tile".into())],
+            },
+        );
+        app.rebuild_overlay_protect();
+        assert!(app.overlay_protect.contains("tile"));
+        assert!(!app.overlay_fitted_lru.contains("tile"));
+
+        // Frame 2: the tile scrolled off (no job at all). It must keep its
+        // fitted bitmap for the round trip.
+        app.overlay_jobs = std::array::from_fn(|_| None);
+        app.rebuild_overlay_protect();
+        assert!(app.overlay_fitted_lru.contains("tile"));
+        assert!(
+            app.thumb_cache
+                .get("tile")
+                .and_then(|r| r.fitted_at(20, 16))
+                .is_some(),
+            "scrolled-off tile keeps its fitted bitmap"
+        );
+        // A key that was never on screen is not kept.
+        app.insert_thumb("never".into(), pixels_with_fitted());
+        app.rebuild_overlay_protect();
+        assert!(
+            app.thumb_cache
+                .get("never")
+                .and_then(|r| r.fitted_at(20, 16))
+                .is_none(),
+            "key that never entered protect is not retained"
+        );
+    }
+
+    #[test]
+    fn eviction_forgets_the_fitted_lru_slot() {
+        let mut app = App::default();
+        app.thumb_cache_cap = 1;
+        app.insert_thumb("old".into(), pixels_with_fitted());
+        app.overlay_fitted_lru.touch("old", 4 * 20 * 16);
+        app.insert_thumb("new".into(), pixels_with_fitted());
+        assert!(!app.thumb_cache.contains_key("old"));
+        assert!(
+            !app.overlay_fitted_lru.contains("old"),
+            "evicted key must not linger in the LRU"
+        );
+        assert!(app.overlay_fitted_lru.bytes <= 4 * 20 * 16);
+    }
+
+    /// The LRU and the on-screen set must stay disjoint: a tile that scrolls
+    /// back into view leaves the LRU (and re-enters with fresh bytes when it
+    /// goes away again), otherwise its byte accounting would go stale across
+    /// a refit and the 24 MB budget could be exceeded.
+    #[test]
+    fn returning_to_screen_drops_the_lru_slot() {
+        let mut app = App::default();
+        app.insert_thumb("tile".into(), pixels_with_fitted());
+        let job = |app: &mut App, on: bool| {
+            app.overlay_jobs = std::array::from_fn(|_| None);
+            if on {
+                app.set_overlay_job(
+                    0,
+                    OverlayJob::Grid {
+                        area: ratatui::layout::Rect::new(0, 0, 8, 8),
+                        tiles: vec![(ratatui::layout::Rect::new(0, 0, 2, 2), "tile".into())],
+                    },
+                );
+            }
+            app.rebuild_overlay_protect();
+        };
+
+        job(&mut app, true); // visible
+        job(&mut app, false); // scrolled off -> LRU
+        assert!(app.overlay_fitted_lru.contains("tile"));
+        // An unrelated on-screen key must not disturb it.
+        app.overlay_protect.insert("other".into());
+        app.overlay_fitted_lru
+            .retain_off_screen(&app.overlay_protect);
+        assert!(app.overlay_fitted_lru.contains("tile"));
+        app.overlay_protect.remove("other");
+        job(&mut app, true); // back on screen
+        assert!(
+            !app.overlay_fitted_lru.contains("tile"),
+            "on-screen key must not linger in the LRU"
+        );
+        assert!(app.overlay_protect.contains("tile"));
+        assert_eq!(app.overlay_fitted_lru.bytes, 0);
+        assert!(
+            app.thumb_cache
+                .get("tile")
+                .and_then(|r| r.fitted_at(20, 16))
+                .is_some(),
+            "fitted bitmap survives while on screen"
+        );
+    }
+
+    /// A re-delivered decode replaces the cache entry with a `Rendered` that
+    /// has no fitted bitmap; the LRU must not keep describing the old one.
+    #[test]
+    fn replacing_a_cache_entry_forgets_its_lru_slot() {
+        let mut app = App::default();
+        app.insert_thumb("k".into(), pixels_with_fitted());
+        app.overlay_fitted_lru.touch("k", 4 * 20 * 16);
+        let img = DynamicImage::ImageRgb8(image::RgbImage::new(8, 6));
+        let fallback = crate::services::blocks::BlockImage::from_image(&img, 2, 2, true);
+        app.insert_thumb(
+            "k".into(),
+            Rendered::Pixels {
+                img,
+                fitted: None,
+                fallback,
+            },
+        );
+        assert!(
+            !app.overlay_fitted_lru.contains("k"),
+            "replaced entry must not keep an LRU slot"
+        );
+        assert_eq!(app.overlay_fitted_lru.bytes, 0);
+        assert!(app
+            .thumb_cache
+            .get("k")
+            .and_then(|r| r.fitted_at(20, 16))
+            .is_none());
+    }
+
+    #[test]
+    fn prune_unprotected_fitted_keeps_on_screen_only() {
+        let mut app = App::default();
+        app.insert_thumb("a".into(), pixels_with_fitted());
+        app.insert_thumb("keep".into(), pixels_with_fitted());
+        app.insert_thumb("lru".into(), pixels_with_fitted());
+        app.insert_thumb("col".into(), pixels_with_fitted_at(400, 250));
+        app.insert_thumb("unprotected-col".into(), pixels_with_fitted_at(400, 250));
+        app.overlay_protect.clear();
+        app.overlay_protect.insert("keep".into());
+        app.overlay_protect.insert("col".into());
+        app.overlay_fitted_lru.touch("lru", 4 * 20 * 16);
+        app.prune_unprotected_fitted();
+        assert!(
+            app.thumb_cache
+                .get("keep")
+                .and_then(|r| r.fitted_at(20, 16))
+                .is_some(),
+            "on-screen key must keep its dest-sized bitmap"
+        );
+        assert!(
+            app.thumb_cache
+                .get("col")
+                .and_then(|r| r.fitted_at(400, 250))
+                .is_some(),
+            "on-screen column bitmap is kept (large is not a reason to drop)"
+        );
+        assert!(
+            app.thumb_cache
+                .get("lru")
+                .and_then(|r| r.fitted_at(20, 16))
+                .is_some(),
+            "off-screen tile in the LRU must stay"
+        );
+        assert!(
+            app.thumb_cache
+                .get("a")
+                .and_then(|r| r.fitted_at(20, 16))
+                .is_none(),
+            "off-screen tile not in the LRU must be dropped"
+        );
+        assert!(
+            app.thumb_cache
+                .get("unprotected-col")
+                .and_then(|r| r.fitted_at(400, 250))
+                .is_none(),
+            "off-screen column-sized fitted must be dropped"
+        );
+        assert!(
+            app.thumb_cache
+                .get("a")
+                .and_then(Rendered::pixels)
+                .is_some(),
+            "store bitmap must stay after pruning fitted"
+        );
+    }
+
+    #[test]
+    fn present_overlay_without_native_skips_fitted_prune() {
+        let mut app = App::default();
+        app.insert_thumb("a".into(), pixels_with_fitted());
+        app.overlay_protect.insert("keep".into());
+        app.present_overlay();
+        assert!(
+            app.thumb_cache
+                .get("a")
+                .and_then(|r| r.fitted_at(20, 16))
+                .is_some(),
+            "Linux/protocol present_overlay must not prune fitted bitmaps"
+        );
+        assert!(
+            app.overlay_protect.is_empty(),
+            "protect must not accumulate where the overlay never shows"
         );
     }
 }

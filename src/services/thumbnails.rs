@@ -62,6 +62,24 @@ pub const CACHE_MAX_FILES: usize = 512;
 /// in microseconds.
 pub const THUMB_MAX_PX: u32 = 768;
 
+/// Longest side of a pixel bitmap kept for the native overlay. Braille
+/// already sampled the 768 px decode; retaining that in the 256-entry
+/// cache costs hundreds of MB on macOS/Windows.
+///
+/// Trade-off, measured: the destination is unknown when the worker runs
+/// (cell pixels are only known at placement time), so this nominal size is
+/// smaller than a HiDPI tile. At ~300% scaling a 20×8-cell tile is
+/// ~416×339 px, and `fit_pixels` then upscales this 256 px bitmap — ~4.9 ms
+/// of Triangle work per *first-sight* tile, versus ~0.6 ms at 1×. The fitted
+/// bitmap is cached per entry and retained by the scroll-back LRU, so the
+/// cost is paid once per tile, not per frame; raising this cap would trade
+/// that back as resident memory (256 px ≈ 38 MB for a full cache).
+pub const OVERLAY_STORE_MAX_PX: u32 = 256;
+
+/// Approximate HiDPI pixels per terminal cell used to size overlay bitmaps.
+const OVERLAY_PX_PER_COL: u32 = 16;
+const OVERLAY_PX_PER_ROW: u32 = 32;
+
 /// Wall-clock budget for one ffmpeg frame extraction. Long enough for a
 /// seek into a large network-hosted video; short enough that a hung process
 /// can't occupy a bounded-pool worker forever.
@@ -510,6 +528,23 @@ impl ThumbRequest {
     }
 }
 
+/// Downscale overlay pixels to the tile they will paint, not the 768 px
+/// decode used for braille. Column: ~16×32 px/cell capped at
+/// [`OVERLAY_STORE_MAX_PX`].
+pub fn overlay_store_img(img: DynamicImage, cols: u16, rows: u16) -> DynamicImage {
+    let w = (u32::from(cols) * OVERLAY_PX_PER_COL)
+        .min(OVERLAY_STORE_MAX_PX)
+        .max(1);
+    let h = (u32::from(rows) * OVERLAY_PX_PER_ROW)
+        .min(OVERLAY_STORE_MAX_PX)
+        .max(1);
+    if img.width() <= w && img.height() <= h {
+        img
+    } else {
+        img.thumbnail(w, h)
+    }
+}
+
 /// A finished preview: a terminal graphics protocol, braille cells, or
 /// raw pixels for the macOS overlay (with braille as the underlay).
 pub enum Rendered {
@@ -517,6 +552,9 @@ pub enum Rendered {
     Blocks(BlockImage),
     Pixels {
         img: DynamicImage,
+        /// Last overlay destination fit (`w`, `h`, bitmap). Lives with the
+        /// cache entry so eviction cannot leave a dangling fitted tile.
+        fitted: Option<(u32, u32, DynamicImage)>,
         fallback: BlockImage,
     },
 }
@@ -536,6 +574,52 @@ impl Rendered {
         match self {
             Self::Pixels { img, .. } => Some(img),
             _ => None,
+        }
+    }
+
+    /// Fitted overlay bitmap at exact dest size, if already cached.
+    pub fn fitted_at(&self, w: u32, h: u32) -> Option<&DynamicImage> {
+        match self {
+            Self::Pixels {
+                fitted: Some((fw, fh, img)),
+                ..
+            } if *fw == w && *fh == h => Some(img),
+            _ => None,
+        }
+    }
+
+    /// Byte size of the cached fitted bitmap, if any. Used by the overlay
+    /// cache's byte-budgeted retention (`App::overlay_fitted_lru`).
+    pub fn fitted_bytes(&self) -> Option<usize> {
+        match self {
+            Self::Pixels {
+                fitted: Some((w, h, _)),
+                ..
+            } => Some(*w as usize * *h as usize * 4),
+            _ => None,
+        }
+    }
+
+    /// Fit `img` into `w × h` and store it on this entry. Same dest size
+    /// reuses the cached bitmap (composite memcpy path).
+    pub fn ensure_fitted(&mut self, w: u32, h: u32) -> Option<&DynamicImage> {
+        match self {
+            Self::Pixels { img, fitted, .. } => {
+                let hit = matches!(fitted.as_ref(), Some((fw, fh, _)) if *fw == w && *fh == h);
+                if !hit {
+                    *fitted = Some((w, h, crate::services::overlay::fit_pixels(img, w, h)));
+                }
+                fitted.as_ref().map(|(_, _, f)| f)
+            }
+            _ => None,
+        }
+    }
+
+    /// Drop the dest-sized overlay bitmap. The small `overlay_store_img`
+    /// (≤256 px) stays so off-screen entries remain cheap to keep.
+    pub fn clear_fitted(&mut self) {
+        if let Self::Pixels { fitted, .. } = self {
+            *fitted = None;
         }
     }
 }
@@ -567,11 +651,15 @@ pub fn build_rendered(
 ) -> Rendered {
     if matches!(picker.protocol_type(), ProtocolType::Halfblocks) {
         let fallback = BlockImage::from_image(&img, cols, rows, truecolor);
-        // Terminal.app / Windows Terminal: keep pixels for the native
-        // overlay and braille as the underlay if placement fails.
+        // Terminal.app / Windows Terminal: keep a fitted overlay bitmap
+        // and braille as the underlay if placement fails.
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
-            return Rendered::Pixels { img, fallback };
+            return Rendered::Pixels {
+                img: overlay_store_img(img, cols, rows),
+                fitted: None,
+                fallback,
+            };
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
@@ -789,6 +877,15 @@ mod tests {
         assert!(load_thumbnail(path.to_str().unwrap(), Some(1), 19).is_err());
     }
     #[test]
+    fn overlay_store_img_caps_longest_side() {
+        let img = DynamicImage::ImageRgb8(image::RgbImage::new(800, 600));
+        let out = overlay_store_img(img, 20, 8);
+        assert!(out.width() <= OVERLAY_STORE_MAX_PX);
+        assert!(out.height() <= OVERLAY_STORE_MAX_PX);
+        assert!(out.width() > 0 && out.height() > 0);
+    }
+
+    #[test]
     fn builds_blocks_rendered_for_halfblocks_picker() {
         let picker = Picker::halfblocks();
         assert!(matches!(
@@ -799,6 +896,11 @@ mod tests {
         let rendered = build_rendered(&picker, true, img, 10, 5);
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         assert!(matches!(rendered, Rendered::Pixels { .. }));
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        if let Rendered::Pixels { img, .. } = &rendered {
+            assert!(img.width() <= OVERLAY_STORE_MAX_PX);
+            assert!(img.height() <= OVERLAY_STORE_MAX_PX);
+        }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         assert!(matches!(rendered, Rendered::Blocks(_)));
         // End-to-end: the braille renderer must fill a 12×7 grid without
@@ -808,5 +910,30 @@ mod tests {
         terminal
             .draw(|f| rendered.render(f.area(), f.buffer_mut()))
             .unwrap();
+    }
+
+    #[test]
+    fn fitted_pixels_are_cached_on_rendered() {
+        let img = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(8, 6, image::Rgb([1, 2, 3])));
+        let fallback = BlockImage::from_image(&img, 2, 2, true);
+        let mut rendered = Rendered::Pixels {
+            img,
+            fitted: None,
+            fallback,
+        };
+        assert!(rendered.ensure_fitted(10, 8).is_some());
+        let p1 = rendered.fitted_at(10, 8).unwrap() as *const DynamicImage;
+        assert_eq!(rendered.fitted_at(10, 8).unwrap().width(), 10);
+        assert_eq!(rendered.fitted_at(10, 8).unwrap().height(), 8);
+        assert!(rendered.ensure_fitted(10, 8).is_some());
+        let p2 = rendered.fitted_at(10, 8).unwrap() as *const DynamicImage;
+        assert_eq!(p1, p2, "same dest size must reuse the cached bitmap");
+        assert!(rendered.ensure_fitted(12, 9).is_some());
+        assert_eq!(rendered.fitted_at(12, 9).unwrap().width(), 12);
+        assert_eq!(rendered.fitted_at(12, 9).unwrap().height(), 9);
+        assert!(rendered.fitted_at(10, 8).is_none());
+        rendered.clear_fitted();
+        assert!(rendered.fitted_at(12, 9).is_none());
+        assert!(rendered.pixels().is_some(), "store bitmap must stay");
     }
 }

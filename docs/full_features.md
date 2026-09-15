@@ -114,7 +114,8 @@ list with a thumbnail grid — image thumbnails, glyphs for folders and unsuppor
 cursor highlighted, filtered (`/`) views included. Select an image (PNG, JPEG, GIF, BMP, WebP)
 and ira renders it with full graphics in terminals that support the kitty, iTerm2, or Sixel
 protocols. Native Windows and Terminal.app use a transparent overlay over the thumbnail
-cells (`IRA_IMAGES=sixel` still forces Sixel). 2×4 Unicode braille is the last resort.
+cells (`IRA_IMAGES=sixel` still forces Sixel). VS Code's integrated terminal on Windows
+has no overlay (braille only). 2×4 Unicode braille is the last resort.
 Decoding happens on a bounded background worker
 pool and is cached in memory and on disk, so scrolling through a folder of photos stays instant
 and the UI never blocks.

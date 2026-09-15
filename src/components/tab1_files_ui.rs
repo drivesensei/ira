@@ -405,11 +405,13 @@ const GRID_NAME_H: u16 = 1;
 fn render_grid(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, active: bool) {
     let theme = app.theme;
     let icons = app.icons;
+    let skip_overlay_job = app.overlay_covers_preview();
     let inner_w = area.width.saturating_sub(2) as usize;
     let inner_h = area.height.saturating_sub(2) as usize;
     let cols = (inner_w / GRID_CELL_W as usize).max(1);
     let grid_rows = (inner_h / (GRID_IMG_H + GRID_NAME_H) as usize).max(1);
     let per_screen = cols * grid_rows;
+    app.raise_thumb_cache_cap(3 * per_screen + 16);
 
     let (title, top, window, prefetch) = {
         let pane = &app.panes[pane_index];
@@ -449,7 +451,7 @@ fn render_grid(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, acti
     f.render_widget(block, area);
 
     let selected = app.panes[pane_index].state.selected();
-    let mut overlay_tiles: Vec<(Rect, crate::services::thumbnails::ThumbRequest)> = Vec::new();
+    let mut overlay_tiles: Vec<(Rect, String)> = Vec::new();
     for (k, (file_idx, entry)) in window.iter().enumerate() {
         let col = (k % cols) as u16;
         let row = (k / cols) as u16;
@@ -493,10 +495,16 @@ fn render_grid(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, acti
                 cols: GRID_CELL_W,
                 rows: GRID_IMG_H,
             };
+            let key = req.mem_key();
+            if !skip_overlay_job {
+                app.protect_overlay_key(&key);
+            }
             match app.preview_image(&req) {
                 Some(rendered) => {
                     rendered.render(img_area, f.buffer_mut());
-                    overlay_tiles.push((img_area, req));
+                    if !skip_overlay_job {
+                        overlay_tiles.push((img_area, key));
+                    }
                 }
                 None => f.render_widget(Paragraph::new(Span::raw(" …").style(dim)), img_area),
             }
@@ -532,10 +540,13 @@ fn render_grid(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, acti
     }
 
     if !overlay_tiles.is_empty() {
-        app.set_overlay_job(crate::app::OverlayJob::Grid {
-            area: inner,
-            tiles: overlay_tiles,
-        });
+        app.set_overlay_job(
+            pane_index,
+            crate::app::OverlayJob::Grid {
+                area: inner,
+                tiles: overlay_tiles,
+            },
+        );
     }
 
     // Prefetch the screens adjacent to the viewport (no-ops for cached

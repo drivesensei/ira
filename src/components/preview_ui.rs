@@ -155,9 +155,14 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect, pane_index: usize) {
 
     match app.preview_request_for(pane_index) {
         Some(req) => {
+            let key = req.mem_key();
+            app.protect_overlay_key(&key);
             if let Some(rendered) = app.preview_image(&req) {
                 rendered.render(inner, frame.buffer_mut());
-                app.set_overlay_job(crate::app::OverlayJob::Column { area: inner, req });
+                app.set_overlay_job(
+                    pane_index,
+                    crate::app::OverlayJob::Column { area: inner, key },
+                );
             } else {
                 // First sight dispatched a background job; the thumbnail
                 // appears on a later frame. Never block the render thread.

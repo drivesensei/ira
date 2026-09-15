@@ -1,6 +1,6 @@
 [package]
 name = "ira"
-version = "0.1.15"
+version = "0.1.16"
 
 description = "A terminal file manager built with Ratatui and crossterm"
 repository = "https://github.com/drivesensei/ira"
@@ -52,7 +52,7 @@ libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSData", "NSGeometry", "NSRunLoop"] }
+objc2-foundation = { version = "0.3", features = ["NSData", "NSDate", "NSGeometry", "NSRunLoop"] }
 objc2-app-kit = { version = "0.3", features = [
     "NSApplication",
     "NSWindow",
