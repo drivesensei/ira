@@ -104,10 +104,12 @@ While searching, typed characters filter the file list by fuzzy subsequence matc
   would show "?" glyphs — kitty is skipped at detection and the iTerm2 protocol is used
   instead. iTerm2, Ghostty, kitty and WezTerm keep their in-terminal protocols; Terminal.app
   and Windows Terminal use the overlay, shown only while that terminal window is in front.
-  Previews fall back to the braille underlay when the window cannot be located (VS Code's
-  integrated terminal on Windows is not a console HWND), the geometry sample goes stale
-  (>2 s), or the pane is too wide/tall for one overlay bitmap — with image support enabled
-  VS Code answers the probe with Sixel and uses its own protocol instead of either.
+  Previews fall back to the braille underlay when the window cannot be located, the geometry
+  sample goes stale (>2 s), or the pane is too wide/tall for one overlay bitmap. On hosts
+  whose console cannot be tied to a window — VS Code's integrated terminal on Windows is not
+  a console HWND — the frontmost terminal window stands in, so a preview can briefly appear
+  over another terminal; with image support enabled VS Code answers the probe with Sixel and
+  uses its own protocol instead.
 
 ## Domain model
 

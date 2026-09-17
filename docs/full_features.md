@@ -117,9 +117,11 @@ protocols. Native Windows and Terminal.app use a transparent overlay over the th
 cells (`IRA_IMAGES=sixel` still forces Sixel), shown only while that terminal window is in
 front. Overlay bitmaps are capped (256 px per grid tile, the decode size for the single
 preview column, 4096 px per surface side), so a pane larger than that or a geometry sample
-older than 2 s falls back to braille — as does VS Code's integrated terminal on Windows,
-which is not a console HWND (with image support enabled it answers the probe with Sixel
-and uses its own protocol instead). 2×4 Unicode braille is the last resort. Text-like files preview natively as text: by extension, and also extensionless names (`Makefile`, `LICENSE`, …) and dotfiles (`.env`, `.env.local`, `.gitignore`), with binaries falling back to a placeholder.
+older than 2 s falls back to braille. When no terminal window can be tied to our console —
+VS Code's integrated terminal on Windows is not a console HWND — the frontmost terminal
+window stands in (so a preview can briefly appear over another terminal); with image support
+enabled VS Code answers the probe with Sixel and uses its own protocol instead. 2×4 Unicode
+braille is the last resort. Text-like files preview natively as text: by extension, and also extensionless names (`Makefile`, `LICENSE`, …) and dotfiles (`.env`, `.env.local`, `.gitignore`), with binaries falling back to a placeholder.
 Decoding happens on a bounded background worker
 pool and is cached in memory and on disk, so scrolling through a folder of photos stays instant
 and the UI never blocks.
