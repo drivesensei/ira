@@ -163,6 +163,16 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect, pane_index: usize) {
                     pane_index,
                     crate::app::OverlayJob::Column { area: inner, key },
                 );
+            } else if app.preview_failed(&req) {
+                // A decode that already failed never arrives: say so instead
+                // of showing a spinner for the rest of the session.
+                frame.render_widget(
+                    Paragraph::new(Line::styled(
+                        " cannot decode ",
+                        Style::default().fg(theme.error),
+                    )),
+                    inner,
+                );
             } else {
                 // First sight dispatched a background job; the thumbnail
                 // appears on a later frame. Never block the render thread.

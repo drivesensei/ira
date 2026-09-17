@@ -398,8 +398,8 @@ fn modified_ago(modified: Option<i64>) -> String {
 /// shapes survived, but photos degraded to unrecognizable mush (and on
 /// braille-block terminals like Terminal.app, 8 px per cell turns even
 /// the larger cell into just 40×32 px).
-const GRID_CELL_W: u16 = 20;
-const GRID_IMG_H: u16 = 8;
+pub(crate) const GRID_CELL_W: u16 = 20;
+pub(crate) const GRID_IMG_H: u16 = 8;
 const GRID_NAME_H: u16 = 1;
 
 /// Thumbnail grid for one pane: every visible image entry is rendered as a
@@ -457,6 +457,44 @@ fn render_grid(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, acti
 
     let selected = app.panes[pane_index].state.selected();
     let mut overlay_tiles: Vec<(Rect, String)> = Vec::new();
+    // Classify every visible cell once, then pin the image keys *before* any
+    // cell is drawn: `preview_image` drains finished jobs into the FIFO cache,
+    // and a tile whose cell is still to come must not be evictable while its
+    // own row has not been rendered yet. One pass also keeps the per-frame
+    // work at one request per cell (the loop below reuses it).
+    enum Cell {
+        Glyph,
+        Image(crate::services::thumbnails::ThumbRequest, String),
+    }
+    let cells: Vec<Cell> = window
+        .iter()
+        .map(|(_, entry)| {
+            if entry.is_dir
+                || crate::services::thumbnails::preview_kind(&entry.path)
+                    == Some(crate::services::thumbnails::PreviewKind::Text)
+                || !app.preview_supported(&entry.path)
+            {
+                return Cell::Glyph;
+            }
+            let req = crate::services::thumbnails::ThumbRequest {
+                path: entry.path.clone(),
+                mtime: entry.modified,
+                size: entry.size,
+                cols: GRID_CELL_W,
+                rows: GRID_IMG_H,
+                surface: crate::services::thumbnails::PreviewSurface::Grid,
+            };
+            let key = req.mem_key();
+            Cell::Image(req, key)
+        })
+        .collect();
+    if !skip_overlay_job {
+        for cell in &cells {
+            if let Cell::Image(_, key) = cell {
+                app.protect_overlay_key(key);
+            }
+        }
+    }
     for (k, (file_idx, entry)) in window.iter().enumerate() {
         let col = (k % cols) as u16;
         let row = (k / cols) as u16;
@@ -484,40 +522,30 @@ fn render_grid(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, acti
         // Image area: thumbnail, or a kind glyph for folders/unsupported.
         // Text files stay glyphs in the grid (cells can't show text) — the
         // column mode renders them natively.
-        if !entry.is_dir
-            && crate::services::thumbnails::preview_kind(&entry.path)
-                == Some(crate::services::thumbnails::PreviewKind::Text)
-        {
-            f.render_widget(
+        match &cells[k] {
+            Cell::Glyph => f.render_widget(
                 Paragraph::new(Span::styled(glyph, glyph_style)).centered(),
                 img_area,
-            );
-        } else if !entry.is_dir && app.preview_supported(&entry.path) {
-            let req = crate::services::thumbnails::ThumbRequest {
-                path: entry.path.clone(),
-                mtime: entry.modified,
-                size: entry.size,
-                cols: GRID_CELL_W,
-                rows: GRID_IMG_H,
-            };
-            let key = req.mem_key();
-            if !skip_overlay_job {
-                app.protect_overlay_key(&key);
-            }
-            match app.preview_image(&req) {
-                Some(rendered) => {
-                    rendered.render(img_area, f.buffer_mut());
-                    if !skip_overlay_job {
-                        overlay_tiles.push((img_area, key));
+            ),
+            Cell::Image(req, key) => {
+                // Read the failure flag before `preview_image` (its result
+                // borrows `app` for the whole match).
+                let failed = app.preview_failed(req);
+                match app.preview_image(req) {
+                    Some(rendered) => {
+                        rendered.render(img_area, f.buffer_mut());
+                        if !skip_overlay_job {
+                            overlay_tiles.push((img_area, key.clone()));
+                        }
                     }
+                    None if failed => f.render_widget(
+                        Paragraph::new(Span::styled(" ✕", Style::default().fg(theme.error)))
+                            .centered(),
+                        img_area,
+                    ),
+                    None => f.render_widget(Paragraph::new(Span::raw(" …").style(dim)), img_area),
                 }
-                None => f.render_widget(Paragraph::new(Span::raw(" …").style(dim)), img_area),
             }
-        } else {
-            f.render_widget(
-                Paragraph::new(Span::styled(glyph, glyph_style)).centered(),
-                img_area,
-            );
         }
 
         // Name line: cursor colors for the selection; `*` marks multi-select.

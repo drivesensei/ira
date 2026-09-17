@@ -14,17 +14,25 @@ pub struct FEntry {
 /// Stat helper shared by every listing path: sorting by size/modified needs
 /// per-entry metadata, so we pay one extra stat per entry here (background
 /// and bounded paths only — this runs off the UI thread or on small folders).
-fn entry_with_meta(path: &std::path::Path, label: &str, is_dir: bool) -> FEntry {
-    let (size, modified) = match std::fs::metadata(path) {
+///
+/// `d_type_is_dir` is the readdir hint (`DirEntry::file_type`), which does
+/// *not* follow symlinks. The metadata we take anyway does, and `is_dir`
+/// decides the icon, the preview classification and every `preview_kind`
+/// guard — so a symlink to a directory must be a directory here, or it is
+/// fed to the image pipeline and sticks on a placeholder.
+fn entry_with_meta(path: &std::path::Path, label: &str, d_type_is_dir: bool) -> FEntry {
+    let (size, modified, is_dir) = match std::fs::metadata(path) {
         Ok(md) => {
             let modified = md
                 .modified()
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs() as i64);
-            (if is_dir { 0 } else { md.len() }, modified)
+            let is_dir = md.is_dir();
+            (if is_dir { 0 } else { md.len() }, modified, is_dir)
         }
-        Err(_) => (0, None),
+        // Stat failed (dangling symlink, permission): keep the readdir hint.
+        Err(_) => (0, None, d_type_is_dir),
     };
     FEntry {
         path: path.to_string_lossy().into_owned(),
@@ -219,5 +227,39 @@ mod tests {
         assert!(labels.contains("f0000.txt") && labels.contains("f1099.txt"));
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A symlink to a directory must be a directory here: `DirEntry::file_type`
+    /// is the readdir hint and does not follow links, while every `is_dir`
+    /// guard downstream (icons, preview classification, the preview request)
+    /// assumes the target's kind. Without this a directory named `*.png`
+    /// takes a decode job and never resolves.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_a_directory_is_listed_as_a_directory() {
+        let root = std::env::temp_dir().join(format!("ira-symlink-{}", std::process::id()));
+        let real = root.join("real-dir");
+        std::fs::create_dir_all(&real).unwrap();
+        let file = root.join("real.png");
+        std::fs::write(&file, b"not really a png").unwrap();
+        std::os::unix::fs::symlink(&real, root.join("album.png")).unwrap();
+        std::os::unix::fs::symlink(&file, root.join("link.png")).unwrap();
+
+        let entries = list_files(root.to_str().unwrap()).unwrap();
+        let by_label = |label: &str| {
+            entries
+                .iter()
+                .find(|e| e.label == label)
+                .cloned()
+                .unwrap_or_else(|| panic!("missing {label}"))
+        };
+        let dir_link = by_label("album.png");
+        assert!(dir_link.is_dir, "a symlinked directory is a directory");
+        assert_eq!(dir_link.size, 0, "directories carry no size");
+        let file_link = by_label("link.png");
+        assert!(!file_link.is_dir, "a symlinked file stays a file");
+        assert_eq!(file_link.size, 16, "size comes from the target");
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

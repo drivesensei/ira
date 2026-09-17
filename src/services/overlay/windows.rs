@@ -24,10 +24,10 @@ use winapi::um::wingdi::{
 };
 use winapi::um::winuser::{
     ClientToScreen, CreateWindowExW, DefWindowProcW, DestroyWindow, GetAncestor, GetClassNameW,
-    GetClientRect, GetDC, GetDpiForWindow, GetForegroundWindow, GetWindow, IsWindowVisible,
-    RegisterClassW, ReleaseDC, SetWindowLongPtrW, SetWindowPos, ShowWindow, UpdateLayeredWindow,
-    CS_HREDRAW, CS_VREDRAW, GA_ROOT, GWLP_HWNDPARENT, GW_OWNER, HWND_TOP, SWP_NOACTIVATE,
-    SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, WNDCLASSW, WS_EX_LAYERED,
+    GetClientRect, GetDC, GetDpiForWindow, GetForegroundWindow, GetWindow, IsWindow,
+    IsWindowVisible, RegisterClassW, ReleaseDC, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW, GA_ROOT, GWLP_HWNDPARENT, GW_OWNER, HWND_TOP,
+    SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, WNDCLASSW, WS_EX_LAYERED,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
@@ -50,7 +50,15 @@ impl WinOverlay {
 
     fn ensure(&mut self) -> Option<HWND> {
         if let Some(hwnd) = self.hwnd {
-            return Some(hwnd);
+            // The handle is only good while the window exists. Our popup is
+            // *owned* by the terminal, so Windows destroys it with its owner —
+            // and handle values are recycled, so a stale one can name an
+            // unrelated window of another process.
+            if unsafe { IsWindow(hwnd) } != 0 {
+                return Some(hwnd);
+            }
+            self.hwnd = None;
+            self.visible = false;
         }
         register_class();
         let title = wide("");
@@ -78,35 +86,54 @@ impl WinOverlay {
         Some(hwnd)
     }
 
-    pub fn show(&mut self, img: &DynamicImage, rect: ScreenRect) {
+    /// Show `img`. Returns whether the popup is on screen afterwards, so the
+    /// caller never records a placement it did not get.
+    pub fn show(&mut self, img: &DynamicImage, rect: ScreenRect) -> bool {
         if rect.width == 0 || rect.height == 0 {
             self.hide();
-            return;
+            return false;
         }
+        // Re-assert frontness where the side effect happens: the geometry
+        // sample this rect came from can be up to GEOM_STALE old, and an
+        // alt-tab inside that window must not leave the popup over the app
+        // that is now in front.
+        let Some(host) = foreground_host() else {
+            self.order_out();
+            return false;
+        };
         let Some(hwnd) = self.ensure() else {
-            return;
+            self.order_out();
+            return false;
         };
         if !blit(hwnd, img, rect) {
             self.hide();
-            return;
+            return false;
         }
         unsafe {
-            attach_to_terminal(hwnd);
+            attach_to_terminal(hwnd, host);
             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
         self.visible = true;
+        true
     }
 
-    pub fn move_to(&mut self, rect: ScreenRect) {
+    /// Reposition, creating the popup if an earlier show never managed to.
+    /// Returns whether the popup is on screen afterwards.
+    pub fn move_to(&mut self, rect: ScreenRect) -> bool {
         if rect.width == 0 || rect.height == 0 {
             self.order_out();
-            return;
+            return false;
         }
-        let Some(hwnd) = self.hwnd else {
-            return;
+        let Some(host) = foreground_host() else {
+            self.order_out();
+            return false;
+        };
+        let Some(hwnd) = self.ensure() else {
+            self.order_out();
+            return false;
         };
         unsafe {
-            attach_to_terminal(hwnd);
+            attach_to_terminal(hwnd, host);
             SetWindowPos(
                 hwnd,
                 HWND_TOP,
@@ -121,16 +148,20 @@ impl WinOverlay {
                 self.visible = true;
             }
         }
+        self.visible
     }
 
     pub fn order_out(&mut self) {
         if !self.visible {
             return;
         }
-        if let Some(hwnd) = self.hwnd {
-            unsafe {
+        match self.hwnd {
+            Some(hwnd) if unsafe { IsWindow(hwnd) } != 0 => unsafe {
                 ShowWindow(hwnd, SW_HIDE);
-            }
+            },
+            // Owner died: our popup went with it.
+            Some(_) => self.hwnd = None,
+            None => {}
         }
         self.visible = false;
     }
@@ -142,8 +173,10 @@ impl WinOverlay {
     pub fn close(&mut self) {
         self.hide();
         if let Some(hwnd) = self.hwnd.take() {
-            unsafe {
-                DestroyWindow(hwnd);
+            if unsafe { IsWindow(hwnd) } != 0 {
+                unsafe {
+                    DestroyWindow(hwnd);
+                }
             }
         }
     }
@@ -201,25 +234,31 @@ fn our_host_hwnd() -> HWND {
     }
 }
 
-unsafe fn attach_to_terminal(overlay: HWND) {
-    let host = our_host_hwnd();
+unsafe fn attach_to_terminal(overlay: HWND, host: HWND) {
     if host.is_null() {
         return;
     }
     SetWindowLongPtrW(overlay, GWLP_HWNDPARENT, host as isize);
 }
 
+/// Our host terminal window, but only while it is actually frontmost.
+/// `None` means "do not paint": the terminal is not in front, or its console
+/// cannot be correlated with a terminal window at all.
+fn foreground_host() -> Option<HWND> {
+    unsafe {
+        let host = our_host_hwnd();
+        if host.is_null() || GetForegroundWindow() != host {
+            return None;
+        }
+        Some(host)
+    }
+}
+
 pub fn query_front_window() -> Option<WindowGeom> {
     unsafe {
-        let hwnd = our_host_hwnd();
-        if hwnd.is_null() {
-            return None;
-        }
         // Only paint while this host is actually front — otherwise the
         // overlay floats over whatever replaced the terminal.
-        if GetForegroundWindow() != hwnd {
-            return None;
-        }
+        let hwnd = foreground_host()?;
         let mut rc = RECT {
             left: 0,
             top: 0,
@@ -243,13 +282,6 @@ pub fn query_front_window() -> Option<WindowGeom> {
             height: (rc.bottom - rc.top).max(0) as u32,
         })
     }
-}
-
-/// Combined font-or-settings cell. Prefer [`console_font_cell_px`] when
-/// deciding whether to snap-to-chrome (GDI metrics are the real cell).
-#[allow(dead_code)]
-pub fn measured_cell_px() -> Option<CellPx> {
-    console_font_cell_px().or_else(wt_settings_cell_px)
 }
 
 pub fn console_font_cell_px() -> Option<CellPx> {
@@ -353,17 +385,28 @@ unsafe extern "system" fn wnd_proc(
 fn blit(hwnd: HWND, img: &DynamicImage, rect: ScreenRect) -> bool {
     let w = rect.width.min(MAX_OVERLAY_PX);
     let h = rect.height.min(MAX_OVERLAY_PX);
+    // The surface must be exactly the rect it was placed for: the caller fits
+    // or composites at that size (`fit_pixels` / `composite_grid`) and clamps
+    // both the same way. Rescaling here would draw an aspect-correct image
+    // that no longer lines up with the text cells, so a mismatch means the
+    // pane is too large for one surface and braille stays as the underlay.
+    if w == 0 || h == 0 || img.width() != w || img.height() != h {
+        return false;
+    }
     let Some(byte_len) = overlay_bitmap_bytes(w, h) else {
         return false;
     };
-    if w == 0 || h == 0 || byte_len == 0 {
+    if byte_len == 0 {
         return false;
     }
-    let rgba = if img.width() != w || img.height() != h {
-        img.resize(w, h, image::imageops::FilterType::Triangle)
-            .to_rgba8()
-    } else {
-        img.to_rgba8()
+    // Borrow when the image is already RGBA8 instead of cloning the canvas.
+    let owned: image::RgbaImage;
+    let rgba: &image::RgbaImage = match img.as_rgba8() {
+        Some(rgba) => rgba,
+        None => {
+            owned = img.to_rgba8();
+            &owned
+        }
     };
     unsafe {
         let hdc_screen = GetDC(ptr::null_mut());

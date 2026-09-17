@@ -62,19 +62,35 @@ pub const CACHE_MAX_FILES: usize = 512;
 /// in microseconds.
 pub const THUMB_MAX_PX: u32 = 768;
 
-/// Longest side of a pixel bitmap kept for the native overlay. Braille
-/// already sampled the 768 px decode; retaining that in the 256-entry
-/// cache costs hundreds of MB on macOS/Windows.
+/// Longest side of the pixel bitmap kept for a *grid* tile in the native
+/// overlay. The grid is the many-entries case (a full cache holds hundreds of
+/// entries and the scroll-back LRU retains more), so its store is the small
+/// one: braille already sampled the 768 px decode and retaining that per
+/// entry costs hundreds of MB on macOS/Windows.
 ///
-/// Trade-off, measured: the destination is unknown when the worker runs
-/// (cell pixels are only known at placement time), so this nominal size is
-/// smaller than a HiDPI tile. At ~300% scaling a 20×8-cell tile is
-/// ~416×339 px, and `fit_pixels` then upscales this 256 px bitmap — ~4.9 ms
-/// of Triangle work per *first-sight* tile, versus ~0.6 ms at 1×. The fitted
-/// bitmap is cached per entry and retained by the scroll-back LRU, so the
-/// cost is paid once per tile, not per frame; raising this cap would trade
-/// that back as resident memory (256 px ≈ 38 MB for a full cache).
+/// Trade-off, measured: the destination is unknown when the worker runs (cell
+/// pixels are only known at placement time), so this nominal size is smaller
+/// than a HiDPI tile. At ~300% scaling a 20×8-cell tile is ~416×339 px, and
+/// `fit_pixels` then upscales this bitmap — ~4.9 ms of Triangle work per
+/// *first-sight* tile, versus ~0.6 ms at 1×. The fitted bitmap is cached per
+/// entry and retained by the scroll-back LRU, so the cost is paid once per
+/// tile, not per frame.
 pub const OVERLAY_STORE_MAX_PX: u32 = 256;
+
+/// Longest side of the pixel bitmap kept for the *column* preview in the
+/// native overlay. The column is a single surface — at most one entry per
+/// pane, the selected file — so it can afford the full decode resolution:
+/// a ~38-cell column is ~790 px wide at 300% scaling, which the grid budget
+/// above would have upscaled ~3×.
+pub const OVERLAY_COLUMN_STORE_MAX_PX: u32 = THUMB_MAX_PX;
+
+/// How a preview is presented. Grid tiles are small and numerous; the column
+/// is one large surface, and the two get different overlay store budgets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PreviewSurface {
+    Grid,
+    Column,
+}
 
 /// Approximate HiDPI pixels per terminal cell used to size overlay bitmaps.
 const OVERLAY_PX_PER_COL: u32 = 16;
@@ -528,8 +544,9 @@ pub fn spawn_workers(
                 _ => {
                     match load_thumbnail(&req.path, req.mtime, req.size)
                         .ok()
-                        .map(|img| build_rendered(&picker, truecolor, img, req.cols, req.rows))
-                    {
+                        .map(|img| {
+                            build_rendered(&picker, truecolor, img, req.cols, req.rows, req.surface)
+                        }) {
                         Some(rendered) => ThumbEvent::Ready(req.clone(), rendered),
                         None => ThumbEvent::Failed(req.clone()),
                     }
@@ -574,6 +591,9 @@ pub struct ThumbRequest {
     /// Preview area in terminal cells the protocol must fit.
     pub cols: u16,
     pub rows: u16,
+    /// Which surface this request feeds: it selects the overlay store budget
+    /// ([`OVERLAY_STORE_MAX_PX`] vs [`OVERLAY_COLUMN_STORE_MAX_PX`]).
+    pub surface: PreviewSurface,
 }
 
 impl ThumbRequest {
@@ -591,16 +611,22 @@ impl ThumbRequest {
     }
 }
 
-/// Downscale overlay pixels to the tile they will paint, not the 768 px
-/// decode used for braille. Column: ~16×32 px/cell capped at
-/// [`OVERLAY_STORE_MAX_PX`].
-pub fn overlay_store_img(img: DynamicImage, cols: u16, rows: u16) -> DynamicImage {
-    let w = (u32::from(cols) * OVERLAY_PX_PER_COL)
-        .min(OVERLAY_STORE_MAX_PX)
-        .max(1);
-    let h = (u32::from(rows) * OVERLAY_PX_PER_ROW)
-        .min(OVERLAY_STORE_MAX_PX)
-        .max(1);
+/// Downscale overlay pixels to the surface they will paint, not the 768 px
+/// decode used for braille. Sizing is nominal (~16×32 px/cell) and capped per
+/// surface — see [`OVERLAY_STORE_MAX_PX`] and
+/// [`OVERLAY_COLUMN_STORE_MAX_PX`].
+pub fn overlay_store_img(
+    img: DynamicImage,
+    cols: u16,
+    rows: u16,
+    surface: PreviewSurface,
+) -> DynamicImage {
+    let cap = match surface {
+        PreviewSurface::Grid => OVERLAY_STORE_MAX_PX,
+        PreviewSurface::Column => OVERLAY_COLUMN_STORE_MAX_PX,
+    };
+    let w = (u32::from(cols) * OVERLAY_PX_PER_COL).min(cap).max(1);
+    let h = (u32::from(rows) * OVERLAY_PX_PER_ROW).min(cap).max(1);
     if img.width() <= w && img.height() <= h {
         img
     } else {
@@ -652,20 +678,29 @@ impl Rendered {
     }
 
     /// Byte size of the cached fitted bitmap, if any. Used by the overlay
-    /// cache's byte-budgeted retention (`App::overlay_fitted_lru`).
+    /// cache's byte-budgeted retention (`App::overlay_fitted_lru`), so it
+    /// reports what is actually retained: the fit path yields RGBA8, but the
+    /// exact-size path clones the source layout (which may be RGB8), and
+    /// assuming 4 bytes per pixel there would over- or under-count.
     pub fn fitted_bytes(&self) -> Option<usize> {
         match self {
             Self::Pixels {
-                fitted: Some((w, h, _)),
+                fitted: Some((w, h, img)),
                 ..
-            } => Some(*w as usize * *h as usize * 4),
+            } => Some(*w as usize * *h as usize * img.color().bytes_per_pixel() as usize),
             _ => None,
         }
     }
 
     /// Fit `img` into `w × h` and store it on this entry. Same dest size
     /// reuses the cached bitmap (composite memcpy path).
+    ///
+    /// A zero-size request is rejected: `fit_pixels` answers it with a 1×1
+    /// placeholder, which would then be reported as a fit for `(0, h)`.
     pub fn ensure_fitted(&mut self, w: u32, h: u32) -> Option<&DynamicImage> {
+        if w == 0 || h == 0 {
+            return None;
+        }
         match self {
             Self::Pixels { img, fitted, .. } => {
                 let hit = matches!(fitted.as_ref(), Some((fw, fh, _)) if *fw == w && *fh == h);
@@ -679,7 +714,8 @@ impl Rendered {
     }
 
     /// Drop the dest-sized overlay bitmap. The small `overlay_store_img`
-    /// (≤256 px) stays so off-screen entries remain cheap to keep.
+    /// (≤256 px for grid tiles, the decode size for the column) stays so
+    /// off-screen entries remain cheap to keep.
     pub fn clear_fitted(&mut self) {
         if let Self::Pixels { fitted, .. } = self {
             *fitted = None;
@@ -711,7 +747,12 @@ pub fn build_rendered(
     img: DynamicImage,
     cols: u16,
     rows: u16,
+    surface: PreviewSurface,
 ) -> Rendered {
+    // Only the native overlay picks a store budget; elsewhere there is no
+    // stored bitmap to size.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let _ = surface;
     if matches!(picker.protocol_type(), ProtocolType::Halfblocks) {
         let fallback = BlockImage::from_image(&img, cols, rows, truecolor);
         // Terminal.app / Windows Terminal: keep a fitted overlay bitmap
@@ -719,7 +760,7 @@ pub fn build_rendered(
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             return Rendered::Pixels {
-                img: overlay_store_img(img, cols, rows),
+                img: overlay_store_img(img, cols, rows, surface),
                 fitted: None,
                 fallback,
             };
@@ -969,12 +1010,21 @@ mod tests {
         assert!(load_thumbnail(path.to_str().unwrap(), Some(1), 19).is_err());
     }
     #[test]
-    fn overlay_store_img_caps_longest_side() {
+    fn overlay_store_img_caps_longest_side_per_surface() {
+        // Grid tile (20×8 cells) keeps the small store.
         let img = DynamicImage::ImageRgb8(image::RgbImage::new(800, 600));
-        let out = overlay_store_img(img, 20, 8);
-        assert!(out.width() <= OVERLAY_STORE_MAX_PX);
-        assert!(out.height() <= OVERLAY_STORE_MAX_PX);
-        assert!(out.width() > 0 && out.height() > 0);
+        let grid = overlay_store_img(img.clone(), 20, 8, PreviewSurface::Grid);
+        assert!(grid.width() <= OVERLAY_STORE_MAX_PX);
+        assert!(grid.height() <= OVERLAY_STORE_MAX_PX);
+        assert!(grid.width() > 0 && grid.height() > 0);
+
+        // The column is one tall surface: 38×30 cells would nominally be
+        // 608×960 px, and capping it at 256 px softens the primary image
+        // view on any HiDPI display (the grid cap must not apply).
+        let column = overlay_store_img(img, 38, 30, PreviewSurface::Column);
+        assert_eq!(column.width(), 608);
+        assert!(column.height() > OVERLAY_STORE_MAX_PX);
+        assert!(column.width() <= OVERLAY_COLUMN_STORE_MAX_PX);
     }
 
     #[test]
@@ -985,7 +1035,7 @@ mod tests {
             ratatui_image::picker::ProtocolType::Halfblocks
         ));
         let img = DynamicImage::ImageRgb8(image::RgbImage::new(100, 100));
-        let rendered = build_rendered(&picker, true, img, 10, 5);
+        let rendered = build_rendered(&picker, true, img, 10, 5, PreviewSurface::Grid);
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         assert!(matches!(rendered, Rendered::Pixels { .. }));
         #[cfg(any(target_os = "macos", target_os = "windows"))]

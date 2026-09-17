@@ -18,6 +18,11 @@ use super::{ScreenRect, WindowGeom};
 pub struct MacOverlay {
     panel: Option<Retained<NSPanel>>,
     image_view: Option<Retained<NSImageView>>,
+    /// Decoded overlay image with the content fingerprint it was built from.
+    /// PNG encoding plus the AppKit decode are the expensive half of a show,
+    /// and a re-show of the same content (after `order_out`, or a re-layout)
+    /// must not repeat them — nor copy the bytes twice to get there.
+    image: Option<(u64, Retained<NSImage>)>,
     pub visible: bool,
 }
 
@@ -26,6 +31,7 @@ impl MacOverlay {
         Self {
             panel: None,
             image_view: None,
+            image: None,
             visible: false,
         }
     }
@@ -78,43 +84,74 @@ impl MacOverlay {
         true
     }
 
-    pub fn show_png(&mut self, png: &[u8], rect: ScreenRect) {
-        if rect.width == 0 || rect.height == 0 || png.is_empty() {
+    /// Show the overlay for `img` (content fingerprint `fp`). Returns whether
+    /// the panel is on screen afterwards: a caller must not record a
+    /// placement that never appeared.
+    pub fn show_image(&mut self, fp: u64, img: &DynamicImage, rect: ScreenRect) -> bool {
+        if rect.width == 0 || rect.height == 0 {
             self.hide();
-            return;
+            return false;
         }
         if !self.ensure() {
-            return;
+            // No panel: never report the previous content as current.
+            self.order_out();
+            return false;
         }
-        let data = NSData::from_vec(png.to_vec());
-        let Some(nsimg) = NSImage::initWithData(NSImage::alloc(), &data) else {
-            return;
+        let cached = self
+            .image
+            .as_ref()
+            .filter(|(cached_fp, _)| *cached_fp == fp)
+            .map(|(_, nsimg)| nsimg.clone());
+        let nsimg = match cached {
+            Some(nsimg) => nsimg,
+            None => {
+                let png = encode_png(img);
+                let data = NSData::with_bytes(&png);
+                let Some(nsimg) = NSImage::initWithData(NSImage::alloc(), &data) else {
+                    self.order_out();
+                    return false;
+                };
+                self.image = Some((fp, nsimg.clone()));
+                nsimg
+            }
+        };
+        let Some(panel) = self.panel.as_ref() else {
+            self.order_out();
+            return false;
         };
         if let Some(view) = &self.image_view {
             view.setImage(Some(&nsimg));
         }
         let cocoa = to_cocoa_rect(rect);
-        if let Some(panel) = &self.panel {
-            panel.setFrame_display(cocoa, true);
-            panel.orderFront(None);
-        }
-        self.visible = true;
+        panel.setFrame_display(cocoa, true);
+        panel.orderFront(None);
         self.pump();
+        self.visible = true;
+        true
     }
 
-    pub fn move_to(&mut self, rect: ScreenRect) {
+    /// Reposition, creating the panel if an earlier show never managed to.
+    /// Returns whether the panel is on screen afterwards.
+    pub fn move_to(&mut self, rect: ScreenRect) -> bool {
         if rect.width == 0 || rect.height == 0 {
             self.order_out();
-            return;
+            return false;
         }
-        if let Some(panel) = &self.panel {
-            panel.setFrame_display(to_cocoa_rect(rect), true);
-            if !self.visible {
-                panel.orderFront(None);
-                self.visible = true;
-                self.pump();
-            }
+        if !self.ensure() {
+            self.order_out();
+            return false;
         }
+        let Some(panel) = self.panel.as_ref() else {
+            self.order_out();
+            return false;
+        };
+        panel.setFrame_display(to_cocoa_rect(rect), true);
+        if !self.visible {
+            panel.orderFront(None);
+            self.visible = true;
+            self.pump();
+        }
+        self.visible
     }
 
     /// Hide the panel without dropping the image (modal / wrong-window).
@@ -133,6 +170,9 @@ impl MacOverlay {
         if let Some(view) = &self.image_view {
             view.setImage(None);
         }
+        // The bytes are gone with the view; the decoded image would only
+        // pin memory.
+        self.image = None;
     }
 
     pub fn close(&mut self) {
@@ -219,8 +259,30 @@ pub fn query_front_window() -> Option<WindowGeom> {
         ""
     };
     let tty = stdin_tty().filter(|t| !t.is_empty() && !t.contains('"') && !t.contains('\\'));
-    let script = if expected.is_empty() {
-        r#"tell application "System Events"
+    let raw = osascript(&bounds_script(expected, tty.as_deref()))?;
+    let raw = if raw.trim() == "NOTFOUND" {
+        // No window owns our tty. That is the multiplexer case (tmux / screen
+        // / an `ssh` wrapper): stdin is the *pane* pty while the emulator
+        // reports its session tty, so tty matching can never succeed. Fall
+        // back to the front window — the pre-tty behaviour — instead of
+        // hiding the overlay for the rest of the session. A terminal that is
+        // genuinely not frontmost still answers "HIDE".
+        osascript(&bounds_script(expected, None))?
+    } else {
+        raw
+    };
+    if raw.trim() == "HIDE" {
+        return None;
+    }
+    parse_bounds(&Some(raw))
+}
+
+/// AppleScript for `expected` (the `TERM_PROGRAM` class), tty-matched when our
+/// stdin tty is known. Returns "HIDE" when the app is not frontmost, and
+/// "NOTFOUND" when no window of it owns our tty.
+fn bounds_script(expected: &str, tty: Option<&str>) -> String {
+    if expected.is_empty() {
+        return r#"tell application "System Events"
             set n to name of first process whose frontmost is true
             if n is not in {"Terminal", "iTerm2", "iTerm", "Ghostty", "kitty", "WezTerm", "Alacritty", "Warp"} then
                 return "HIDE"
@@ -231,11 +293,13 @@ pub fn query_front_window() -> Option<WindowGeom> {
                 return (item 1 of p as text) & "," & (item 2 of p as text) & "," & (item 1 of s as text) & "," & (item 2 of s as text)
             end tell
         end tell"#
-            .to_string()
-    } else if expected == "iTerm2" {
-        iterm_bounds_script(tty.as_deref())
-    } else if expected == "Ghostty" {
-        r#"tell application "System Events" to set n to name of first process whose frontmost is true
+            .to_string();
+    }
+    if expected == "iTerm2" {
+        return iterm_bounds_script(tty);
+    }
+    if expected == "Ghostty" {
+        return r#"tell application "System Events" to set n to name of first process whose frontmost is true
 if n does not contain "Ghostty" and n is not "ghostty" then return "HIDE"
 tell application "System Events"
     tell (first process whose frontmost is true)
@@ -244,15 +308,9 @@ tell application "System Events"
         return (item 1 of p as text) & "," & (item 2 of p as text) & "," & (item 1 of s as text) & "," & (item 2 of s as text)
     end tell
 end tell"#
-            .to_string()
-    } else {
-        terminal_app_bounds_script(tty.as_deref())
-    };
-    let raw = osascript(&script)?;
-    if raw.trim() == "HIDE" {
-        return None;
+            .to_string();
     }
-    parse_bounds(&Some(raw))
+    terminal_app_bounds_script(tty)
 }
 
 fn terminal_app_bounds_script(tty: Option<&str>) -> String {
@@ -270,11 +328,17 @@ tell application "Terminal"
     repeat with w in windows
         try
             if tty of selected tab of w is targetTty then
-                return bounds of w
+                if w is front window then
+                    return bounds of w
+                else
+                    -- Our tty lives in a window that is not in front: painting
+                    -- at its rectangle would land on the front window.
+                    return "HIDE"
+                end if
             end if
         end try
     end repeat
-    return "HIDE"
+    return "NOTFOUND"
 end tell"#
     )
 }
@@ -295,12 +359,18 @@ tell application "iTerm"
         repeat with t in tabs of w
             repeat with s in sessions of t
                 try
-                    if tty of s is targetTty then return bounds of w
+                    if tty of s is targetTty then
+                        if w is current window then
+                            return bounds of w
+                        else
+                            return "HIDE"
+                        end if
+                    end if
                 end try
             end repeat
         end repeat
     end repeat
-    return "HIDE"
+    return "NOTFOUND"
 end tell"#
     )
 }

@@ -114,8 +114,12 @@ list with a thumbnail grid — image thumbnails, glyphs for folders and unsuppor
 cursor highlighted, filtered (`/`) views included. Select an image (PNG, JPEG, GIF, BMP, WebP)
 and ira renders it with full graphics in terminals that support the kitty, iTerm2, or Sixel
 protocols. Native Windows and Terminal.app use a transparent overlay over the thumbnail
-cells (`IRA_IMAGES=sixel` still forces Sixel). VS Code's integrated terminal on Windows
-has no overlay (braille only). 2×4 Unicode braille is the last resort. Text-like files preview natively as text: by extension, and also extensionless names (`Makefile`, `LICENSE`, …) and dotfiles (`.env`, `.env.local`, `.gitignore`), with binaries falling back to a placeholder.
+cells (`IRA_IMAGES=sixel` still forces Sixel), shown only while that terminal window is in
+front. Overlay bitmaps are capped (256 px per grid tile, the decode size for the single
+preview column, 4096 px per surface side), so a pane larger than that or a geometry sample
+older than 2 s falls back to braille — as does VS Code's integrated terminal on Windows,
+which is not a console HWND (with image support enabled it answers the probe with Sixel
+and uses its own protocol instead). 2×4 Unicode braille is the last resort. Text-like files preview natively as text: by extension, and also extensionless names (`Makefile`, `LICENSE`, …) and dotfiles (`.env`, `.env.local`, `.gitignore`), with binaries falling back to a placeholder.
 Decoding happens on a bounded background worker
 pool and is cached in memory and on disk, so scrolling through a folder of photos stays instant
 and the UI never blocks.

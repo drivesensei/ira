@@ -27,8 +27,8 @@ use crate::{
         overlay::{self, Overlay},
         state::{load_state, load_state_from, save_state, save_state_to, SessionState, SizeEntry},
         thumbnails::{
-            preview_kind, prune_cache, spawn_workers, PreviewKind, Rendered, ThumbEvent,
-            ThumbRequest, WorkerQueues, JOB_QUEUE_HI_CAP, JOB_QUEUE_LO_CAP,
+            preview_kind, prune_cache, spawn_workers, PreviewKind, PreviewSurface, Rendered,
+            ThumbEvent, ThumbRequest, WorkerQueues, JOB_QUEUE_HI_CAP, JOB_QUEUE_LO_CAP,
         },
         transfer::{
             spawn_delete_job, spawn_job, Job, JobControl, JobEvent, JobKind, JobStatus,
@@ -455,8 +455,9 @@ pub struct App {
     overlay_jobs: [Option<OverlayJob>; overlay::OVERLAY_SLOTS],
     /// Keys on-screen last/this frame; eviction must not drop these.
     overlay_protect: HashSet<String>,
-    /// Grid tiles that scrolled off recently, newest first. Keys enter only
-    /// when they leave the on-screen set (`rebuild_overlay_protect`), so a key
+    /// Tiles that scrolled off recently, oldest first (most recent at the
+    /// back). Keys enter only when they leave the on-screen set
+    /// (`rebuild_overlay_protect`), so a key
     /// that stays visible costs nothing here; a tile that scrolls off keeps its
     /// fitted bitmap for the round trip. Bounded by count and bytes.
     overlay_fitted_lru: FittedLru,
@@ -482,10 +483,11 @@ enum OverlayJobKind {
     Grid,
 }
 
-/// Recently scrolled-away grid tiles, newest first, with a byte budget so a
-/// HiDPI tile cannot blow up retention. Maintained incrementally: `touch` on
-/// leaving the screen, `forget` when the cache entry is evicted, `contains` in
-/// the prune. The deque and the set are always in sync.
+/// Recently scrolled-away tiles — grid *and* column — oldest first, bounded by
+/// count and by bytes so a HiDPI tile cannot blow up retention. Maintained
+/// incrementally: `touch` on leaving the screen, `forget` when the cache entry
+/// is evicted, `contains` in the prune. The deque and the set are always in
+/// sync.
 #[derive(Default)]
 struct FittedLru {
     order: VecDeque<(String, usize)>,
@@ -496,13 +498,21 @@ struct FittedLru {
 impl FittedLru {
     /// Remember `key` as the most recent off-screen tile, `bytes` being its
     /// fitted bitmap size. Re-touching moves it to the back.
+    ///
+    /// A single bitmap larger than the whole budget is not admitted: the
+    /// budget has to bound what is retained, and the alternative (keep it and
+    /// rely on the next entrant to evict it) leaves one pane-sized bitmap
+    /// (tens of MB at 4K/HiDPI) pinned indefinitely.
     fn touch(&mut self, key: &str, bytes: usize) {
         self.forget(key);
+        if bytes > OVERLAY_FITTED_LRU_BYTES {
+            return;
+        }
         self.set.insert(key.to_string());
         self.order.push_back((key.to_string(), bytes));
         self.bytes = self.bytes.saturating_add(bytes);
-        while self.order.len() > OVERLAY_FITTED_LRU
-            || (self.bytes > OVERLAY_FITTED_LRU_BYTES && self.order.len() > 1)
+        while !self.order.is_empty()
+            && (self.order.len() > OVERLAY_FITTED_LRU || self.bytes > OVERLAY_FITTED_LRU_BYTES)
         {
             self.pop_front();
         }
@@ -555,9 +565,9 @@ impl FittedLru {
 }
 
 /// Keep a dest-sized fitted bitmap only if it is on-screen, or a tile that
-/// scrolled off recently (the LRU). The LRU admits any departed key, large
-/// column bitmaps included — the byte budget, not a size test, is what keeps
-/// that safe (`OVERLAY_FITTED_LRU_BYTES`).
+/// scrolled off recently (the LRU). Every departed key is admitted, column
+/// bitmaps included — `OVERLAY_FITTED_LRU_BYTES` bounds the total, and
+/// `FittedLru::touch` refuses a single bitmap bigger than the whole budget.
 fn should_keep_fitted(key: &str, protect: &HashSet<String>, lru: &FittedLru) -> bool {
     protect.contains(key) || lru.contains(key)
 }
@@ -575,12 +585,9 @@ fn overlay_job_fps(
                 return None;
             }
             let tiles = [(*area, key.as_str())];
-            Some((
-                *area,
-                OverlayJobKind::Column,
-                overlay::content_hash(cell, term, *area, &tiles),
-                overlay::placement_hash(window, cell, term, *area, &tiles),
-            ))
+            let (place_fp, content_fp) =
+                overlay::overlay_fingerprints(window, cell, term, *area, &tiles);
+            Some((*area, OverlayJobKind::Column, content_fp, place_fp))
         }
         OverlayJob::Grid { area, tiles } => {
             let ready: Vec<(ratatui::layout::Rect, &str)> = tiles
@@ -591,12 +598,9 @@ fn overlay_job_fps(
             if ready.is_empty() {
                 return None;
             }
-            Some((
-                *area,
-                OverlayJobKind::Grid,
-                overlay::content_hash(cell, term, *area, &ready),
-                overlay::placement_hash(window, cell, term, *area, &ready),
-            ))
+            let (place_fp, content_fp) =
+                overlay::overlay_fingerprints(window, cell, term, *area, &ready);
+            Some((*area, OverlayJobKind::Grid, content_fp, place_fp))
         }
     }
 }
@@ -1446,6 +1450,7 @@ impl App {
             size: entry.size,
             cols: 0,
             rows: 0,
+            surface: PreviewSurface::Column,
         };
         let key = req.mem_key();
         if let Some(preview) = self.text_cache.get(&key) {
@@ -1646,13 +1651,22 @@ impl App {
             self.overlay.hide_slot(slot);
             return;
         };
+        if overlay::area_exceeds_surface_cap(area, cell) {
+            // Wider or taller than one surface can cover: braille underlay.
+            self.overlay.hide_slot(slot);
+            return;
+        }
         let screen = overlay::preview_screen_rect(window, origin, cell, area);
         if self.overlay.is_current(slot, place_fp) {
             return;
         }
         if self.overlay.same_content(slot, content_fp) {
-            self.overlay.move_to(slot, screen);
-            self.overlay.mark_current(slot, place_fp, content_fp);
+            // Reposition, creating the surface if an earlier show never got
+            // one. `move_to` reports whether anything is on screen; only then
+            // is the placement current.
+            if self.overlay.move_to(slot, screen) {
+                self.overlay.mark_current(slot, place_fp, content_fp);
+            }
             return;
         }
         match kind {
@@ -1674,7 +1688,11 @@ impl App {
                         self.overlay.hide_slot(slot);
                         return;
                     };
-                    self.overlay.show(slot, fitted, screen, content_fp);
+                    if !self.overlay.show(slot, fitted, screen, content_fp) {
+                        // Not on screen (no surface / encode failed): leave it
+                        // un-marked so the next frame retries the full show.
+                        return;
+                    }
                 }
             }
             OverlayJobKind::Grid => {
@@ -1702,7 +1720,9 @@ impl App {
                     self.overlay.hide_slot(slot);
                     return;
                 };
-                self.overlay.show(slot, &composed, screen, content_fp);
+                if !self.overlay.show(slot, &composed, screen, content_fp) {
+                    return;
+                }
             }
         }
         self.overlay.mark_current(slot, place_fp, content_fp);
@@ -1784,6 +1804,7 @@ impl App {
                 size: entry.size,
                 cols,
                 rows,
+                surface: PreviewSurface::Grid,
             };
             let _ = self.preview_image(&req);
         }
@@ -1826,6 +1847,7 @@ impl App {
                 size: entry.size,
                 cols: area.0,
                 rows: area.1,
+                surface: PreviewSurface::Column,
             };
             self.try_send_prefetch(&req);
         }
@@ -1844,6 +1866,10 @@ impl App {
             || self.info.is_some()
             || self.deletion_box_visible()
             || self.keybindings_visible
+            // An error notice renders as a centered modal over the files
+            // area (the same area the overlay floats above), so it must
+            // suppress the overlay and stop polling like any other dialog.
+            || self.status.as_ref().is_some_and(|s| s.is_error)
     }
 
     /// Cycles the image preview presentation of the ACTIVE pane (`v`):
@@ -1858,7 +1884,9 @@ impl App {
         };
         self.pane_mut().preview_mode = next;
         if !matches!(next, PreviewMode::Column | PreviewMode::Grid) {
-            self.overlay.hide_all();
+            // Only this pane changed mode: tearing down the other pane's
+            // surface would blink it and force a full re-composite.
+            self.overlay.hide_slot(self.active_pane);
         }
         let label = match next {
             PreviewMode::Off => "off",
@@ -1916,6 +1944,13 @@ impl App {
             size: entry.size,
             cols: pane.preview_area.0,
             rows: pane.preview_area.1,
+            // Details reuses the column surface, so only grid mode asks for
+            // the small store.
+            surface: if pane.preview_mode == PreviewMode::Grid {
+                PreviewSurface::Grid
+            } else {
+                PreviewSurface::Column
+            },
         })
     }
 
@@ -1945,6 +1980,13 @@ impl App {
             self.thumb_pending.insert(key);
         }
         None
+    }
+
+    /// Whether this request is known to fail (undecodable file, unreadable
+    /// path). The UI shows a failure placeholder instead of "loading…",
+    /// which is otherwise pinned for the rest of the session.
+    pub fn preview_failed(&self, req: &ThumbRequest) -> bool {
+        self.thumb_failed.contains(&req.mem_key())
     }
 
     /// Collects finished thumbnail jobs into the protocol cache.
@@ -4828,6 +4870,7 @@ mod preview_tests {
                 size: 0,
                 cols: 38,
                 rows: 10,
+                surface: PreviewSurface::Column,
             })
             .collect();
         for req in &reqs {
@@ -5401,6 +5444,70 @@ mod preview_tests {
     }
 
     #[test]
+    fn grid_marks_failed_decodes_and_pins_every_visible_tile() {
+        use crate::components::tab1_files_ui::{GRID_CELL_W, GRID_IMG_H};
+        let entry = |label: &str| FEntry {
+            path: png_at(label),
+            label: label.into(),
+            is_dir: false,
+            size: 12,
+            modified: None,
+        };
+        let mut app = App::default();
+        app.set_picker(ratatui_image::picker::Picker::halfblocks(), true);
+        app.panes[0].preview_mode = PreviewMode::Grid;
+        app.panes[0].folder = Some(Folder::new(
+            "grid".into(),
+            std::env::temp_dir().to_string_lossy().into_owned(),
+            '1',
+        ));
+        app.panes[0].files = vec![entry("broken.png"), entry("later.png")];
+        app.panes[0].listing_settled = true;
+        app.panes[0].state.select(Some(0));
+
+        // Build the key the way the renderer does, then blacklist exactly it.
+        let req = |label: &str| ThumbRequest {
+            path: png_at(label),
+            mtime: None,
+            size: 12,
+            cols: GRID_CELL_W,
+            rows: GRID_IMG_H,
+            surface: PreviewSurface::Grid,
+        };
+        let broken = req("broken.png");
+        app.thumb_failed.insert(broken.mem_key());
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| crate::components::tab1_files_ui::render(f, &mut app, f.area(), 0, true))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            text.contains('✕'),
+            "a failed decode shows the failure mark, not a spinner"
+        );
+
+        // Every visible image tile is pinned before any cell is drawn, so the
+        // per-frame drain cannot evict a tile mid-render.
+        assert!(
+            app.overlay_protect.contains(&broken.mem_key()),
+            "failed tile not pinned"
+        );
+        assert!(
+            app.overlay_protect.contains(&req("later.png").mem_key()),
+            "visible tile not pinned before the drain"
+        );
+    }
+
+    #[test]
     fn insert_thumb_is_duplicate_free_and_skips_overlay_keys() {
         let mut app = App::default();
         app.thumb_cache_cap = 2;
@@ -5471,6 +5578,88 @@ mod preview_tests {
         assert!(app.overlay_jobs.iter().all(|j| j.is_none()));
     }
 
+    #[test]
+    fn fitted_lru_refuses_a_bitmap_larger_than_its_budget() {
+        let mut lru = FittedLru::default();
+        // One pane-sized fitted bitmap (tens of MB at 4K/HiDPI) must not be
+        // retained past the budget just because it is the only entry.
+        lru.touch("huge", OVERLAY_FITTED_LRU_BYTES + 1);
+        assert!(!lru.contains("huge"));
+        assert_eq!(lru.bytes, 0);
+
+        // The budget is enforced on the sum, oldest first.
+        lru.touch("a", OVERLAY_FITTED_LRU_BYTES / 2);
+        lru.touch("b", OVERLAY_FITTED_LRU_BYTES / 2);
+        lru.touch("c", 4096);
+        assert!(lru.bytes <= OVERLAY_FITTED_LRU_BYTES);
+        assert!(lru.contains("c"));
+        assert!(!lru.contains("a"), "the oldest entry is the one retired");
+    }
+
+    #[test]
+    fn fitted_bytes_follow_the_retained_layout() {
+        // The exact-size fit clones the source layout (RGB8 here), so the
+        // byte budget must account 3 bytes per pixel, not an assumed 4.
+        let img = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(4, 4, image::Rgb([1, 2, 3])));
+        let fallback = crate::services::blocks::BlockImage::from_image(&img, 2, 2, true);
+        let mut rendered = Rendered::Pixels {
+            img,
+            fitted: None,
+            fallback,
+        };
+        assert!(rendered.ensure_fitted(4, 4).is_some());
+        assert_eq!(rendered.fitted_bytes(), Some(4 * 4 * 3));
+        // A resized fit is RGBA8.
+        assert!(rendered.ensure_fitted(8, 8).is_some());
+        assert_eq!(rendered.fitted_bytes(), Some(8 * 8 * 4));
+    }
+
+    #[test]
+    fn ensure_fitted_rejects_a_zero_size_request() {
+        // `fit_pixels` answers a zero-size dest with a 1×1 placeholder, which
+        // must not be reported as a fit.
+        let mut rendered = pixels_with_fitted();
+        rendered.clear_fitted();
+        assert!(rendered.ensure_fitted(0, 16).is_none());
+        assert!(rendered.ensure_fitted(20, 0).is_none());
+        assert!(rendered.fitted_at(0, 16).is_none());
+        assert_eq!(rendered.fitted_bytes(), None);
+    }
+
+    #[test]
+    fn error_notice_suppresses_the_overlay_like_any_dialog() {
+        let mut app = App::default();
+        assert!(!app.overlay_covers_preview());
+        // An error renders as a centered modal over the files area, so the
+        // floating overlay has to yield to it.
+        app.set_status("Failed to delete notes.txt".to_string(), true);
+        assert!(app.overlay_covers_preview());
+        app.set_status("Deleted notes.txt".to_string(), false);
+        assert!(
+            !app.overlay_covers_preview(),
+            "a transient notice is not a modal"
+        );
+    }
+
+    #[test]
+    fn failed_decodes_are_reported_to_the_ui() {
+        let mut app = App::default();
+        let req = ThumbRequest {
+            path: "/tmp/ira-does-not-exist.png".into(),
+            mtime: None,
+            size: 0,
+            cols: 20,
+            rows: 8,
+            surface: PreviewSurface::Grid,
+        };
+        assert!(!app.preview_failed(&req));
+        app.thumb_failed.insert(req.mem_key());
+        assert!(
+            app.preview_failed(&req),
+            "the UI shows a failure placeholder"
+        );
+    }
+
     fn pixels_with_fitted() -> Rendered {
         pixels_with_fitted_at(20, 16)
     }
@@ -5496,8 +5685,8 @@ mod preview_tests {
         assert!(should_keep_fitted("on", &protect, &lru));
         assert!(should_keep_fitted("recent", &protect, &lru));
         assert!(!should_keep_fitted("gone", &protect, &lru));
-        // A column-sized bitmap is only kept while it is on-screen: it never
-        // enters the LRU, so no size heuristic is needed.
+        // A column-sized bitmap enters the LRU like any other departed key;
+        // the byte budget (and `touch`'s over-budget refusal) bounds it.
         assert!(!should_keep_fitted("col", &protect, &lru));
     }
 

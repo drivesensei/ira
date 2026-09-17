@@ -167,9 +167,12 @@ forces the fallback set, `icons = "emoji"` forces emoji on a host the list above
   Emoji, in color). It switches to Nerd glyphs as soon as the profile font is one that
   has them (e.g. `Cascadia Mono NF`, or a fallback list such as
   `Cascadia Mono, Symbols Nerd Font Mono`). Image previews use a transparent
-  Win32 overlay (silent probe + `WT_SESSION`); `IRA_IMAGES=sixel` forces Sixel.
-  VS Code's integrated terminal on Windows is not a console HWND — overlay
-  placement is skipped and previews stay on the braille underlay.
+  Win32 overlay, used only while the frontmost window is a terminal window the
+  console can be tied to (`ConsoleWindowClass` / `CASCADIA_HOSTING_WINDOW_CLASS`);
+  `IRA_IMAGES=sixel` forces Sixel. VS Code's integrated terminal on Windows is not a
+  console HWND; the frontmost terminal window is used as a fallback host, and with
+  `Terminal > Integrated: Enable Images` VS Code answers the probe with Sixel and
+  renders through that protocol instead.
 - **Terminal.app** has no image protocol. Previews use a transparent AppKit
   overlay over the thumbnail cells (2×4 braille underlay if the window cannot
   be located). iTerm2, Ghostty, kitty and WezTerm keep their in-terminal
@@ -185,7 +188,7 @@ forces the fallback set, `icons = "emoji"` forces emoji on a host the list above
 Prints what was resolved without starting the UI:
 
 ```
-ira 0.1.15
+ira 0.1.17
 truecolor: yes
 icons: nerd (auto: a font with Nerd glyphs is available)
 nerd glyphs: yes (installed font "JetBrainsMono Nerd Font")
