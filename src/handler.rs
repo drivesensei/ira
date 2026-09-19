@@ -66,6 +66,10 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         if app.renaming.is_none() {
             match key_event.code {
                 KeyCode::Char('a') | KeyCode::Char('A') => app.toggle_select_all(),
+                // Ctrl+O reveals the selection in the OS file browser. A Ctrl
+                // combo on purpose: every plain letter still belongs to the
+                // common-folder / bookmark shortcut pool.
+                KeyCode::Char('o') | KeyCode::Char('O') => app.open_in_file_manager(),
                 _ => {}
             }
         }

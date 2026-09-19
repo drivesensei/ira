@@ -209,7 +209,14 @@ pub fn render(app: &mut App, frame: &mut Frame) {
             chrome::bind_pair("b", "bookmark this folder", "/", "fuzzy search", &theme),
             chrome::bind_pair("Esc", "clear search filter", "?", "entry info", &theme),
             chrome::bind_pair("[", "go to path", "]", "copy folder path", &theme),
-            chrome::bind_pair("-", "eject drive", "0", "terminal here", &theme),
+            chrome::bind_row(
+                &[
+                    ("0", "terminal here"),
+                    ("Ctrl+O", "file browser"),
+                    ("-", "eject drive"),
+                ],
+                &theme,
+            ),
             chrome::bind_pair("*", "this help", "q", "quit", &theme),
         ];
         let max_w = lines.iter().map(|l| l.width() as u16).max().unwrap_or(40);
@@ -743,6 +750,9 @@ mod tests {
             assert!(text.contains(binding), "missing {binding:?}: {text}");
         }
         assert!(text.contains("terminal here"), "{text}");
+        // `Ctrl+O` spends no bookmark letter, so it is listed here rather
+        // than in a shortcut box.
+        assert!(text.contains("file browser"), "{text}");
 
         // Any key closes it.
         handle_key_events(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()), &mut app).unwrap();

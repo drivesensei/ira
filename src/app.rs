@@ -2505,25 +2505,46 @@ impl App {
         };
         let candidates = terminal_candidates(&dir);
         let tried: Vec<String> = candidates.iter().map(|(p, _)| p.clone()).collect();
-        for (program, args) in candidates {
-            if !which(&program) {
-                continue;
-            }
-            let mut cmd = std::process::Command::new(&program);
-            cmd.args(&args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .current_dir(&dir);
-            match cmd.spawn() {
-                Ok(_) => return, // success is visible: the window opened
-                Err(_) => continue,
-            }
+        if !spawn_first_available(&candidates, &dir) {
+            self.set_status(
+                format!("No terminal emulator found (tried {}).", tried.join(", ")),
+                true,
+            );
         }
-        self.set_status(
-            format!("No terminal emulator found (tried {}).", tried.join(", ")),
-            true,
-        );
+    }
+
+    /// `(target, is_dir, cwd)` for `Ctrl+O`: the cursor entry when the pane has
+    /// one — the platform reveals *that* — otherwise the pane's own folder.
+    fn reveal_target(&self) -> Option<(String, bool, String)> {
+        let folder = self.pane().folder.as_ref()?.path.clone();
+        match self.selected_visible_entry() {
+            Some(entry) if !entry.path.is_empty() => {
+                Some((entry.path.clone(), entry.is_dir, folder))
+            }
+            _ => Some((folder.clone(), true, folder)),
+        }
+    }
+
+    /// Reveals the active pane's selection in the OS file browser (`Ctrl+O`).
+    ///
+    /// Finder and File Explorer select the item in its folder; on Linux the
+    /// item is opened when it is a directory and its containing folder
+    /// otherwise, because no file manager exposes a portable "select this
+    /// file" request. Best-effort like `0` — the window opening is the
+    /// feedback — and a total failure reports what it tried.
+    pub fn open_in_file_manager(&mut self) {
+        let Some((target, is_dir, cwd)) = self.reveal_target() else {
+            self.set_status("No folder open to reveal.", true);
+            return;
+        };
+        let candidates = file_manager_candidates(&target, is_dir);
+        let tried: Vec<String> = candidates.iter().map(|(p, _)| p.clone()).collect();
+        if !spawn_first_available(&candidates, &cwd) {
+            self.set_status(
+                format!("No file browser found (tried {}).", tried.join(", ")),
+                true,
+            );
+        }
     }
 
     // ---- Copy / move between panes (async, via the Copy Board) ----
@@ -4425,6 +4446,53 @@ pub fn terminal_candidates(dir: &str) -> Vec<(String, Vec<String>)> {
     ]
 }
 
+/// File browsers to try for `Ctrl+O`, in preference order.
+///
+/// Linux: the default handler first (`xdg-open`), then the common file
+/// managers by name. A directory target opens itself; a file target opens the
+/// folder holding it, because no file manager exposes a portable "select this
+/// file" request.
+#[cfg(not(any(target_os = "macos", windows)))]
+pub fn file_manager_candidates(target: &str, is_dir: bool) -> Vec<(String, Vec<String>)> {
+    let dir = if is_dir {
+        target.to_string()
+    } else {
+        std::path::Path::new(target)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| target.to_string())
+    };
+    let mut v = vec![("xdg-open".to_string(), vec![dir.clone()])];
+    for program in ["nautilus", "dolphin", "thunar", "nemo", "caja", "pcmanfm"] {
+        v.push((program.to_string(), vec![dir.clone()]));
+    }
+    v
+}
+
+/// Finder: `open -R <path>` reveals (selects) the item in its window.
+/// `/usr/bin/open` always exists and is on `PATH`.
+#[cfg(target_os = "macos")]
+pub fn file_manager_candidates(target: &str, _is_dir: bool) -> Vec<(String, Vec<String>)> {
+    vec![(
+        "open".to_string(),
+        vec!["-R".to_string(), target.to_string()],
+    )]
+}
+
+/// File Explorer: `/select,<path>` opens the containing folder with the item
+/// selected (works for files and folders alike). `explorer` splits on commas,
+/// so a path containing one is quoted.
+#[cfg(windows)]
+pub fn file_manager_candidates(target: &str, _is_dir: bool) -> Vec<(String, Vec<String>)> {
+    let arg = if target.contains(',') {
+        format!("/select,\"{target}\"")
+    } else {
+        format!("/select,{target}")
+    };
+    vec![("explorer".to_string(), vec![arg])]
+}
+
 /// Terminal emulators to try for `0` on macOS, in preference order.
 ///
 /// GUI terminal apps are not on `PATH`, so they launch through `open`:
@@ -4528,10 +4596,33 @@ fn which(program: &str) -> bool {
     let Ok(path_var) = std::env::var("PATH") else {
         return false;
     };
-    std::env::split_paths(&path_var).any(|dir| {
-        let candidate = dir.join(program);
-        candidate.is_file()
-    })
+    // Windows executables carry an extension, so a bare `explorer` / `wt` /
+    // `cmd` is never itself a file there and the `.exe` spelling has to be
+    // probed too (harmless on Unix, where such a name simply does not exist).
+    let with_exe = format!("{program}.exe");
+    std::env::split_paths(&path_var)
+        .any(|dir| dir.join(program).is_file() || dir.join(&with_exe).is_file())
+}
+
+/// Spawns the first candidate that exists, detached, with `cwd` as its
+/// working directory. `false` = nothing could be started (the caller reports
+/// the list it tried). Success is its own feedback: a window opens.
+fn spawn_first_available(candidates: &[(String, Vec<String>)], cwd: &str) -> bool {
+    for (program, args) in candidates {
+        if !which(program) {
+            continue;
+        }
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .current_dir(cwd);
+        if cmd.spawn().is_ok() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Joins Unicode characters into a `String`.
@@ -5440,6 +5531,155 @@ mod preview_tests {
         assert!(
             app.overlay_protect.is_empty(),
             "grid must not pin overlay keys while a modal is open"
+        );
+    }
+
+    #[test]
+    fn reveal_target_follows_the_cursor_entry_then_the_folder() {
+        use crate::domain::data::Folder;
+        let mut app = App::default();
+        assert!(app.reveal_target().is_none(), "no folder open to reveal");
+        app.panes[0].folder = Some(Folder::new("t".into(), "/tmp/ira-reveal".into(), '#'));
+        let entry = |label: &str, is_dir: bool| FEntry {
+            path: format!("/tmp/ira-reveal/{label}"),
+            label: label.into(),
+            is_dir,
+            size: if is_dir { 0 } else { 12 },
+            modified: None,
+        };
+        app.panes[0].files = vec![entry("photo.png", false), entry("album", true)];
+        app.panes[0].selected = vec![false, false];
+        app.panes[0].state.select(Some(0));
+        assert_eq!(
+            app.reveal_target(),
+            Some((
+                "/tmp/ira-reveal/photo.png".into(),
+                false,
+                "/tmp/ira-reveal".into()
+            ))
+        );
+        app.panes[0].state.select(Some(1));
+        assert_eq!(
+            app.reveal_target(),
+            Some((
+                "/tmp/ira-reveal/album".into(),
+                true,
+                "/tmp/ira-reveal".into()
+            ))
+        );
+        // Empty pane: the folder itself.
+        app.panes[0].files.clear();
+        app.panes[0].state.select(None);
+        assert_eq!(
+            app.reveal_target(),
+            Some(("/tmp/ira-reveal".into(), true, "/tmp/ira-reveal".into()))
+        );
+    }
+
+    #[cfg(not(any(target_os = "macos", windows)))]
+    #[test]
+    fn file_browser_candidates_open_a_files_folder_and_a_folders_self() {
+        let file = file_manager_candidates("/tmp/ira-reveal/photo.png", false);
+        assert_eq!(file[0].0, "xdg-open", "the default handler comes first");
+        assert_eq!(file[0].1, vec!["/tmp/ira-reveal".to_string()]);
+        assert!(
+            file.iter().any(|(p, _)| p == "nautilus"),
+            "named file managers are the fallback"
+        );
+        let dir = file_manager_candidates("/tmp/ira-reveal/album", true);
+        assert_eq!(dir[0].1, vec!["/tmp/ira-reveal/album".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_first_available_runs_a_candidate_in_the_given_folder() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("ira-browser-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("argv.txt");
+        let browser = dir.join("fake-browser");
+        let mut script = std::fs::File::create(&browser).unwrap();
+        writeln!(script, "#!/bin/sh").unwrap();
+        writeln!(script, "printf '%s\\n' \"$1\" \"$PWD\" > {}", log.display()).unwrap();
+        drop(script);
+        std::fs::set_permissions(&browser, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // An absolute program is found whatever `PATH` holds, so this proves
+        // the spawn, its argv and its cwd without mutating the environment or
+        // launching a real file manager.
+        assert!(spawn_first_available(
+            &[(
+                browser.to_string_lossy().into_owned(),
+                vec!["/tmp/target".into()]
+            )],
+            "/tmp"
+        ));
+        let mut written = String::new();
+        for _ in 0..200 {
+            if let Ok(text) = std::fs::read_to_string(&log) {
+                if !text.is_empty() {
+                    written = text;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let lines: Vec<&str> = written.lines().collect();
+        assert_eq!(
+            lines.first().copied(),
+            Some("/tmp/target"),
+            "the target is passed as argv"
+        );
+        // `$PWD` resolves symlinks (/tmp on macOS), so compare canonical forms.
+        assert_eq!(
+            std::fs::canonicalize(lines.get(1).copied().unwrap_or_default()).ok(),
+            std::fs::canonicalize("/tmp").ok(),
+            "spawned with the folder as its working directory"
+        );
+        // Nothing on `PATH` by that name: reported as a failure, not a panic.
+        assert!(!spawn_first_available(
+            &[("ira-no-such-browser".into(), vec!["/tmp".into()])],
+            "/tmp"
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ctrl_o_reveals_in_the_file_browser_without_taking_a_letter() {
+        use crate::domain::data::Folder;
+        let mut app = App::default();
+        // Nothing open: the action reports instead of failing silently.
+        handle_key_events(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            &mut app,
+        )
+        .unwrap();
+        assert!(app.status.as_ref().is_some_and(|s| s.is_error));
+
+        // A plain `o` is still the bookmark shortcut it was: Ctrl+O spends no
+        // letter from the pool.
+        let bm = std::env::temp_dir().join("ira-ctrl-o-bm");
+        std::fs::create_dir_all(&bm).unwrap();
+        let mut app = App::default();
+        app.bookmarks = Some(vec![Folder::new(
+            "bm".into(),
+            bm.to_string_lossy().into_owned(),
+            'o',
+        )]);
+        handle_key_events(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+            &mut app,
+        )
+        .unwrap();
+        assert_eq!(
+            app.panes[app.active_pane]
+                .folder
+                .as_ref()
+                .map(|f| f.path.clone()),
+            Some(bm.to_string_lossy().into_owned()),
+            "plain `o` must still jump to its bookmark"
         );
     }
 

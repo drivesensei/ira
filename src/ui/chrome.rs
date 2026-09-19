@@ -158,15 +158,28 @@ pub fn marquee_spans(
 /// One keybindings-dialog row: two `[key] description` columns; the key
 /// cells are bold accent.
 pub fn bind_pair(k1: &str, d1: &str, k2: &str, d2: &str, theme: &Theme) -> Line<'static> {
+    bind_row(&[(k1, d1), (k2, d2)], theme)
+}
+
+/// One help-dialog row: `pairs` are laid out in fixed columns (key 8, then
+/// description 22) so rows line up. The dialog is sized to the minimum
+/// terminal (13 rows in 15), and a row may carry three bindings — 22 rather
+/// than 30 description columns is what keeps that inside 90 columns.
+pub fn bind_row(pairs: &[(&str, &str)], theme: &Theme) -> Line<'static> {
     let key = Style::default()
         .fg(theme.accent)
         .add_modifier(Modifier::BOLD);
-    Line::from(vec![
-        Span::styled(format!(" {k1:<8}"), key),
-        Span::styled(format!("{d1:<30}"), Style::default().fg(theme.text)),
-        Span::styled(format!("{k2:<8}"), key),
-        Span::raw(d2.to_string()),
-    ])
+    let desc = Style::default().fg(theme.text);
+    let mut spans = Vec::new();
+    for (i, (k, d)) in pairs.iter().enumerate() {
+        spans.push(Span::styled(format!(" {k:<8}"), key));
+        if i + 1 == pairs.len() {
+            spans.push(Span::raw(d.to_string()));
+        } else {
+            spans.push(Span::styled(format!("{d:<22}"), desc));
+        }
+    }
+    Line::from(spans)
 }
 
 /// Dialog accent: maps onto the semantic palette.

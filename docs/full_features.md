@@ -159,6 +159,13 @@ dialog.
   GNOME Terminal, Konsole, xfce4-terminal, and xterm; macOS launches Terminal.app, iTerm2,
   WezTerm, Ghostty, kitty, or Alacritty (via `open`, since GUI apps aren't on `PATH`);
   Windows opens Windows Terminal, falling back to a `cmd` window.
+- **Reveal in the OS file browser** — `Ctrl+O` hands the selection to the desktop:
+  Finder selects it (`open -R`), File Explorer selects it in its folder
+  (`explorer /select,`), and Linux opens the file manager (`xdg-open`, then nautilus,
+  dolphin, thunar, nemo, caja, or pcmanfm) on the containing folder — a directory opens
+  itself, since file managers have no portable "select this file" request. With nothing
+  selected, the current folder is opened. It is a `Ctrl` combo on purpose: every plain
+  letter stays available for bookmark shortcuts.
 - **Hidden files** — `.` toggles dot-file visibility; the setting persists across restarts.
 - **Sortable listings** — `,` cycles the listing through name, size, modified, and kind.
 - **Scroll acceleration** — hold `↑`/`↓` and the cursor ramps up through long listings; change

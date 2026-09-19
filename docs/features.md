@@ -83,6 +83,8 @@ Shows the contents of the currently selected folder (`src/services/list_files.rs
 | `+` | Split / unsplit the files pane (side by side) |
 | `\` | Switch to the next built-in theme (wraps around; persisted) |
 | `Tab` | Switch focus (panes / Copy Board) |
+| `0` | Open a terminal in the active pane's folder |
+| `Ctrl+O` | Reveal the selection in the OS file browser — Finder, File Explorer, or your default file manager; with nothing selected it opens the current folder |
 | `q` / `Ctrl+C` | Quit |
 
 While searching, typed characters filter the file list by fuzzy subsequence match (case-insensitive, scoring consecutive and word-boundary matches). `Backspace` deletes a character, `Enter` confirms (jumps to the selected match), `Esc` cancels, `↑`/`↓` move within the matches, and `→` enters the selected match. The search is scoped to the files already listed in the current folder and resets whenever the folder changes.
