@@ -74,6 +74,12 @@ pub struct Pane {
     pub filter_indices: Vec<usize>,
     /// Path to select on the next listing settle (e.g. a just-created entry).
     pub pending_select: Option<String>,
+    /// True once the user moved the cursor in this pane (`↑`/`↓`, `z`/`x`).
+    /// While a transfer streams into a folder this pane shows, the live
+    /// re-listing then skips this pane entirely, so neither the cursor nor
+    /// the scroll window is disturbed mid-browse. Reset when a new transfer
+    /// arms, so the incoming item is revealed again.
+    pub user_navigated: bool,
     /// Bumped on every listing request; results carrying an older
     /// generation are dropped, so overlapping listings never interleave
     /// (the "folder lists itself" bug).
@@ -2245,6 +2251,7 @@ impl App {
     }
 
     pub fn next_item(&mut self) {
+        self.pane_mut().user_navigated = true;
         let count = self.visible_count();
         if count == 0 {
             self.pane_mut().state.select(None);
@@ -2259,6 +2266,7 @@ impl App {
     }
 
     pub fn prev_item(&mut self) {
+        self.pane_mut().user_navigated = true;
         match self.pane().state.selected() {
             Some(i) if i > 0 => {
                 let step = self.scroll_step(-1);
@@ -2426,6 +2434,7 @@ impl App {
 
     pub fn goto_top(&mut self) {
         self.reset_scroll_ramp();
+        self.pane_mut().user_navigated = true;
         if self.visible_count() > 0 {
             self.pane_mut().state.select(Some(0));
         } else {
@@ -2435,6 +2444,7 @@ impl App {
 
     pub fn goto_bottom(&mut self) {
         self.reset_scroll_ramp();
+        self.pane_mut().user_navigated = true;
         let count = self.visible_count();
         if count > 0 {
             self.pane_mut().state.select(Some(count - 1));
@@ -2513,8 +2523,9 @@ impl App {
         }
     }
 
-    /// `(target, is_dir, cwd)` for `Ctrl+O`: the cursor entry when the pane has
-    /// one — the platform reveals *that* — otherwise the pane's own folder.
+    /// `(target, is_dir, cwd)` for the file-browser reveal (`-`): the cursor
+    /// entry when the pane has one — the platform reveals *that* — otherwise
+    /// the pane's own folder.
     fn reveal_target(&self) -> Option<(String, bool, String)> {
         let folder = self.pane().folder.as_ref()?.path.clone();
         match self.selected_visible_entry() {
@@ -2525,7 +2536,7 @@ impl App {
         }
     }
 
-    /// Reveals the active pane's selection in the OS file browser (`Ctrl+O`).
+    /// Reveals the active pane's selection in the OS file browser (`-`).
     ///
     /// Finder and File Explorer select the item in its folder; on Linux the
     /// item is opened when it is a directory and its containing folder
@@ -3399,11 +3410,19 @@ impl App {
             last_refresh: Instant::now(),
         });
 
-        // The selection is handled; drop it and focus the Copy Board.
+        // The selection is handled; drop it. Show the Copy Board so a large
+        // transfer is visibly in progress, but do NOT take the keyboard:
+        // focus stays on the source files pane and browsing continues, and
+        // Tab reaches the board when you want to pause/cancel (mirroring the
+        // preview panel). Select the new job so it is highlighted on arrival.
         self.pane_mut().selected.fill(false);
         self.copy_board = true;
-        self.board_focused = true;
         self.copy_board_state.select(Some(self.jobs.len() - 1));
+        // A fresh transfer may reveal its incoming item again: clear the
+        // "user took the cursor" marks left by earlier browsing.
+        for pane in self.panes.iter_mut() {
+            pane.user_navigated = false;
+        }
     }
 
     /// Whether keyboard focus is on the Copy Board.
@@ -3570,13 +3589,24 @@ impl App {
                         if let Some(last) = j.paths.last() {
                             let dest_item = std::path::Path::new(&j.dest_dir)
                                 .join(std::path::Path::new(last).file_name().unwrap_or_default());
-                            if let Some(pane) = self
-                                .panes
-                                .iter_mut()
-                                .find(|p| p.folder.as_ref().is_some_and(|f| f.path == j.dest_dir))
-                            {
-                                pane.pending_select =
-                                    Some(dest_item.to_string_lossy().into_owned());
+                            let dest_item = dest_item.to_string_lossy().into_owned();
+                            if let Some(pane) = self.panes.iter_mut().find(|p| {
+                                p.folder.as_ref().is_some_and(|f| f.path == j.dest_dir)
+                            }) {
+                                // Land on the finished item — unless the user
+                                // took the cursor over while it streamed, in
+                                // which case leave it where they put it.
+                                let target = if pane.user_navigated {
+                                    pane.state
+                                        .selected()
+                                        .and_then(|i| pane.files.get(i))
+                                        .map(|f| f.path.clone())
+                                } else {
+                                    Some(dest_item)
+                                };
+                                if target.is_some() {
+                                    pane.pending_select = target;
+                                }
                             }
                         }
                     }
@@ -3663,6 +3693,16 @@ impl App {
                 f.path == sync.dest_dir || f.path.starts_with(&format!("{}/", sync.dest_dir))
             });
             if !viewing {
+                continue;
+            }
+            // Once the user has taken the cursor over in this pane, leave it
+            // entirely alone: a periodic re-list would reset the scroll
+            // window and re-select the position captured when the refresh
+            // started — a stale target, so the cursor appears to jump by
+            // however far the user moved in the meantime. The transfer's
+            // progress stays visible in the Copy Board; the pane catches up
+            // in one clean re-list when the job finishes.
+            if self.panes[i].user_navigated {
                 continue;
             }
             let pane = &mut self.panes[i];
@@ -4446,7 +4486,7 @@ pub fn terminal_candidates(dir: &str) -> Vec<(String, Vec<String>)> {
     ]
 }
 
-/// File browsers to try for `Ctrl+O`, in preference order.
+/// File browsers to try for the file-browser reveal (`-`), in preference order.
 ///
 /// Linux: the default handler first (`xdg-open`), then the common file
 /// managers by name. A directory target opens itself; a file target opens the
@@ -5647,20 +5687,20 @@ mod preview_tests {
     }
 
     #[test]
-    fn ctrl_o_reveals_in_the_file_browser_without_taking_a_letter() {
+    fn dash_reveals_in_the_file_browser_without_taking_a_letter() {
         use crate::domain::data::Folder;
         let mut app = App::default();
         // Nothing open: the action reports instead of failing silently.
         handle_key_events(
-            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE),
             &mut app,
         )
         .unwrap();
         assert!(app.status.as_ref().is_some_and(|s| s.is_error));
 
-        // A plain `o` is still the bookmark shortcut it was: Ctrl+O spends no
-        // letter from the pool.
-        let bm = std::env::temp_dir().join("ira-ctrl-o-bm");
+        // The reveal spends no bookmark letter: a plain `o` is still whatever
+        // bookmark holds it.
+        let bm = std::env::temp_dir().join("ira-dash-bm");
         std::fs::create_dir_all(&bm).unwrap();
         let mut app = App::default();
         app.bookmarks = Some(vec![Folder::new(

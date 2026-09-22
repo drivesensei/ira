@@ -153,7 +153,7 @@ fn hidden_files_toggle() {
 }
 
 #[test]
-fn copy_uses_all_selected_entries_and_focuses_board() {
+fn copy_uses_all_selected_entries_and_shows_board_without_focus() {
     let base = std::env::temp_dir().join(format!("ira_sel_copy_{}", std::process::id()));
     let src = base.join("src");
     let dst = base.join("dst");
@@ -187,12 +187,21 @@ fn copy_uses_all_selected_entries_and_focuses_board() {
     );
     assert_eq!(confirm.dest_dir.as_deref(), Some(dst.to_str().unwrap()));
 
-    // Confirming spawns ONE batch job for the whole selection and focuses
-    // the board.
+    // Confirming spawns ONE batch job for the whole selection and shows the
+    // Copy Board WITHOUT taking the keyboard: progress is visible, browsing
+    // continues, and Tab is what reaches the board.
     app.confirm_pending();
     assert_eq!(app.jobs.len(), 1, "one batch job, not one per file");
     assert_eq!(app.jobs[0].paths.len(), 2);
-    assert!(app.copy_board && app.board_has_focus());
+    assert!(
+        app.copy_board && !app.board_has_focus(),
+        "the board opens for progress but must not capture the keyboard"
+    );
+    assert_eq!(
+        app.copy_board_state.selected(),
+        Some(0),
+        "the new job is the one highlighted when the board is focused"
+    );
 
     wait_for_jobs(&mut app);
 
@@ -2238,6 +2247,107 @@ fn transfer_reveals_folder_live_in_destination_pane() {
     );
     assert!(app.panes[1].files.iter().any(|f| f.label == "photos"));
 
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn navigating_the_destination_pane_during_a_transfer_is_not_yanked_back() {
+    let base = std::env::temp_dir().join(format!("ira_no_yank_{}", std::process::id()));
+    let src = base.join("src");
+    let dst = base.join("dst");
+    std::fs::create_dir_all(src.join("photos")).unwrap();
+    std::fs::create_dir_all(&dst).unwrap();
+    // A source big enough that "photos" streams in while we browse.
+    for i in 0..2000 {
+        std::fs::write(
+            src.join("photos").join(format!("p{i:04}.jpg")),
+            vec![0u8; 100 * 1024],
+        )
+        .unwrap();
+    }
+    // Pre-existing destination entries to scroll onto.
+    std::fs::write(dst.join("aaa.txt"), "A").unwrap();
+    std::fs::write(dst.join("bbb.txt"), "B").unwrap();
+
+    let mut app = App::default();
+    app.panes[0].folder = Some(Folder::new("src".into(), src.to_str().unwrap().into(), '#'));
+    app.panes[1].folder = Some(Folder::new("dst".into(), dst.to_str().unwrap().into(), '#'));
+    app.panes[0].files = vec![FEntry {
+        path: src.join("photos").to_str().unwrap().to_string(),
+        label: "photos".to_string(),
+        is_dir: true,
+        size: 0,
+        modified: None,
+    }];
+    app.panes[0].selected = vec![false];
+    app.panes[0].state.select(Some(0));
+
+    app.request_copy();
+    app.confirm_pending();
+
+    // Stall the worker so the transfer stays live while we navigate.
+    std::thread::sleep(Duration::from_millis(80));
+    app.jobs[0].control.set_paused(true);
+    assert!(
+        app.transfer_dest.is_some(),
+        "the transfer must still be live: a finished copy would not re-list"
+    );
+
+    // Wait for the live reveal to land the cursor on the incoming folder.
+    let mut revealed = false;
+    for _ in 0..300 {
+        app.tick();
+        if app.panes[1]
+            .state
+            .selected()
+            .and_then(|i| app.panes[1].files.get(i))
+            .is_some_and(|f| f.label == "photos")
+        {
+            revealed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(revealed, "incoming folder is revealed live");
+
+    // The user takes the cursor over: focus the destination pane and jump to
+    // the top of the list.
+    app.active_pane = 1;
+    app.goto_top();
+    let label_at = |app: &App| {
+        app.panes[1]
+            .state
+            .selected()
+            .and_then(|i| app.panes[1].files.get(i))
+            .map(|f| f.label.clone())
+    };
+    assert_eq!(label_at(&app).as_deref(), Some("aaa.txt"));
+    let generation = app.panes[1].listing_generation;
+
+    // Once the user drives the pane, the live refresh must leave it alone:
+    // no re-list (which would reset the scroll window and re-apply a stale
+    // cursor target) and no cursor move.
+    for _ in 0..700 {
+        app.tick();
+        assert_eq!(
+            app.panes[1].listing_generation, generation,
+            "the browsed pane must not be re-listed under the user"
+        );
+        assert_eq!(
+            label_at(&app).as_deref(),
+            Some("aaa.txt"),
+            "the cursor must not be yanked back to the incoming item"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    app.jobs[0].control.set_paused(false);
+    wait_for_jobs(&mut app);
+    assert_eq!(
+        label_at(&app).as_deref(),
+        Some("aaa.txt"),
+        "completing the transfer must not move the user's cursor either"
+    );
     let _ = std::fs::remove_dir_all(&base);
 }
 

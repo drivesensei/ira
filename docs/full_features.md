@@ -21,7 +21,7 @@ The drive bar lists every storage device — mounted or not — with a positiona
 | Key | Action |
 | --- | --- |
 | `1`–`9` | Open the Nth drive (mounts it first if unmounted) |
-| `-` | Eject (unmount) the removable drive of the active pane |
+| `Ctrl+-` | Eject (unmount) the removable drive of the active pane |
 
 The list is re-scanned every tick, so USB sticks and external disks appear and disappear on their
 own — no restart, no manual refresh. Mounting uses the same udisks2 backend as your desktop file
@@ -72,6 +72,14 @@ an explicit confirmation.
 
 Copies and moves run on background threads — the UI never freezes, no matter how large the tree.
 
+Starting a transfer opens the Copy Board on its own so progress is visible, but it does **not**
+take the keyboard: you keep browsing the panes and `Tab` onto the board when you want to
+pause or cancel. The destination pane reveals the incoming item as it lands; once you scroll
+that pane, its live refresh stops entirely for the rest of the transfer, so neither the cursor
+nor the scroll position is disturbed — it catches up in one clean re-list when the job
+finishes. Each job shows live progress. Cancelled transfers clean up after themselves;
+finished folders arrive complete.
+
 | Key (Copy Board focused) | Action |
 | --- | --- |
 | `` ` `` | Toggle the Copy Board sidebar |
@@ -79,9 +87,6 @@ Copies and moves run on background threads — the UI never freezes, no matter h
 | `Space` / `p` | Pause / resume the selected job |
 | `x` | Cancel the job (removes the partial destination) |
 | `Esc` | Close the board |
-
-Each job shows live progress. Cancelled transfers clean up after themselves; finished folders
-arrive complete.
 
 ## Folder Sizes, Measured in the Background
 
@@ -159,12 +164,12 @@ dialog.
   GNOME Terminal, Konsole, xfce4-terminal, and xterm; macOS launches Terminal.app, iTerm2,
   WezTerm, Ghostty, kitty, or Alacritty (via `open`, since GUI apps aren't on `PATH`);
   Windows opens Windows Terminal, falling back to a `cmd` window.
-- **Reveal in the OS file browser** — `Ctrl+O` hands the selection to the desktop:
+- **Reveal in the OS file browser** — `-` hands the selection to the desktop:
   Finder selects it (`open -R`), File Explorer selects it in its folder
   (`explorer /select,`), and Linux opens the file manager (`xdg-open`, then nautilus,
   dolphin, thunar, nemo, caja, or pcmanfm) on the containing folder — a directory opens
   itself, since file managers have no portable "select this file" request. With nothing
-  selected, the current folder is opened. It is a `Ctrl` combo on purpose: every plain
+  selected, the current folder is opened. It is a punctuation key on purpose: every plain
   letter stays available for bookmark shortcuts.
 - **Hidden files** — `.` toggles dot-file visibility; the setting persists across restarts.
 - **Sortable listings** — `,` cycles the listing through name, size, modified, and kind.

@@ -66,10 +66,10 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         if app.renaming.is_none() {
             match key_event.code {
                 KeyCode::Char('a') | KeyCode::Char('A') => app.toggle_select_all(),
-                // Ctrl+O reveals the selection in the OS file browser. A Ctrl
-                // combo on purpose: every plain letter still belongs to the
-                // common-folder / bookmark shortcut pool.
-                KeyCode::Char('o') | KeyCode::Char('O') => app.open_in_file_manager(),
+                // Eject sits on Ctrl+- so the plain `-` key can reveal in the
+                // OS file browser below (its old Ctrl+O combo never reached
+                // the app on Linux terminals).
+                KeyCode::Char('-') => app.eject_active_drive(),
                 _ => {}
             }
         }
@@ -258,9 +258,10 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         // `]` copies the active pane's current folder path to the clipboard.
         KeyCode::Char(']') => app.copy_folder_path(),
 
-        // `-` ejects (unmounts) the removable drive of the active pane.
-        // (`e` belongs to the Desktop common-folder shortcut on macOS.)
-        KeyCode::Char('-') => app.eject_active_drive(),
+        // `-` reveals the selection in the OS file browser. A punctuation key,
+        // so every plain letter stays in the common-folder / bookmark
+        // shortcut pool; ejects the drive on Ctrl+-.
+        KeyCode::Char('-') => app.open_in_file_manager(),
 
         // Esc clears the confirmed search filter (all files visible again).
         KeyCode::Esc => app.clear_filter(),

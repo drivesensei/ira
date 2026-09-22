@@ -212,8 +212,8 @@ pub fn render(app: &mut App, frame: &mut Frame) {
             chrome::bind_row(
                 &[
                     ("0", "terminal here"),
-                    ("Ctrl+O", "file browser"),
-                    ("-", "eject drive"),
+                    ("-", "file browser"),
+                    ("Ctrl+-", "eject drive"),
                 ],
                 &theme,
             ),
@@ -750,8 +750,8 @@ mod tests {
             assert!(text.contains(binding), "missing {binding:?}: {text}");
         }
         assert!(text.contains("terminal here"), "{text}");
-        // `Ctrl+O` spends no bookmark letter, so it is listed here rather
-        // than in a shortcut box.
+        // The reveal key is punctuation, so it spends no bookmark letter and is
+        // listed here rather than in a shortcut box.
         assert!(text.contains("file browser"), "{text}");
 
         // Any key closes it.
