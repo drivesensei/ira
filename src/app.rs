@@ -2461,12 +2461,33 @@ impl App {
         } else {
             self.split = true;
             self.active_pane = 0;
-            // Seed the new pane with the current view so both panes start on
-            // the same folder.
-            if self.panes[1].folder.is_none() {
-                self.panes[1].folder = self.panes[0].folder.clone();
-                self.panes[1].files = self.panes[0].files.clone();
-                self.panes[1].state.select(None);
+            // A freshly opened panel always mirrors the open pane's path:
+            // the pane's stale location (a previous split's browsing or the
+            // saved session's `right` folder) is deliberately not resumed.
+            let settled = self.panes[0].listing_settled;
+            let (src_side, dst_side) = self.panes.split_at_mut(1);
+            let src = &src_side[0];
+            let dst = &mut dst_side[0];
+            dst.folder = src.folder.clone();
+            dst.sort_mode = src.sort_mode;
+            dst.state.select(None);
+            dst.render_scroll = 0;
+            dst.grid_top = 0;
+            dst.pending_select = None;
+            dst.user_navigated = false;
+            if settled {
+                // Mirror the settled view verbatim — no extra disk walk.
+                dst.files = src.files.clone();
+                dst.selected = vec![false; dst.files.len()];
+                dst.filter_query = src.filter_query.clone();
+                dst.filter_indices = src.filter_indices.clone();
+                dst.listing_settled = true;
+            }
+            if !settled {
+                // Source still streaming: clone would freeze pane 1 on a
+                // prefix. Give it its own listing of the mirrored path
+                // ("Loading…" until its own generation arrives).
+                self.request_pane_listing(1);
             }
         }
     }
@@ -4864,6 +4885,50 @@ mod preview_tests {
                              // Switching focus never altered the other pane's mode.
         assert_eq!(app.panes[0].preview_mode, PreviewMode::Column);
         assert_eq!(app.panes[1].preview_mode, PreviewMode::Grid);
+    }
+
+    #[test]
+    fn opening_split_mirrors_open_pane_path_not_stale_location() {
+        let f = |p: &str| FEntry {
+            path: p.into(),
+            label: p.rsplit('/').next().unwrap().into(),
+            is_dir: false,
+            size: 0,
+            modified: None,
+        };
+        let paths = |app: &App, pane: usize| -> Vec<String> {
+            app.panes[pane].files.iter().map(|e| e.path.clone()).collect()
+        };
+        let mut app = App::default();
+        app.panes[0].folder = Some(Folder::new("home".into(), "/tmp/ira-home".into(), '#'));
+        app.panes[0].files = vec![f("/tmp/ira-home/a.txt")];
+        app.panes[0].listing_settled = true;
+        // Pane 1 carries a stale location (previous split / saved session).
+        app.panes[1].folder = Some(Folder::new("old".into(), "/tmp/ira-old".into(), '#'));
+        app.panes[1].files = vec![f("/tmp/ira-old/stale.txt")];
+        app.panes[1].listing_settled = true;
+        app.panes[1].state.select(Some(0));
+        app.panes[1].pending_select = Some("/tmp/ira-old/stale.txt".into());
+
+        app.toggle_split();
+
+        assert_eq!(app.panes[1].folder.as_ref().unwrap().path, "/tmp/ira-home");
+        assert_eq!(paths(&app, 1), paths(&app, 0));
+        assert!(app.panes[1].selected.iter().all(|s| !*s));
+        assert_eq!(app.panes[1].selected.len(), app.panes[1].files.len());
+        assert_eq!(app.panes[1].state.selected(), None);
+        assert_eq!(app.panes[1].pending_select, None);
+        assert!(app.panes[1].listing_settled);
+
+        // Collapse, browse pane 0 elsewhere, reopen: the new panel follows
+        // the open pane's *current* path, not any earlier mirror or the
+        // pane's own history.
+        app.toggle_split();
+        app.panes[0].folder = Some(Folder::new("games".into(), "/tmp/ira-games".into(), '#'));
+        app.panes[0].files = vec![f("/tmp/ira-games/rom.bin")];
+        app.toggle_split();
+        assert_eq!(app.panes[1].folder.as_ref().unwrap().path, "/tmp/ira-games");
+        assert_eq!(paths(&app, 1), paths(&app, 0));
     }
 
     #[test]
