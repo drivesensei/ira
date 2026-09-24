@@ -18,11 +18,40 @@ Releases are published automatically for every version tag — see
 - **Windows** (winget): `winget install drivesensei.IRA`
 - **Ubuntu/Debian**: download the `.deb` from a release and run
   `sudo dpkg -i ira_<version>_amd64.deb` (or `apt install ./ira_...deb`)
-- **Arch Linux**: install the `ira-bin` package from the AUR
-- **Anywhere with Rust**: `cargo install ira`
+- **Arch Linux / Omarchy**: run the Omarchy plugin below, or unpack the latest
+  `<arch>-unknown-linux-musl` tarball from a release into `~/.local/bin`
+- **Anywhere with Rust**: build from source (see [Build](#build))
 
 Linux drive-mounting support uses `udisks2` (installed automatically on most desktop
 distributions; listed as a recommended dependency in the `.deb`).
+
+### Omarchy
+
+Omarchy's shell has a plugin manager, so IRA is one command away on an Omarchy machine:
+
+```sh
+omarchy plugin add https://github.com/drivesensei/ira --enable
+```
+
+That puts an IRA button in the bar and opens a panel with it. Left click opens the
+panel, right click opens IRA. When `ira` is not on your `PATH` yet, the panel's
+**Install IRA** action fetches the latest release into `~/.local/bin` (no sudo)
+and adds a launcher entry, so IRA also shows up in the Omarchy app menu;
+**Update IRA** does the same for a newer release.
+
+Summon the panel from a binding or a script:
+
+```sh
+omarchy-shell shell summon drivesensei.ira
+```
+
+For example, in `~/.config/hypr/bindings.lua` (free on a stock Omarchy):
+
+```lua
+o.bind("SUPER + ALT + I", "IRA", { tui = "ira" })
+```
+
+Remove the plugin again with `omarchy plugin remove drivesensei.ira`.
 
 
 ## Build

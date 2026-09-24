@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "drivesensei.ira",
+  "name": "IRA",
+  "version": "1.0.0",
+  "author": "drivesensei",
+  "description": "IRA — the Integrated Retro Archives terminal file manager, in the Omarchy bar: open it, install it, or update it from one panel.",
+  "repository": "https://github.com/drivesensei/ira",
+  "homepage": "https://github.com/drivesensei/ira",
+  "license": "MIT",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "omarchy-plugin/Ira.qml"
+  },
+  "barWidget": {
+    "displayName": "IRA",
+    "description": "Open, install, or update the IRA terminal file manager",
+    "category": "Files",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
