@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no" />
+    <meta name="theme-color" content="#0b0d12" />
+    <title>IRA Browser — Keyboard-first file manager</title>
+    <link data-trunk rel="rust" data-bin="ira-browser" data-wasm-opt="0" />
+    <link data-trunk rel="css" href="styles.css" />
+    <link data-trunk rel="copy-file" href="ira-fs.js" />
+  </head>
+  <body>
+    <header class="product-bar">
+      <a class="brand" href="/">I: <strong>IRA</strong></a>
+      <div class="privacy"><span></span> LOCAL-FIRST · FILES NEVER UPLOADED</div>
+      <div class="actions">
+        <button id="restore-folder" hidden>Reconnect folder</button>
+        <button id="choose-folder">Choose folder</button>
+      </div>
+    </header>
+    <main id="ira-shell">
+      <pre id="ira-terminal" aria-label="IRA browser file manager" tabindex="-1"></pre>
+      <section id="welcome" aria-labelledby="welcome-title">
+        <p>IRA FOR THE BROWSER</p>
+        <h1 id="welcome-title">Your files.<br />Your permission.</h1>
+        <p class="intro">Choose a folder inside your Home directory to open IRA’s real dual-pane interface. Processing stays in this browser and nothing is uploaded.</p>
+        <div class="welcome-actions">
+          <button id="welcome-choose">Choose a local folder</button>
+          <button id="sample-workspace" class="secondary-action">Explore sample workspace</button>
+        </div>
+        <small>Chrome protects the entire Home folder and system folders. Choose a workspace such as Projects, Documents, Downloads, or Pictures.</small>
+        <small class="compatibility-note">Browser note: some IRA keybindings may be unavailable when Chrome or your operating system reserves the same shortcut.</small>
+      </section>
+    </main>
+    <div id="unsupported" role="alert" hidden></div>
+    <dialog id="editor-dialog">
+      <form method="dialog">
+        <header><strong id="editor-name">EDIT TEXT</strong><button value="cancel" aria-label="Close">×</button></header>
+        <textarea id="editor-content" spellcheck="false"></textarea>
+        <footer><span>Changes stay on this device.</span><button value="cancel">Cancel</button><button id="save-editor" value="default">Save · Ctrl+S</button></footer>
+      </form>
+    </dialog>
+    <script type="module" src="ira-fs.js"></script>
+  </body>
+</html>

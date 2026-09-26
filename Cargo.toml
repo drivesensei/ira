@@ -12,9 +12,8 @@ categories = ["command-line-utilities"]
 
 [dependencies]
 dirs-next = "2.0.0"
-open = "5.4.3"
 parking_lot = "0.12.5"
-ratatui = "0.30.2"
+ratatui = { version = "0.30.2", default-features = false, features = ["all-widgets", "layout-cache", "macros", "underline-color"] }
 image = { version = "0.25.6", default-features = false, features = [
     "png",
     "jpeg",
@@ -25,9 +24,6 @@ image = { version = "0.25.6", default-features = false, features = [
 # Terminal image rendering (kitty/iTerm2/sixel/halfblocks). Default features
 # are disabled: they pull chafa-dyn, a runtime dependency on libchafa.so that
 # breaks Windows/macOS distribution of prebuilt binaries.
-ratatui-image = { version = "11", default-features = false, features = [
-    "crossterm",
-] }
 winapi = { version = "0.3.9", features = [
     "fileapi",
     "winbase",
@@ -40,7 +36,7 @@ winapi = { version = "0.3.9", features = [
     "wingdi",
     "libloaderapi",
 ] }
-ratatui-textarea = "0.9.2"
+ratatui-textarea = { version = "0.9.2", default-features = false }
 serde = { version = "1", features = ["derive"] }
 # Windows Terminal / VS Code settings.json (font-face lookup for icon detection).
 serde_json = "1"
@@ -49,6 +45,18 @@ unicode-width = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# `ratatui-image` reaches `getrandom` through `rand`. Browsers provide secure
+# randomness through Web Crypto rather than an operating-system device.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+web-time = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+open = "5.4.3"
+ratatui = { version = "0.30.2", features = ["crossterm"] }
+ratatui-image = { version = "11", default-features = false, features = ["crossterm"] }
+ratatui-textarea = { version = "0.9.2", default-features = false, features = ["crossterm"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

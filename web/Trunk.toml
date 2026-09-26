@@ -1,0 +1,10 @@
+[build]
+release = true
+filehash = true
+minify = "never"
+no_sri = false
+
+[serve]
+addresses = ["127.0.0.1"]
+port = 8010
+open = false

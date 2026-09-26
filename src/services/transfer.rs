@@ -4,6 +4,7 @@
 //! channel; the caller (the TUI) drains events and stays responsive. Jobs can
 //! be paused and cancelled through a shared [`JobControl`].
 
+use crate::clock::Instant;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 #[cfg(unix)]
@@ -12,7 +13,6 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::Instant;
 
 use parking_lot::{Condvar, Mutex};
 

@@ -1,4 +1,4 @@
-use std::time::Instant;
+use crate::clock::{Instant, SystemTime, UNIX_EPOCH};
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -352,8 +352,8 @@ fn modified_ago(modified: Option<i64>) -> String {
     let Some(epoch) = modified else {
         return "—".into();
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let ago = (now - epoch).max(0);

@@ -3,7 +3,9 @@ use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::clock::Instant;
 
 use crate::services::list_files::FEntry;
 

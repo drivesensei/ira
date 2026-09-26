@@ -1,0 +1,3 @@
+Keyboard-first file management in the browser.
+
+Press V for previews, / to search, and + for dual-pane mode.

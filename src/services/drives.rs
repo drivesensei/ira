@@ -2,6 +2,11 @@ use std::io::Result as IOResult;
 
 use crate::domain::data::Folder;
 
+#[cfg(target_arch = "wasm32")]
+pub fn list_drives() -> IOResult<Vec<Folder>> {
+    Ok(Vec::new())
+}
+
 #[cfg(target_os = "macos")]
 use std::fs::read_dir;
 

@@ -9,7 +9,9 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(target_os = "macos", windows))]
 use std::sync::{Condvar, LazyLock, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
+
+use crate::clock::Instant;
 
 use image::DynamicImage;
 use ratatui::layout::Rect;

@@ -1,3 +1,4 @@
+use crate::clock::Instant;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error;
 use std::path::{Path, PathBuf};
@@ -6,11 +7,15 @@ use std::process::Stdio;
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
+#[cfg(target_arch = "wasm32")]
+use crate::services::thumbnails::Picker;
 use image::DynamicImage;
+#[cfg(not(target_arch = "wasm32"))]
 use open::that_detached;
 use ratatui::widgets::ListState;
+#[cfg(not(target_arch = "wasm32"))]
 use ratatui_image::picker::Picker;
 
 use crate::{
@@ -755,6 +760,69 @@ fn matching_drive<'a>(drives: &'a [Folder], folder_path: &str) -> Option<&'a Fol
 }
 
 impl App {
+    /// Installs text returned by the browser's File System Access adapter in
+    /// the same cache consumed by IRA's native preview column.
+    #[cfg(target_arch = "wasm32")]
+    pub fn install_browser_text_preview(
+        &mut self,
+        path: &str,
+        content: String,
+        binary: bool,
+        truncated: bool,
+    ) {
+        let Some(entry) = self
+            .panes
+            .iter()
+            .flat_map(|pane| pane.files.iter())
+            .find(|entry| entry.path == path)
+        else {
+            return;
+        };
+        let req = ThumbRequest {
+            path: entry.path.clone(),
+            mtime: entry.modified,
+            size: entry.size,
+            cols: 0,
+            rows: 0,
+            surface: PreviewSurface::Column,
+        };
+        self.text_cache.insert(
+            req.mem_key(),
+            TextPreview {
+                path: path.to_string(),
+                content,
+                binary,
+                truncated,
+            },
+        );
+    }
+
+    /// Decodes browser-provided image bytes into IRA's real braille preview
+    /// renderer. This preserves the native preview layout without relying on
+    /// terminal escape protocols that browsers cannot interpret.
+    #[cfg(target_arch = "wasm32")]
+    pub fn install_browser_image_preview(&mut self, path: &str, bytes: &[u8]) {
+        let Ok(image) = image::load_from_memory(bytes) else {
+            return;
+        };
+        let requests: Vec<_> = (0..self.panes.len())
+            .filter_map(|pane| self.preview_request_for(pane))
+            .filter(|request| request.path == path && request.cols > 0 && request.rows > 0)
+            .collect();
+        for request in requests {
+            let blocks = crate::services::blocks::BlockImage::from_image(
+                &image,
+                request.cols,
+                request.rows,
+                true,
+            );
+            let key = request.mem_key();
+            self.thumb_failed.remove(&key);
+            self.thumb_pending.remove(&key);
+            self.insert_thumb(key, Rendered::Blocks(blocks));
+        }
+    }
+
     /// Constructs a new instance of [`App`].
     pub fn new() -> Self {
         let mut default = Self::default();
@@ -1322,6 +1390,7 @@ impl App {
     /// Forwards a key event to the editor buffer; reports whether the
     /// buffer changed (drives the dirty marker). Read-only editors accept
     /// movement keys (so the head can be scrolled) but no modifications.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn edit_input(&mut self, key: ratatui::crossterm::event::KeyEvent) -> bool {
         use ratatui::crossterm::event::KeyCode;
         let Some(edit) = &mut self.edit else {
@@ -1528,6 +1597,7 @@ impl App {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn needs_native_overlay(&self) -> bool {
         (cfg!(target_os = "macos") || cfg!(windows))
             && self.picker.as_ref().is_some_and(|p| {
@@ -1536,6 +1606,11 @@ impl App {
                     ratatui_image::picker::ProtocolType::Halfblocks
                 )
             })
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn needs_native_overlay(&self) -> bool {
+        false
     }
 
     /// Place or hide the native overlay after a frame. Braille stays in
@@ -3611,9 +3686,11 @@ impl App {
                             let dest_item = std::path::Path::new(&j.dest_dir)
                                 .join(std::path::Path::new(last).file_name().unwrap_or_default());
                             let dest_item = dest_item.to_string_lossy().into_owned();
-                            if let Some(pane) = self.panes.iter_mut().find(|p| {
-                                p.folder.as_ref().is_some_and(|f| f.path == j.dest_dir)
-                            }) {
+                            if let Some(pane) = self
+                                .panes
+                                .iter_mut()
+                                .find(|p| p.folder.as_ref().is_some_and(|f| f.path == j.dest_dir))
+                            {
                                 // Land on the finished item — unless the user
                                 // took the cursor over while it streamed, in
                                 // which case leave it where they put it.
@@ -4701,6 +4778,7 @@ fn chars_to_string(chars: &[char]) -> String {
 /// not honor `Terminal=true` desktop entries, so terminal-based editors (e.g.
 /// Neovim) launch without a controlling terminal and appear to do nothing.
 /// `gio open` handles terminal apps correctly.
+#[cfg(not(target_arch = "wasm32"))]
 fn open_file(path: &str) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
@@ -4718,6 +4796,13 @@ fn open_file(path: &str) -> Result<(), String> {
     }
 
     that_detached(path).map_err(|err| format!("Failed to open '{path}': {err}"))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn open_file(path: &str) -> Result<(), String> {
+    Err(format!(
+        "Opening '{path}' requires the browser file adapter"
+    ))
 }
 
 #[test]
@@ -4897,7 +4982,11 @@ mod preview_tests {
             modified: None,
         };
         let paths = |app: &App, pane: usize| -> Vec<String> {
-            app.panes[pane].files.iter().map(|e| e.path.clone()).collect()
+            app.panes[pane]
+                .files
+                .iter()
+                .map(|e| e.path.clone())
+                .collect()
         };
         let mut app = App::default();
         app.panes[0].folder = Some(Folder::new("home".into(), "/tmp/ira-home".into(), '#'));
