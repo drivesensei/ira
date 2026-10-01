@@ -35,6 +35,8 @@ jobs:
           cp desktop/target/release/ira-desktop dist/IRA.app/Contents/MacOS/ira-desktop
           cp desktop/macos/Info.plist dist/IRA.app/Contents/Info.plist
           chmod +x dist/IRA.app/Contents/MacOS/ira-desktop
+          codesign --force --deep --sign - dist/IRA.app
+          codesign --verify --deep --strict --verbose=2 dist/IRA.app
           tar -czf ira-desktop-macos-arm64.tar.gz -C dist IRA.app
 
       - uses: actions/upload-artifact@v4

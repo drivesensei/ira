@@ -20,9 +20,10 @@ repository's GitHub Actions tab. It uploads separate macOS arm64 and Windows
 x86_64 executable artifacts for 14 days; it does not create a GitHub release.
 The macOS artifact ZIP contains a `.tar.gz` with the `IRA.app` bundle. Extract
 both archives, then open the app in Finder. Since this test build is not signed
-or notarized, macOS may ask you to confirm the first launch: Control-click the
-app, choose **Open**, then choose **Open** again. The Windows artifact ZIP
-contains a GUI-subsystem `.exe`; extract it and open the executable directly.
+with a Developer ID or notarized, macOS may ask you to approve the first launch
+in **System Settings → Privacy & Security → Open Anyway**. The Windows artifact
+ZIP contains a GUI-subsystem `.exe`; extract it and open the executable
+directly.
 
 Framework sources and examples:
 
