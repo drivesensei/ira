@@ -29,8 +29,13 @@ jobs:
       - name: Build production binary
         run: cargo build --manifest-path desktop/Cargo.toml --release --locked
 
-      - name: Stage binary
-        run: tar -czf ira-desktop-macos-arm64.tar.gz -C desktop/target/release ira-desktop
+      - name: Package macOS app
+        run: |
+          mkdir -p dist/IRA.app/Contents/MacOS
+          cp desktop/target/release/ira-desktop dist/IRA.app/Contents/MacOS/ira-desktop
+          cp desktop/macos/Info.plist dist/IRA.app/Contents/Info.plist
+          chmod +x dist/IRA.app/Contents/MacOS/ira-desktop
+          tar -czf ira-desktop-macos-arm64.tar.gz -C dist IRA.app
 
       - uses: actions/upload-artifact@v4
         with:
