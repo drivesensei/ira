@@ -1,6 +1,6 @@
 # Migration state
 
-Updated: 2026-10-01 | Branch: main | HEAD: d8250b5 (F-001 verified; F-002 spec clarifications in final review)
+Updated: 2026-10-01 | Branch: main | HEAD: a668e0e (F-002 contract approved for red-test preparation)
 Phase: 3 Foundation | Current wave: 0 / F-002 red-test contract design | Gate: FAIL (150 feature rows remain open before implementation/evidence)
 
 ## Project coordinates
