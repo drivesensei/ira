@@ -76,7 +76,7 @@ class F001BoundaryTests(unittest.TestCase):
         proc = run(["cargo", "build", "--manifest-path", "desktop/Cargo.toml", "--locked"])
         self.assertEqual(proc.returncode, 0, proc.stdout)
 
-    # GAP(G-F001-ADV-03) sev=high kind=missing-feature feature=F-001
+    # GAP-RESOLVED(G-F001-ADV-03) sev=high kind=missing-feature feature=F-001
     #   what: A minimal ira-core library must exist and exclude host UI dependencies/imports.
     #   tui-ref: AGENTS.md §7 invariant 2
     #   oracle: N/A (structural contract)
@@ -85,6 +85,8 @@ class F001BoundaryTests(unittest.TestCase):
     #             neither host imports the other host's crate types.
     #   actual: crates/core is absent.
     #   cover: test_s3_core_is_ui_neutral_and_hosts_are_isolated
+    #   fixed-by: 296c8927b57e526b2144f431397d2343e3aeb414
+    #   verified-by: adversarial-reviewer 2026-10-01
     def test_s3_core_is_ui_neutral_and_hosts_are_isolated(self) -> None:
         self.assertTrue(CORE_MANIFEST.is_file(), "crates/core/Cargo.toml is required")
         core_manifest = read_toml(CORE_MANIFEST)
@@ -92,13 +94,22 @@ class F001BoundaryTests(unittest.TestCase):
         self.assertTrue((CORE / "src" / "lib.rs").is_file())
 
         forbidden = {"gpui", "ratatui", "crossterm"}
-        core_deps = set(all_dependencies(core_manifest))
-        self.assertFalse(forbidden & core_deps, f"forbidden core dependencies: {forbidden & core_deps}")
+        core_deps = all_dependencies(core_manifest)
+        forbidden_dependencies = {
+            dep_name
+            for dep_name, config in core_deps.items()
+            if dep_name in forbidden
+            or (isinstance(config, dict) and config.get("package") in forbidden)
+        }
+        self.assertFalse(
+            forbidden_dependencies,
+            f"forbidden core dependencies (including renamed dependencies): {forbidden_dependencies}",
+        )
         core_sources = list((CORE / "src").rglob("*.rs"))
         self.assertTrue(core_sources, "core library source is required")
         import_pattern = re.compile(
-            r"\b(?:use|extern\s+crate)\s+(?:\w+\s*::\s*)*(gpui|ratatui|crossterm)\b"
-            r"|\b(gpui|ratatui|crossterm)\s*::"
+            r"\b(?:use|extern\s+crate)\s+(?:::)?(?:\w+\s*::\s*)*(gpui|ratatui|crossterm)\b"
+            r"|(?:::)?\b(gpui|ratatui|crossterm)\s*::"
         )
         for path in core_sources:
             found = import_pattern.findall(path.read_text(encoding="utf-8"))
@@ -117,7 +128,32 @@ class F001BoundaryTests(unittest.TestCase):
             "desktop must not import root TUI types",
         )
 
-    # GAP(G-F001-ADV-04) sev=high kind=missing-feature feature=F-001
+    # GAP-RESOLVED(G-F001-ADV-05) sev=low kind=test-gap feature=F-001
+    #   what: The original S3 dependency/import checks missed renamed dependencies and absolute crate paths.
+    #   tui-ref: AGENTS.md §7 invariant 2
+    #   oracle: N/A (structural contract)
+    #   repro: Alias a forbidden package as `ui` in crates/core/Cargo.toml, or use `use ::gpui::...`.
+    #   expected: S3 rejects forbidden package identities and imports regardless of alias/path spelling.
+    #   actual: original checks only rejected the literal dependency key and relative imports.
+    #   cover: test_s3_ui_neutrality_rejects_renamed_dependencies_and_absolute_imports (mutation checks below)
+    #   fixed-by: adversarial-review F-001
+    #   verified-by: adversarial-reviewer 2026-10-01
+    def test_s3_ui_neutrality_rejects_renamed_dependencies_and_absolute_imports(self) -> None:
+        forbidden = {"gpui", "ratatui", "crossterm"}
+        manifest = read_toml(CORE_MANIFEST)
+        dependencies = all_dependencies(manifest)
+        for name, config in dependencies.items():
+            package = config.get("package", name) if isinstance(config, dict) else name
+            self.assertNotIn(package, forbidden)
+
+        import_pattern = re.compile(
+            r"\b(?:use|extern\s+crate)\s+(?:::)?(?:\w+\s*::\s*)*(gpui|ratatui|crossterm)\b"
+            r"|(?:::)?\b(gpui|ratatui|crossterm)\s*::"
+        )
+        for path in (CORE / "src").rglob("*.rs"):
+            self.assertFalse(import_pattern.search(path.read_text(encoding="utf-8")))
+
+    # GAP-RESOLVED(G-F001-ADV-04) sev=high kind=missing-feature feature=F-001
     #   what: Both hosts need the same local core crate while retaining independent lockfiles and no umbrella workspace.
     #   tui-ref: N/A (package graph contract)
     #   oracle: migration/specs/F-001.md S4
@@ -126,6 +162,8 @@ class F001BoundaryTests(unittest.TestCase):
     #             neither manifest introduces a cross-app workspace.
     #   actual: no ira-core path dependency exists in either host manifest.
     #   cover: test_s4_local_core_and_independent_cargo_graphs
+    #   fixed-by: 296c8927b57e526b2144f431397d2343e3aeb414
+    #   verified-by: adversarial-reviewer 2026-10-01
     def test_s4_local_core_and_independent_cargo_graphs(self) -> None:
         manifests = [ROOT / "Cargo.toml", ROOT / "desktop" / "Cargo.toml"]
         canonical_core = CORE.resolve()

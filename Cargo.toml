@@ -11,6 +11,7 @@ keywords = ["tui", "file-manager", "terminal"]
 categories = ["command-line-utilities"]
 
 [dependencies]
+ira-core = { path = "crates/core" }
 dirs-next = "2.0.0"
 open = "5.4.3"
 parking_lot = "0.12.5"
