@@ -1,0 +1,9 @@
+split=1
+active=0
+hidden=1
+preview0=0
+preview1=2
+theme=tokyo-night
+left=fixture	/tmp/ira-config-script.70CHFM/fixture
+right=Fixture Right	/tmp/ira-config-script.70CHFM/fixture/right
+size=1	2	3	1	1700000000	/tmp/path with spaces

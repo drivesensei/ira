@@ -1,0 +1,12 @@
+# Entry/input oracle captures
+
+- Oracle source: `tui-oracle-baseline^{}` = `1cad4ce`; binary built from `git archive tui-oracle-baseline` with the archived `Cargo.lock` and `cargo build --locked --bin ira`.
+- `version.txt`: run with a fresh temporary `HOME` and `XDG_CONFIG_HOME`; `--version` printed `ira 0.1.21` and exited 0 without TTY initialization.
+- `check-terminal.txt`: run with temporary HOME and `IRA_IMAGES=blocks`; printed the diagnostic report and exited 0. Font and truecolor fields reflect this Linux host and are not portable expected values.
+- `initial.txt`: tmux 120x40, working directory `/tmp/ira-entry-input-fixture`, temporary HOME, `IRA_IMAGES=blocks`, `TERM=xterm-256color`, `COLORTERM=truecolor`; session state explicitly pointed both panes at the fixture. The screen listed its four non-hidden entries. The host-dependent volume labels were redacted. The capability query delayed the first rendered screen for about 10–12 seconds in this headless tmux session.
+- A later `Ctrl+C` quit returned the pane to shell (`pane_dead=1`, no nonzero status). The fixture's before/after SHA-256 manifests were identical (`fixture-diff.txt`).
+- Follow-up input captures used the manager-verified real PTY procedure (`exec_command` with `tty: true`, 120x40, fresh temporary HOME). `*` opened the centered 13-row help; `x` dismissed it and was consumed. `/bravo` showed only `bravo.md`; Enter retained the match with `(Esc clears)`; Esc restored all four entries. Captures: `keybindings.txt`, `search-input.txt`, `search-confirmed.txt`, and `search-cleared.txt`.
+- A second fresh-HOME PTY session entered `/zebra`, observed an empty results area without a dedicated no-match message, then pressed Esc and observed all four entries return. Captures: `search-no-match.txt` and `search-cancelled.txt`.
+- A third PTY session pressed `n`, typed `test-file.txt`, and pressed Esc; the create-entry prompt accepted characters and canceled without creating a file (`new-entry.txt`). A go-to-path prompt was opened but not fully characterized; Ctrl+C exited before the path-entry behavior was explored.
+- The earlier tmux key attempts were ambiguous and removed. These PTY captures supersede that limitation; remaining source-only behaviors are listed in the inventory.
+- The TUI's initial `App::new` enumerates host drives even with a disposable HOME; only listing metadata for the global drive bar was read. No operation was issued against those drives. All fixture filesystem interactions were confined to `/tmp/ira-entry-input-fixture`.

@@ -1,0 +1,4 @@
+PTY 120x40, fresh fixture-backed HOME; input: Esc while `/zebra` was unconfirmed.
+
+The transient query/results disappeared and all four fixture entries returned. This
+cancel path did not leave a persistent filter.

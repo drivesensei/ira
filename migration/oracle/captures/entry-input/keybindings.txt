@@ -1,0 +1,20 @@
+PTY 120x40, fixture-backed HOME; input: `*`.
+
+╭ Keybindings ───────────────────────────────────────────────────────────────────────╮
+│ Arrows  navigate; ←/→ open/leave   z / x   top / bottom                            │
+│ Space   multi-select entry         c       copy to other pane                       │
+│ m       move to other pane         Enter   rename entry                             │
+│ Del     delete (with confirm)      n       new folder / file                        │
+│ .       toggle hidden files        ,       cycle sort mode                          │
+│ v       cycle image preview        Tab     switch pane                               │
+│ Ctrl+A  select / clear all         Alt+I   invert selection                          │
+│ +       split pane                 `       copy board                                │
+│ b       bookmark this folder       /       fuzzy search                              │
+│ Esc     clear search filter        ?       entry info                                │
+│ [       go to path                 ]       copy folder path                          │
+│ 0       terminal here              -       file browser          Ctrl+-  eject drive│
+│ *       this help                  q       quit                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────╯
+
+Dismissal check: `x` closed the help overlay; the key was consumed and did not perform
+normal-mode `x` (jump to bottom) or update the pane cursor.

@@ -1,0 +1,4 @@
+PTY 120x40, fresh fixture-backed HOME; inputs: `n`, `test-file.txt`, Esc.
+
+`n` opened the create-entry dialog. Character input appeared in its name field. Esc closed
+the dialog; Enter was not pressed, so no fixture entry was created.

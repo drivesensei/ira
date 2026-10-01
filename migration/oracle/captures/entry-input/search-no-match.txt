@@ -1,0 +1,4 @@
+PTY 120x40, fresh fixture-backed HOME; input: `/zebra` without pressing Enter.
+
+Observed while the query was active: `/zebra` was displayed; no fixture entries were
+shown in the results area. No separate “no matches” message was visible.

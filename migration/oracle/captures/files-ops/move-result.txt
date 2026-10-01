@@ -1,0 +1,11 @@
+Live oracle result (direct PTY, 120x40):
+
+Action: press `y` on the confirmation `Move 'b.txt' → right?`.
+Copy Board row: `[✓] M b.txt done`.
+Filesystem diff in disposable copy-case fixture:
+- `left/b.txt` removed.
+- `right/b.txt` created with bytes `source-b\n` (9 bytes).
+- Existing destination `right/a.txt` unchanged (27 bytes).
+- Prior copy result `right/a (2).txt` contains source `a.txt` bytes (9 bytes).
+
+The confirmation UI is preserved in `move-confirm.txt`; the completed board row and filesystem result were read from the live PTY and fixture immediately after confirmation.

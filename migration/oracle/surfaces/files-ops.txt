@@ -1,0 +1,50 @@
+key:normal:n
+key:normal:enter
+key:rename:escape
+key:rename:enter
+key:rename:backspace
+key:rename:left
+key:rename:right
+key:normal:c
+key:normal:m
+key:normal:delete
+key:normal:backspace:macos
+key:confirm:y
+key:confirm:enter
+key:confirm:n
+key:confirm:escape
+key:confirm:o
+key:copy-board:tab-focus
+key:copy-board:space
+key:copy-board:p
+key:copy-board:x
+key:copy-board:escape
+key:normal:space
+key:normal:ctrl-a
+key:normal:alt-i
+key:normal:.
+key:normal:,
+mode:new-entry
+mode:rename
+mode:confirmation
+ui:details-listing
+ui:copy-board
+ui:delete-progress
+file:~/.config/ira/state
+cfg:session.hidden
+msg:Error reading entry: {e}
+msg:The other pane has no folder to copy into.
+msg:Cannot copy/move a folder into itself.
+msg:Enter a name first.
+msg:'{name}' already exists.
+msg:'{name}' already exists and is not a folder.
+msg:Failed to create
+msg:Cannot rename:
+msg:Failed to rename:
+msg:Sorted by size (largest first)
+msg:Sorted by last modified (newest first)
+msg:Sorted by kind
+msg:Sorted by name
+msg:SKIPPED (already exists):
+msg:FAILED (
+msg:Failed to delete '{path}': {err}

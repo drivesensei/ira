@@ -1,0 +1,119 @@
+cfg:theme.accent
+cfg:theme.bg
+cfg:theme.border
+cfg:theme.border_active
+cfg:theme.chips
+cfg:theme.cursor_bg
+cfg:theme.cursor_fg
+cfg:theme.dir
+cfg:theme.error
+cfg:theme.files.archive
+cfg:theme.files.audio
+cfg:theme.files.code
+cfg:theme.files.data
+cfg:theme.files.document
+cfg:theme.files.executable
+cfg:theme.files.image
+cfg:theme.files.video
+cfg:theme.hidden
+cfg:theme.icons
+cfg:theme.info
+cfg:theme.key_bg
+cfg:theme.key_fg
+cfg:theme.preset
+cfg:theme.selection
+cfg:theme.shadow
+cfg:theme.success
+cfg:theme.surface
+cfg:theme.surface_alt
+cfg:theme.text
+cfg:theme.text_muted
+cfg:theme.warning
+msg:(empty file)
+msg:Cannot copy/move a folder into itself.
+msg:Cannot rename
+msg:Enter a name first.
+msg:Error reading metadata
+msg:Failed to copy the folder path to the clipboard.
+msg:Failed to create
+msg:Failed to delete
+msg:Failed to eject
+msg:Failed to mount
+msg:Failed to open
+msg:Failed to rename
+msg:Folder path copied to clipboard
+msg:No common folders found
+msg:No file browser found
+msg:No folder open to reveal.
+msg:No folder open to start a terminal in.
+msg:No free bookmark shortcut available (a-p are taken)
+msg:No removable drive is mounted
+msg:No terminal emulator found
+msg:Please increase the terminal's size
+msg:Preview:
+msg:Saved
+msg:Switched to
+msg:The other pane has no folder to copy into.
+msg:already exists
+msg:already exists and is not a folder.
+msg:any key close
+msg:any key dismiss
+msg:any key hide (deletion continues)
+msg:binary file
+msg:binary file — not editable
+msg:cannot decode
+msg:file changed on disk — press Esc and reopen
+msg:file path changed on disk — press Esc and reopen
+msg:file too large to edit (> 5 MB)
+msg:folders have no image preview
+msg:format not supported (png/jpg/gif/bmp/webp/mp4/mov/heic/pdf)
+msg:install ffmpeg for HEIC previews
+msg:install ffmpeg for video previews
+msg:install poppler (pdftoppm) for PDF previews
+msg:loading {label}…
+msg:loading…
+msg:non-UTF-8 file — read-only preview only
+msg:open failed
+msg:read-only
+msg:save failed
+msg:select a file
+msg:… truncated
+ui:actions-row
+ui:bookmark-row
+ui:common-folder-row
+ui:confirmation-modal
+ui:contextual-hint-marquee
+ui:copy-board
+ui:copy-board-job-state
+ui:deletion-progress-dialog
+ui:details-relative-time
+ui:dialog-glass-chrome
+ui:drive-row
+ui:empty-common-folders
+ui:empty-file-preview
+ui:error-modal
+ui:file-row-truncation
+ui:files-details-view
+ui:files-grid-view
+ui:files-list-view
+ui:goto-path-dialog
+ui:info-dialog
+ui:keybinding-chip-outline
+ui:keybinding-chip-rounded
+ui:keybinding-chip-square
+ui:keybindings-help-dialog
+ui:main-five-row-layout
+ui:metadata-size-progress
+ui:minimum-terminal-size-warning
+ui:multi-selection-info-dialog
+ui:new-entry-dialog
+ui:preview-column
+ui:preview-error-state
+ui:preview-loading-state
+ui:rename-dialog
+ui:split-pane-view
+ui:status-notice-bar
+ui:text-input-block-cursor
+ui:theme-filetype-colors
+ui:theme-preset-label
+ui:truncated-preview

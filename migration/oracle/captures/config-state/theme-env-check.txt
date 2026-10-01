@@ -1,0 +1,8 @@
+ira 0.1.21
+truecolor: no (256-color fallback)
+icons: emoji (IRA_ICONS override)
+nerd glyphs: yes (installed font "FiraCode Nerd Font")
+theme: nord (from theme.toml preset)
+image protocol: Blocks (no graphics protocol)
+cell size: 10x20 px
+theme file: /tmp/ira-theme-only.rb1rQe/xdg-config/ira/theme.toml (present)

@@ -1,0 +1,9 @@
+ira 0.1.21
+truecolor: yes
+icons: nerd (auto: a font with Nerd glyphs is available)
+nerd glyphs: yes (installed font "FiraCode Nerd Font")
+theme: mocha (default)
+image protocol: Blocks (IRA_IMAGES override)
+cell size: 10x20 px
+theme file: /tmp/ira-entry-input-home/.config/ira/theme.toml (not found)
+check_terminal_exit=0

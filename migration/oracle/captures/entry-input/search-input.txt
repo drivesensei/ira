@@ -1,0 +1,8 @@
+PTY 120x40, fixture-backed HOME; input: `/`, then `bravo`.
+
+Observed while query was active:
+- query text displayed as `/bravo` in the selected-entry detail area;
+- `bravo.md` was the sole visible match and selected;
+- nonmatching `alpha.txt`, `charlie space.txt`, and `folder` were not listed.
+
+This is an interactive fuzzy-search result list, not a confirmed persistent filter yet.

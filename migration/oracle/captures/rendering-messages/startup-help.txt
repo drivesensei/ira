@@ -1,0 +1,30 @@
+Frozen TUI: tui-oracle-baseline peeled commit 1cad4ce43cc72d52d4cc4eef920e0da22cb69568
+Driver: `stty cols 120 rows 40; HOME=<fresh> XDG_CONFIG_HOME=<fresh> ira`
+PTY observation: startup queried terminal capabilities; screen was stable by 12s.
+Initial first-run 120x40 screen:
+  Drives: 1 SEAGATE SATA HDD; 2 ADATA NVME SSD
+  Common folders: w Home (fresh temporary HOME; exact path intentionally omitted)
+  Bookmarks empty; Actions: + Split Pane, ` Copy Board, 0 Terminal, \\ Theme
+  Files panel has no open folder; footer includes help/hints.
+Action: `*`.
+Observed centered `Keybindings` panel with rows:
+  Arrows navigate; ←/→ open/leave | z / x top / bottom
+  Space multi-select entry | c copy to other pane
+  m move to other pane | Enter rename entry
+  Del delete (with confirm) | n new folder / file
+  . toggle hidden files | , cycle sort mode
+  v cycle image preview | Tab switch pane
+  Ctrl+A select / clear all | Alt+I invert selection
+  + split pane | ` copy board
+  b bookmark this folder | / fuzzy search
+  Esc clear search filter | ? entry info
+  [ go to path | ] copy folder path
+  0 terminal here | - file browser | Ctrl+- eject drive
+  * this help | q quit
+The help dialog was dismissed by sending `q`; the same key was consumed by the open modal. A second `q` exited cleanly (status 0, restored terminal).
+
+Error modal live scenario (same fresh HOME and terminal size): `w`, `n`, Enter on blank new-entry name.
+Observed dialog centered at rows 17–23, title `Error`, bold text `Enter a name first.`, hint `[any key] dismiss`. The modal overlay was red-accented, rounded, centered, dimming the UI. It disappeared after the 8-second status lifetime elapsed; the key-dismiss behavior was not independently runtime-verified. No fixture filesystem change was made. After the modal timed out, Esc returned to the base UI and `q` exited cleanly (status 0).
+No stdout/stderr text after terminal teardown was observed.
+
+Not captured dynamically: too-small size, every modal and file view, each theme/preset, long-message wrap, preview loader/error variants, status expiry timing. Corresponding source/test evidence is called out in the inventory.

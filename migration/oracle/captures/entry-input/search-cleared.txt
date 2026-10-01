@@ -1,0 +1,4 @@
+PTY 120x40, fixture-backed HOME; input continued with Esc after confirming `/bravo`.
+
+The `(Esc clears)` hint disappeared and the full fixture listing returned: `alpha.txt`,
+`bravo.md`, `charlie space.txt`, and `folder`.

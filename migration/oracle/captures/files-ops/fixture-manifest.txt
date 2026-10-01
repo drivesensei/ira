@@ -1,0 +1,12 @@
+left/	directory
+left/.secret	bytes=7	sha256=e084a3683ef795d1cdbf5e9b253f2ca1f783ae0d0d6e47e419acbbc4fc80bbfa
+left/README	bytes=14	sha256=d3f7384d1c0da7b281bafa49961fefc36cdce03bb3124ed51183e970eac84168
+left/a.txt	bytes=9	sha256=02c3aefd0aa6de40361fcb994fbcacb134d602dd4a529697066914b5782f2108
+left/b.txt	bytes=9	sha256=a1a42d982af8e223c43e979b02a06f6646ac0cc2874254b3087730bdffb2cb21
+left/folder/	directory
+left/folder/nested/	directory
+left/folder/nested/inside.txt	bytes=7	sha256=7b2441693c861bf6969869d8b6f45f098bc8ef07b78ca043a1cb663159aabb10
+left/large.bin	bytes=1048576	sha256=fbbab289f7f94b25736c58be46a994c441fd02552cc6022352e3d86d2fab7c83
+right/	directory
+right/a.txt	bytes=27	sha256=f91162fbd810a0cff9fc1574b1215bc72e1bd4a59fd7b5e73f6be0e610055b48
+state	bytes=211	sha256=bc4d943401f8e122421362f86c890f159fccbd2bf6bc33028cfa61d0e66ff90b

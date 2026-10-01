@@ -1,0 +1,8 @@
+split=0
+active=0
+hidden=0
+preview0=3
+preview1=3
+theme=mocha
+left=Home	/tmp/ira-first-run-pty.sCkfPZ/home
+right=

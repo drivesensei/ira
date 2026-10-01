@@ -1,0 +1,2 @@
+TUI exit via Ctrl+C: exit code 0.
+Fixture before/after SHA-256 manifests: identical; no file changes.

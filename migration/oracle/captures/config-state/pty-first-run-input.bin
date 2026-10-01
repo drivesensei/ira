@@ -1,0 +1,3 @@
+Script started on 2026-10-01 15:38:45-06:00 [COMMAND="env HOME=/tmp/ira-first-run-pty.sCkfPZ/home XDG_CONFIG_HOME=/tmp/ira-first-run-pty.sCkfPZ/xdg-config IRA_IMAGES=blocks TERM=xterm-256color COLORTERM=truecolor /home/vlad/Projects/ira/target/debug/ira" TERM="dumb" TTY="/dev/pts/8" COLUMNS="120" LINES="40"]
+[0nwq
+Script done on 2026-10-01 15:39:01-06:00 [COMMAND_EXIT_CODE="0"]

@@ -1,0 +1,4 @@
+PTY 120x40, fixture-backed HOME; input continued with Enter after `/bravo`.
+
+The matching view remained filtered to `bravo.md`; the detail hint changed to `(Esc clears)`.
+This confirms the query as the pane filter. Normal footer hints returned.
