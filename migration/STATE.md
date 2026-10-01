@@ -1,6 +1,6 @@
 # Migration state
 
-Updated: 2026-10-01 | Branch: main | HEAD: a668e0e (F-002 contract approved for red-test preparation)
+Updated: 2026-10-01 | Branch: main | HEAD: 67da7b8 (F-002 readiness and key-phase contract refined)
 Phase: 3 Foundation | Current wave: 0 / F-002 red-test contract design | Gate: FAIL (150 feature rows remain open before implementation/evidence)
 
 ## Project coordinates
@@ -23,7 +23,7 @@ Rows=151; 144 NOT_STARTED, 1 VERIFIED, 6 BLOCKED; 99 inventory entries; 418 cano
 ## Blockers
 - The fast gate reports 151 violations, all because feature rows remain open; surface presence is complete but does not prove semantic equivalence. The surface-presence check has no uncovered items; presence is not equivalent to semantically correct ownership.
 - The 151-row matrix includes behavior-sized splits for input contexts/dialogs and a `migration/surface-ownership.tsv` ledger. Advisor re-review conditions were reconciled in D-0010: F-034 is split into F-034/F-151, F-013 now follows F-002, and F-014 excludes terminal overlay code.
-- F-001 is VERIFIED at e346263 after 7 boundary tests, 278 root tests, both local locked builds, EQUIVALENT logic review, resolved adversarial GAPs, and macOS/Windows desktop CI run 36937979352. No GPUI window was launched on those runners; this row makes no native runtime claim. F-002's approved spec covers standalone `tools/ira-parity`, versioned TOML traces, explicit v1 input/observation contracts, portable-pty 0.9.0, exact-baseline detached builds/cache metadata, cleanup on every exit path, protected environment roots, and live Linux/macOS/Windows replay. Architecture approved after the final contract revision; platform approved with clarifications that are now adopted. Adversarial contract-design and oracle checks are in progress; no F-002 feature implementation has started. Migration-wide CI (F-150) and native-window smoke evidence remain outstanding.
+- F-001 is VERIFIED at e346263 after 7 boundary tests, 278 root tests, both local locked builds, EQUIVALENT logic review, resolved adversarial GAPs, and macOS/Windows desktop CI run 36937979352. No GPUI window was launched on those runners; this row makes no native runtime claim. F-002's approved spec covers standalone `tools/ira-parity`, versioned TOML traces, explicit v1 input/observation contracts, observation-based readiness before input, TUI press-only phase support, portable-pty 0.9.0, exact-baseline detached builds/cache metadata, cleanup on every exit path, protected environment roots, and live Linux/macOS/Windows replay. Architecture and platform approved. The reviewer observed frozen-baseline startup, resize, and non-TTY flag behavior; PTY key injection remained inconclusive. Test-only red suite preparation is in progress; no F-002 feature implementation has started. Migration-wide CI (F-150) and native-window smoke evidence remain outstanding.
 - Root-wide `cargo fmt --all -- --check` and strict workspace clippy have pre-existing findings from the frozen TUI and an untracked user example. Record a scoped/legacy-baseline policy before changing TUI code or claiming gate success.
 - Rows F-068..F-070, F-072..F-073 and F-088 are BLOCKED until terminal-host/OS behavior gets a signed parity mapping; no waiver/equivalence has UX, logic, and adversarial sign-offs yet. F-150 now tracks the missing migration CI.
 
