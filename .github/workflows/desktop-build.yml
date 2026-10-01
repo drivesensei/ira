@@ -1,0 +1,68 @@
+name: Desktop test binaries
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/desktop-build.yml"
+      - "desktop/**"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    name: macOS desktop binary
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop -> target
+
+      - name: Build production binary
+        run: cargo build --manifest-path desktop/Cargo.toml --release --locked
+
+      - name: Stage binary
+        run: tar -czf ira-desktop-macos-arm64.tar.gz -C desktop/target/release ira-desktop
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ira-desktop-macos-arm64
+          path: ira-desktop-macos-arm64.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  windows:
+    name: Windows desktop binary
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop -> target
+
+      - name: Build production binary
+        run: cargo build --manifest-path desktop/Cargo.toml --release --locked
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+
+      - name: Stage binary
+        shell: pwsh
+        run: Copy-Item desktop/target/release/ira-desktop.exe ira-desktop-windows-x86_64.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ira-desktop-windows-x86_64
+          path: ira-desktop-windows-x86_64.exe
+          if-no-files-found: error
+          retention-days: 14
