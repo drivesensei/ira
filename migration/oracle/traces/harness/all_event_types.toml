@@ -1,0 +1,36 @@
+schema_version = 1
+scenario_id = "f002.schema-event-order"
+platforms = ["linux", "macos", "windows-msvc"]
+fixture = { kind = "empty_directory" }
+
+[terminal]
+columns = 90
+rows = 24
+
+[readiness]
+observation = { kind = "terminal_screen" }
+condition = { contains = ["Common folders"] }
+deadline_ms = 15000
+
+[[events]]
+kind = "key"
+code = { character = "z" }
+modifiers = []
+phase = "press"
+
+[[events]]
+kind = "text"
+value = "sample text"
+
+[[events]]
+kind = "paste"
+value = "sample paste\nwith newline"
+
+[[events]]
+kind = "resize"
+columns = 18
+rows = 5
+
+[[observations]]
+kind = "terminal_screen"
+expect = { dimensions = { columns = 18, rows = 5 } }

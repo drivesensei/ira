@@ -1,0 +1,21 @@
+schema_version = 1
+scenario_id = "f002.initial-screen"
+platforms = ["linux", "macos", "windows-msvc"]
+fixture = { kind = "empty_directory" }
+events = []
+
+[terminal]
+columns = 90
+rows = 24
+
+[environment]
+IRA_IMAGES = "blocks"
+
+[readiness]
+observation = { kind = "terminal_screen" }
+condition = { contains = ["Common folders"] }
+deadline_ms = 15000
+
+[[observations]]
+kind = "terminal_screen"
+expect = { contains = ["Common folders"] }

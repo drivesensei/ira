@@ -1,0 +1,23 @@
+schema_version = 1
+scenario_id = "f002.reject-repeat-key"
+platforms = ["linux", "macos", "windows-msvc"]
+fixture = { kind = "empty_directory" }
+
+[terminal]
+columns = 90
+rows = 24
+
+[readiness]
+observation = { kind = "terminal_screen" }
+condition = { contains = ["Common folders"] }
+deadline_ms = 15000
+
+[[events]]
+kind = "key"
+code = { character = "q" }
+modifiers = []
+phase = "repeat"
+
+[expected_error]
+kind = "unsupported_event"
+message_contains = "repeat"
