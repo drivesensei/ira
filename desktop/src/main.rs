@@ -45,22 +45,26 @@ impl Render for IraDesktop {
     }
 }
 
-fn main() {
-    Application::new().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(640.0), px(420.0)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..Default::default()
-            },
-            |_window, cx| {
-                cx.new(|_cx| IraDesktop {
-                    button_was_clicked: false,
-                })
-            },
-        )
-        .expect("failed to open IRA desktop window");
+fn open_main_window(cx: &mut App) {
+    let bounds = Bounds::centered(None, size(px(640.0), px(420.0)), cx);
+    cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            ..Default::default()
+        },
+        |_window, cx| {
+            cx.new(|_cx| IraDesktop {
+                button_was_clicked: false,
+            })
+        },
+    )
+    .expect("failed to open IRA desktop window");
 
-        cx.activate(true);
-    });
+    cx.activate(true);
+}
+
+fn main() {
+    let app = Application::new();
+    app.on_reopen(open_main_window);
+    app.run(|cx: &mut App| open_main_window(cx));
 }
