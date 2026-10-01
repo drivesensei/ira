@@ -1,0 +1,7 @@
+split=1
+active=0
+hidden=0
+preview0=0
+preview1=0
+left=left	/home/vlad/Projects/ira/migration/oracle/fixtures/files-ops/live/left
+right=right	/home/vlad/Projects/ira/migration/oracle/fixtures/files-ops/live/right

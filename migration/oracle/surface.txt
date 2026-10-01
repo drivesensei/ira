@@ -1,4 +1,3 @@
-cfg:IRA_THUMBNAIL_CACHE_DIR
 cfg:session.hidden
 cfg:state.active
 cfg:state.hidden
@@ -47,6 +46,7 @@ cli:-V
 cli:unknown-argument-falls-through
 env:IRA_ICONS
 env:IRA_IMAGES
+env:IRA_THUMBNAIL_CACHE_DIR
 env:IRA_WT_SETTINGS
 env:LC_TERMINAL
 env:LOCALAPPDATA
@@ -118,7 +118,6 @@ key:info-dialog:r
 key:info-dialog:x
 key:keybindings-help:any-key-dismiss
 key:normal:+
-key:normal:,
 key:normal:-:reveal-in-file-manager
 key:normal:.
 key:normal:/
@@ -343,7 +342,7 @@ ui:file-row-truncation
 ui:files-details-view
 ui:files-grid-view
 ui:files-list-view
-ui:filesystem-external-change-refresh
+ui:filesystem-external-change-no-auto-refresh
 ui:filesystem-hidden-filter
 ui:filesystem-large-directory-streaming
 ui:filesystem-listing

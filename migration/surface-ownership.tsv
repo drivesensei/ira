@@ -1,0 +1,419 @@
+surface	owner_row	owner_inventory
+cfg:session.hidden	F-016	INV-CONFIG-002
+cfg:state.active	F-016	INV-CONFIG-002
+cfg:state.hidden	F-016	INV-CONFIG-002
+cfg:state.left	F-016	INV-CONFIG-002
+cfg:state.preview0	F-016	INV-CONFIG-002
+cfg:state.preview1	F-016	INV-CONFIG-002
+cfg:state.right	F-016	INV-CONFIG-002
+cfg:state.size	F-016	INV-CONFIG-002
+cfg:state.split	F-016	INV-CONFIG-002
+cfg:state.theme	F-016	INV-CONFIG-002
+cfg:theme.accent	F-020	INV-CONFIG-006
+cfg:theme.bg	F-020	INV-CONFIG-006
+cfg:theme.border	F-020	INV-CONFIG-006
+cfg:theme.border_active	F-020	INV-CONFIG-006
+cfg:theme.chips	F-020	INV-CONFIG-006
+cfg:theme.cursor_bg	F-020	INV-CONFIG-006
+cfg:theme.cursor_fg	F-020	INV-CONFIG-006
+cfg:theme.dir	F-020	INV-CONFIG-006
+cfg:theme.error	F-020	INV-CONFIG-006
+cfg:theme.files.archive	F-020	INV-CONFIG-006
+cfg:theme.files.audio	F-020	INV-CONFIG-006
+cfg:theme.files.code	F-020	INV-CONFIG-006
+cfg:theme.files.data	F-020	INV-CONFIG-006
+cfg:theme.files.document	F-020	INV-CONFIG-006
+cfg:theme.files.executable	F-020	INV-CONFIG-006
+cfg:theme.files.image	F-020	INV-CONFIG-006
+cfg:theme.files.video	F-020	INV-CONFIG-006
+cfg:theme.hidden	F-020	INV-CONFIG-006
+cfg:theme.icons	F-020	INV-CONFIG-006
+cfg:theme.info	F-020	INV-CONFIG-006
+cfg:theme.key_bg	F-020	INV-CONFIG-006
+cfg:theme.key_fg	F-020	INV-CONFIG-006
+cfg:theme.preset	F-019	INV-CONFIG-005
+cfg:theme.selection	F-020	INV-CONFIG-006
+cfg:theme.shadow	F-020	INV-CONFIG-006
+cfg:theme.success	F-020	INV-CONFIG-006
+cfg:theme.surface	F-020	INV-CONFIG-006
+cfg:theme.surface_alt	F-020	INV-CONFIG-006
+cfg:theme.text	F-020	INV-CONFIG-006
+cfg:theme.text_muted	F-020	INV-CONFIG-006
+cfg:theme.warning	F-020	INV-CONFIG-006
+cli:--check-terminal	F-028	INV-ENTRY-002
+cli:--help	F-111	INV-DOCS-001
+cli:--version	F-027	INV-ENTRY-001
+cli:-V	F-027	INV-ENTRY-001
+cli:unknown-argument-falls-through	F-031	INV-ENTRY-005
+env:IRA_ICONS	F-020	INV-CONFIG-006
+env:IRA_IMAGES	F-028	INV-ENTRY-002
+env:IRA_THUMBNAIL_CACHE_DIR	F-082	INV-PE-009
+env:IRA_WT_SETTINGS	F-073	INV-PLAT-009
+env:LC_TERMINAL	F-028	INV-ENTRY-002
+env:LOCALAPPDATA	F-073	INV-PLAT-009
+env:PATH:ffmpeg-and-pdftoppm	F-078	INV-PE-005
+env:TERM	F-028	INV-ENTRY-002
+env:TERM_PROGRAM	F-028	INV-ENTRY-002
+env:TERM_PROGRAM:mac-terminal-detection	F-069	INV-PLAT-005
+env:WT_PROFILE_ID	F-073	INV-PLAT-009
+env:WT_SESSION	F-028	INV-ENTRY-002
+exit:code:0	F-027	INV-ENTRY-001
+exit:external-app-detached	F-083	INV-PE-010
+file:VSCode-User-settings.json	F-073	INV-PLAT-009
+file:WindowsTerminal-portable-marker-.portable	F-073	INV-PLAT-009
+file:WindowsTerminal-settings.json	F-073	INV-PLAT-009
+file:bookmarks	F-018	INV-CONFIG-004
+file:state	F-016	INV-CONFIG-002
+file:theme.toml	F-020	INV-CONFIG-006
+file:thumbnail-cache-png	F-082	INV-PE-009
+file:~/.config/ira/state	F-015	INV-CONFIG-001
+hook:osc52-clipboard-request	F-087	INV-PE-014
+key:confirm:enter	F-041	INV-INPUT-010
+key:confirm:escape	F-041	INV-INPUT-010
+key:confirm:n	F-041	INV-INPUT-010
+key:confirm:o	F-041	INV-INPUT-010
+key:confirm:y	F-041	INV-INPUT-010
+key:confirmation:enter	F-041	INV-INPUT-010
+key:confirmation:escape	F-041	INV-INPUT-010
+key:confirmation:n	F-041	INV-INPUT-010
+key:confirmation:o	F-041	INV-INPUT-010
+key:confirmation:y	F-041	INV-INPUT-010
+key:copy-board:asterisk	F-040	INV-INPUT-009
+key:copy-board:backslash	F-040	INV-INPUT-009
+key:copy-board:backtick	F-040	INV-INPUT-009
+key:copy-board:down	F-040	INV-INPUT-009
+key:copy-board:escape	F-040	INV-INPUT-009
+key:copy-board:p	F-040	INV-INPUT-009
+key:copy-board:q	F-040	INV-INPUT-009
+key:copy-board:space	F-040	INV-INPUT-009
+key:copy-board:tab-focus	F-040	INV-INPUT-009
+key:copy-board:up	F-040	INV-INPUT-009
+key:copy-board:v	F-040	INV-INPUT-009
+key:copy-board:x	F-040	INV-INPUT-009
+key:create-entry:backspace	F-038	INV-INPUT-007
+key:create-entry:char	F-038	INV-INPUT-007
+key:create-entry:enter	F-038	INV-INPUT-007
+key:create-entry:escape	F-038	INV-INPUT-007
+key:create-entry:left	F-038	INV-INPUT-007
+key:create-entry:right	F-038	INV-INPUT-007
+key:dialog:any-key-dismiss	F-130	INV-INPUT-011
+key:editor:ctrl-s:save-preview-text	F-146	INV-INPUT-012/INV-PE-003
+key:editor:esc:exit-preview-text	F-043	INV-INPUT-012
+key:editor:tab:discard-and-focus-cycle	F-043	INV-INPUT-012
+key:fuzzy-search:alt-down	F-039	INV-INPUT-008
+key:fuzzy-search:alt-up	F-039	INV-INPUT-008
+key:fuzzy-search:backspace	F-039	INV-INPUT-008
+key:fuzzy-search:char	F-039	INV-INPUT-008
+key:fuzzy-search:down	F-039	INV-INPUT-008
+key:fuzzy-search:enter	F-039	INV-INPUT-008
+key:fuzzy-search:escape	F-039	INV-INPUT-008
+key:fuzzy-search:right	F-039	INV-INPUT-008
+key:fuzzy-search:up	F-039	INV-INPUT-008
+key:global:ctrl-c	F-034	INV-INPUT-003
+key:global:ctrl-minus	F-129	INV-INPUT-004
+key:goto-path:backspace	F-037	INV-INPUT-006
+key:goto-path:char	F-037	INV-INPUT-006
+key:goto-path:enter	F-037	INV-INPUT-006
+key:goto-path:escape	F-037	INV-INPUT-006
+key:info-dialog:r	F-042	INV-INPUT-011
+key:info-dialog:x	F-042	INV-INPUT-011
+key:keybindings-help:any-key-dismiss	F-044	INV-INPUT-013
+key:normal:+	F-137	INV-INPUT-003
+key:normal:-:reveal-in-file-manager	F-086	INV-PE-013
+key:normal:.	F-135	INV-INPUT-003
+key:normal:/	F-125	INV-INPUT-003/INV-INPUT-008
+key:normal:0	F-085	INV-PE-012
+key:normal:0:terminal-here	F-085	INV-PE-012
+key:normal:?	F-151	INV-INPUT-003
+key:normal:Enter	F-036	INV-INPUT-005
+key:normal:Esc	F-139	INV-INPUT-003
+key:normal:Left	F-033	INV-INPUT-002
+key:normal:Right	F-033	INV-INPUT-002
+key:normal:Space	F-128	INV-INPUT-004
+key:normal:Tab	F-138	INV-INPUT-003
+key:normal:]:copy-folder-path	F-087	INV-PE-014
+key:normal:alt+a	F-143	INV-INPUT-004
+key:normal:alt+i	F-144	INV-INPUT-004
+key:normal:alt-down	F-033	INV-INPUT-002
+key:normal:alt-i	F-144	INV-INPUT-004
+key:normal:alt-super-a	F-143	INV-INPUT-004
+key:normal:alt-super-i	F-144	INV-INPUT-004
+key:normal:alt-up	F-033	INV-INPUT-002
+key:normal:asterisk	F-044	INV-INPUT-013
+key:normal:b	F-124	INV-INPUT-003
+key:normal:backslash	F-134	INV-INPUT-003
+key:normal:backspace-macos	F-127	INV-INPUT-004
+key:normal:backspace:macos	F-127	INV-INPUT-004
+key:normal:backtick	F-126	INV-INPUT-003/INV-INPUT-009
+key:normal:bookmark-shortcut	F-141	INV-INPUT-002
+key:normal:c	F-035	INV-INPUT-004
+key:normal:comma	F-136	INV-INPUT-003
+key:normal:common-folder-shortcut	F-141	INV-INPUT-002
+key:normal:ctrl-a	F-143	INV-INPUT-004
+key:normal:ctrl-minus:eject-drive	F-129	INV-INPUT-004
+key:normal:delete	F-127	INV-INPUT-004
+key:normal:down	F-033	INV-INPUT-002
+key:normal:drive-digit-1-9	F-140	INV-INPUT-002
+key:normal:e	F-141	INV-INPUT-002
+key:normal:enter	F-036	INV-INPUT-005
+key:normal:enter:open-default	F-083	INV-PE-010
+key:normal:escape	F-139	INV-INPUT-003
+key:normal:i	F-141	INV-INPUT-002
+key:normal:l:open-default-or-directory	F-083	INV-PE-010
+key:normal:left	F-033	INV-INPUT-002
+key:normal:left-bracket	F-037	INV-INPUT-006
+key:normal:m	F-145	INV-INPUT-004
+key:normal:minus	F-086	INV-PE-013
+key:normal:n	F-038	INV-INPUT-007
+key:normal:o	F-041	INV-INPUT-010
+key:normal:period	F-135	INV-INPUT-003
+key:normal:plus	F-137	INV-INPUT-003
+key:normal:q	F-034	INV-INPUT-003
+key:normal:question-mark	F-151	INV-INPUT-003
+key:normal:r	F-141	INV-INPUT-002
+key:normal:right	F-033	INV-INPUT-002
+key:normal:right-bracket	F-087	INV-PE-014
+key:normal:right:open-default-or-directory	F-083	INV-PE-010
+key:normal:slash	F-125	INV-INPUT-003/INV-INPUT-008
+key:normal:space	F-128	INV-INPUT-004
+key:normal:super+a	F-143	INV-INPUT-004
+key:normal:super+i	F-144	INV-INPUT-004
+key:normal:t	F-141	INV-INPUT-002
+key:normal:tab	F-138	INV-INPUT-003
+key:normal:tab:text-preview-editor	F-076	INV-PE-003
+key:normal:u	F-141	INV-INPUT-002
+key:normal:up	F-033	INV-INPUT-002
+key:normal:v	F-074	INV-PE-001
+key:normal:w	F-141	INV-INPUT-002
+key:normal:x	F-033	INV-INPUT-002
+key:normal:y	F-141	INV-INPUT-002
+key:normal:z	F-033	INV-INPUT-002
+key:preview-text-edit:ctrl-s	F-146	INV-INPUT-012/INV-PE-003
+key:preview-text-edit:escape	F-043	INV-INPUT-012
+key:preview-text-edit:tab	F-043	INV-INPUT-012
+key:preview-text-edit:textarea	F-043	INV-INPUT-012
+key:rename:backspace	F-036	INV-INPUT-005
+key:rename:char	F-036	INV-INPUT-005
+key:rename:enter	F-036	INV-INPUT-005
+key:rename:escape	F-036	INV-INPUT-005
+key:rename:left	F-036	INV-INPUT-005
+key:rename:right	F-036	INV-INPUT-005
+key:search:Enter	F-039	INV-INPUT-008
+key:search:Esc	F-039	INV-INPUT-008
+mode:confirmation	F-041	INV-INPUT-010
+mode:copy-board-focus	F-040	INV-INPUT-009
+mode:create-entry	F-038	INV-INPUT-007
+mode:delete-progress	F-131	INV-INPUT-011
+mode:error-dialog	F-130	INV-INPUT-011
+mode:fuzzy-search-input	F-039	INV-INPUT-008
+mode:goto-path	F-037	INV-INPUT-006
+mode:info-dialog	F-042	INV-INPUT-011
+mode:keybindings-help	F-044	INV-INPUT-013
+mode:multi-selection-info	F-132	INV-INPUT-011
+mode:new-entry	F-038	INV-INPUT-007
+mode:normal	F-032	INV-INPUT-001
+mode:preview-text-edit	F-043	INV-INPUT-012
+mode:rename	F-036	INV-INPUT-005
+mode:search	F-039	INV-INPUT-008
+msg:'{name}' already exists and is not a folder.	F-050	INV-files-ops-006
+msg:'{name}' already exists.	F-050	INV-files-ops-006
+msg:(empty file)	F-075	INV-PE-002
+msg:Cannot copy/move a folder into itself.	F-052	INV-files-ops-008
+msg:Cannot rename	F-051	INV-files-ops-007
+msg:Cannot rename:	F-051	INV-files-ops-007
+msg:Enter a name first.	F-050	INV-files-ops-006
+msg:Error reading entry	F-058	INV-filesystem-001
+msg:Error reading entry: {e}	F-058	INV-filesystem-001
+msg:Error reading metadata	F-042	INV-INPUT-011
+msg:FAILED (	F-050	INV-files-ops-006
+msg:Failed to copy the folder path to the clipboard.	F-087	INV-PE-014
+msg:Failed to create	F-050	INV-files-ops-006
+msg:Failed to delete	F-055	INV-files-ops-011
+msg:Failed to delete '{path}': {err}	F-055	INV-files-ops-011
+msg:Failed to eject	F-088	INV-PE-015
+msg:Failed to mount	F-088	INV-PE-015
+msg:Failed to open	F-083	INV-PE-010
+msg:Failed to rename	F-051	INV-files-ops-007
+msg:Failed to rename:	F-051	INV-files-ops-007
+msg:Folder path copied to clipboard	F-087	INV-PE-014
+msg:Loading…	F-058	INV-filesystem-001
+msg:No common folders found	F-067	INV-PLAT-003
+msg:No file browser found	F-086	INV-PE-013
+msg:No folder open to reveal.	F-086	INV-PE-013
+msg:No folder open to start a terminal in.	F-085	INV-PE-012
+msg:No free bookmark shortcut available (a-p are taken)	F-142	INV-CONFIG-004
+msg:No removable drive is mounted	F-088	INV-PE-015
+msg:No terminal emulator found	F-085	INV-PE-012
+msg:Please increase the terminal's size	F-093	INV-RENDER-001
+msg:Preview-column	F-074	INV-PE-001
+msg:Preview-details	F-074	INV-PE-001
+msg:Preview-grid	F-074	INV-PE-001
+msg:Preview-off	F-074	INV-PE-001
+msg:Preview:	F-074	INV-PE-001
+msg:SKIPPED (already exists):	F-052	INV-files-ops-008
+msg:Saved	F-076	INV-PE-003
+msg:Sorted by kind	F-046	INV-files-ops-002
+msg:Sorted by last modified (newest first)	F-046	INV-files-ops-002
+msg:Sorted by name	F-046	INV-files-ops-002
+msg:Sorted by size (largest first)	F-046	INV-files-ops-002
+msg:Switched to	F-134	INV-INPUT-003
+msg:The other pane has no folder to copy into.	F-052	INV-files-ops-008
+msg:already exists	F-050	INV-files-ops-006
+msg:already exists and is not a folder.	F-050	INV-files-ops-006
+msg:any key close	F-132	INV-INPUT-011
+msg:any key dismiss	F-101	INV-RENDER-009
+msg:any key hide (deletion continues)	F-131	INV-INPUT-011
+msg:binary file	F-075	INV-PE-002
+msg:binary file — not editable	F-076	INV-PE-003
+msg:binary-file	F-075	INV-PE-002
+msg:binary-file-not-editable	F-076	INV-PE-003
+msg:cannot decode	F-077	INV-PE-004
+msg:cannot-decode	F-077	INV-PE-004
+msg:empty-file	F-075	INV-PE-002
+msg:failed-to-copy-folder-path	F-087	INV-PE-014
+msg:failed-to-eject-drive	F-088	INV-PE-015
+msg:failed-to-mount-drive	F-088	INV-PE-015
+msg:failed-to-open	F-083	INV-PE-010
+msg:file changed on disk — press Esc and reopen	F-076	INV-PE-003
+msg:file path changed on disk — press Esc and reopen	F-076	INV-PE-003
+msg:file too large to edit (> 5 MB)	F-076	INV-PE-003
+msg:file-changed-on-disk	F-076	INV-PE-003
+msg:file-path-changed-on-disk	F-076	INV-PE-003
+msg:file-too-large-to-edit	F-076	INV-PE-003
+msg:folder-path-copied	F-087	INV-PE-014
+msg:folders have no image preview	F-081	INV-PE-008
+msg:folders-have-no-image-preview	F-081	INV-PE-008
+msg:format not supported (png/jpg/gif/bmp/webp/mp4/mov/heic/pdf)	F-077	INV-PE-004
+msg:format-not-supported	F-077	INV-PE-004
+msg:install ffmpeg for HEIC previews	F-079	INV-PE-006
+msg:install ffmpeg for video previews	F-078	INV-PE-005
+msg:install poppler (pdftoppm) for PDF previews	F-080	INV-PE-007
+msg:install-ffmpeg-heic	F-079	INV-PE-006
+msg:install-ffmpeg-video	F-078	INV-PE-005
+msg:install-poppler-pdftoppm	F-080	INV-PE-007
+msg:ira-version-line	F-027	INV-ENTRY-001
+msg:loading {label}…	F-058	INV-filesystem-001
+msg:loading…	F-058	INV-filesystem-001
+msg:no-file-browser-found	F-086	INV-PE-013
+msg:no-folder-for-terminal	F-085	INV-PE-012
+msg:no-folder-to-reveal	F-086	INV-PE-013
+msg:no-removable-drive-mounted	F-088	INV-PE-015
+msg:no-terminal-emulator-found	F-085	INV-PE-012
+msg:non-UTF-8 file — read-only preview only	F-075	INV-PE-002
+msg:non-UTF8-preview-readonly	F-075	INV-PE-002
+msg:open failed	F-083	INV-PE-010
+msg:preview-paused	F-081	INV-PE-008
+msg:read-only	F-075	INV-PE-002
+msg:save failed	F-076	INV-PE-003
+msg:saved-file	F-076	INV-PE-003
+msg:select a file	F-039	INV-INPUT-008
+msg:select-a-file	F-039	INV-INPUT-008
+msg:truncated	F-075	INV-PE-002
+msg:… truncated	F-075	INV-PE-002
+ui:actions-row	F-094	INV-RENDER-002
+ui:binary-preview-placeholder	F-075	INV-PE-002
+ui:bookmark-row	F-018	INV-CONFIG-004
+ui:clipboard-folder-path	F-087	INV-PE-014
+ui:common-folder-icon	F-067	INV-PLAT-003
+ui:common-folder-row	F-067	INV-PLAT-003
+ui:common-folders-empty-message	F-067	INV-PLAT-003
+ui:common-folders-panel	F-067	INV-PLAT-003
+ui:confirmation-modal	F-099	INV-RENDER-007
+ui:confirmed-fuzzy-filter	F-109	INV-STATE-SEARCH-008
+ui:confirmed-zero-result-rendering	F-109	INV-STATE-SEARCH-008
+ui:contextual-hint-marquee	F-097	INV-RENDER-005
+ui:copy-board	F-094	INV-RENDER-002
+ui:copy-board-job-state	F-094	INV-RENDER-002
+ui:delete-progress	F-131	INV-INPUT-011
+ui:deletion-progress-dialog	F-131	INV-INPUT-011
+ui:details-listing	F-147	INV-RENDER-003/INV-files-ops-004
+ui:details-relative-time	F-147	INV-RENDER-003/INV-files-ops-004
+ui:dialog-glass-chrome	F-098	INV-RENDER-006
+ui:drive-row	F-094	INV-RENDER-002
+ui:empty-common-folders	F-067	INV-PLAT-003
+ui:empty-file-preview	F-075	INV-PE-002
+ui:empty-preview-placeholder	F-075	INV-PE-002
+ui:error-modal	F-101	INV-RENDER-009
+ui:event-bracketed-paste	F-032	INV-INPUT-001
+ui:event-focus-ignored	F-032	INV-INPUT-001
+ui:event-mouse-ignored	F-032	INV-INPUT-001
+ui:event-press-only	F-032	INV-INPUT-001
+ui:event-resize-ignored	F-032	INV-INPUT-001
+ui:file-row-truncation	F-095	INV-RENDER-003
+ui:files-details-view	F-147	INV-RENDER-003/INV-files-ops-004
+ui:files-grid-view	F-148	INV-RENDER-003
+ui:files-list-view	F-095	INV-RENDER-003
+ui:filesystem-external-change-no-auto-refresh	F-063	INV-filesystem-006
+ui:filesystem-hidden-filter	F-059	INV-filesystem-002
+ui:filesystem-large-directory-streaming	F-061	INV-filesystem-004
+ui:filesystem-listing	F-058	INV-filesystem-001
+ui:filesystem-metadata	F-058	INV-filesystem-001
+ui:filesystem-permissions-display	F-064	INV-filesystem-007
+ui:filesystem-refresh-after-operations	F-063	INV-filesystem-006
+ui:filesystem-special-file-classification	F-064	INV-filesystem-007
+ui:filesystem-symlink-classification	F-060	INV-filesystem-003
+ui:four-mode-sort-cycle	F-046	INV-files-ops-002
+ui:fuzzy-live-search-results	F-108	INV-STATE-SEARCH-007
+ui:generic-command-mode-absent	F-091	INV-PE-018
+ui:git-status-integration-absent	F-089	INV-PE-016
+ui:goto-path-dialog	F-133	INV-RENDER-007/INV-INPUT-005/006/007
+ui:heic-preview	F-079	INV-PE-006
+ui:image-preview	F-077	INV-PE-004
+ui:info-dialog	F-042	INV-INPUT-011
+ui:initial-tui-screen	F-029	INV-ENTRY-003
+ui:keybinding-chip-outline	F-096	INV-RENDER-004
+ui:keybinding-chip-rounded	F-096	INV-RENDER-004
+ui:keybinding-chip-square	F-096	INV-RENDER-004
+ui:keybindings-help	F-097	INV-RENDER-005
+ui:keybindings-help-dialog	F-097	INV-RENDER-005
+ui:macos-appkit-preview-panel	F-069	INV-PLAT-005
+ui:macos-terminal-window-geometry-overlay	F-069	INV-PLAT-005
+ui:main-five-row-layout	F-093	INV-RENDER-001
+ui:metadata-size-progress	F-062	INV-filesystem-005
+ui:minimum-terminal-size-warning	F-093	INV-RENDER-001
+ui:multi-selection-info-dialog	F-132	INV-INPUT-011
+ui:nerd-font-capability-fallback	F-072	INV-PLAT-008
+ui:new-entry-dialog	F-133	INV-RENDER-007/INV-INPUT-005/006/007
+ui:open-with-chooser-absent	F-084	INV-PE-011
+ui:os-drag-drop-absent	F-092	INV-PE-019
+ui:overlay-hidden-when-terminal-not-frontmost	F-069	INV-PLAT-005
+ui:overlay-size-cap	F-068	INV-PLAT-004
+ui:overlay-two-pane-limit	F-068	INV-PLAT-004
+ui:pdf-first-page-preview	F-080	INV-PE-007
+ui:plugins-and-hooks-absent	F-091	INV-PE-018
+ui:preview-column	F-074	INV-PE-001
+ui:preview-decode-error-placeholder	F-077	INV-PE-004
+ui:preview-details	F-074	INV-PE-001
+ui:preview-dirty-indicator	F-076	INV-PE-003
+ui:preview-error-state	F-077	INV-PE-004
+ui:preview-grid	F-074	INV-PE-001
+ui:preview-loading-placeholder	F-082	INV-PE-009
+ui:preview-loading-state	F-082	INV-PE-009
+ui:preview-off	F-074	INV-PE-001
+ui:preview-paused-under-modal	F-081	INV-PE-008
+ui:preview-readonly-editor	F-075	INV-PE-002
+ui:preview-text-editor	F-076	INV-PE-003
+ui:preview-truncated-marker	F-075	INV-PE-002
+ui:remote-vfs-integration-absent	F-090	INV-PE-017
+ui:removable-drive-eject	F-088	INV-PE-015
+ui:removable-drive-mount	F-088	INV-PE-015
+ui:rename-dialog	F-133	INV-RENDER-007/INV-INPUT-005/006/007
+ui:reveal-in-file-manager	F-086	INV-PE-013
+ui:split-pane	F-094	INV-RENDER-002
+ui:split-pane-view	F-094	INV-RENDER-002
+ui:status-notice-bar	F-101	INV-RENDER-009
+ui:system-default-open	F-083	INV-PE-010
+ui:terminal-capability-report	F-028	INV-ENTRY-002
+ui:terminal-here	F-085	INV-PE-012
+ui:terminal-image-preview-overlay	F-068	INV-PLAT-004
+ui:text-file-preview	F-075	INV-PE-002
+ui:text-input-block-cursor	F-098	INV-RENDER-006
+ui:theme-filetype-colors	F-096	INV-RENDER-004
+ui:theme-preset-label	F-096	INV-RENDER-004
+ui:truncated-preview	F-095	INV-RENDER-003
+ui:two-pane-split-state	F-110	INV-STATE-SEARCH-009
+ui:video-frame-preview	F-078	INV-PE-005
+ui:visible-row-cursor-model	F-102	INV-STATE-SEARCH-001
+ui:windows-layered-preview-popup	F-070	INV-PLAT-006
+ui:windows-terminal-window-geometry-overlay	F-070	INV-PLAT-006
+ui:windows-volume-label-display	F-071	INV-PLAT-007

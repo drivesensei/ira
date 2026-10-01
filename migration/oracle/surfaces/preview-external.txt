@@ -41,7 +41,7 @@ ui:remote-vfs-integration-absent
 ui:plugins-and-hooks-absent
 ui:generic-command-mode-absent
 ui:os-drag-drop-absent
-cfg:IRA_THUMBNAIL_CACHE_DIR
+env:IRA_THUMBNAIL_CACHE_DIR
 env:PATH:ffmpeg-and-pdftoppm
 env:TERM_PROGRAM:mac-terminal-detection
 file:thumbnail-cache-png

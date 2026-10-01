@@ -10,5 +10,5 @@ ui:filesystem-symlink-classification
 ui:filesystem-special-file-classification
 ui:filesystem-large-directory-streaming
 ui:filesystem-refresh-after-operations
-ui:filesystem-external-change-refresh
+ui:filesystem-external-change-no-auto-refresh
 ui:filesystem-permissions-display

@@ -1,0 +1,8 @@
+split=1
+active=0
+hidden=0
+preview0=0
+preview1=0
+theme=mocha
+left=Home	/home/vlad/Projects/ira/migration/oracle/fixtures/files-ops/home
+right=right	/home/vlad/Projects/ira/migration/oracle/fixtures/files-ops/live/right
