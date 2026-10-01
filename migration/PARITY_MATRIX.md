@@ -4,7 +4,7 @@ Manager parity ledger derived from nine discovery inventories. Surface ownership
 
 | ID | Area | Feature | Surface | TUI refs | Deps | Wave | Status | Owner | Evidence | Gaps |
 |---|---|---|---|---|---|---|---|---|---|---|
-| F-001 | foundation | Core crate and TUI/GPUI boundary | - | Cargo.toml; desktop/Cargo.toml; INV-DOCS-002 | - | 0 | RED_TESTS | review:adversarial_F001_red | migration/specs/F-001.md; tests/boundary/test_f001_boundary.py::{test_s1_root_tui_package_identity_and_build_contract,test_s2_desktop_shell_identity_and_build_contract,test_s3_core_is_ui_neutral_and_hosts_are_isolated,test_s4_local_core_and_independent_cargo_graphs,test_s5_both_packages_build_and_root_tests_pass,test_s6_scope_is_limited_to_the_minimal_boundary}; migration/reports/F-001/adversarial-red.md; d79d33d | G-F001-ADV-03,G-F001-ADV-04 |
+| F-001 | foundation | Core crate and TUI/GPUI boundary | - | Cargo.toml; desktop/Cargo.toml; INV-DOCS-002 | - | 0 | VERIFIED | - | tests/boundary/test_f001_boundary.py (7 passed); cargo build --locked; desktop locked build; root tests (278 passed); migration/reports/F-001/{dev-1,logic-review,adversarial-review}.md; CI run 36937979352 (macOS + Windows); merge e346263 | - |
 | F-002 | foundation | Oracle scenario and differential parity harness | - | migration/oracle/**; scripts/parity_gate.py | F-001 | 0 | NOT_STARTED | - | - | - |
 | F-003 | foundation | Action registry and keymap engine | - | src/handler.rs; INV-INPUT-001 | F-001,F-002,F-004 | 0 | NOT_STARTED | - | - | - |
 | F-004 | foundation | Application state model | - | src/app.rs; INV-STATE-001 | F-001,F-002 | 0 | NOT_STARTED | - | - | - |
