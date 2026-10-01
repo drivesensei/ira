@@ -38,3 +38,50 @@ S2/S4/S5 currently name locked builds and `cargo metadata`/path-dependency check
 S3's proposed check rejects direct GPUI/Ratatui/Crossterm dependencies, but the invariant also excludes imports of their types. Have the red boundary checks inspect `crates/core/**` for host-UI imports/dependencies and validate each app depends only on the core package path. Keep the root TUI's existing Ratatui/Crossterm dependencies valid; the restriction applies only inside `ira-core`.
 
 Platform-specific paths, filesystem APIs, config roots, process launch, and native behavior are explicitly out of F-001 scope. D-0003's typed-path and serialization decisions remain prerequisites for their later owning rows, not for this crate skeleton.
+
+# Advisory: F-002 cross-platform harness pre-review by platform-advisor
+
+Scope reviewed: `migration/specs/F-002.md`, F-002/F-150 matrix rows, current Wave 0, existing artifact workflow, and the tagged-oracle requirement.
+
+## Verdict: CHANGES REQUIRED before red tests
+
+The spec correctly recognizes platform-specific input encoding, explicit isolation, failure cleanup, and that stored captures are not live replay. It leaves the core platform contract unresolved, however; implementers cannot write portable red tests until the PTY, supported runtime matrix, and baseline artifact lifecycle are fixed.
+
+### R1 [must] Select one cross-platform PTY implementation and define live execution on all targets
+Use a pinned `portable-pty` release (current documented release 0.9.0) behind a small harness adapter: Unix PTY on Linux/macOS and ConPTY on Windows. Its API exposes native PTY selection, child wait/termination, resize and master I/O, and its package is small (~114 kB source) with MIT license; it is part of WezTerm. It requires no tmux, shell framework, Python, external terminal application, or separately installed PTY DLL for this harness. The [crate docs](https://docs.rs/portable-pty/0.9.0/portable_pty/) and [published manifest/license](https://docs.rs/crate/portable-pty/0.9.0/source/Cargo.toml) document the cross-platform API and MIT terms. Audit the resolved dependency closure in the lockfile before merge.
+
+F-150 must run actual tagged-oracle scenarios on `ubuntu-latest`, `macos-14`, and `windows-latest` (MSVC). Do not label Windows schema/golden-only checks as live behavior coverage. ConPTY's `CreatePseudoConsole` requires Windows 10 version 1809 or later ([Microsoft API requirements](https://learn.microsoft.com/en-us/windows/console/createpseudoconsole)); state this as the harness live-test minimum. Keep app OS support policy separate. If a runner cannot execute a live scenario, its report must explicitly say capture-only/unavailable and the owning parity row cannot claim live OS evidence.
+
+### R2 [must] Define a platform-aware input encoding and scenario support contract
+Keep one scenario schema, but encode logical event intent separately from adapter bytes/VT sequences and terminal resize events. The Unix PTY and ConPTY adapters must preserve the exact ordered key/input sequence presented to the frozen TUI. Each scenario must declare `live` support per OS or a concrete platform profile; unsupported live input is an explicit test result, never a silent skip. Only create OS-specific expectations where the frozen oracle demonstrably differs. Include ordinary character, Enter/Esc/arrows, resize and EOF/quit coverage on each native runner so ConPTY behavior is actually exercised.
+
+### R3 [must] Build only the pinned baseline, reproducibly, with a cache that cannot select a different binary
+In CI fetch the exact `tui-oracle-baseline` commit (full-history checkout or explicit tag fetch), verify its peeled SHA against `1cad4ce43cc72d52d4cc4eef920e0da22cb69568`, and build it in a detached clean checkout/archive using that commit's root `Cargo.toml` and `Cargo.lock`. Never fall back to `target/debug/ira` from the current checkout. Build once per OS/target/toolchain and reuse the exact artifact for all scenarios in that job. Cache key must include baseline SHA, OS, target triple, Rust toolchain/compiler version, and baseline lockfile hash; store/verify an artifact digest, rebuild on a cache miss, and fail if the exact baseline cannot be built or verified. `actions/checkout` default shallow history is insufficient without an explicit fetch of the baseline tag.
+
+### R4 [must] Make timeout, child cleanup and environment isolation testable invariants
+Apply a per-scenario deadline independent of test-suite timeout. On timeout or assertion error, terminate the PTY child, wait/reap it with a bounded cleanup deadline, close PTY handles, join/drain the output reader, and remove the unique fixture even if cleanup itself reports failure; report both primary and cleanup errors. Do not use sleeps: drive readiness from PTY output or a bounded poll/deadline. Spawn the exact executable with an argv array (no shell) and explicit cwd.
+
+Start from cleared env and set only documented values. On Unix isolate `HOME`, XDG config/cache/data roots, `TMPDIR`, `TERM` and locale. On Windows isolate `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `TEMP`/`TMP`, and set the minimum OS variables required to launch the child (`SystemRoot`/`WINDIR`, `PATH`, and where needed `HOMEDRIVE`/`HOMEPATH`); preserve no inherited IRA or terminal-host settings. Create all profile dirs under the per-run temp root. Test that poisoned parent `IRA_*`, `TERM_PROGRAM`, `WT_*`, HOME/XDG/APPDATA variables cannot escape fixture/config roots.
+
+### R5 [should] Separate deterministic harness tests from live PTY tests in CI, without false green claims
+Run schema, fixture, normalization, diagnostics, and mutation tests on all three OSes. Run the same declared live scenarios against the baseline per OS on all three native runners. Keep PTY-dependent tests as required jobs, not `#[ignore]` or OS `cfg` exclusions. If the GPUI native window is unavailable in hosted CI, record that as a separate F-150 UI smoke limitation; it does not prevent terminal oracle replay and must not be conflated with it. Use each runner's own temporary storage and target cache; do not share PTY sessions or mutable fixtures.
+
+No license/tool blocker is identified for the recommended PTY crate. The exact Rust dependency closure and `portable-pty` 0.9.0 MSVC build/ConPTY replay still need to be confirmed in F-150 before F-002 can be marked verified.
+
+# Advisory: F-002 final cross-platform pre-review by platform-advisor
+
+Scope reviewed: revised `migration/specs/F-002.md`, D-0011, F-002/F-150 matrix rows, Wave 0 and dependency graph.
+
+## Verdict: APPROVE WITH TWO SPEC CLARIFICATIONS — red-test preparation may begin
+
+The revised spec adopts the required native Unix PTY/Windows ConPTY strategy, all-three-OS live replay, exact frozen-baseline SHA and detached build, OS/target/toolchain/lockfile cache key with digest check and no current-tree fallback, cleared per-OS environment, absolute deadlines, child reaping/handle and output-reader cleanup, fixture cleanup, and Windows 10 1809 harness minimum. D-0011 records the same policy. F-150 owns CI/live-replay and license-closure verification; it does not claim cached build artifacts or stored goldens alone as live evidence. No unacceptable license or external tool requirement is apparent for the proposed `portable-pty` dependency.
+
+The remaining items are spec precision, not a reason to delay adversarial red-test authoring. Ensure the red tests cover these requirements before implementation begins.
+
+### R1 [must] Constrain scenario environment overrides so they cannot defeat isolation
+The `Config influence` paragraph says each scenario supplies explicit environment overrides, while S9 says to start from a cleared environment and set only the OS minimum allowlist plus isolated roots. State that scenario overrides are separately allowlisted; harness-owned variables (`HOME`, XDG roots, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `TEMP`/`TMP`, and `TMPDIR`) cannot be redirected outside the run root. Permit IRA feature-specific env values only when their path targets are contained under that run root. The poisoned-parent test alone does not cover a trace that explicitly overrides a protected path.
+
+### R2 [should] Specify detached baseline worktree cleanup
+S7 requires a detached baseline worktree and cache, while S8 explicitly guarantees only PTY handles, readers and scenario fixture cleanup. Define that the temporary baseline checkout/worktree is removed on normal completion and failed setup/build, with Windows handle-safe cleanup; cache entries remain separately keyed/reusable. CI runner destruction reduces leakage but does not define local harness behavior. Add a cleanup failure diagnostic/test if practical.
+
+Other reviewed details are adequate. Keep F-150's actual live tagged-oracle replay required on Linux, macOS 14, and Windows MSVC; if any live runner is unavailable, report it as unavailable rather than treating captures/schema tests as equivalent. The Windows 1809 minimum applies only to this ConPTY harness path and must remain separate from IRA's product support policy.

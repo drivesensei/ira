@@ -164,3 +164,81 @@ The spec correctly preserves GPUI 0.2.2 and makes no workspace or upgrade change
 ## Readiness
 
 The spec is sufficiently concrete for the adversarial reviewer to prepare and land failing checks under `tests/boundary/`; it clearly forbids production/TUI edits outside its bounded write-set. **F-001 implementation remains blocked** until architecture/platform/UX pre-reviews are recorded on this exact spec, the red checks and GAP notes exist, and the manager approves the reviewed spec. No source or test files were changed in this review.
+
+---
+
+# F-002 specification pre-review
+
+Scope reviewed: `migration/specs/F-002.md`, matrix row F-002, D-0002/D-0004/D-0009/D-0010, `.cursor/skills/parity-testing/SKILL.md`, `scripts/parity_gate.py`, existing root tests and F-001 boundary tests, `migration/oracle/tools/render_ansi_capture.py`, oracle captures, and GPUI architecture notes.
+
+Verdict: **PROCEED WITH CHANGES; F-002 red-test preparation should wait until these concrete choices are adopted into the spec and the platform-advisor confirms the PTY dependency/configuration.** The draft has good isolation, fail-closed, human-reviewed-golden, and capability-based observation goals. Its location, input/target boundary, baseline artifact and dependency ownership are still open, and the current proposed write-set disagrees with the parity-testing skill's trace location and tests-in-the-owning-crate convention.
+
+## Ranked recommendations
+
+### R1 [must] Put the harness in a standalone developer tool crate and give it its own manifest ownership
+
+Recommended home: `tools/ira-parity/` as an independent Cargo package (not a member of a root/desktop workspace). Put unit/integration tests under `tools/ira-parity/tests/**`, the versioned input traces under `migration/oracle/traces/<area>/*.trace` as required by `parity-testing/SKILL.md`, and scenario-specific expected observations in those traces or a clearly paired `migration/oracle/goldens/**` directory. Preserve `migration/oracle/captures/**` as existing checked discovery evidence; don't retrofit/overwrite them as generated goldens. The tool crate owns `tools/ira-parity/Cargo.toml` and its own `Cargo.lock`. No root `Cargo.toml`/`Cargo.lock`, desktop manifest/lock, root `tests/*.rs`, shared scripts, or workflow changes are required for F-002; F-150 owns CI wiring. Invoke explicitly with `cargo test --manifest-path tools/ira-parity/Cargo.toml --locked` / `cargo run --manifest-path ...`; do not add a workspace or root integration target just to register it.
+
+Why: root and desktop remain independent Cargo packages and lockfiles (D-0004); F-002 needs PTY/trace dependencies that should not leak into either shipped app. The current draft says `tests/parity/**`, `migration/oracle/scenarios/**`, and “manifest/package only if” while `parity-testing` specifies a parity crate and `migration/oracle/traces/**`. Decide the package now and narrow the F-002 matrix/WAVE-0 write-set to the standalone tool, traces/goldens, and their tests.
+
+### R2 [must] Define a stable event and observation adapter contract, independent of GPUI and F-003 actions
+
+Keep the trace protocol terminal-semantic rather than action-named: a versioned ordered sequence of key events (`code`, modifiers, press/repeat/release kind), text/paste, and resize. Use a machine-readable TOML v1 document for `*.trace` with explicit fixture recipe, initial environment, dimensions, ordered events and observation assertions. Define a small `TraceTarget` boundary with lifecycle/setup, `apply(InputEvent)`, `observe(ObservationKind)`, and shutdown/exit reporting. Oracle target owns PTY/Crossterm encoding and terminal screen parsing; a later core target maps the same semantic events into a core-owned input boundary; an optional later GPUI target maps into 0.2.2 test support. The harness protocol must contain no GPUI types, Crossterm types, `F-003` action IDs, or view structs.
+
+Use a neutral observation vocabulary for process status/stdout/stderr, terminal screen, domain snapshots (cwd/panes/ordered entries/cursor/selection/message), filesystem results, and persisted bytes. Each adapter declares/supplies supported observations; compare only observations asserted by a trace and supported by both selected targets, with a clear diagnostic for unsupported requests. Keep native OS-window screenshots/lifecycle smoke evidence separate under D-0002; it is not a deterministic F-002 screen-observation adapter. This resolves the current ambiguity in S3/S6, where terminal screen data and a non-UI core target are described as though they have the same observations.
+
+The existing `render_ansi_capture.py` handles a small subset of CSI/OSC sequences for a final 16/256-color screen; it is not an interactive PTY or general terminal emulator. Do not treat its output as a complete normalizer. Test cursor, wide Unicode, erase, alternate-screen, title/OSC, and resize/input handling that the TUI actually emits, or choose a pinned VT parser and confirm the exact supported sequence subset from real captures.
+
+### R3 [must] Make the baseline executable reproducible and identity-checked
+
+Use a detached temporary worktree at the frozen tag, and verify `git rev-parse tui-oracle-baseline^{commit}` equals the pinned SHA `1cad4ce43cc72d52d4cc4eef920e0da22cb69568` before building. Build the root `ira` binary once per job/target with the manifest and `Cargo.lock` from that worktree, `--locked`, and an isolated `CARGO_TARGET_DIR`; reuse that artifact for all scenarios in the run. Store it under an ignored cache such as `target/oracle/<commit>/<target>/` with a sidecar recording tag, commit, target triple, `rustc -Vv`, baseline lockfile digest, build profile and binary SHA-256. On reuse, verify every field and the executable hash; on missing/mismatch, rebuild from the verified worktree or fail with an actionable error. A CI cache is an optional speedup keyed by those same identity fields, never an authority; never fall back to current `target/debug/ira` or a working-tree build. This is compatible with F-001 adding `ira-core` to current manifests: the detached baseline still uses its original standalone manifest/lock at the tagged commit.
+
+### R4 [must] Exercise live oracle traces on Windows through a pinned PTY/ConPTY backend
+
+Recommend Rust `portable-pty` as the one backend API for Unix PTYs and Windows' native pseudo-console implementation, pinned to an exact reviewed release in `tools/ira-parity/Cargo.lock`. Its docs describe a cross-platform PTY API and note multiple Windows implementations ([portable-pty docs](https://docs.rs/portable-pty/latest/portable_pty/)); the exact release/configuration still needs Windows CI confirmation. F-150 should run at least one real baseline startup/input/exit trace on Linux, macOS, and `windows-latest`, and should include modifier keys, resize, cleanup after timeout, and actual terminal dimensions. Do not silently make Windows schema/golden-only: ConPTY is the selected live strategy, and any inability to run it is a visible failing platform prerequisite requiring a reviewed fallback/decision. Keep schemas and recorded evidence portable across targets but do not demand byte-identical terminal rendering across OSes when host/terminal capability output differs; trace assertions should explicitly limit the comparable fields or supply per-platform expectations.
+
+### R5 [should] Bound F-002 to infrastructure and harness contract, not parity adapters for unfinished features
+
+F-002 should deliver scenario parsing/validation, safe fixture/environment setup, baseline PTY runner, one neutral target interface, observation/diff plumbing, candidate golden staging, and tests including a fake target that proves a mismatch fails. It should not implement a core or GPUI target adapter, migrate existing captures, normalize every TUI surface, add feature behavior, or wire F-150 CI. A small successful TUI trace plus malformed-schema, isolation, mismatch, timeout-cleanup, and golden-staging tests are adequate F-002 acceptance. Core/desktop adapters and feature-specific trace suites arrive alongside the owned behavior rows. Preserve logic-reviewer approval of every promoted golden; runner-generated candidates are not approved truth.
+
+Cost/risk of ignoring: F-002 becomes an unbounded project-wide test framework, couples trace schema to not-yet-defined app internals, and consumes feature-wave ownership before core/action contracts exist.
+
+## Readiness and residual risk
+
+Red-test preparation **may start after** the manager folds R1–R4 into F-002 and the platform advisor confirms the exact PTY release can run live on the supported Windows runner. At present the draft still asks these questions and leaves package ownership unsettled, so tests would encode an undecided architecture. Once updated, infrastructure tests can begin before implementation; the review does not require a new GPUI API or `test-support` dependency in F-002. No spec, production, test, or planning files were edited in this review.
+
+---
+
+# F-002 final specification re-review
+
+Scope reviewed: revised `migration/specs/F-002.md`, D-0011, matrix rows F-002/F-150, WAVE-0 and `GRAPH.md`, plus the F-002 platform-advisor review.
+
+Verdict: **PROCEED WITH CHANGES. Adversarial red-test preparation may begin now; implementation remains gated on reviewed executable red tests and the normal feature review.** The major architecture choices from the prior review are now explicit: standalone `tools/ira-parity`, TOML-based traces, `ScenarioTarget`, `portable-pty 0.9.0` with live Unix/ConPTY runs, and baseline resolution from the verified detached tag. D-0011 records those choices. F-002's matrix and Wave 0 write-set are narrowed to tool/traces; F-150 owns CI. The baseline SHA and cache identity are sufficiently fail-closed to proceed with test-first work.
+
+## Remaining findings
+
+### R15 [must before approving the final F-002 spec] Close the input/observation contract holes
+
+The document still calls event representation “a pre-review question” under Triggers, and Open Question 2 still asks whether the schema/adapter contract is suitable. S1/S3 name TOML and `ScenarioTarget`, but do not define the actual logical event variants/fields or how a target reports supported observations. D-0002 requires state/effect comparisons; S3 only lists process, terminal screen, filesystem, and persisted state, leaving future core adapters with no shared cursor/pane/selection/message observation. During red-test preparation, specify at minimum an ordered tagged event enum (`Key { code, modifiers, kind }`, `Paste { text }`, `Resize { cols, rows }`) and neutral observation selectors for process, terminal screen, core state (cwd/panes/ordered entries/cursor/selection/message), filesystem, and persisted bytes. Define the adapter contract around setup/fixture, `apply(event)`, `observe(selector)`, and bounded finish/exit; adapters must report unsupported observation kinds explicitly. Keep action IDs, GPUI views, and terminal byte encodings out of the trace schema. Then delete the contradictory open-question text. The exact spelling can be set by the red-test owner, but the spec must freeze these semantics first.
+
+Cost/risk of ignoring: trace files and later core/GPUI adapters will invent incompatible event and observation models, or omit state needed to prove parity.
+
+### R16 [should] Align the trace filename and complete the exact build/cache cleanup recipe
+
+Use `migration/oracle/traces/<area>/<name>.trace` with TOML syntax so the path conforms to `.cursor/skills/parity-testing/SKILL.md` while honoring D-0011's TOML decision; the current `.toml` suffix is a small protocol mismatch. Pin one build command/profile for the baseline artifact (for example the locked root `ira` binary for the host target in dev profile) and include profile/build flags in its cache identity or declare them fixed. Record enough sidecar metadata to verify tag, commit, OS/target, toolchain, baseline lock hash, profile, and executable digest. Add explicit detached-worktree cleanup on success/failure; S8 currently cleans per-scenario fixture/PTY state but not the baseline worktree itself. Finally, add `migration/reports/F-002/dev-1.md` to the WAVE-0 F-002 write-set or remove it from the spec write-set; the two currently differ.
+
+Cost/risk of ignoring: the same cache key could refer to binaries from different build modes, a failed run can leave a worktree behind, and the developer/reviewer scopes disagree about the evidence report.
+
+## Test-first readiness
+
+Adversarial **test design and red-test preparation can start now** because package ownership, PTY strategy, supported live runners, baseline source, and F-002 scope are decided. The adversarial brief should own R15 as a contract-first test-design step and submit the event/observation shape for manager acceptance before committing schema-dependent red tests. No feature implementation may start from this report; F-002 implementation follows only after those tests are in place and the feature brief/write-set is accepted. The remaining platform task is to prove the pinned dependency closure/MSVC ConPTY replay in F-150 before F-002 is marked VERIFIED, as the platform review specifies. No code, spec, matrix, decision, or wave files were changed here.
+
+---
+
+# F-002 final contract acceptance
+
+Reviewed the revised `migration/specs/F-002.md` against the F-002/F-150 matrix rows, D-0011, and Wave 0 ownership. **PROCEED: adversarial red-test and schema preparation may begin.** The v1 contract now defines ordered semantic input variants and fields, explicit target lifecycle, neutral process/screen/domain/filesystem/persisted observations, and fail-fast behavior when a requested observation is unsupported. This keeps the harness independent of GPUI, terminal encoding, and F-003 action IDs while allowing later core/desktop adapters to share traces.
+
+The additional baseline build/profile and cache-sidecar identity, detached-worktree cleanup including Windows handles, and report/test write-set alignment close the residual operational and ownership recommendations from the prior review. F-002 remains isolated to its standalone tool, traces, and report; F-150 retains CI and cross-platform dependency/replay verification.
+
+No architecture must-fix remains before red-test/schema preparation. F-002 implementation still follows the accepted spec, executable failing checks/GAP notes, and the manager's normal review gate. The `portable-pty` dependency closure and live MSVC ConPTY replay remain F-150 evidence required before F-002 can be marked verified. This is an architecture acceptance only, not implementation or parity sign-off. No production, test, spec, matrix, decision, or wave files were changed.

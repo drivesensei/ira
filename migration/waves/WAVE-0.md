@@ -6,7 +6,7 @@ Exit criteria: F-001..F-014 and F-150 pass feature review and tests; shell remai
 | Row | Batch | Developer branch | Write-set | Reads | Reviewers | Advisors | Status |
 |---|---|---|---|---|---|---|---|
 | F-001 | A (barrier) | migrate/F-001-core-boundary | root `Cargo.toml`/`Cargo.lock`; `desktop/Cargo.toml`/`desktop/Cargo.lock`; `crates/core/**`; minimal `desktop/src/main.rs` wiring; `tests/boundary/**` | root TUI and GPUI shell | adv, logic | arch, platform | NOT_STARTED |
-| F-002 | B (barrier) | migrate/F-002-parity-harness | `tests/parity/**`; `migration/oracle/scenarios/**`; harness registration | F-001 contracts | adv, logic | arch | NOT_STARTED |
+| F-002 | B (barrier) | migrate/F-002-parity-harness | `tools/ira-parity/**`; `migration/oracle/traces/**`; `migration/reports/F-002/**` | F-001 contracts | adv, logic | arch, platform | NOT_STARTED |
 | F-013 | C | migrate/F-013-perf-baseline | `migration/oracle/perf.md`; `tests/perf/**` | frozen TUI; F-001,F-002 | adv, logic | arch, platform | NOT_STARTED |
 | F-150 | C | migrate/F-150-ci | `.github/workflows/migration-ci.yml`; CI docs/scripts | F-001,F-002 | adv, logic | platform, arch | NOT_STARTED |
 | F-004 | C (barrier) | migrate/F-004-state-model | `crates/core/src/state/**` | F-001,F-002 | adv, logic | arch, ux | NOT_STARTED |

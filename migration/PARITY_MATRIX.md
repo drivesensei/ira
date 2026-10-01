@@ -5,7 +5,7 @@ Manager parity ledger derived from nine discovery inventories. Surface ownership
 | ID | Area | Feature | Surface | TUI refs | Deps | Wave | Status | Owner | Evidence | Gaps |
 |---|---|---|---|---|---|---|---|---|---|---|
 | F-001 | foundation | Core crate and TUI/GPUI boundary | - | Cargo.toml; desktop/Cargo.toml; INV-DOCS-002 | - | 0 | VERIFIED | - | tests/boundary/test_f001_boundary.py (7 passed); cargo build --locked; desktop locked build; root tests (278 passed); migration/reports/F-001/{dev-1,logic-review,adversarial-review}.md; CI run 36937979352 (macOS + Windows); merge e346263 | - |
-| F-002 | foundation | Oracle scenario and differential parity harness | - | migration/oracle/**; scripts/parity_gate.py | F-001 | 0 | NOT_STARTED | - | - | - |
+| F-002 | foundation | Frozen-oracle scenario and differential parity harness | - | tools/ira-parity/**; migration/oracle/traces/**; migration/reports/F-002/** | F-001 | 0 | NOT_STARTED | - | - | - |
 | F-003 | foundation | Action registry and keymap engine | - | src/handler.rs; INV-INPUT-001 | F-001,F-002,F-004 | 0 | NOT_STARTED | - | - | - |
 | F-004 | foundation | Application state model | - | src/app.rs; INV-STATE-001 | F-001,F-002 | 0 | NOT_STARTED | - | - | - |
 | F-005 | foundation | Filesystem service and error taxonomy | - | src/services/filesystem.rs; INV-filesystem-001 | F-001,F-004 | 0 | NOT_STARTED | - | - | - |
@@ -153,5 +153,5 @@ Manager parity ledger derived from nine discovery inventories. Surface ownership
 | F-147 | rendering | Details-view columns and relative-time formatting | ui:files-details-view,ui:details-listing,ui:details-relative-time | INV-RENDER-003; INV-files-ops-004 | F-008,F-009 | 2 | NOT_STARTED | - | - | - |
 | F-148 | rendering | Grid-view row composition | ui:files-grid-view | INV-RENDER-003 | F-008,F-009 | 2 | NOT_STARTED | - | - | - |
 | F-149 | platform | Native quit shortcuts | - | desktop UX floor; ux-keymodel.md | F-011,F-034,F-115 | 2 | NOT_STARTED | - | - | - |
-| F-150 | foundation | Migration CI builds both locked manifests on Linux, macOS and Windows with native smoke evidence | - | .github/workflows/**; platform-ci.md | F-001,F-002 | 0 | NOT_STARTED | integrator | - | - |
+| F-150 | foundation | Migration CI builds both locked manifests and replays oracle scenarios on Linux, macOS and Windows with native smoke evidence | - | .github/workflows/**; platform-ci.md | F-001,F-002 | 0 | NOT_STARTED | integrator | - | - |
 | F-151 | input | Selected-entry information action | key:normal:?,key:normal:question-mark | INV-INPUT-003 | F-003,F-004,F-009,F-010 | 2 | NOT_STARTED | - | - | - |
