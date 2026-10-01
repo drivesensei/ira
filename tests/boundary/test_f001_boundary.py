@@ -76,7 +76,7 @@ class F001BoundaryTests(unittest.TestCase):
         proc = run(["cargo", "build", "--manifest-path", "desktop/Cargo.toml", "--locked"])
         self.assertEqual(proc.returncode, 0, proc.stdout)
 
-    # GAP(G-F001-ADV-03) sev=high kind=missing-feature feature=F-001
+    # GAP-FIXED(G-F001-ADV-03) sev=high kind=missing-feature feature=F-001
     #   what: A minimal ira-core library must exist and exclude host UI dependencies/imports.
     #   tui-ref: AGENTS.md §7 invariant 2
     #   oracle: N/A (structural contract)
@@ -85,6 +85,7 @@ class F001BoundaryTests(unittest.TestCase):
     #             neither host imports the other host's crate types.
     #   actual: crates/core is absent.
     #   cover: test_s3_core_is_ui_neutral_and_hosts_are_isolated
+    #   fixed-by: 296c8927b57e526b2144f431397d2343e3aeb414
     def test_s3_core_is_ui_neutral_and_hosts_are_isolated(self) -> None:
         self.assertTrue(CORE_MANIFEST.is_file(), "crates/core/Cargo.toml is required")
         core_manifest = read_toml(CORE_MANIFEST)
@@ -117,7 +118,7 @@ class F001BoundaryTests(unittest.TestCase):
             "desktop must not import root TUI types",
         )
 
-    # GAP(G-F001-ADV-04) sev=high kind=missing-feature feature=F-001
+    # GAP-FIXED(G-F001-ADV-04) sev=high kind=missing-feature feature=F-001
     #   what: Both hosts need the same local core crate while retaining independent lockfiles and no umbrella workspace.
     #   tui-ref: N/A (package graph contract)
     #   oracle: migration/specs/F-001.md S4
@@ -126,6 +127,7 @@ class F001BoundaryTests(unittest.TestCase):
     #             neither manifest introduces a cross-app workspace.
     #   actual: no ira-core path dependency exists in either host manifest.
     #   cover: test_s4_local_core_and_independent_cargo_graphs
+    #   fixed-by: 296c8927b57e526b2144f431397d2343e3aeb414
     def test_s4_local_core_and_independent_cargo_graphs(self) -> None:
         manifests = [ROOT / "Cargo.toml", ROOT / "desktop" / "Cargo.toml"]
         canonical_core = CORE.resolve()
