@@ -1,0 +1,18 @@
+// GAP(G-F017-ADV-01) sev=high kind=behavior-divergence feature=F-017
+//   what:     Renaming onto an existing name silently overwrites the target.
+//   tui-ref:  src/ops/rename.rs:118 (fn rename_entry returns Err(Exists))
+//   oracle:   migration/oracle/captures/fileops/rename_collision.txt
+//   repro:    fixture a.txt + b.txt; rename a.txt -> b.txt
+//   expected: error "Destination already exists", both files unchanged
+//   actual:   b.txt replaced
+//   cover:    gap_f017_adv_01_rename_collision_must_not_overwrite
+#[test]
+#[ignore = "GAP G-F017-ADV-01"]
+fn gap_f017_adv_01_rename_collision_must_not_overwrite() {
+    // real assertions
+}
+
+// After the developer fixes it (remove #[ignore], test passes):
+// GAP-FIXED(G-F017-ADV-01) ...   fixed-by: 3fa91c2
+// After the reviewer verifies:
+// GAP-RESOLVED(G-F017-ADV-01) ... verified-by: adversarial 2026-10-02

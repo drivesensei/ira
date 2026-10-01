@@ -1,0 +1,3 @@
+# One item per line: kind:name   (kinds: key cmd cli env cfg file msg mode ui exit hook)
+# Filled by tui-discovery-explorer agents. Every line must appear in the Surface column of PARITY_MATRIX.md.
+# Lines starting with '#' are ignored by the gate.

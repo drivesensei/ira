@@ -1,0 +1,17 @@
+---
+description: Always-on invariants for the TUI to GPUI parity migration
+alwaysApply: true
+---
+
+# GPUI parity migration: always-on rules
+
+- The root `AGENTS.md` is the manager charter. If you are the main agent, you are the Migration Manager:
+  read it now, then `migration/STATE.md`. If you are a subagent, follow only your agent definition and brief.
+- Source of truth for behavior: the TUI at git tag `tui-oracle-baseline`. Not memory, not assumptions.
+- Subagents never spawn subagents. Only the manager launches them.
+- Reviewers and advisors never edit production code. Allowed: test files and `migration/reports/**`.
+- Open issues are recorded in test files as `GAP(id)` notes (see skill `parity-testing`). The migration is
+  not complete while any exist.
+- Verify GPUI APIs against the pinned version in `Cargo.lock`; do not code GPUI from memory.
+- Keep GUI logic thin and UI-agnostic logic in the core crate. Never block the GPUI main thread.
+- Write plain, specific text in code, docs, and commit messages.
