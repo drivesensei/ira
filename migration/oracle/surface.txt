@@ -1,3 +1,419 @@
-# One item per line: kind:name   (kinds: key cmd cli env cfg file msg mode ui exit hook)
-# Filled by tui-discovery-explorer agents. Every line must appear in the Surface column of PARITY_MATRIX.md.
-# Lines starting with '#' are ignored by the gate.
+cfg:IRA_THUMBNAIL_CACHE_DIR
+cfg:session.hidden
+cfg:state.active
+cfg:state.hidden
+cfg:state.left
+cfg:state.preview0
+cfg:state.preview1
+cfg:state.right
+cfg:state.size
+cfg:state.split
+cfg:state.theme
+cfg:theme.accent
+cfg:theme.bg
+cfg:theme.border
+cfg:theme.border_active
+cfg:theme.chips
+cfg:theme.cursor_bg
+cfg:theme.cursor_fg
+cfg:theme.dir
+cfg:theme.error
+cfg:theme.files.archive
+cfg:theme.files.audio
+cfg:theme.files.code
+cfg:theme.files.data
+cfg:theme.files.document
+cfg:theme.files.executable
+cfg:theme.files.image
+cfg:theme.files.video
+cfg:theme.hidden
+cfg:theme.icons
+cfg:theme.info
+cfg:theme.key_bg
+cfg:theme.key_fg
+cfg:theme.preset
+cfg:theme.selection
+cfg:theme.shadow
+cfg:theme.success
+cfg:theme.surface
+cfg:theme.surface_alt
+cfg:theme.text
+cfg:theme.text_muted
+cfg:theme.warning
+cli:--check-terminal
+cli:--help
+cli:--version
+cli:-V
+cli:unknown-argument-falls-through
+env:IRA_ICONS
+env:IRA_IMAGES
+env:IRA_WT_SETTINGS
+env:LC_TERMINAL
+env:LOCALAPPDATA
+env:PATH:ffmpeg-and-pdftoppm
+env:TERM
+env:TERM_PROGRAM
+env:TERM_PROGRAM:mac-terminal-detection
+env:WT_PROFILE_ID
+env:WT_SESSION
+exit:code:0
+exit:external-app-detached
+file:VSCode-User-settings.json
+file:WindowsTerminal-portable-marker-.portable
+file:WindowsTerminal-settings.json
+file:bookmarks
+file:state
+file:theme.toml
+file:thumbnail-cache-png
+file:~/.config/ira/state
+hook:osc52-clipboard-request
+key:confirm:enter
+key:confirm:escape
+key:confirm:n
+key:confirm:o
+key:confirm:y
+key:confirmation:enter
+key:confirmation:escape
+key:confirmation:n
+key:confirmation:o
+key:confirmation:y
+key:copy-board:asterisk
+key:copy-board:backslash
+key:copy-board:backtick
+key:copy-board:down
+key:copy-board:escape
+key:copy-board:p
+key:copy-board:q
+key:copy-board:space
+key:copy-board:tab-focus
+key:copy-board:up
+key:copy-board:v
+key:copy-board:x
+key:create-entry:backspace
+key:create-entry:char
+key:create-entry:enter
+key:create-entry:escape
+key:create-entry:left
+key:create-entry:right
+key:dialog:any-key-dismiss
+key:editor:ctrl-s:save-preview-text
+key:editor:esc:exit-preview-text
+key:editor:tab:discard-and-focus-cycle
+key:fuzzy-search:alt-down
+key:fuzzy-search:alt-up
+key:fuzzy-search:backspace
+key:fuzzy-search:char
+key:fuzzy-search:down
+key:fuzzy-search:enter
+key:fuzzy-search:escape
+key:fuzzy-search:right
+key:fuzzy-search:up
+key:global:ctrl-c
+key:global:ctrl-minus
+key:goto-path:backspace
+key:goto-path:char
+key:goto-path:enter
+key:goto-path:escape
+key:info-dialog:r
+key:info-dialog:x
+key:keybindings-help:any-key-dismiss
+key:normal:+
+key:normal:,
+key:normal:-:reveal-in-file-manager
+key:normal:.
+key:normal:/
+key:normal:0
+key:normal:0:terminal-here
+key:normal:?
+key:normal:Enter
+key:normal:Esc
+key:normal:Left
+key:normal:Right
+key:normal:Space
+key:normal:Tab
+key:normal:]:copy-folder-path
+key:normal:alt+a
+key:normal:alt+i
+key:normal:alt-down
+key:normal:alt-i
+key:normal:alt-super-a
+key:normal:alt-super-i
+key:normal:alt-up
+key:normal:asterisk
+key:normal:b
+key:normal:backslash
+key:normal:backspace-macos
+key:normal:backspace:macos
+key:normal:backtick
+key:normal:bookmark-shortcut
+key:normal:c
+key:normal:comma
+key:normal:common-folder-shortcut
+key:normal:ctrl-a
+key:normal:ctrl-minus:eject-drive
+key:normal:delete
+key:normal:down
+key:normal:drive-digit-1-9
+key:normal:e
+key:normal:enter
+key:normal:enter:open-default
+key:normal:escape
+key:normal:i
+key:normal:l:open-default-or-directory
+key:normal:left
+key:normal:left-bracket
+key:normal:m
+key:normal:minus
+key:normal:n
+key:normal:o
+key:normal:period
+key:normal:plus
+key:normal:q
+key:normal:question-mark
+key:normal:r
+key:normal:right
+key:normal:right-bracket
+key:normal:right:open-default-or-directory
+key:normal:slash
+key:normal:space
+key:normal:super+a
+key:normal:super+i
+key:normal:t
+key:normal:tab
+key:normal:tab:text-preview-editor
+key:normal:u
+key:normal:up
+key:normal:v
+key:normal:w
+key:normal:x
+key:normal:y
+key:normal:z
+key:preview-text-edit:ctrl-s
+key:preview-text-edit:escape
+key:preview-text-edit:tab
+key:preview-text-edit:textarea
+key:rename:backspace
+key:rename:char
+key:rename:enter
+key:rename:escape
+key:rename:left
+key:rename:right
+key:search:Enter
+key:search:Esc
+mode:confirmation
+mode:copy-board-focus
+mode:create-entry
+mode:delete-progress
+mode:error-dialog
+mode:fuzzy-search-input
+mode:goto-path
+mode:info-dialog
+mode:keybindings-help
+mode:multi-selection-info
+mode:new-entry
+mode:normal
+mode:preview-text-edit
+mode:rename
+mode:search
+msg:'{name}' already exists and is not a folder.
+msg:'{name}' already exists.
+msg:(empty file)
+msg:Cannot copy/move a folder into itself.
+msg:Cannot rename
+msg:Cannot rename:
+msg:Enter a name first.
+msg:Error reading entry
+msg:Error reading entry: {e}
+msg:Error reading metadata
+msg:FAILED (
+msg:Failed to copy the folder path to the clipboard.
+msg:Failed to create
+msg:Failed to delete
+msg:Failed to delete '{path}': {err}
+msg:Failed to eject
+msg:Failed to mount
+msg:Failed to open
+msg:Failed to rename
+msg:Failed to rename:
+msg:Folder path copied to clipboard
+msg:Loading…
+msg:No common folders found
+msg:No file browser found
+msg:No folder open to reveal.
+msg:No folder open to start a terminal in.
+msg:No free bookmark shortcut available (a-p are taken)
+msg:No removable drive is mounted
+msg:No terminal emulator found
+msg:Please increase the terminal's size
+msg:Preview-column
+msg:Preview-details
+msg:Preview-grid
+msg:Preview-off
+msg:Preview:
+msg:SKIPPED (already exists):
+msg:Saved
+msg:Sorted by kind
+msg:Sorted by last modified (newest first)
+msg:Sorted by name
+msg:Sorted by size (largest first)
+msg:Switched to
+msg:The other pane has no folder to copy into.
+msg:already exists
+msg:already exists and is not a folder.
+msg:any key close
+msg:any key dismiss
+msg:any key hide (deletion continues)
+msg:binary file
+msg:binary file — not editable
+msg:binary-file
+msg:binary-file-not-editable
+msg:cannot decode
+msg:cannot-decode
+msg:empty-file
+msg:failed-to-copy-folder-path
+msg:failed-to-eject-drive
+msg:failed-to-mount-drive
+msg:failed-to-open
+msg:file changed on disk — press Esc and reopen
+msg:file path changed on disk — press Esc and reopen
+msg:file too large to edit (> 5 MB)
+msg:file-changed-on-disk
+msg:file-path-changed-on-disk
+msg:file-too-large-to-edit
+msg:folder-path-copied
+msg:folders have no image preview
+msg:folders-have-no-image-preview
+msg:format not supported (png/jpg/gif/bmp/webp/mp4/mov/heic/pdf)
+msg:format-not-supported
+msg:install ffmpeg for HEIC previews
+msg:install ffmpeg for video previews
+msg:install poppler (pdftoppm) for PDF previews
+msg:install-ffmpeg-heic
+msg:install-ffmpeg-video
+msg:install-poppler-pdftoppm
+msg:ira-version-line
+msg:loading {label}…
+msg:loading…
+msg:no-file-browser-found
+msg:no-folder-for-terminal
+msg:no-folder-to-reveal
+msg:no-removable-drive-mounted
+msg:no-terminal-emulator-found
+msg:non-UTF-8 file — read-only preview only
+msg:non-UTF8-preview-readonly
+msg:open failed
+msg:preview-paused
+msg:read-only
+msg:save failed
+msg:saved-file
+msg:select a file
+msg:select-a-file
+msg:truncated
+msg:… truncated
+ui:actions-row
+ui:binary-preview-placeholder
+ui:bookmark-row
+ui:clipboard-folder-path
+ui:common-folder-icon
+ui:common-folder-row
+ui:common-folders-empty-message
+ui:common-folders-panel
+ui:confirmation-modal
+ui:confirmed-fuzzy-filter
+ui:confirmed-zero-result-rendering
+ui:contextual-hint-marquee
+ui:copy-board
+ui:copy-board-job-state
+ui:delete-progress
+ui:deletion-progress-dialog
+ui:details-listing
+ui:details-relative-time
+ui:dialog-glass-chrome
+ui:drive-row
+ui:empty-common-folders
+ui:empty-file-preview
+ui:empty-preview-placeholder
+ui:error-modal
+ui:event-bracketed-paste
+ui:event-focus-ignored
+ui:event-mouse-ignored
+ui:event-press-only
+ui:event-resize-ignored
+ui:file-row-truncation
+ui:files-details-view
+ui:files-grid-view
+ui:files-list-view
+ui:filesystem-external-change-refresh
+ui:filesystem-hidden-filter
+ui:filesystem-large-directory-streaming
+ui:filesystem-listing
+ui:filesystem-metadata
+ui:filesystem-permissions-display
+ui:filesystem-refresh-after-operations
+ui:filesystem-special-file-classification
+ui:filesystem-symlink-classification
+ui:four-mode-sort-cycle
+ui:fuzzy-live-search-results
+ui:generic-command-mode-absent
+ui:git-status-integration-absent
+ui:goto-path-dialog
+ui:heic-preview
+ui:image-preview
+ui:info-dialog
+ui:initial-tui-screen
+ui:keybinding-chip-outline
+ui:keybinding-chip-rounded
+ui:keybinding-chip-square
+ui:keybindings-help
+ui:keybindings-help-dialog
+ui:macos-appkit-preview-panel
+ui:macos-terminal-window-geometry-overlay
+ui:main-five-row-layout
+ui:metadata-size-progress
+ui:minimum-terminal-size-warning
+ui:multi-selection-info-dialog
+ui:nerd-font-capability-fallback
+ui:new-entry-dialog
+ui:open-with-chooser-absent
+ui:os-drag-drop-absent
+ui:overlay-hidden-when-terminal-not-frontmost
+ui:overlay-size-cap
+ui:overlay-two-pane-limit
+ui:pdf-first-page-preview
+ui:plugins-and-hooks-absent
+ui:preview-column
+ui:preview-decode-error-placeholder
+ui:preview-details
+ui:preview-dirty-indicator
+ui:preview-error-state
+ui:preview-grid
+ui:preview-loading-placeholder
+ui:preview-loading-state
+ui:preview-off
+ui:preview-paused-under-modal
+ui:preview-readonly-editor
+ui:preview-text-editor
+ui:preview-truncated-marker
+ui:remote-vfs-integration-absent
+ui:removable-drive-eject
+ui:removable-drive-mount
+ui:rename-dialog
+ui:reveal-in-file-manager
+ui:split-pane
+ui:split-pane-view
+ui:status-notice-bar
+ui:system-default-open
+ui:terminal-capability-report
+ui:terminal-here
+ui:terminal-image-preview-overlay
+ui:text-file-preview
+ui:text-input-block-cursor
+ui:theme-filetype-colors
+ui:theme-preset-label
+ui:truncated-preview
+ui:two-pane-split-state
+ui:video-frame-preview
+ui:visible-row-cursor-model
+ui:windows-layered-preview-popup
+ui:windows-terminal-window-geometry-overlay
+ui:windows-volume-label-display

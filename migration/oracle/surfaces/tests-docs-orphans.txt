@@ -1,0 +1,4 @@
+cli:--help
+cli:unknown-argument-falls-through
+exit:code:0
+ui:keybindings-help

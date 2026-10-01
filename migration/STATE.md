@@ -1,6 +1,6 @@
 # Migration state
 
-Updated: 2026-10-01 | Branch: main | HEAD: 1f2f5a3
+Updated: 2026-10-01 | Branch: main | HEAD: 5a99091
 Phase: 1 Deep discovery | Current wave: none | Gate: FAIL (discovery and matrix are incomplete)
 
 ## Project coordinates
@@ -13,23 +13,22 @@ Phase: 1 Deep discovery | Current wave: none | Gate: FAIL (discovery and matrix 
 - CI: `.github/workflows/desktop-build.yml` builds packaged macOS arm64 and Windows x86_64 app binaries; repo-wide migration CI not yet verified or present.
 
 ## Counts
-Rows=0; discovery not yet complete. Blind audit clean rounds=0.
+Rows=0; 99 inventory entries; 419 unique surface items. Discovery reconciliation and matrix construction remain. Blind completion-audit clean rounds=0.
 
 ## In flight
 | Agent | Role | Row(s) | Branch/worktree | Launched | Expect |
 |---|---|---|---|---|---|
-| discover_state_search | TUI explorer | discovery | shared checkout, disjoint inventory/oracle files | 2026-10-01 | state model and search/filter runtime inventory |
-| discover_preview_external | TUI explorer | discovery | shared checkout, disjoint inventory/oracle files | 2026-10-01 | preview/viewers and external integration inventory |
+| - | - | - | - | - | No subagents in flight; discovery and blind reports await manager reconciliation |
 
 ## Blockers
 - Fast parity gate currently finds zero rows; this is expected until discovery and planning produce the matrix.
 - Root-wide `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --locked -- -D warnings` expose pre-existing TUI findings, including an untracked user example. The tagged TUI baseline remains unchanged; gate scope needs an explicit migration decision before implementation.
-- Discovery is partial: 52 inventory entries are recorded across entry/input (18), config/state (12), file operations (13), and rendering/messages (9). State/search and preview/external explorers are active.
-- No matrix rows or merged central surface items exist yet; filesystem services, tests/docs, platform slice details, and orphan sweep remain unclaimed.
+- Discovery inventories record 99 behavior entries across nine slices; all 42 `src/**/*.rs` files have an explicit inventory owner or module-barrel classification. Three blind discovery cross-checks found no material source-derived contradiction; runtime evidence strength varies and open risks remain documented.
+- The merged `migration/oracle/surface.txt` contains 419 unique items. The fast gate therefore currently reports 420 violations: no matrix rows plus every surface item uncovered. Manager must reconcile overlaps and map all items into appropriately sized feature rows before Phase 2 is complete.
 
 ## Next 5 actions
-1. Verify completed entry/input, config/state, file-operation, and rendering/message inventories/captures; check all evidence paths and commit ids.
-2. Complete state/search and preview/external, then cover filesystem services, tests/docs, platform risks, and orphan modules.
-3. Enumerate all `src/**` modules, perform blind cross-checks, reconcile live behavior, and merge the full surface.
+1. Reconcile all nine inventories, verify capture links/baseline commit ids, and resolve overlaps/discrepancies from the blind reports.
+2. Close high-risk runtime gaps safely (notably delete/cancel, recursive merge, dialogs, terminal size and platform-only behavior); record any unavailable host checks.
+3. Map the 419 surface items into small, independently verifiable matrix rows and define their dependencies.
 4. Reconcile advisor recommendations with complete discovery and record adopt/adapt/reject decisions.
 5. Build and review the parity matrix, common-ground foundation, dependencies, and conflict-free feature waves before implementation.

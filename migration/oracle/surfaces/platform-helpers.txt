@@ -1,0 +1,31 @@
+# Surfaces discovered in platform helper source ownership sweep.
+# The entries are terminal/TUI oracle capabilities, not GPUI implementation requirements.
+ui:common-folders-panel
+ui:common-folders-empty-message
+key:normal:w
+key:normal:e
+key:normal:r
+key:normal:t
+key:normal:y
+key:normal:u
+key:normal:i
+msg:No common folders found
+ui:common-folder-icon
+ui:nerd-font-capability-fallback
+ui:terminal-image-preview-overlay
+ui:overlay-hidden-when-terminal-not-frontmost
+ui:overlay-two-pane-limit
+ui:overlay-size-cap
+env:TERM
+env:TERM_PROGRAM
+env:WT_PROFILE_ID
+env:IRA_WT_SETTINGS
+env:LOCALAPPDATA
+file:WindowsTerminal-settings.json
+file:VSCode-User-settings.json
+file:WindowsTerminal-portable-marker-.portable
+ui:windows-volume-label-display
+ui:macos-terminal-window-geometry-overlay
+ui:windows-terminal-window-geometry-overlay
+ui:macos-appkit-preview-panel
+ui:windows-layered-preview-popup

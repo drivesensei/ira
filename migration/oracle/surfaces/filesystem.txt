@@ -1,0 +1,14 @@
+key:normal:.
+key:normal:?
+msg:Loading…
+msg:Error reading entry
+msg:Error reading metadata
+ui:filesystem-listing
+ui:filesystem-hidden-filter
+ui:filesystem-metadata
+ui:filesystem-symlink-classification
+ui:filesystem-special-file-classification
+ui:filesystem-large-directory-streaming
+ui:filesystem-refresh-after-operations
+ui:filesystem-external-change-refresh
+ui:filesystem-permissions-display

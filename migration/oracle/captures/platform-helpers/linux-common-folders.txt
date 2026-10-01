@@ -1,0 +1,6 @@
+Oracle commit: 1cad4ce43cc72d52d4cc4eef920e0da22cb69568 (prebuilt target/debug/ira)
+Host: Linux; PTY: 120 columns x 40 rows; fresh HOME=/home/vlad/target/tmp/platform-helper-probe/home; XDG_CONFIG_HOME=/home/vlad/target/tmp/platform-helper-probe/config
+Keys: launch, observe startup, send `w`, observe folder listing, send `q`.
+Observed startup: normal TUI screen, Drives panel, Common folders panel; Home displayed with shortcut `w` and folder icon. Other common folders were absent for the temporary user profile because dirs-next returned no desktop/documents/downloads/music/video/public paths. This distinguishes absent paths from UI's `None` fallback message.
+After `w`: the listing switched to Home and showed entries from the isolated home directory; the shortcut bar remained. `q` exited with status 0. No files intentionally created or changed by this probe.
+The raw PTY stream is rendered inline by the execution tool; text observations above are the normalized capture.
