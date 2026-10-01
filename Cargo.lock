@@ -699,6 +699,7 @@ version = "0.1.21"
 dependencies = [
  "dirs-next",
  "image",
+ "ira-core",
  "libc",
  "objc2",
  "objc2-app-kit",
@@ -714,6 +715,10 @@ dependencies = [
  "unicode-width",
  "winapi",
 ]
+
+[[package]]
+name = "ira-core"
+version = "0.1.0"
 
 [[package]]
 name = "is-docker"
