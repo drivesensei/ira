@@ -1,20 +1,31 @@
 # F-002 real PTY lifecycle red-test harness contract
 
-This contract is intentionally documentation-only until the implementation
-extracts a PTY session API. At `5ae8bf3`, `run_oracle_with_baseline` creates the
-fixture, PTY pair, child, and reader inline; `PtyChildLifecycle` is private and
-owns only the child and reader. A test built on `ScriptedTarget` cannot reach
-these OS resources. Guessing an API here would either test a fabricated seam
-or keep testing a mock, so the open GAPs remain open.
+`f002_lifecycle_child.rs` is a real helper-child fixture launched through
+`portable-pty`; `f002_lifecycle_session.rs` is the compile-time red contract for
+the session API that must replace the inline lifecycle. At `5ae8bf3`,
+`run_oracle_with_baseline` creates the fixture, PTY pair, child, and reader
+inline; `PtyChildLifecycle` is private and owns only the child and reader. The
+session contract currently fails at `use ira_parity::lifecycle` because that
+module does not yet exist.
 
-When the session extraction lands, replace the lifecycle-related mock evidence
-with integration tests that instantiate the same session type used by the TUI
-adapter. The helper child must be launched through the session's real PTY and
-must have deterministic modes selected by arguments/environment (no sleeps for
-synchronization). The session should expose observable results or test hooks
-for child status, reader completion, handle closure, fixture removal, and
-ordered cleanup events; tests must not infer success from the helper's own
-claims.
+The API shape proposed by the executable contract is:
+
+```rust
+PtySession::spawn(CommandBuilder, TempDir, PtySize, PtySessionConfig)
+session.wait_for_output(marker, deadline)
+session.wait_for_child_exit_and_drain(deadline)
+session.shutdown() -> ShutdownReport
+session.shutdown_with_primary_error(error) -> CombinedError
+```
+
+`ShutdownReport` exposes whether the OS child was reaped, the reader joined,
+and PTY handles closed before fixture removal. `CombinedError` retains primary
+and cleanup errors plus ordered `CleanupEvent`s. Deterministic failure injectors
+in `PtySessionConfig` let tests cause a reader error and fixture-removal error.
+This is a minimal reviewer-proposed test seam; the developer can adapt names,
+but the tests must continue to instantiate the same session implementation as
+the TUI adapter. The helper is the `helper_child_entry` case in
+`f002_lifecycle_child.rs`, selected by environment mode (no sleeps).
 
 Required cases mapped to the existing open notes:
 
@@ -31,9 +42,11 @@ deadlines and synchronization channels/pipes rather than `sleep`.
 
 ## Current status
 
-The existing tests `deadline_terminates_reaps_child_and_closes_pty` and
-`timeout_drains_and_joins_readers_before_fixture_removal` compile against
-`ScriptedTarget` and remain useful only for orchestration behavior. They were
-not relabeled as real-child evidence. The helper-child cases above are blocked
-on the extracted production session API and helper fixture infrastructure;
-there is no honest red runtime result against that absent API yet.
+The direct helper tests prove the OS child/PTY fixture works, but they do not
+prove the future session cleanup path. The session contract is an expected
+compile failure until the extracted production API exists. Reader failure,
+cleanup ordering, fixture removal order, and error composition are asserted in
+that contract and cannot run yet. The existing tests
+`deadline_terminates_reaps_child_and_closes_pty` and
+`timeout_drains_and_joins_readers_before_fixture_removal` still exercise only
+`ScriptedTarget`; they do not close any GAP.
