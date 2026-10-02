@@ -2,6 +2,7 @@
 
 Initial commit reviewed: `88dcf9c38185c3a10ee1938050c9dd095e456a2b`
 Remediation reviewed: `62db2ceba7e7d67b7db60cf280954853d297f9b3`
+Tag-namespace fix reviewed: `5ae8bf38346e7ff20f636f9928eebcf29bc97ab6`
 
 Attempts made:
 - Read the complete production source, contract tests, F-002 spec, reviewer protocol, and manager charter §7.
@@ -14,7 +15,8 @@ Attempts made:
 - Against remediation `62db2ce`, reran ADV-44/45/46/49: all four pass. Ran the revised G31 and G38 contract tests individually: both pass with meaningful observed bytes and serialized metadata assertions.
 - Re-ran G27/G29/G30 individually with `--ignored`: all pass as scripted tests, but the implementations remain test doubles and do not exercise real timeout/build/test-failure child or reader cleanup.
 - Disk-backed real baseline success/cache-hit cleanup probe passed. The first attempt with `/dev/shm` failed at link time with a bus error due to constrained tmpfs; rerun passed using the report's disk-backed target.
-- Tested Git ref collision in a temporary repository and against the exact remediation crate: tag `oracle` points to commit A while `refs/oracle` points to B. Git's unqualified `rev-parse oracle^{commit}` selects B and `BaselineResolver::resolve()` incorrectly rejects the valid tag SHA A.
+- Tested Git ref collision before remediation: tag `oracle` points to commit A while `refs/oracle` points to B. Git's unqualified `rev-parse oracle^{commit}` selected B and the resolver rejected the valid tag SHA A.
+- Re-ran the committed collision test against `5ae8bf38346e7ff20f636f9928eebcf29bc97ab6`: `TMPDIR=/home/vlad/.cache/ira-parity-f002-fix-tmp CARGO_TARGET_DIR=/home/vlad/.cache/ira-parity-f002-fix-target cargo test --manifest-path tools/ira-parity/Cargo.toml --locked --test f002_adversarial baseline_resolution_is_qualified_to_tag_namespace -- --exact --test-threads=1` — **1 passed, 0 failed**.
 
 Resolved by remediation and reviewer verification:
 - `G-F002-ADV-44`: mismatching expected observation content now fails comparison; adversarial test passes.
@@ -22,9 +24,7 @@ Resolved by remediation and reviewer verification:
 - `G-F002-ADV-46` and `G-F002-ADV-31`: declared readiness data gates event delivery; contract and adversarial tests pass. G31 inspects the captured filesystem bytes rather than trusting target booleans.
 - `G-F002-ADV-49`: OSC title sequence is removed; adversarial test passes.
 - `G-F002-ADV-38`: staged metadata now includes actual profile/date and all tested values; revised serialized-metadata test passes.
-
-Open finding:
-- `G-F002-ADV-50`, medium, `baseline_resolution_is_qualified_to_tag_namespace`: `BaselineResolver::resolve` validates `refs/tags/<tag>` syntax but runs unqualified `rev-parse <tag>^{commit}`. A valid direct ref `refs/<tag>` shadows the tag and causes a false SHA rejection. Repro test is in `tools/ira-parity/tests/f002_adversarial.rs`; it fails against the exact remediation crate. Resolve via the explicit `refs/tags/<tag>^{commit}` refspec.
+- `G-F002-ADV-50`: resolver now peels the explicitly qualified `refs/tags/<tag>^{commit}`; the committed collision test passes against the exact fix commit.
 
 Verified fixes / passing probes:
 - All 13 ignored baseline/cache/cleanup tests passed; extra real success + cache-hit cleanup probe passed.
@@ -39,9 +39,9 @@ Mutation checks:
 - Changed returned readiness flag locally; readiness contract test failed as intended. Restored source.
 - `git diff` confirms no production-source changes.
 
-Resolved by review: `G-F002-ADV-31`, `G-F002-ADV-38`, `G-F002-ADV-44`, `G-F002-ADV-45`, `G-F002-ADV-46`, `G-F002-ADV-49`.
-Open: `G-F002-ADV-27`, `G-F002-ADV-29`, `G-F002-ADV-30`, `G-F002-ADV-50`.
+Resolved by review: `G-F002-ADV-31`, `G-F002-ADV-38`, `G-F002-ADV-44`, `G-F002-ADV-45`, `G-F002-ADV-46`, `G-F002-ADV-49`, `G-F002-ADV-50`.
+Open: `G-F002-ADV-27`, `G-F002-ADV-29`, `G-F002-ADV-30`.
 
-Verdict: FINDINGS (4 open GAPs: 27, 29, 30, 50).
+Verdict: FINDINGS (3 open GAPs: 27, 29, 30).
 
 Enrichment candidates: none.
