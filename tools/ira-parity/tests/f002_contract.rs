@@ -576,7 +576,7 @@ fn ordinary_run_does_not_modify_approved_goldens() {
     let golden = temp.path().join("golden.toml");
     std::fs::write(&golden, b"approved-v1").unwrap();
     ScenarioRunner::new(
-        RunOptions::default().with_approved_golden_dir(&temp.path().join("approved")),
+        RunOptions::default().with_approved_golden_dir(temp.path().join("approved")),
     )
     .run_oracle_trace(&trace_file("initial_screen.toml"))
     .unwrap();
@@ -676,7 +676,7 @@ fn baseline_worktree_is_removed_after_success_cache_hit_build_failure_timeout_an
         "test-failure",
     ] {
         let temp = tempdir();
-        let mut resolver = BaselineResolver::new(Path::new(env!("CARGO_MANIFEST_DIR")))
+        let resolver = BaselineResolver::new(Path::new(env!("CARGO_MANIFEST_DIR")))
             .with_expected_sha(ORACLE_SHA)
             .with_test_exit_path(exit)
             .with_temp_root(temp.path());
@@ -788,7 +788,7 @@ fn readiness_uses_output_polling_and_absolute_deadline() {
 #[ignore = "GAP G-F002-ADV-32"]
 fn readiness_timeout_sends_no_input() {
     let trace = trace_file("initial_screen.toml").with_events(vec![InputEvent::Key {
-        code: KeyCode::Character('q'),
+        code: KeyCode::Character { character: 'q' },
         modifiers: BTreeSet::new(),
         phase: KeyPhase::Press,
     }]);
@@ -879,7 +879,7 @@ fn poisoned_parent_environment_cannot_escape_isolated_roots_windows() {
 #[ignore = "GAP G-F002-ADV-35"]
 fn scenario_override_cannot_escape_protected_roots() {
     for value in ["/outside/home", "../../outside/tmp"] {
-        let error = ChildEnvironment::build(
+        let error = ChildEnvironment::build_with_overrides(
             &EnvironmentPolicy::unix_for_test(),
             "/tmp/run-root",
             [("HOME", value)],
