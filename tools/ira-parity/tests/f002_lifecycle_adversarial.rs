@@ -11,6 +11,7 @@ const ROOT: &str = "IRA_ADV_LIFECYCLE_ROOT";
 const PAYLOAD: usize = 1024 * 1024;
 
 #[test]
+#[allow(clippy::zombie_processes)] // The helper is intentionally orphaned when its PTY parent is terminated.
 fn lifecycle_attack_helper() {
     let Ok(mode) = std::env::var(MODE) else {
         return;
@@ -106,7 +107,7 @@ fn await_output_produced(session: &PtySession) {
     }
 }
 
-// GAP(G-F002-ADV-59) sev=high kind=behavior-divergence feature=F-002
+// GAP-FIXED(G-F002-ADV-59) sev=high kind=behavior-divergence feature=F-002
 //   what:     Joining a finished reader abandons bytes and errors still queued in its channel.
 //   tui-ref:  migration/specs/F-002.md S8/S12
 //   oracle:   real PTY helper writes exactly 1 MiB of Q and signals flush completion
@@ -114,6 +115,7 @@ fn await_output_produced(session: &PtySession) {
 //   expected: Every written payload byte is drained before fixture removal.
 //   actual:   shutdown stops receiving as soon as JoinHandle reports finished; queued data is lost.
 //   cover:    shutdown_drains_all_queued_output_before_success
+//   fixed-by: lifecycle follow-up; both adversarial 1 MiB output paths and queued failure pass.
 #[test]
 fn shutdown_drains_all_queued_output_before_success() {
     let mut session = start("flood", config());
@@ -194,7 +196,7 @@ fn partial_spawn_failure_removes_fixture() {
     assert!(!path.exists());
 }
 
-// GAP(G-F002-ADV-60) sev=medium kind=behavior-divergence feature=F-002
+// GAP-FIXED(G-F002-ADV-60) sev=medium kind=behavior-divergence feature=F-002
 //   what:     The cleanup deadline starts after a blocking portable-pty kill operation.
 //   tui-ref:  migration/specs/F-002.md S8/S12; portable-pty 0.9.0 lib.rs ChildKiller::kill
 //   oracle:   helper ignores SIGHUP; pinned dependency spends 200ms in its kill grace period
@@ -202,6 +204,7 @@ fn partial_spawn_failure_removes_fixture() {
 //   expected: Absolute cleanup budgets include child termination, with scheduling tolerance.
 //   actual:   Unix Child::kill sleeps four times before the harness starts its reap deadline.
 //   cover:    termination_is_included_in_absolute_cleanup_deadline
+//   fixed-by: lifecycle follow-up; Linux uses nonblocking cloned HUP signal and bounded SIGKILL escalation.
 #[cfg(unix)]
 #[test]
 fn termination_is_included_in_absolute_cleanup_deadline() {

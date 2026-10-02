@@ -35,6 +35,8 @@ pub struct RunOptions {
     pub cleanup: Duration,
     approved: Option<PathBuf>,
     readiness: Duration,
+    fixture_removal_failure_for_test: bool,
+    fixture_retention_capture_for_test: Option<std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>>,
 }
 impl Default for RunOptions {
     fn default() -> Self {
@@ -44,6 +46,8 @@ impl Default for RunOptions {
             cleanup: Duration::from_secs(2),
             approved: None,
             readiness: Duration::from_secs(15),
+            fixture_removal_failure_for_test: false,
+            fixture_retention_capture_for_test: None,
         }
     }
 }
@@ -72,6 +76,15 @@ impl RunOptions {
     }
     pub fn with_approved_golden_dir(mut self, p: impl AsRef<Path>) -> Self {
         self.approved = Some(p.as_ref().into());
+        self
+    }
+    #[doc(hidden)]
+    pub fn with_fixture_removal_failure_for_test(
+        mut self,
+        capture: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
+    ) -> Self {
+        self.fixture_removal_failure_for_test = true;
+        self.fixture_retention_capture_for_test = Some(capture);
         self
     }
 }
@@ -421,6 +434,13 @@ impl ScenarioRunner {
         for (k, v) in isolated.iter() {
             cmd.env(k, v);
         }
+        let mut session_config = PtySessionConfig::new(self.opts.cleanup, self.opts.cleanup);
+        if self.opts.fixture_removal_failure_for_test {
+            session_config = session_config.with_fixture_remove_failure();
+            if let Some(capture) = &self.opts.fixture_retention_capture_for_test {
+                session_config = session_config.with_fixture_retention_capture(capture.clone());
+            }
+        }
         let mut lifecycle = PtySession::spawn(
             cmd,
             fixture,
@@ -430,7 +450,7 @@ impl ScenarioRunner {
                 pixel_width: 0,
                 pixel_height: 0,
             },
-            PtySessionConfig::new(self.opts.cleanup, self.opts.cleanup),
+            session_config,
         )
         .map_err(|e| err(e.to_string()))?;
         macro_rules! session_try {
@@ -559,12 +579,21 @@ impl ScenarioRunner {
             ),
             applied.len()
         );
-        lifecycle.shutdown().map_err(|e| RunError {
-            message: e.to_string(),
-            timeout: true,
-            readiness: false,
-            delivered: applied.len(),
-        })?;
+        let shutdown = if matched {
+            lifecycle.shutdown().map(|_| ())
+        } else {
+            lifecycle
+                .shutdown_with_primary_error(diagnostics.join("; "))
+                .map(|_| ())
+        };
+        if let Err(error) = shutdown {
+            return Err(RunError {
+                message: error.to_string(),
+                timeout: Instant::now() >= end,
+                readiness: false,
+                delivered: applied.len(),
+            });
+        }
         if !matched {
             return Err(RunError {
                 message: diagnostics.join("; "),

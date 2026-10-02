@@ -9,13 +9,14 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, RecvTimeoutError},
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     thread::JoinHandle,
     time::{Duration, Instant},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CleanupEvent {
+    InputClosed,
     ChildReaped,
     HandlesClosed,
     ReaderJoined,
@@ -28,6 +29,7 @@ pub struct PtySessionConfig {
     pub reader_join_deadline: Duration,
     reader_failure_after_bytes: Option<usize>,
     fixture_remove_failure: bool,
+    fixture_retention_capture: Option<Arc<Mutex<Option<PathBuf>>>>,
 }
 
 impl PtySessionConfig {
@@ -37,6 +39,7 @@ impl PtySessionConfig {
             reader_join_deadline,
             reader_failure_after_bytes: None,
             fixture_remove_failure: false,
+            fixture_retention_capture: None,
         }
     }
 
@@ -49,6 +52,11 @@ impl PtySessionConfig {
         self.fixture_remove_failure = true;
         self
     }
+
+    pub fn with_fixture_retention_capture(mut self, capture: Arc<Mutex<Option<PathBuf>>>) -> Self {
+        self.fixture_retention_capture = Some(capture);
+        self
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -56,6 +64,7 @@ pub struct ShutdownReport {
     pub child_reaped: bool,
     pub reader_joined: bool,
     pub handles_closed_before_fixture_removed: bool,
+    pub events: Vec<CleanupEvent>,
 }
 
 #[derive(Debug)]
@@ -306,19 +315,9 @@ impl PtySession {
                 .is_some()
             {
                 self.close_pty_handles();
-                while Instant::now() < end {
-                    match self
-                        .rx
-                        .recv_timeout(end.saturating_duration_since(Instant::now()))
-                    {
-                        Ok(message) => self.accept(message),
-                        Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => {
-                            break
-                        }
-                    }
-                    if self.reader.as_ref().is_some_and(JoinHandle::is_finished) {
-                        break;
-                    }
+                self.drain_reader_until_finished(end)?;
+                if let Some(error) = &self.reader_error {
+                    return Err(error.clone());
                 }
                 return Ok(self.output.clone());
             }
@@ -343,6 +342,33 @@ impl PtySession {
         Ok(())
     }
 
+    fn drain_reader_until_finished(&mut self, deadline: Instant) -> Result<(), String> {
+        loop {
+            while let Ok(message) = self.rx.try_recv() {
+                self.accept(message);
+            }
+            if self.reader.as_ref().is_some_and(JoinHandle::is_finished) && self.reader_closed {
+                while let Ok(message) = self.rx.try_recv() {
+                    self.accept(message);
+                }
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err("PTY output reader drain deadline exceeded".into());
+            }
+            match self.rx.recv_timeout(
+                Duration::from_millis(5).min(deadline.saturating_duration_since(Instant::now())),
+            ) {
+                Ok(message) => self.accept(message),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) if self.reader_closed => return Ok(()),
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err("PTY output reader channel closed".into())
+                }
+            }
+        }
+    }
+
     fn accept(&mut self, message: ReaderMessage) {
         match message {
             ReaderMessage::Bytes(bytes) => self.output.extend(bytes),
@@ -355,6 +381,82 @@ impl PtySession {
         self.writer.take();
         self.slave.take();
         self.master.take();
+    }
+
+    fn terminate_and_reap_child(&mut self, deadline: Instant, cleanup: &mut Vec<String>) -> bool {
+        let Some(child) = self.child.as_mut() else {
+            return true;
+        };
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                self.child.take();
+                return true;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                cleanup.push(format!("child reap poll failed: {error}"));
+                return false;
+            }
+        }
+
+        // Child::kill on portable-pty's Unix implementation sleeps for up to
+        // 200ms. Its cloned signaler sends HUP directly without that grace;
+        // we provide our own grace inside this absolute deadline and escalate
+        // to SIGKILL if the child does not exit.
+        let mut signaler = child.clone_killer();
+        if let Err(error) = signaler.kill() {
+            cleanup.push(format!("child termination signal failed: {error}"));
+        }
+        drop(signaler);
+
+        #[cfg(unix)]
+        let force_kill_at = Instant::now() + deadline.saturating_duration_since(Instant::now()) / 2;
+        #[cfg(unix)]
+        let mut force_kill_sent = false;
+
+        loop {
+            let status = self.child.as_mut().map(|child| child.try_wait());
+            match status {
+                Some(Ok(Some(_))) => {
+                    self.child.take();
+                    return true;
+                }
+                Some(Ok(None)) => {}
+                Some(Err(error)) => {
+                    cleanup.push(format!("child reap poll failed: {error}"));
+                    return false;
+                }
+                None => return true,
+            }
+
+            #[cfg(unix)]
+            if !force_kill_sent && Instant::now() >= force_kill_at {
+                if let Some(pid) = self.child.as_ref().and_then(|child| child.process_id()) {
+                    // SAFETY: pid is the direct child process returned by the
+                    // owned portable-pty Child handle.
+                    let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                    if result != 0 {
+                        let error = std::io::Error::last_os_error();
+                        cleanup.push(format!("force-kill signal failed: {error}"));
+                    }
+                } else {
+                    cleanup.push("child process id unavailable for bounded force-kill".into());
+                    return false;
+                }
+                force_kill_sent = true;
+            }
+
+            if Instant::now() >= deadline {
+                cleanup.push("child cleanup deadline exceeded".into());
+                return false;
+            }
+            match self.rx.recv_timeout(
+                Duration::from_millis(1).min(deadline.saturating_duration_since(Instant::now())),
+            ) {
+                Ok(message) => self.accept(message),
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {}
+            }
+        }
     }
 
     pub fn shutdown(&mut self) -> Result<ShutdownReport, LifecycleError> {
@@ -373,91 +475,26 @@ impl PtySession {
         primary: Option<String>,
     ) -> Result<ShutdownReport, LifecycleError> {
         self.shutdown_attempted = true;
+        let child_deadline = Instant::now() + self.config.cleanup_deadline;
         let mut events = Vec::new();
         let mut cleanup = Vec::new();
-        let child_reaped = if let Some(child) = self.child.as_mut() {
-            let initial = child.try_wait();
-            match initial {
-                Ok(Some(_)) => {
-                    self.child.take();
-                    true
-                }
-                Ok(None) => match self
-                    .child
-                    .as_mut()
-                    .map(|child| child.kill())
-                    .unwrap_or_else(|| Err(std::io::Error::other("child handle missing")))
-                {
-                    Ok(()) => {
-                        let end = Instant::now() + self.config.cleanup_deadline;
-                        loop {
-                            let status = self
-                                .child
-                                .as_mut()
-                                .map(|child| child.try_wait())
-                                .unwrap_or_else(|| {
-                                    Err(std::io::Error::other("child handle missing"))
-                                });
-                            match status {
-                                Ok(Some(_)) => {
-                                    self.child.take();
-                                    break true;
-                                }
-                                Ok(None) => {}
-                                Err(error) => {
-                                    cleanup.push(format!("child reap poll failed: {error}"));
-                                    break false;
-                                }
-                            }
-                            if Instant::now() >= end {
-                                cleanup.push("child reap cleanup deadline exceeded".into());
-                                break false;
-                            }
-                            match self.rx.recv_timeout(
-                                Duration::from_millis(10)
-                                    .min(end.saturating_duration_since(Instant::now())),
-                            ) {
-                                Ok(message) => self.accept(message),
-                                Err(RecvTimeoutError::Timeout) => {}
-                                Err(RecvTimeoutError::Disconnected) => {}
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        cleanup.push(format!("child kill failed: {error}"));
-                        false
-                    }
-                },
-                Err(error) => {
-                    cleanup.push(format!("child reap poll failed: {error}"));
-                    false
-                }
-            }
-        } else {
-            true
-        };
+        // S12 phase 1: release all input and slave endpoints before polling or signaling.
+        self.writer.take();
+        self.slave.take();
+        events.push(CleanupEvent::InputClosed);
+        let child_reaped = self.terminate_and_reap_child(child_deadline, &mut cleanup);
         if child_reaped {
             events.push(CleanupEvent::ChildReaped);
         }
 
         // Keep pumping output during child termination, then close the PTY
         // endpoints to unblock the platform reader.
-        self.close_pty_handles();
+        self.master.take();
         events.push(CleanupEvent::HandlesClosed);
 
         let reader_joined = if self.reader.is_some() {
-            let end = Instant::now() + self.config.reader_join_deadline;
-            while !self.reader.as_ref().is_some_and(JoinHandle::is_finished) && Instant::now() < end
-            {
-                match self.rx.recv_timeout(
-                    Duration::from_millis(10).min(end.saturating_duration_since(Instant::now())),
-                ) {
-                    Ok(message) => self.accept(message),
-                    Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => break,
-                }
-            }
-            if self.reader.as_ref().is_some_and(JoinHandle::is_finished) {
+            let end = child_deadline.max(Instant::now()) + self.config.reader_join_deadline;
+            if self.drain_reader_until_finished(end).is_ok() {
                 if let Some(reader) = self.reader.take() {
                     match reader.join() {
                         Ok(()) => true,
@@ -493,6 +530,10 @@ impl PtySession {
             self.fixture_removal_attempted = true;
             if self.fixture_remove_failure {
                 cleanup.push("fixture removal failed (injected)".into());
+                if let Some(capture) = &self.config.fixture_retention_capture {
+                    *capture.lock().unwrap_or_else(|poison| poison.into_inner()) =
+                        Some(self.fixture_path.clone());
+                }
                 if let Some(fixture) = self.fixture.take() {
                     let _retained_path = fixture.keep();
                 }
@@ -514,6 +555,7 @@ impl PtySession {
                 child_reaped,
                 reader_joined,
                 handles_closed_before_fixture_removed,
+                events,
             })
         } else {
             Err(LifecycleError {
