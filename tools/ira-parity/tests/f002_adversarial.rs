@@ -7,7 +7,7 @@ use ira_parity::{
 
 const INITIAL: &str = include_str!("../../../migration/oracle/traces/harness/initial_screen.toml");
 
-// GAP(G-F002-ADV-49) sev=medium kind=edge-case feature=F-002
+// GAP-RESOLVED(G-F002-ADV-49) sev=medium kind=edge-case feature=F-002
 //   what:     Terminal normalizer leaks OSC title bytes into the user-visible screen.
 //   tui-ref:  migration/specs/F-002.md S5
 //   oracle:   terminal control sequence semantics
@@ -15,6 +15,7 @@ const INITIAL: &str = include_str!("../../../migration/oracle/traces/harness/ini
 //   expected: OSC title control sequence is removed and screen content remains intact.
 //   actual:   Escape parser stops at the first alphabetic OSC payload character and leaks the suffix.
 //   cover:    normalizer_discards_osc_title_sequences
+//   verified-by: adversarial reviewer 2026-10-01; test passed on integrated F-002 branch.
 #[test]
 fn normalizer_discards_osc_title_sequences() {
     let actual =
@@ -22,7 +23,7 @@ fn normalizer_discards_osc_title_sequences() {
     assert_eq!(actual, "Common folders");
 }
 
-// GAP(G-F002-ADV-44) sev=high kind=behavior-divergence feature=F-002
+// GAP-RESOLVED(G-F002-ADV-44) sev=high kind=behavior-divergence feature=F-002
 //   what:     Runner reports observations_match even when a declared observation's expected content is absent.
 //   tui-ref:  migration/specs/F-002.md S1, S3, S5-S6
 //   oracle:   migration/oracle/traces/harness/initial_screen.toml
@@ -30,6 +31,7 @@ fn normalizer_discards_osc_title_sequences() {
 //   expected: Scenario comparison fails and identifies the mismatched observation.
 //   actual:   Runner ignores ExpectedObservation.expect and reports a match.
 //   cover:    expected_observation_content_is_compared
+//   verified-by: adversarial reviewer 2026-10-01; test passed on integrated F-002 branch.
 #[test]
 fn expected_observation_content_is_compared() {
     let source = format!(
@@ -43,7 +45,7 @@ fn expected_observation_content_is_compared() {
     assert!(!result.observations_match());
 }
 
-// GAP(G-F002-ADV-45) sev=medium kind=platform feature=F-002
+// GAP-RESOLVED(G-F002-ADV-45) sev=medium kind=platform feature=F-002
 //   what:     Trace platform profiles are not checked against the runner's selected platform.
 //   tui-ref:  migration/specs/F-002.md S1, S4, S11
 //   oracle:   F-002 platform profile contract
@@ -51,6 +53,7 @@ fn expected_observation_content_is_compared() {
 //   expected: Runner rejects the trace before target.start.
 //   actual:   Runner starts the target and executes it despite incompatible profile.
 //   cover:    incompatible_trace_platform_is_rejected_before_start
+//   verified-by: adversarial reviewer 2026-10-01; test passed on integrated F-002 branch.
 #[test]
 fn incompatible_trace_platform_is_rejected_before_start() {
     let source = INITIAL.replace(
@@ -65,7 +68,7 @@ fn incompatible_trace_platform_is_rejected_before_start() {
     assert_eq!(target.start_count(), 0);
 }
 
-// GAP(G-F002-ADV-46) sev=high kind=behavior-divergence feature=F-002
+// GAP-RESOLVED(G-F002-ADV-46) sev=high kind=behavior-divergence feature=F-002
 //   what:     Runner accepts a trace whose declared readiness kind differs from the target observation contract.
 //   tui-ref:  migration/specs/F-002.md S1, S3, S8
 //   oracle:   F-002 readiness contract
@@ -73,6 +76,7 @@ fn incompatible_trace_platform_is_rejected_before_start() {
 //   expected: The readiness observation itself is sampled and its condition gates event delivery.
 //   actual:   Runner delegates readiness without checking Readiness.observation and may send input early.
 //   cover:    readiness_observation_kind_is_enforced
+//   verified-by: adversarial reviewer 2026-10-01; test passed on integrated F-002 branch.
 #[test]
 fn readiness_observation_kind_is_enforced() {
     let source = INITIAL.replace(
