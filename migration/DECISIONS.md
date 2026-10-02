@@ -108,3 +108,12 @@ Recommendations from every advisor report are answered in this log. No terminal-
 - Advisor: platform-advisor and architecture-advisor F-150 round 1.
 - Adversarial: pending red workflow contract tests | Logic: not applicable (CI infrastructure row)
 - Affects rows: F-150,F-002.
+
+## D-0013 F-002 architecture redesign after repeated review cycles
+- Context: Three F-002 implementation/review cycles exposed unproven PTY cleanup through scripted targets, golden staging that serialized the input trace rather than observed output, and paste input downgraded to ordinary bytes. Architecture escalation report `migration/reports/F-002/architecture-redesign-1.md` recommends a RETHINK and restart.
+- Options considered: continue narrow patches on the current architecture; restart from scratch and discard all work; preserve fixes with focused evidence through `5ae8bf3` and restart only the remaining work around explicit lifecycle ownership, typed observation capture, and paste fidelity.
+- Decision: ADOPT the restart and preserve the verified implementation base through `5ae8bf3`. Update the F-002 spec with S12-S14; add real helper-child lifecycle tests against the same extracted PTY session used by the adapter before implementation; then implement lifecycle teardown, typed staged observation bundles, and bracketed-paste fidelity in serialized write sets. The reviewer owns GAP-RESOLVED transitions; G27/G29/G30 and LOG-05/06 remain open until independently verified. F-150 remains the native macOS/Windows and license-evidence barrier. Do not mark F-002 verified before those CI results.
+- Rationale: scripted `TraceTarget` lifecycle tests cannot establish OS process/PTY/reader cleanup; captured golden evidence must contain actual output; and Crossterm dispatch distinguishes `Event::Paste` from ordinary key input. A narrow patch that merely makes mocks green would not satisfy S6-S8/S10.
+- Advisor: architecture-advisor `reports/F-002/architecture-redesign-1.md` R1-R6; manager adopted R1-R4 and R6, with R5 as regression constraint.
+- Adversarial: G50 re-verification pending; G27/G29/G30 open | Logic: LOG-05/06 open; LOG-01..04 resolved on reviewer branch.
+- Affects rows: F-002,F-150.
