@@ -146,7 +146,7 @@ fn successful_baseline_build_drop_removes_real_worktree() {
     );
 }
 
-// GAP(G-F002-ADV-50) sev=medium kind=edge-case feature=F-002
+// GAP-RESOLVED(G-F002-ADV-50) sev=medium kind=edge-case feature=F-002
 //   what:     Baseline tag resolution uses an unqualified ref and can be shadowed by a conflicting refs/<tag>.
 //   tui-ref:  migration/specs/F-002.md S2, S7
 //   oracle:   tui-oracle-baseline exact peeled tag SHA
@@ -154,6 +154,7 @@ fn successful_baseline_build_drop_removes_real_worktree() {
 //   expected: Resolver reads refs/tags/oracle and accepts commit A independent of other refs.
 //   actual:   `rev-parse oracle^{commit}` resolves refs/oracle first and rejects the correct tag as wrong SHA.
 //   cover:    baseline_resolution_is_qualified_to_tag_namespace
+//   verified-by: adversarial reviewer 2026-10-01 against 5ae8bf3
 #[test]
 fn baseline_resolution_is_qualified_to_tag_namespace() {
     use ira_parity::baseline::BaselineResolver;
