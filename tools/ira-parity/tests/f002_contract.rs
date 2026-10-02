@@ -722,10 +722,14 @@ fn cleanup_error_is_reported_with_primary_error() {
 //   repro:    Run a fake target that never exits before the scenario deadline.
 //   expected: Child is terminated/reaped and PTY handles are closed within cleanup deadline.
 //   actual:   Blocked because tools/ira-parity/Cargo.toml and runner are absent.
-//   cover:    deadline_terminates_reaps_child_and_closes_pty
+//   cover:    RED HARNESS CONTRACT: real_pty_session_timeout_kills_and_reaps_helper_child;
+//             real_pty_session_closes_master_and_slave_before_fixture_removal
 #[test]
 #[ignore = "GAP G-F002-ADV-29"]
 fn deadline_terminates_reaps_child_and_closes_pty() {
+    // This remains an orchestration-only probe. ScriptedTarget reports these
+    // booleans itself and does not exercise the OS child or PTY; it cannot
+    // close G-F002-ADV-29. See migration/reports/F-002/lifecycle-red-1.md.
     let mut target = ScriptedTarget::hanging_child();
     let result = ScenarioRunner::new(RunOptions::with_deadlines(
         Duration::from_millis(25),
@@ -744,10 +748,14 @@ fn deadline_terminates_reaps_child_and_closes_pty() {
 //   repro:    Timeout a child while stdout/stderr readers hold fixture-associated handles.
 //   expected: Readers are joined and handles closed before fixture deletion.
 //   actual:   Blocked because tools/ira-parity/Cargo.toml and runner are absent.
-//   cover:    timeout_drains_and_joins_readers_before_fixture_removal
+//   cover:    RED HARNESS CONTRACT: real_pty_session_joins_reader_before_fixture_removal;
+//             real_pty_session_preserves_primary_and_cleanup_errors
 #[test]
 #[ignore = "GAP G-F002-ADV-30"]
 fn timeout_drains_and_joins_readers_before_fixture_removal() {
+    // This remains an orchestration-only probe. ScriptedTarget reports these
+    // booleans itself and does not hold real handles; it cannot close
+    // G-F002-ADV-30. See migration/reports/F-002/lifecycle-red-1.md.
     let mut target = ScriptedTarget::hanging_with_open_readers();
     let result = ScenarioRunner::new(RunOptions::with_deadlines(
         Duration::from_millis(25),
