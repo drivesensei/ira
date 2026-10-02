@@ -3,9 +3,15 @@
 //! so cargo reports exactly which observation-bundle surface is missing.
 use ira_parity::{
     golden::{GoldenMetadata, GoldenStore, ObservationBundle, ObservationRecord, ObservationValue},
+    runner::{Observation, RunCapture, RunOptions, ScenarioRunner, TraceTarget},
     trace::{parse_trace, ObservationKind, Trace},
 };
-use std::{fs, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 fn bundle(observations: Vec<ObservationRecord>) -> ObservationBundle {
     let trace: Trace = parse_trace(include_str!(
@@ -24,22 +30,93 @@ fn bundle(observations: Vec<ObservationRecord>) -> ObservationBundle {
     )
 }
 
+struct DivergentObservationTarget;
+
+impl TraceTarget for DivergentObservationTarget {
+    fn name(&self) -> &str {
+        "capture-probe"
+    }
+    fn supports_observation(&self, _: &ObservationKind) -> bool {
+        true
+    }
+    fn start(
+        &mut self,
+        _: &Path,
+        _: (u16, u16),
+        _: &BTreeMap<String, String>,
+    ) -> Result<(), ira_parity::runner::RunError> {
+        Ok(())
+    }
+    fn wait_ready(
+        &mut self,
+        _: &ira_parity::trace::Readiness,
+        _: Instant,
+    ) -> Result<(), ira_parity::runner::RunError> {
+        Ok(())
+    }
+    fn apply(
+        &mut self,
+        _: &ira_parity::trace::InputEvent,
+    ) -> Result<(), ira_parity::runner::RunError> {
+        Ok(())
+    }
+    fn observe(
+        &mut self,
+        _: &ObservationKind,
+    ) -> Result<Observation, ira_parity::runner::RunError> {
+        let mut table = toml::map::Map::new();
+        table.insert(
+            "status".into(),
+            toml::Value::String("observed-only output".into()),
+        );
+        Ok(Observation {
+            value: Some(toml::Value::Table(table)),
+            ..Observation::default()
+        })
+    }
+    fn shutdown(&mut self) -> Result<i32, ira_parity::runner::RunError> {
+        Ok(0)
+    }
+}
+
 #[test]
 fn s13_capture_uses_actual_observation_not_trace_expectation() {
-    let observed = ObservationRecord::new(
-        ObservationKind::TerminalScreen,
-        None,
-        ObservationValue::Text("observed screen output".into()),
-    );
-    let bundle = bundle(vec![observed]);
+    let trace = parse_trace(
+        r#"
+schema_version = 1
+scenario_id = "capture.observed-output"
+platforms = ["linux"]
+fixture = { kind = "empty_directory" }
+events = []
+[terminal]
+columns = 80
+rows = 24
+[environment]
+[readiness]
+observation = { kind = "domain_snapshot", name = "capture_probe" }
+condition = { contains = ["observed-only"] }
+deadline_ms = 1000
+[[observations]]
+kind = "domain_snapshot"
+name = "capture_probe"
+expect = { status = "trace expectation" }
+"#,
+    )
+    .unwrap();
+    let capture: RunCapture = ScenarioRunner::new(RunOptions::for_platform("linux"))
+        .run_capture_with_target(&trace, &mut DivergentObservationTarget)
+        .unwrap();
     let stage = tempfile::tempdir().unwrap();
     GoldenStore::new(stage.path())
-        .capture_bundle_to_staging(stage.path(), &bundle)
+        .capture_run_to_staging(stage.path(), &capture)
         .unwrap();
     let loaded = ObservationBundle::load_from_staging(stage.path()).unwrap();
     assert_eq!(
         loaded.observations()[0].value(),
-        &ObservationValue::Text("observed screen output".into())
+        &ObservationValue::Structured(toml::Value::Table(toml::map::Map::from_iter([(
+            "status".into(),
+            toml::Value::String("observed-only output".into()),
+        )])))
     );
 }
 
@@ -81,6 +158,8 @@ fn s13_paths_round_trip_without_unicode_normalization_or_loss() {
         .map(|path| {
             ObservationRecord::new(
                 ObservationKind::Filesystem {
+                    // Deliberately lossy for the raw Unix name: the record's
+                    // PathBuf must remain the authoritative serialized path.
                     relative_path: path.to_string_lossy().into_owned(),
                 },
                 Some(path.clone()),
@@ -168,9 +247,9 @@ fn s13_bundle_order_is_stable_and_manifest_is_published_last() {
 //   what:     Staged golden output must contain the target's observed value, not only the trace input/expectation.
 //   tui-ref:  migration/specs/F-002.md S6,S13
 //   oracle:   Observe(kind) value is the capture evidence; trace expectations are separate inputs.
-//   repro:    Capture a bundle with "observed screen output" and reload its observation record.
-//   expected: Loaded bundle has that exact observed output and does not substitute the trace assertion.
-//   actual:   Golden capture API has no observation bundle or capture_bundle_to_staging method.
+//   repro:    Run a custom TraceTarget returning status="observed-only output" against a trace expecting status="trace expectation", then stage the run capture.
+//   expected: Loaded bundle contains the target's actual observation despite the expectation mismatch.
+//   actual:   No RunCapture/run_capture_with_target/capture_run_to_staging seam exists; the current run result drops observations.
 //   cover:    s13_capture_uses_actual_observation_not_trace_expectation
 // GAP(G-F002-ADV-52) sev=high kind=data-compat feature=F-002
 //   what:     Byte observations require lossless tagged encoding, including NUL and invalid UTF-8 bytes.
@@ -184,9 +263,9 @@ fn s13_bundle_order_is_stable_and_manifest_is_published_last() {
 //   what:     Captured paths need reversible identity; lossy strings or normalization merge distinct paths.
 //   tui-ref:  migration/specs/F-002.md S5,S13; AGENTS.md invariant 5
 //   oracle:   Paths retain platform OsString identity; NFC/NFD are distinct on Linux and raw Unix bytes may be invalid UTF-8.
-//   repro:    Round-trip NFC, NFD, and (on Unix) an OsString containing byte ff.
-//   expected: Loaded relative paths preserve identity and remain deterministically ordered.
-//   actual:   Current ObservationKind path is String and no reversible path codec/bundle loader exists.
+//   repro:    Record NFC, NFD, and (on Unix) OsString byte ff while the kind's String path uses to_string_lossy; round-trip the bundle.
+//   expected: Loaded relative_path preserves PathBuf identity; the lossy kind string never becomes serialized path authority.
+//   actual:   Current ObservationKind relative_path is String and no reversible record path codec/bundle loader exists.
 //   cover:    s13_paths_round_trip_without_unicode_normalization_or_loss
 // GAP(G-F002-ADV-54) sev=medium kind=edge-case feature=F-002
 //   what:     Observation order must be stable and a failed/incomplete write must not publish a complete manifest.
