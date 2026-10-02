@@ -28,6 +28,22 @@ pub struct ChildEnvironment {
     values: BTreeMap<String, String>,
     root: PathBuf,
 }
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        use std::path::Component;
+        match component {
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+            Component::RootDir => out.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(part) => out.push(part),
+        }
+    }
+    out
+}
 impl ChildEnvironment {
     pub fn build<I, K, V>(
         policy: &EnvironmentPolicy,
@@ -121,15 +137,18 @@ impl ChildEnvironment {
                     root.join(path)
                 };
                 let canonical_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
-                let candidate = std::fs::canonicalize(&resolved).unwrap_or(resolved.clone());
+                let candidate = std::fs::canonicalize(&resolved)
+                    .unwrap_or_else(|_| normalize_lexically(&resolved));
                 if !candidate.starts_with(&canonical_root) {
                     return Err(EnvironmentError(key.into()));
                 }
                 values.insert(key.into(), candidate.to_string_lossy().to_string());
-            } else if !key.starts_with("IRA_")
-                && !["TMUX", "TERM_PROGRAM", "SSH_TTY"].contains(&key)
-            {
+            } else if strict_roots && key == "IRA_IMAGES" {
                 values.insert(key.into(), value.as_ref().into());
+            } else if strict_roots {
+                return Err(EnvironmentError(format!(
+                    "unsupported environment override {key}"
+                )));
             }
         }
         std::fs::create_dir_all(&root).map_err(|e| EnvironmentError(e.to_string()))?;

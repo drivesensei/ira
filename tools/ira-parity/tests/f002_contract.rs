@@ -269,8 +269,10 @@ fn baseline_never_selects_current_head_binary() {
 #[test]
 #[ignore = "GAP G-F002-ADV-09"]
 fn baseline_builds_once_for_job() {
-    let resolver =
-        BaselineResolver::new(Path::new(env!("CARGO_MANIFEST_DIR"))).with_expected_sha(ORACLE_SHA);
+    let cache = tempdir();
+    let resolver = BaselineResolver::new(Path::new(env!("CARGO_MANIFEST_DIR")))
+        .with_expected_sha(ORACLE_SHA)
+        .with_cache_dir(cache.path());
     let first = resolver.resolve_and_build().unwrap();
     let second = resolver.resolve_and_build().unwrap();
     assert_eq!(first.build_count(), 1);

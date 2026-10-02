@@ -100,6 +100,21 @@ impl TraceTarget for ScriptedTarget {
         }
         Ok(())
     }
+    fn wait_for_observation(&mut self, deadline: Instant) -> Result<(), RunError> {
+        if self.mode != "hang" && self.mode != "readers" {
+            return Ok(());
+        }
+        let (_keep_open, rx) = std::sync::mpsc::channel::<()>();
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(RunError {
+                message: "scenario deadline exceeded".into(),
+                timeout: true,
+                readiness: false,
+                delivered: self.events.len(),
+            }),
+            _ => Ok(()),
+        }
+    }
     fn apply(&mut self, e: &InputEvent) -> Result<(), RunError> {
         self.events.push(e.clone());
         Ok(())
