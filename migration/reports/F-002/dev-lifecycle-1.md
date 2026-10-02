@@ -1,34 +1,27 @@
 # F-002 lifecycle implementation report
 
-## Status and scope
-
-STATUS: DONE for the serialized S12 lifecycle slice; not a claim that F-002 is complete.
-ROW(S): F-002
-CHANGED: `tools/ira-parity/src/lifecycle.rs`, `src/lib.rs`, `src/runner.rs`, lifecycle and contract tests, and runner-include test wrappers.
-COMMITS: recorded in the commit history for this report.
-
-The adapter now uses `PtySession` to own the fixture, PTY master/slave, writer, child, and reader thread. The same session creates and drives the real TUI child in `run_oracle_with_baseline`; the former inline `PtyChildLifecycle` was removed. Errors after session startup go through bounded shutdown and retain the primary operation error alongside cleanup failures.
-
-Teardown drops writer/slave ownership, polls the child, terminates a still-live child, polls/reaps it under a deadline while continuing to receive output, closes the PTY endpoints, joins the reader under its own deadline, then removes the fixture. If child or reader cleanup fails, the session retains those handles and fixture; if the owning session is dropped after a failed cleanup attempt, remaining resources are held in a process-lifetime retention list rather than dropping a live `JoinHandle`. An injected fixture-removal failure relinquishes the tempdir without deleting the directory; its test removes the preserved path after asserting retention.
+STATUS: DONE for the assigned S12 lifecycle follow-up; reviewer verification remains pending.
+ROW(S): F-002 S12; ADV-29/30, ADV-59/60, LOG-07..11 marked GAP-FIXED.
+CHANGED: `tools/ira-parity` PTY session teardown, real runner error composition, lifecycle tests.
+COMMITS: follow-up commit recorded in Git history; prior lifecycle implementation `d945cd9`.
+TESTS: all applicable lifecycle and F-002 Linux suites listed below pass.
+GAPS: S13/S14 markers remain open and unchanged; ADV-40 remains open for native macOS/Windows evidence.
+FINDINGS: pinned Unix `Child::kill()` blocks for a 200ms grace. The adapter instead uses `clone_killer()` for immediate HUP, polls the owned child, escalates to SIGKILL halfway through one shutdown-entry child deadline, and keeps polling/output drain within that deadline. Writer/slave are dropped before child poll/signal. Reader messages are drained through `Closed` even after its thread signals completion. The runner mismatch test confirms the primary mismatch and fixture-cleanup failure are both reported.
+RISKS: Native Linux execution only. macOS and Windows clone-killer, PTY reader unblock, and handle-close ordering remain unverified. A failed reap/join retains owned process/thread/fixture state; no live reader JoinHandle is detached.
+NEXT ACTION: adversarial and logic reviewers verify fixed markers; manager schedules native macOS/Windows runs before closing platform-specific evidence.
 
 ## Evidence
 
-- Red baseline: `f002_lifecycle_session --no-run` failed because `ira_parity::lifecycle` did not exist; recorded in `migration/reports/F-002/lifecycle-red-1.md`.
-- `cargo test --manifest-path tools/ira-parity/Cargo.toml --locked --test f002_lifecycle_session -- --test-threads=1`: 6 passed. Covers real child success, bounded termination, output drain while child exits, injected reader failure, primary/cleanup composition, handle ordering, and fixture retention/removal.
-- `cargo test ... --test f002_lifecycle_child -- --test-threads=1`: 4 passed against a real helper child and PTY.
-- `cargo test ... --test f002_contract -- --test-threads=1`: 29 passed, 11 ignored with existing GAP reasons. Includes both lifecycle orchestration probes and the live Linux baseline replay.
-- `cargo test ... --test f002_adversarial -- --test-threads=1`: 6 passed.
-- `cargo test ... --test f002_contract tagged_oracle_trace_replays_on_linux_macos_windows -- --exact --test-threads=1`: passed on Linux against the frozen oracle tag.
+- Prior red baseline: `f002_lifecycle_session --no-run` failed because the extracted lifecycle API was absent; `migration/reports/F-002/lifecycle-red-1.md` records the red result.
+- Reviewer red results before this follow-up: `adv-lifecycle-review-1.md` records 5 passed / 4 failed in the lifecycle adversarial suite; `logic-lifecycle-review-1.md` records the child-drain/input-order failures and a 210ms bounded-kill probe against a 150ms ceiling. Those exact test names now pass below.
+- `cargo test --manifest-path tools/ira-parity/Cargo.toml --locked --test f002_lifecycle_logic -- --test-threads=1`: 7 passed, including complete 1 MiB drain, input-close ordering, baseline-backed mismatch plus cleanup injection, and 20ms + 20ms bounded-kill probe (<150ms).
+- `cargo test --manifest-path tools/ira-parity/Cargo.toml --locked --test f002_lifecycle_adversarial -- --test-threads=1`: 9 passed, including queued output/failure drain, reader timeout ownership, repeated cleanup, fixture retention, and bounded termination.
+- `cargo test --manifest-path tools/ira-parity/Cargo.toml --locked --test f002_lifecycle_session -- --test-threads=1`: 6 passed.
+- `cargo test --manifest-path tools/ira-parity/Cargo.toml --locked --test f002_lifecycle_child -- --test-threads=1`: 4 passed.
+- `cargo test --manifest-path tools/ira-parity/Cargo.toml --locked --test f002_contract -- --test-threads=1`: 29 passed, 11 pre-existing ignored with GAP reasons.
+- `cargo test --manifest-path tools/ira-parity/Cargo.toml --locked --test f002_adversarial -- --test-threads=1`: 6 passed.
 - `cargo fmt --manifest-path tools/ira-parity/Cargo.toml -- --check`: passed.
 - `cargo clippy --manifest-path tools/ira-parity/Cargo.toml --locked --lib -- -D warnings`: passed.
-- `cargo clippy --all-targets` / full integration-test compilation remains blocked by the intentionally red S13 `f002_capture_bundle_contract` compile contract (missing `RunCapture` and observation-bundle APIs). S14 `f002_paste_protocol` remains red as expected: actual bytes are plain `pasted`, expected bytes are bracketed-paste framed.
-
-## GAPs, findings, and risks
-
-G-F002-ADV-29 and G-F002-ADV-30 are marked `GAP-FIXED` pending adversarial verification; their original scripted probes remain supplemental, and the new helper-child tests exercise the extracted session. No S13/S14 behavior was implemented. G-F002-ADV-27 concerns baseline worktree cleanup, not this PTY lifecycle slice, and remains open.
-
-The pinned Unix implementation maps PTY `EIO` to EOF; Linux real-child tests confirm closing the owned master lets the cloned reader finish and join. macOS was not available for native execution. Windows ConPTY uses a shared `Arc<Mutex<Inner>>` and cloned pipe handles; its close/output ordering is not claimed verified without native Windows execution. No native macOS/Windows lifecycle result is claimed.
-
-RISKS: `portable-pty::Child::wait` is intentionally not used because it can block indefinitely; kill followed by `try_wait` polling is bounded. A cleanup deadline that expires retains the session resources, so the caller should treat that error as fatal cleanup failure and preserve the owning session while possible.
-
-NEXT ACTION: adversarial and logic reviewers verify GAP-FIXED lifecycle markers and platform review schedules native macOS/Windows confirmation; manager then assigns S13 separately.
+- Scoped clippy with `-D warnings` for `f002_lifecycle_logic`, `f002_lifecycle_adversarial`, `f002_lifecycle_session`, `f002_lifecycle_child`, and `f002_contract`: passed.
+- `python3 scripts/scope_check.py custom --allow 'tools/ira-parity/**' --allow 'migration/reports/F-002/dev-lifecycle-1.md'`: passed before report refresh; rerun on final diff.
+- Intentional later-slice limitations: full `--all-targets` remains unavailable while the S13 capture-bundle contract is compile-red; S14 paste framing is not part of this task and remains open.

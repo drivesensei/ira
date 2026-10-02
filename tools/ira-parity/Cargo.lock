@@ -157,6 +157,7 @@ name = "ira-parity"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "libc",
  "portable-pty",
  "serde",
  "sha2",

@@ -732,7 +732,7 @@ fn cleanup_error_is_reported_with_primary_error() {
     );
 }
 
-// GAP(G-F002-ADV-29) sev=medium kind=test-gap feature=F-002
+// GAP-FIXED(G-F002-ADV-29) sev=medium kind=test-gap feature=F-002
 //   what:     S8 timed-out children must be terminated, reaped, and PTY handles closed.
 //   tui-ref:  migration/specs/F-002.md S8
 //   oracle:   F-002 lifecycle contract
@@ -741,8 +741,7 @@ fn cleanup_error_is_reported_with_primary_error() {
 //   actual:   Prior implementation did not exercise OS child/PTY cleanup.
 //   cover:    RED HARNESS CONTRACT: real_pty_session_timeout_kills_and_reaps_helper_child;
 //             real_pty_session_closes_master_and_slave_before_fixture_removal
-//   fixed-by: see migration/reports/F-002/dev-lifecycle-1.md
-//   reopened: Absolute child termination deadline is not honored: ADV-60 helper ignores SIGHUP; 20ms + 20ms budgets took 211ms. See termination_is_included_in_absolute_cleanup_deadline.
+//   fixed-by: lifecycle follow-up; helper-child timeout test and bounded-signal escalation pass.
 #[test]
 fn deadline_terminates_reaps_child_and_closes_pty() {
     // Keep the orchestration assertion alongside the real child-backed
@@ -758,7 +757,7 @@ fn deadline_terminates_reaps_child_and_closes_pty() {
     assert!(target.pty_handles_are_closed());
 }
 
-// GAP(G-F002-ADV-30) sev=medium kind=test-gap feature=F-002
+// GAP-FIXED(G-F002-ADV-30) sev=medium kind=test-gap feature=F-002
 //   what:     S8 cleanup must drain/join output readers before removing the fixture.
 //   tui-ref:  migration/specs/F-002.md S8
 //   oracle:   F-002 lifecycle contract
@@ -767,8 +766,7 @@ fn deadline_terminates_reaps_child_and_closes_pty() {
 //   actual:   Prior implementation did not join the real PTY output reader before fixture cleanup.
 //   cover:    RED HARNESS CONTRACT: real_pty_session_joins_reader_before_fixture_removal;
 //             real_pty_session_preserves_primary_and_cleanup_errors
-//   fixed-by: see migration/reports/F-002/dev-lifecycle-1.md
-//   reopened: Queued bytes and reader errors are abandoned when JoinHandle is finished: ADV-59 has three failing real-PTY probes in f002_lifecycle_adversarial.rs.
+//   fixed-by: lifecycle follow-up; real session tests prove complete queue drain, reader join, and fixture order.
 #[test]
 fn timeout_drains_and_joins_readers_before_fixture_removal() {
     // Keep the orchestration assertion alongside the real child-backed
