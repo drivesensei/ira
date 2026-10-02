@@ -201,7 +201,7 @@ impl BaselineResolver {
                 self.tag
             )));
         }
-        let refspec = format!("{}^{{commit}}", self.tag);
+        let refspec = format!("{tag_ref}^{{commit}}");
         let resolve_ref = || {
             Command::new("git")
                 .arg("-C")

@@ -141,7 +141,7 @@ fn successful_baseline_build_drop_removes_real_worktree() {
     );
 }
 
-// GAP(G-F002-ADV-50) sev=medium kind=edge-case feature=F-002
+// GAP-FIXED(G-F002-ADV-50) sev=medium kind=edge-case feature=F-002
 //   what:     Baseline tag resolution uses an unqualified ref and can be shadowed by a conflicting refs/<tag>.
 //   tui-ref:  migration/specs/F-002.md S2, S7
 //   oracle:   tui-oracle-baseline exact peeled tag SHA
