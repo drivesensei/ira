@@ -17,7 +17,8 @@ const INITIAL: &str = include_str!("../../../migration/oracle/traces/harness/ini
 //   cover:    normalizer_discards_osc_title_sequences
 #[test]
 fn normalizer_discards_osc_title_sequences() {
-    let actual = ira_parity::normalize::normalize_screen("\x1b]0;host-title\x07Common folders", &[]);
+    let actual =
+        ira_parity::normalize::normalize_screen("\x1b]0;host-title\x07Common folders", &[]);
     assert_eq!(actual, "Common folders");
 }
 
@@ -31,9 +32,8 @@ fn normalizer_discards_osc_title_sequences() {
 //   cover:    expected_observation_content_is_compared
 #[test]
 fn expected_observation_content_is_compared() {
-    let source = INITIAL.replace(
-        "[[observations]]\nkind = \"terminal_screen\"\nexpect = { contains = [\"Common folders\"] }",
-        "[[observations]]\nkind = \"terminal_screen\"\nexpect = { contains = [\"must-not-match\"] }",
+    let source = format!(
+        "{INITIAL}\n[[observations]]\nkind = \"terminal_screen\"\nexpect = {{ contains = [\"must-not-match\"] }}\n"
     );
     let trace = parse_trace(&source).unwrap();
     let mut target = ScriptedTarget::recording();
@@ -53,11 +53,14 @@ fn expected_observation_content_is_compared() {
 //   cover:    incompatible_trace_platform_is_rejected_before_start
 #[test]
 fn incompatible_trace_platform_is_rejected_before_start() {
-    let source = INITIAL.replace("platforms = [\"linux\", \"macos\", \"windows-msvc\"]", "platforms = [\"macos\"]");
+    let source = INITIAL.replace(
+        "platforms = [\"linux\", \"macos\", \"windows-msvc\"]",
+        "platforms = [\"macos\"]",
+    );
     let trace = parse_trace(&source).unwrap();
     let mut target = ScriptedTarget::counting_starts();
-    let result = ScenarioRunner::new(RunOptions::for_platform("linux"))
-        .run_with_target(&trace, &mut target);
+    let result =
+        ScenarioRunner::new(RunOptions::for_platform("linux")).run_with_target(&trace, &mut target);
     assert!(result.is_err(), "incompatible platform unexpectedly ran");
     assert_eq!(target.start_count(), 0);
 }
@@ -72,14 +75,25 @@ fn incompatible_trace_platform_is_rejected_before_start() {
 //   cover:    readiness_observation_kind_is_enforced
 #[test]
 fn readiness_observation_kind_is_enforced() {
-    let source = INITIAL.replace("observation = { kind = \"terminal_screen\" }", "observation = { kind = \"filesystem\", relative_path = \".\" }");
+    let source = INITIAL.replace(
+        "observation = { kind = \"terminal_screen\" }",
+        "observation = { kind = \"filesystem\", relative_path = \".\" }",
+    );
     let trace = parse_trace(&source).unwrap();
     let mut target = ScriptedTarget::recording();
     let result = ScenarioRunner::new(RunOptions::default())
         .run_with_target(&trace, &mut target)
         .unwrap();
-    assert!(target.observed_kinds().contains(&ObservationKind::TerminalScreen), "expected trace to observe terminal screen");
-    assert!(!result.readiness_satisfied_before_first_input(), "filesystem readiness was never verified");
+    assert!(
+        target
+            .observed_kinds()
+            .contains(&ObservationKind::TerminalScreen),
+        "expected trace to observe terminal screen"
+    );
+    assert!(
+        !result.readiness_satisfied_before_first_input(),
+        "filesystem readiness was never verified"
+    );
 }
 
 #[test]
@@ -91,21 +105,38 @@ fn successful_baseline_build_drop_removes_real_worktree() {
         .with_expected_sha(ORACLE_SHA)
         .with_cache_dir(cache.path())
         .with_temp_root(temp.path());
-    let baseline = resolver.resolve_and_build().expect("real baseline build succeeds");
+    let baseline = resolver
+        .resolve_and_build()
+        .expect("real baseline build succeeds");
     assert_eq!(baseline.commit_sha(), ORACLE_SHA);
     let first_build_count = baseline.build_count();
     assert!(baseline.executable_path().is_file());
     assert!(baseline.worktree_is_detached_and_clean());
     let worktree = baseline.worktree_path().to_path_buf();
     drop(baseline);
-    assert!(!worktree.exists(), "successful build leaked worktree {worktree:?}");
+    assert!(
+        !worktree.exists(),
+        "successful build leaked worktree {worktree:?}"
+    );
 
-    let cached = resolver.resolve_and_build().expect("verified cache hit succeeds");
+    let cached = resolver
+        .resolve_and_build()
+        .expect("verified cache hit succeeds");
     assert_eq!(cached.commit_sha(), ORACLE_SHA);
-    assert_eq!(cached.build_count(), first_build_count, "cache hit unexpectedly rebuilt oracle");
-    assert!(cached.executable_path().is_file(), "cached executable disappeared with worktree");
+    assert_eq!(
+        cached.build_count(),
+        first_build_count,
+        "cache hit unexpectedly rebuilt oracle"
+    );
+    assert!(
+        cached.executable_path().is_file(),
+        "cached executable disappeared with worktree"
+    );
     assert!(cached.worktree_is_detached_and_clean());
     let cached_worktree = cached.worktree_path().to_path_buf();
     drop(cached);
-    assert!(!cached_worktree.exists(), "cache-hit path leaked worktree {cached_worktree:?}");
+    assert!(
+        !cached_worktree.exists(),
+        "cache-hit path leaked worktree {cached_worktree:?}"
+    );
 }

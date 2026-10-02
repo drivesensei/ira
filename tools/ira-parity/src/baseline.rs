@@ -189,17 +189,60 @@ impl BaselineResolver {
         self.last.borrow().clone().unwrap_or_default()
     }
     pub fn resolve(&self) -> Result<(), BaselineError> {
-        let refspec = format!("{}^{{commit}}", self.tag);
-        let o = Command::new("git")
-            .arg("-C")
-            .arg(&self.repo)
-            .args(["rev-parse", "--verify", &refspec])
+        let tag_ref = format!("refs/tags/{}", self.tag);
+        let valid = Command::new("git")
+            .arg("check-ref-format")
+            .arg(&tag_ref)
             .output()
-            .map_err(|e| BaselineError(e.to_string()))?;
-        if !o.status.success() {
-            return Err(BaselineError(format!("tag {} not found", self.tag)));
+            .map_err(|e| BaselineError(format!("git ref validation failed: {e}")))?;
+        if !valid.status.success() {
+            return Err(BaselineError(format!(
+                "invalid baseline tag name {}",
+                self.tag
+            )));
         }
-        let got = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        let refspec = format!("{}^{{commit}}", self.tag);
+        let resolve_ref = || {
+            Command::new("git")
+                .arg("-C")
+                .arg(&self.repo)
+                .args(["rev-parse", "--verify", &refspec])
+                .output()
+        };
+        let mut output = resolve_ref().map_err(|e| BaselineError(e.to_string()))?;
+        if !output.status.success() {
+            let source = Command::new("git")
+                .arg("-C")
+                .arg(&self.repo)
+                .args(["remote", "get-url", "origin"])
+                .output()
+                .map_err(|e| BaselineError(format!("tag {} not found: {e}", self.tag)))?;
+            if !source.status.success() {
+                return Err(BaselineError(format!("tag {} not found", self.tag)));
+            }
+            let fetch = Command::new("git")
+                .arg("-C")
+                .arg(&self.repo)
+                .args(["fetch", "--no-tags", "origin"])
+                .arg(format!("+{tag_ref}:{tag_ref}"))
+                .output()
+                .map_err(|e| BaselineError(format!("baseline tag fetch failed: {e}")))?;
+            if !fetch.status.success() {
+                return Err(BaselineError(format!(
+                    "tag {} not found; fetch failed: {}",
+                    self.tag,
+                    String::from_utf8_lossy(&fetch.stderr).trim()
+                )));
+            }
+            output = resolve_ref().map_err(|e| BaselineError(e.to_string()))?;
+            if !output.status.success() {
+                return Err(BaselineError(format!(
+                    "tag {} not found after fetch",
+                    self.tag
+                )));
+            }
+        }
+        let got = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if got != self.sha {
             return Err(BaselineError(format!(
                 "SHA mismatch: expected {}, found {got}",

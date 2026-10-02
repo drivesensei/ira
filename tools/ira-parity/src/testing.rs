@@ -6,6 +6,8 @@ use std::{path::Path, time::Instant};
 pub struct ScriptedTarget {
     events: Vec<InputEvent>,
     observed: Vec<ObservationKind>,
+    values: Vec<(ObservationKind, Observation)>,
+    filesystem_bytes: Option<Vec<u8>>,
     mode: &'static str,
     starts: usize,
     closed: bool,
@@ -19,10 +21,17 @@ impl ScriptedTarget {
     pub fn recording() -> Self {
         Self::new("record")
     }
+    pub fn recording_filesystem(bytes: Vec<u8>) -> Self {
+        let mut target = Self::recording();
+        target.filesystem_bytes = Some(bytes);
+        target
+    }
     fn new(m: &'static str) -> Self {
         Self {
             events: vec![],
             observed: vec![],
+            values: vec![],
+            filesystem_bytes: None,
             mode: m,
             starts: 0,
             closed: false,
@@ -54,6 +63,9 @@ impl ScriptedTarget {
     pub fn observed_kinds(&self) -> &[ObservationKind] {
         &self.observed
     }
+    pub fn observations(&self) -> &[(ObservationKind, Observation)] {
+        &self.values
+    }
     pub fn start_count(&self) -> usize {
         self.starts
     }
@@ -79,6 +91,9 @@ impl ScriptedTarget {
 impl TraceTarget for ScriptedTarget {
     fn name(&self) -> &str {
         "scripted"
+    }
+    fn supports_observation(&self, _kind: &ObservationKind) -> bool {
+        true
     }
     fn start(
         &mut self,
@@ -121,8 +136,9 @@ impl TraceTarget for ScriptedTarget {
     }
     fn observe(&mut self, k: &ObservationKind) -> Result<Observation, RunError> {
         self.observed.push(k.clone());
-        Ok(Observation {
-            screen: Some("Common folders\nActions".into()),
+        let observation = Observation {
+            screen: matches!(k, ObservationKind::TerminalScreen)
+                .then(|| "Common folders\nActions".to_string()),
             stdout: if self.mode == "streams" {
                 Some("stdout-marker".into())
             } else {
@@ -133,8 +149,16 @@ impl TraceTarget for ScriptedTarget {
             } else {
                 None
             },
+            bytes: matches!(
+                k,
+                ObservationKind::Filesystem { .. } | ObservationKind::PersistedBytes { .. }
+            )
+            .then(|| self.filesystem_bytes.clone())
+            .flatten(),
             ..Observation::default()
-        })
+        };
+        self.values.push((k.clone(), observation.clone()));
+        Ok(observation)
     }
     fn shutdown(&mut self) -> Result<i32, RunError> {
         self.closed = true;
