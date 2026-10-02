@@ -6,11 +6,11 @@ use ira_parity::{
     normalize::normalize_screen,
     runner::{RunOptions, ScenarioRunner},
     testing::ScriptedTarget,
-    trace::{parse_trace, ObservationKind},
+    trace::{parse_trace, InputEvent, ObservationKind},
 };
 use std::process::Command;
 
-// GAP(G-F002-LOG-01) sev=high kind=behavior-divergence feature=F-002
+// GAP-RESOLVED(G-F002-LOG-01) sev=high kind=behavior-divergence feature=F-002
 //   what:     The oracle runner treats expected non-screen observations as matched without comparing them.
 //   tui-ref:  migration/specs/F-002.md S3, S5, S6; src/main.rs:65-68 (process event effects)
 //   oracle:   migration/oracle/traces/harness/initial_screen.toml (trace schema/contract)
@@ -18,6 +18,7 @@ use std::process::Command;
 //   expected: The declared process assertion mismatches (or fails with a diagnostic naming process).
 //   actual:   Runner reports observations_match=true because expected_observations_match only inspects screen text and dimensions.
 //   cover:    process_observation_assertions_are_compared
+//   verified-by: logic-reviewer 2026-10-01; 62db2ce; process-observation probe passes and mismatch diagnostic is emitted.
 #[test]
 fn process_observation_assertions_are_compared() {
     let source = include_str!("../../../migration/oracle/traces/harness/initial_screen.toml")
@@ -37,7 +38,7 @@ fn process_observation_assertions_are_compared() {
     );
 }
 
-// GAP(G-F002-LOG-02) sev=medium kind=behavior-divergence feature=F-002
+// GAP-RESOLVED(G-F002-LOG-02) sev=medium kind=behavior-divergence feature=F-002
 //   what:     CSI sequences terminated by nonalphabetic finals erase the first character of following UI text.
 //   tui-ref:  migration/specs/F-002.md S5; src/tui.rs:62-67 (terminal control sequences)
 //   oracle:   ANSI/VT screen stream emitted by the frozen TUI
@@ -45,12 +46,13 @@ fn process_observation_assertions_are_compared() {
 //   expected: The delete-key CSI sequence is removed and the full message remains.
 //   actual:   The normalizer treats '~' as payload until 'M', dropping that first message character.
 //   cover:    normalizer_preserves_text_after_csi_tilde_final
+//   verified-by: logic-reviewer 2026-10-01; 62db2ce; CSI tilde-final probe passes.
 #[test]
 fn normalizer_preserves_text_after_csi_tilde_final() {
     assert_eq!(normalize_screen("\x1b[3~Message", &[]), "Message");
 }
 
-// GAP(G-F002-LOG-03) sev=high kind=security feature=F-002
+// GAP-RESOLVED(G-F002-LOG-03) sev=high kind=security feature=F-002
 //   what:     A protected-root override through a symlink can create a directory outside the scenario root before rejection.
 //   tui-ref:  migration/specs/F-002.md S9; environment/config isolation contract
 //   oracle:   isolated scenario root policy in F-002 S9
@@ -58,6 +60,7 @@ fn normalizer_preserves_text_after_csi_tilde_final() {
 //   expected: Reject before following the symlink or creating anything outside the run root.
 //   actual:   Canonicalization falls back to lexical containment for the missing leaf; create_dir_all follows the symlink, then later containment validation rejects.
 //   cover:    symlink_parent_escape_has_no_external_side_effect
+//   verified-by: logic-reviewer 2026-10-01; 62db2ce; symlink-parent escape rejected without creating the outside leaf.
 #[cfg(unix)]
 #[test]
 fn symlink_parent_escape_has_no_external_side_effect() {
@@ -80,7 +83,7 @@ fn symlink_parent_escape_has_no_external_side_effect() {
     );
 }
 
-// GAP(G-F002-LOG-04) sev=high kind=behavior-divergence feature=F-002
+// GAP-RESOLVED(G-F002-LOG-04) sev=high kind=behavior-divergence feature=F-002
 //   what:     Baseline resolution fails immediately when the pinned tag is absent locally instead of fetching it.
 //   tui-ref:  migration/specs/F-002.md S2, S7 (baseline acquisition from immutable tag)
 //   oracle:   tui-oracle-baseline tag peeled to 1cad4ce43cc72d52d4cc4eef920e0da22cb69568
@@ -88,6 +91,7 @@ fn symlink_parent_escape_has_no_external_side_effect() {
 //   expected: Resolver fetches the baseline tag, verifies its peeled SHA, and proceeds.
 //   actual:   resolve() returns "tag ... not found" without attempting fetch.
 //   cover:    baseline_resolution_fetches_missing_pinned_tag
+//   verified-by: logic-reviewer 2026-10-01; 62db2ce; missing-tag fetch probe passes and verifies the peeled SHA.
 #[test]
 fn baseline_resolution_fetches_missing_pinned_tag() {
     let temp = tempfile::tempdir().unwrap();
@@ -140,7 +144,11 @@ fn baseline_resolution_fetches_missing_pinned_tag() {
         .arg(&clone)
         .output()
         .unwrap();
-    assert!(clone_result.status.success());
+    assert!(
+        clone_result.status.success(),
+        "git clone --no-tags failed: {}",
+        String::from_utf8_lossy(&clone_result.stderr)
+    );
     assert!(!clone.join(".git/refs/tags/tui-oracle-baseline").exists());
 
     let resolved = BaselineResolver::new(&clone)
@@ -149,5 +157,54 @@ fn baseline_resolution_fetches_missing_pinned_tag() {
     assert!(
         resolved.is_ok(),
         "missing pinned tag should be fetched: {resolved:?}"
+    );
+}
+
+#[test]
+fn repeated_expected_observations_are_all_checked() {
+    let source = format!(
+        "{}\n[[observations]]\nkind = \"terminal_screen\"\nexpect = {{ contains = [\"Common folders\"] }}\n\
+         [[observations]]\nkind = \"terminal_screen\"\nexpect = {{ contains = [\"not present\"] }}\n",
+        include_str!("../../../migration/oracle/traces/harness/initial_screen.toml")
+    );
+    let trace = parse_trace(&source).expect("valid trace with repeated observations");
+    let mut target = ScriptedTarget::recording();
+    let result = ScenarioRunner::new(RunOptions::default())
+        .run_with_target(&trace, &mut target)
+        .expect("scenario runs even when an observation assertion mismatches");
+    assert!(!result.observations_match());
+    assert!(result
+        .observation_diagnostics()
+        .iter()
+        .any(|message| message.contains("not present")));
+}
+
+#[test]
+fn readiness_uses_the_declared_process_observation() {
+    let source = include_str!("../../../migration/oracle/traces/harness/initial_screen.toml")
+        .replace(
+            "observation = { kind = \"terminal_screen\" }\ncondition = { contains = [\"Common folders\"] }",
+            "observation = { kind = \"process\" }\ncondition = { contains = [\"stdout-marker\"] }",
+        );
+    let trace = parse_trace(&source)
+        .expect("valid process-readiness trace")
+        .with_events(vec![InputEvent::Text {
+            value: "after-ready".into(),
+        }]);
+    let mut target = ScriptedTarget::writing_stream_markers("unused", "unused");
+    let result = ScenarioRunner::new(RunOptions::default())
+        .run_with_target(&trace, &mut target)
+        .expect("process output satisfies process readiness");
+    assert!(result.readiness_satisfied_before_first_input());
+    assert!(result.observations_match());
+    assert_eq!(
+        target.applied_events(),
+        &[InputEvent::Text {
+            value: "after-ready".into()
+        }]
+    );
+    assert_eq!(
+        target.observed_kinds().first(),
+        Some(&ObservationKind::Process)
     );
 }
