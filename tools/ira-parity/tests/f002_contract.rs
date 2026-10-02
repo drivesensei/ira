@@ -284,7 +284,7 @@ fn baseline_builds_once_for_job() {
 //   tui-ref:  migration/specs/F-002.md S3
 //   oracle:   migration/oracle/traces/harness/initial_screen.toml
 //   repro:    Run the valid trace against a recording target.
-//   expected: Target receives events in order and each declared observation exactly once.
+//   expected: Target receives events in order; readiness and every declared assertion are sampled.
 //   actual:   Blocked because tools/ira-parity/Cargo.toml and runner are absent.
 //   cover:    target_contract_applies_events_in_order_and_observes_each_declared_kind
 //   fixed-by: 176d6de
@@ -296,7 +296,9 @@ fn target_contract_applies_events_in_order_and_observes_each_declared_kind() {
         .run_with_target(&trace, &mut target)
         .unwrap();
     assert_eq!(target.applied_events(), trace.events());
-    assert_eq!(target.observed_kinds(), trace.observation_kinds());
+    let mut expected_observations = vec![trace.readiness.observation.clone()];
+    expected_observations.extend(trace.observation_kinds());
+    assert_eq!(target.observed_kinds(), expected_observations);
 }
 
 // GAP-FIXED(G-F002-ADV-11) sev=medium kind=test-gap feature=F-002
@@ -777,7 +779,7 @@ fn readiness_uses_declared_observation_kind_before_input() {
         modifiers: BTreeSet::new(),
         phase: KeyPhase::Press,
     }]);
-    let mut target = ScriptedTarget::recording();
+    let mut target = ScriptedTarget::recording_filesystem(b"actual fixture bytes".to_vec());
     let result = ScenarioRunner::new(RunOptions::default()).run_with_target(&trace, &mut target);
     assert!(
         result.is_err(),
@@ -792,6 +794,11 @@ fn readiness_uses_declared_observation_kind_before_input() {
         .contains(&ObservationKind::Filesystem {
             relative_path: ".".into()
         }));
+    assert!(target.observations().iter().any(|(kind, observation)| {
+        kind == &ObservationKind::Filesystem {
+            relative_path: ".".into(),
+        } && observation.bytes.as_deref() == Some(b"actual fixture bytes")
+    }));
 }
 
 // GAP-FIXED(G-F002-ADV-32) sev=medium kind=test-gap feature=F-002
@@ -979,7 +986,9 @@ fn only_documented_os_environment_is_inherited() {
 //   reopened: previous assertion used GoldenMetadata::has_field's constant list, not staged serialized metadata.
 #[test]
 fn golden_metadata_requires_oracle_sha_scenario_fixture_dimensions_events_os_and_date() {
-    let trace = trace_file("initial_screen.toml");
+    let trace = trace_file("initial_screen.toml").with_events(vec![InputEvent::Text {
+        value: "golden metadata event".into(),
+    }]);
     let temp = tempdir();
     let approved = temp.path().join("approved");
     let stage = temp.path().join("stage");
@@ -1010,6 +1019,8 @@ fn golden_metadata_requires_oracle_sha_scenario_fixture_dimensions_events_os_and
     );
     assert_eq!(table["fixture"].as_str(), Some(trace.fixture.kind.as_str()));
     assert_eq!(table["dimensions"].as_str(), Some("90x24"));
+    let expected_events = format!("{:?}", trace.events());
+    assert_eq!(table["events"].as_str(), Some(expected_events.as_str()));
     let expected_os = if cfg!(target_os = "windows") {
         "windows-msvc"
     } else {

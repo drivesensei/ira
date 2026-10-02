@@ -44,6 +44,48 @@ fn normalize_lexically(path: &Path) -> PathBuf {
     }
     out
 }
+fn contained_path(root: &Path, path: &Path) -> Result<PathBuf, EnvironmentError> {
+    let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| normalize_lexically(root));
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let lexical = normalize_lexically(&resolved);
+    if !lexical.starts_with(&canonical_root) {
+        return Err(EnvironmentError("path escapes scenario root".into()));
+    }
+
+    // Check the deepest existing ancestor before the caller creates any leaf
+    // directories. canonicalize(full_path) is insufficient for a missing leaf
+    // below an in-root symlink that resolves outside the fixture.
+    let mut ancestor = lexical.as_path();
+    while !ancestor.exists() {
+        ancestor = ancestor
+            .parent()
+            .ok_or_else(|| EnvironmentError("path has no existing ancestor".into()))?;
+    }
+    let canonical_ancestor = std::fs::canonicalize(ancestor)
+        .map_err(|e| EnvironmentError(format!("cannot resolve protected path ancestor: {e}")))?;
+    if !canonical_ancestor.starts_with(&canonical_root) {
+        return Err(EnvironmentError(
+            "path escapes scenario root through symlink".into(),
+        ));
+    }
+
+    if lexical.exists() {
+        let canonical = std::fs::canonicalize(&lexical)
+            .map_err(|e| EnvironmentError(format!("cannot resolve protected path: {e}")))?;
+        if !canonical.starts_with(&canonical_root) {
+            return Err(EnvironmentError(
+                "path escapes scenario root through symlink".into(),
+            ));
+        }
+        Ok(canonical)
+    } else {
+        Ok(lexical)
+    }
+}
 impl ChildEnvironment {
     pub fn build<I, K, V>(
         policy: &EnvironmentPolicy,
@@ -81,6 +123,7 @@ impl ChildEnvironment {
         V: AsRef<str>,
     {
         let root = root.as_ref().to_path_buf();
+        std::fs::create_dir_all(&root).map_err(|e| EnvironmentError(e.to_string()))?;
         let mut values = BTreeMap::new();
         let keys = if policy.windows {
             vec!["USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP"]
@@ -130,18 +173,8 @@ impl ChildEnvironment {
                 if !strict_roots {
                     continue;
                 }
-                let path = PathBuf::from(value.as_ref());
-                let resolved = if path.is_absolute() {
-                    path
-                } else {
-                    root.join(path)
-                };
-                let canonical_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
-                let candidate = std::fs::canonicalize(&resolved)
-                    .unwrap_or_else(|_| normalize_lexically(&resolved));
-                if !candidate.starts_with(&canonical_root) {
-                    return Err(EnvironmentError(key.into()));
-                }
+                let candidate = contained_path(&root, Path::new(value.as_ref()))
+                    .map_err(|_| EnvironmentError(key.into()))?;
                 values.insert(key.into(), candidate.to_string_lossy().to_string());
             } else if strict_roots && key == "IRA_IMAGES" {
                 values.insert(key.into(), value.as_ref().into());
@@ -151,7 +184,6 @@ impl ChildEnvironment {
                 )));
             }
         }
-        std::fs::create_dir_all(&root).map_err(|e| EnvironmentError(e.to_string()))?;
         for k in &keys {
             let p = PathBuf::from(&values[*k]);
             std::fs::create_dir_all(&p).map_err(|e| EnvironmentError(e.to_string()))?;

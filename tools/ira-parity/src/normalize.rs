@@ -9,19 +9,40 @@ pub struct Difference {
 }
 pub fn normalize_screen(input: &str, roots: &[&str]) -> String {
     let mut out = String::new();
-    let mut esc = false;
+    #[derive(Clone, Copy)]
+    enum State {
+        Text,
+        Escape,
+        Csi,
+        Osc,
+        OscEscape,
+    }
+    let mut state = State::Text;
     for ch in input.chars() {
-        if esc {
-            if ch.is_ascii_alphabetic() {
-                esc = false
+        state = match state {
+            State::Text if ch == '\x1b' => State::Escape,
+            State::Text => {
+                out.push(ch);
+                State::Text
             }
-            continue;
-        }
-        if ch == '\x1b' {
-            esc = true;
-            continue;
-        }
-        out.push(ch)
+            State::Escape => match ch {
+                '[' => State::Csi,
+                ']' => State::Osc,
+                // A two-byte ESC sequence is complete here. Other control
+                // strings (DCS, SOS, PM, APC) are not produced by the TUI;
+                // do not discard any printable text following this pair.
+                _ => State::Text,
+            },
+            State::Csi if ('@'..='~').contains(&ch) => State::Text,
+            State::Csi => State::Csi,
+            State::Osc if ch == '\x07' => State::Text,
+            State::Osc if ch == '\x1b' => State::OscEscape,
+            State::Osc => State::Osc,
+            State::OscEscape if ch == '\\' => State::Text,
+            State::OscEscape if ch == '\x07' => State::Text,
+            // ESC not followed by ST is OSC payload; preserve it if printable.
+            State::OscEscape => State::Osc,
+        };
     }
     for root in roots {
         if !root.is_empty() {

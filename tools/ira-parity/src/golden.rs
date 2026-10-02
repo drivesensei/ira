@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GoldenMetadata {
@@ -52,6 +53,24 @@ impl GoldenMetadata {
         toml::from_str(&s).map_err(|e| e.to_string())
     }
 }
+fn current_capture_date() -> String {
+    let days_since_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| (duration.as_secs() / 86_400) as i64)
+        .unwrap_or(0);
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
 pub struct GoldenStore {
     approved: PathBuf,
 }
@@ -71,8 +90,12 @@ impl GoldenStore {
         let metadata = GoldenMetadata::from_trace(
             "1cad4ce43cc72d52d4cc4eef920e0da22cb69568",
             t,
-            "unknown",
-            "unknown",
+            if cfg!(target_os = "windows") {
+                "windows-msvc"
+            } else {
+                std::env::consts::OS
+            },
+            &current_capture_date(),
         );
         fs::write(
             stage.join("metadata.toml"),
