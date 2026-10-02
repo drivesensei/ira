@@ -89,6 +89,10 @@ pub trait TraceTarget {
         readiness: &crate::trace::Readiness,
         deadline: Instant,
     ) -> Result<(), RunError>;
+    fn wait_for_observation(&mut self, deadline: Instant) -> Result<(), RunError> {
+        let _ = deadline;
+        Ok(())
+    }
     fn apply(&mut self, event: &InputEvent) -> Result<(), RunError>;
     fn observe(&mut self, kind: &ObservationKind) -> Result<Observation, RunError>;
     fn shutdown(&mut self) -> Result<i32, RunError>;
@@ -181,11 +185,13 @@ impl ScenarioRunner {
         .map_err(|e| err(e.to_string()))?;
         let values = env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         target.start(&root, (t.terminal.columns, t.terminal.rows), &values)?;
+        let scenario_deadline = Instant::now() + self.opts.deadline;
         let deadline = Instant::now()
             + self
                 .opts
                 .readiness
-                .min(Duration::from_millis(t.readiness.deadline_ms));
+                .min(Duration::from_millis(t.readiness.deadline_ms))
+                .min(scenario_deadline.saturating_duration_since(Instant::now()));
         if let Err(e) = target.wait_ready(&t.readiness, deadline) {
             let _ = target.shutdown();
             return Err(RunError {
@@ -224,12 +230,26 @@ impl ScenarioRunner {
             target.apply(ev)?;
             applied.push(ev.clone())
         }
+        if let Err(error) = target.wait_for_observation(scenario_deadline) {
+            let cleanup = target.shutdown();
+            return Err(RunError {
+                message: match cleanup {
+                    Ok(_) => error.to_string(),
+                    Err(cleanup) => format!("{error}; cleanup failed: {cleanup}"),
+                },
+                timeout: true,
+                readiness: false,
+                delivered: applied.len(),
+            });
+        }
         let mut matched = true;
         for k in t.observation_kinds() {
             let o = target.observe(&k)?;
             if let Some(s) = o.screen {
                 for needle in &t.readiness.condition.contains {
-                    matched &= s.contains(needle)
+                    matched &=
+                        crate::normalize::normalize_screen(&s, &[root.to_string_lossy().as_ref()])
+                            .contains(needle)
                 }
             }
         }
@@ -266,10 +286,28 @@ impl ScenarioRunner {
         for event in t.events() {
             encode(event)?;
         }
-        let baseline = BaselineResolver::new(Path::new(env!("CARGO_MANIFEST_DIR")))
+        let mut baseline = BaselineResolver::new(Path::new(env!("CARGO_MANIFEST_DIR")))
             .with_expected_sha(ORACLE_SHA)
             .resolve_and_build()
             .map_err(|e| err(e.to_string()))?;
+        let result = self.run_oracle_with_baseline(t, &baseline);
+        match baseline.cleanup() {
+            Ok(()) => result,
+            Err(cleanup) => match result {
+                Ok(_) => Err(err(format!("baseline cleanup failed: {cleanup}"))),
+                Err(mut primary) => {
+                    primary.message =
+                        format!("{}; baseline cleanup failed: {cleanup}", primary.message);
+                    Err(primary)
+                }
+            },
+        }
+    }
+    fn run_oracle_with_baseline(
+        &self,
+        t: &Trace,
+        baseline: &crate::baseline::Baseline,
+    ) -> Result<RunResult, RunError> {
         let fixture = tempfile::Builder::new()
             .prefix("ira-parity-fixture-")
             .tempdir()
@@ -291,23 +329,24 @@ impl ScenarioRunner {
                 pixel_height: 0,
             })
             .map_err(|e| err(e.to_string()))?;
+        let scenario_deadline = Instant::now() + self.opts.deadline;
         let mut cmd = portable_pty::CommandBuilder::new(baseline.executable_path());
         cmd.env_clear();
         cmd.cwd(fixture.path());
         for (k, v) in isolated.iter() {
             cmd.env(k, v);
         }
-        let mut child = pair
+        let mut reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|e| err(e.to_string()))?;
+        let child = pair
             .slave
             .spawn_command(cmd)
             .map_err(|e| err(e.to_string()))?;
         // portable-pty's parent-side slave handle keeps the reader from ever
         // observing EOF after the child exits if it remains open.
         drop(pair.slave);
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| err(e.to_string()))?;
         let (tx, rx) = mpsc::channel();
         let reader_task = std::thread::spawn(move || {
             let mut b = [0u8; 4096];
@@ -322,7 +361,9 @@ impl ScenarioRunner {
                 }
             }
         });
-        let deadline = Instant::now() + Duration::from_millis(t.readiness.deadline_ms);
+        let mut lifecycle = PtyChildLifecycle::new(child, reader_task, self.opts.cleanup);
+        let deadline = (Instant::now() + Duration::from_millis(t.readiness.deadline_ms))
+            .min(scenario_deadline);
         let mut screen = Vec::new();
         while Instant::now() < deadline {
             if let Ok(b) = rx.recv_timeout(Duration::from_millis(100)) {
@@ -345,16 +386,11 @@ impl ScenarioRunner {
             .iter()
             .all(|s| String::from_utf8_lossy(&screen).contains(s))
         {
-            let cleanup = terminate_child(&mut child, self.opts.cleanup);
-            let reader_cleanup = reader_task
-                .join()
-                .map_err(|_| "PTY output reader panicked".to_string());
+            let cleanup = lifecycle.shutdown();
             return Err(RunError {
-                message: match (cleanup, reader_cleanup) {
-                    (Ok(()), Ok(())) => "readiness timeout before input".into(),
-                    (c, r) => {
-                        format!("readiness timeout before input; cleanup: {c:?}; reader: {r:?}")
-                    }
+                message: match cleanup {
+                    Ok(()) => "readiness timeout before input".into(),
+                    Err(cleanup) => format!("readiness timeout before input; cleanup: {cleanup}"),
                 },
                 timeout: true,
                 readiness: true,
@@ -364,6 +400,14 @@ impl ScenarioRunner {
         let mut writer = pair.master.take_writer().map_err(|e| err(e.to_string()))?;
         let mut applied = Vec::new();
         for ev in t.events() {
+            if Instant::now() >= scenario_deadline {
+                return Err(RunError {
+                    message: "scenario deadline exceeded before input delivery".into(),
+                    timeout: true,
+                    readiness: false,
+                    delivered: applied.len(),
+                });
+            }
             let bytes = encode(ev)?;
             writer.write_all(&bytes).map_err(|e| err(e.to_string()))?;
             if let InputEvent::Resize { columns, rows } = ev {
@@ -381,13 +425,19 @@ impl ScenarioRunner {
         // Interactive TUI processes intentionally remain alive after replay.
         // Wait for a new output observation under a bounded deadline instead
         // of incorrectly waiting for normal process exit.
-        let end = Instant::now() + self.opts.deadline;
+        let end = scenario_deadline;
+        let volatile_root = fixture.path().to_string_lossy().into_owned();
         if !t.expected_observations().is_empty() {
             while Instant::now() < end {
                 match rx.recv_timeout(end.saturating_duration_since(Instant::now())) {
                     Ok(bytes) => {
                         screen = bytes;
-                        if expected_observations_match(t, &screen, pair.master.as_ref())? {
+                        if expected_observations_match(
+                            t,
+                            &screen,
+                            pair.master.as_ref(),
+                            &[&volatile_root],
+                        )? {
                             break;
                         }
                     }
@@ -395,18 +445,24 @@ impl ScenarioRunner {
                 }
             }
         }
-        let matched = expected_observations_match(t, &screen, pair.master.as_ref())?;
+        let matched =
+            expected_observations_match(t, &screen, pair.master.as_ref(), &[&volatile_root])?;
         let _ = writer.flush();
-        terminate_child(&mut child, self.opts.cleanup).map_err(|e| RunError {
+        drop(writer);
+        lifecycle.shutdown().map_err(|e| RunError {
             message: e,
             timeout: true,
             readiness: false,
             delivered: applied.len(),
         })?;
-        drop(writer);
-        reader_task
-            .join()
-            .map_err(|_| err("PTY output reader panicked"))?;
+        if !matched {
+            return Err(RunError {
+                message: "scenario deadline expired before expected observations matched".into(),
+                timeout: true,
+                readiness: false,
+                delivered: applied.len(),
+            });
+        }
         Ok(RunResult {
             events: applied,
             ready: true,
@@ -422,8 +478,10 @@ fn expected_observations_match(
     trace: &Trace,
     bytes: &[u8],
     master: &dyn portable_pty::MasterPty,
+    volatile_roots: &[&str],
 ) -> Result<bool, RunError> {
-    let screen = String::from_utf8_lossy(bytes);
+    let raw = String::from_utf8_lossy(bytes);
+    let screen = crate::normalize::normalize_screen(&raw, volatile_roots);
     let mut matched = true;
     for expected in trace.expected_observations() {
         if let Some(fields) = expected.expect.as_table() {
@@ -465,6 +523,57 @@ fn terminate_child(
             return Err("child cleanup deadline exceeded".into());
         }
         std::thread::yield_now();
+    }
+}
+struct PtyChildLifecycle {
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    reader: Option<std::thread::JoinHandle<()>>,
+    deadline: Duration,
+}
+impl PtyChildLifecycle {
+    fn new(
+        child: Box<dyn portable_pty::Child + Send + Sync>,
+        reader: std::thread::JoinHandle<()>,
+        deadline: Duration,
+    ) -> Self {
+        Self {
+            child: Some(child),
+            reader: Some(reader),
+            deadline,
+        }
+    }
+    fn shutdown(&mut self) -> Result<(), String> {
+        let mut errors = Vec::new();
+        if let Some(child) = self.child.as_mut() {
+            if let Err(e) = terminate_child(child, self.deadline) {
+                errors.push(e);
+            }
+        }
+        self.child.take();
+        if let Some(reader) = self.reader.take() {
+            let end = Instant::now() + self.deadline;
+            while !reader.is_finished() && Instant::now() < end {
+                std::thread::yield_now();
+            }
+            if reader.is_finished() {
+                if reader.join().is_err() {
+                    errors.push("PTY output reader panicked".into());
+                }
+            } else {
+                drop(reader);
+                errors.push("PTY output reader cleanup deadline exceeded".into());
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+}
+impl Drop for PtyChildLifecycle {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
     }
 }
 fn encode(e: &InputEvent) -> Result<Vec<u8>, RunError> {
