@@ -1,6 +1,7 @@
 # Adversarial report: F-002 (mode B) round 1
 
-Commit reviewed: `88dcf9c38185c3a10ee1938050c9dd095e456a2b`
+Initial commit reviewed: `88dcf9c38185c3a10ee1938050c9dd095e456a2b`
+Remediation reviewed: `62db2ceba7e7d67b7db60cf280954853d297f9b3`
 
 Attempts made:
 - Read the complete production source, contract tests, F-002 spec, reviewer protocol, and manager charter §7.
@@ -10,21 +11,27 @@ Attempts made:
 - Added a real baseline success/cache-hit/drop probe. It checks cached executable survives checkout removal and both successful and cache-hit worktrees are removed.
 - Confirmed Windows-only coverage is cfg-gated and was not run here; no macOS/Windows native behavior is claimed.
 - Attempted an external protected-root side-effect probe; it passed (override rejected before directory creation), so no issue filed.
+- Against remediation `62db2ce`, reran ADV-44/45/46/49: all four pass. Ran the revised G31 and G38 contract tests individually: both pass with meaningful observed bytes and serialized metadata assertions.
+- Re-ran G27/G29/G30 individually with `--ignored`: all pass as scripted tests, but the implementations remain test doubles and do not exercise real timeout/build/test-failure child or reader cleanup.
+- Disk-backed real baseline success/cache-hit cleanup probe passed. The first attempt with `/dev/shm` failed at link time with a bus error due to constrained tmpfs; rerun passed using the report's disk-backed target.
+- Tested Git ref collision in a temporary repository and against the exact remediation crate: tag `oracle` points to commit A while `refs/oracle` points to B. Git's unqualified `rev-parse oracle^{commit}` selects B and `BaselineResolver::resolve()` incorrectly rejects the valid tag SHA A.
 
-Findings (open GAPs in `tools/ira-parity/tests/f002_adversarial.rs` and `f002_contract.rs`):
-- `G-F002-ADV-44`, high, `expected_observation_content_is_compared`: `ScenarioRunner::run_with_target` ignores `ExpectedObservation.expect` and reports a match for mismatched screen contents.
-- `G-F002-ADV-45`, medium, `incompatible_trace_platform_is_rejected_before_start`: declared trace profiles are not checked against `RunOptions.platform`; a macOS-only trace runs under Linux.
-- `G-F002-ADV-46`, high, `readiness_observation_kind_is_enforced`: runner marks ready and proceeds without enforcing the declared readiness observation kind; a filesystem readiness assertion can be bypassed by terminal readiness.
-- `G-F002-ADV-49`, medium, `normalizer_discards_osc_title_sequences`: OSC title control bytes/payload leak into normalized screen text (`\x1b]0;host-title\x07...` becomes `ost-title\x07...`).
-- `G-F002-ADV-38`, medium, `golden_metadata_requires_oracle_sha_scenario_fixture_dimensions_events_os_and_date`: staged `metadata.toml` serializes `os_profile = "unknown"` and `capture_date = "unknown"` instead of the required platform/date. The revised test reads and checks actual serialized values.
+Resolved by remediation and reviewer verification:
+- `G-F002-ADV-44`: mismatching expected observation content now fails comparison; adversarial test passes.
+- `G-F002-ADV-45`: incompatible platform is rejected before target start; adversarial test passes.
+- `G-F002-ADV-46` and `G-F002-ADV-31`: declared readiness data gates event delivery; contract and adversarial tests pass. G31 inspects the captured filesystem bytes rather than trusting target booleans.
+- `G-F002-ADV-49`: OSC title sequence is removed; adversarial test passes.
+- `G-F002-ADV-38`: staged metadata now includes actual profile/date and all tested values; revised serialized-metadata test passes.
+
+Open finding:
+- `G-F002-ADV-50`, medium, `baseline_resolution_is_qualified_to_tag_namespace`: `BaselineResolver::resolve` validates `refs/tags/<tag>` syntax but runs unqualified `rev-parse <tag>^{commit}`. A valid direct ref `refs/<tag>` shadows the tag and causes a false SHA rejection. Repro test is in `tools/ira-parity/tests/f002_adversarial.rs`; it fails against the exact remediation crate. Resolve via the explicit `refs/tags/<tag>^{commit}` refspec.
 
 Verified fixes / passing probes:
 - All 13 ignored baseline/cache/cleanup tests passed; extra real success + cache-hit cleanup probe passed.
 - Existing supported-event live replay and unsupported repeat/release rejection passed on Linux.
 - Existing normalization, byte comparison, mismatch diagnostic, staging, ordinary-run, environment isolation, malformed trace, and tagged resize replay tests passed.
-- `G-F002-ADV-31` was reopened in the contract test: it now declares filesystem readiness with pending input and fails because the runner accepts terminal readiness without observing the declared kind. The prior readiness/deadline assertions called `ScriptedTarget` methods returning hardcoded `true`.
-- `G-F002-ADV-38` was reopened in the contract test: it now reads staged `metadata.toml` and verifies fields/values; this exposes current `unknown` OS/date serialization.
-- `G-F002-ADV-27` stays open for unproven timeout/test-failure exit modes. The real baseline probe verifies successful and cache-hit cleanup, while previous “timeout”/“test-failure” labels exercise the same injected early-error branch.
+- `G-F002-ADV-27` stays open for unproven timeout/test-failure exit modes. The real baseline probe verifies successful and cache-hit cleanup; the scripted labels exercise the same injected early-error branch.
+- `G-F002-ADV-29` and `G-F002-ADV-30` stay open: current ignored tests use `ScriptedTarget` booleans rather than an actual child/PTY and reader cleanup path.
 
 Mutation checks:
 - Bypassed executable digest comparison locally; `cache_hit_verifies_metadata_and_executable_digest` failed as intended. Restored source.
@@ -32,8 +39,9 @@ Mutation checks:
 - Changed returned readiness flag locally; readiness contract test failed as intended. Restored source.
 - `git diff` confirms no production-source changes.
 
-Reopened: `G-F002-ADV-31`, `G-F002-ADV-38`; `G-F002-ADV-27` stays open for unexercised failure modes.
+Resolved by review: `G-F002-ADV-31`, `G-F002-ADV-38`, `G-F002-ADV-44`, `G-F002-ADV-45`, `G-F002-ADV-46`, `G-F002-ADV-49`.
+Open: `G-F002-ADV-27`, `G-F002-ADV-29`, `G-F002-ADV-30`, `G-F002-ADV-50`.
 
-Verdict: FINDINGS (5 open GAPs, including 31 and 38; 27 remains open for untested cleanup modes).
+Verdict: FINDINGS (4 open GAPs: 27, 29, 30, 50).
 
 Enrichment candidates: none.
