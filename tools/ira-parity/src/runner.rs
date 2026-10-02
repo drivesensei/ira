@@ -1,12 +1,11 @@
 use crate::{
     baseline::{BaselineResolver, ORACLE_SHA},
+    lifecycle::{PtySession, PtySessionConfig},
     trace::{InputEvent, KeyPhase, ObservationKind, Trace},
 };
 use std::{
     collections::BTreeMap,
-    io::{Read, Write},
     path::{Path, PathBuf},
-    sync::mpsc,
     time::{Duration, Instant},
 };
 use thiserror::Error;
@@ -415,15 +414,6 @@ impl ScenarioRunner {
                 .map(|(key, value)| (key.as_str(), value.as_str())),
         )
         .map_err(|e| err(format!("isolated environment failed: {e}")))?;
-        let sys = portable_pty::native_pty_system();
-        let pair = sys
-            .openpty(portable_pty::PtySize {
-                rows: t.terminal.rows,
-                cols: t.terminal.columns,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| err(e.to_string()))?;
         let scenario_deadline = Instant::now() + self.opts.deadline;
         let mut cmd = portable_pty::CommandBuilder::new(baseline.executable_path());
         cmd.env_clear();
@@ -431,38 +421,49 @@ impl ScenarioRunner {
         for (k, v) in isolated.iter() {
             cmd.env(k, v);
         }
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| err(e.to_string()))?;
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|e| err(e.to_string()))?;
-        // portable-pty's parent-side slave handle keeps the reader from ever
-        // observing EOF after the child exits if it remains open.
-        drop(pair.slave);
-        let (tx, rx) = mpsc::channel();
-        let reader_task = std::thread::spawn(move || {
-            let mut b = [0u8; 4096];
-            let mut all = Vec::new();
-            loop {
-                match reader.read(&mut b) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        all.extend_from_slice(&b[..n]);
-                        let _ = tx.send(all.clone());
+        let mut lifecycle = PtySession::spawn(
+            cmd,
+            fixture,
+            portable_pty::PtySize {
+                rows: t.terminal.rows,
+                cols: t.terminal.columns,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            PtySessionConfig::new(self.opts.cleanup, self.opts.cleanup),
+        )
+        .map_err(|e| err(e.to_string()))?;
+        macro_rules! session_try {
+            ($result:expr, $delivered:expr) => {
+                match $result {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return Err(finish_failed_session(
+                            &mut lifecycle,
+                            error.to_string(),
+                            false,
+                            false,
+                            $delivered,
+                        ))
                     }
                 }
-            }
-        });
-        let mut lifecycle = PtyChildLifecycle::new(child, reader_task, self.opts.cleanup);
+            };
+        }
+        let fixture_path = lifecycle.fixture_path().to_path_buf();
         let deadline = (Instant::now() + Duration::from_millis(t.readiness.deadline_ms))
             .min(scenario_deadline);
         let mut screen = Vec::new();
-        let volatile_root = fixture.path().to_string_lossy().into_owned();
+        let volatile_root = fixture_path.to_string_lossy().into_owned();
         while Instant::now() < deadline {
-            if let Ok(b) = rx.recv_timeout(Duration::from_millis(100)) {
+            let next = match lifecycle
+                .next_output((Instant::now() + Duration::from_millis(100)).min(deadline))
+            {
+                Ok(next) => next,
+                Err(error) => {
+                    return Err(finish_failed_session(&mut lifecycle, error, false, true, 0))
+                }
+            };
+            if let Some(b) = next {
                 screen = b;
                 let observation = Observation {
                     screen: Some(String::from_utf8_lossy(&screen).into_owned()),
@@ -479,39 +480,37 @@ impl ScenarioRunner {
         };
         let (ready, diagnostics) = compare_readiness(t, &observation, &[&volatile_root]);
         if !ready {
-            let cleanup = lifecycle.shutdown();
-            return Err(RunError {
-                message: match cleanup {
-                    Ok(()) => diagnostics.join("; "),
-                    Err(cleanup) => format!("{}; cleanup: {cleanup}", diagnostics.join("; ")),
-                },
-                timeout: true,
-                readiness: true,
-                delivered: 0,
-            });
+            return Err(finish_failed_session(
+                &mut lifecycle,
+                diagnostics.join("; "),
+                true,
+                true,
+                0,
+            ));
         }
-        let mut writer = pair.master.take_writer().map_err(|e| err(e.to_string()))?;
         let mut applied = Vec::new();
         for ev in t.events() {
             if Instant::now() >= scenario_deadline {
-                return Err(RunError {
-                    message: "scenario deadline exceeded before input delivery".into(),
-                    timeout: true,
-                    readiness: false,
-                    delivered: applied.len(),
-                });
+                return Err(finish_failed_session(
+                    &mut lifecycle,
+                    "scenario deadline exceeded before input delivery",
+                    true,
+                    false,
+                    applied.len(),
+                ));
             }
-            let bytes = encode(ev)?;
-            writer.write_all(&bytes).map_err(|e| err(e.to_string()))?;
+            let bytes = session_try!(encode(ev), applied.len());
+            session_try!(lifecycle.write_input(&bytes), applied.len());
             if let InputEvent::Resize { columns, rows } = ev {
-                pair.master
-                    .resize(portable_pty::PtySize {
+                session_try!(
+                    lifecycle.resize(portable_pty::PtySize {
                         rows: *rows,
                         cols: *columns,
                         pixel_width: 0,
                         pixel_height: 0,
-                    })
-                    .map_err(|e| err(e.to_string()))?
+                    }),
+                    applied.len()
+                );
             }
             applied.push(ev.clone())
         }
@@ -521,34 +520,47 @@ impl ScenarioRunner {
         let end = scenario_deadline;
         if !t.expected_observations().is_empty() {
             while Instant::now() < end {
-                match rx.recv_timeout(end.saturating_duration_since(Instant::now())) {
-                    Ok(bytes) => {
+                match lifecycle.next_output(end) {
+                    Ok(Some(bytes)) => {
                         screen = bytes;
-                        if expected_observations_match(
-                            t,
-                            &screen,
-                            pair.master.as_ref(),
-                            fixture.path(),
-                            &[&volatile_root],
-                        )? {
+                        if session_try!(
+                            expected_observations_match(
+                                t,
+                                &screen,
+                                session_try!(lifecycle.master(), applied.len()),
+                                &fixture_path,
+                                &[&volatile_root],
+                            ),
+                            applied.len()
+                        ) {
                             break;
                         }
                     }
-                    Err(_) => break,
+                    Ok(None) => break,
+                    Err(error) => {
+                        return Err(finish_failed_session(
+                            &mut lifecycle,
+                            error,
+                            false,
+                            false,
+                            applied.len(),
+                        ))
+                    }
                 }
             }
         }
-        let (matched, diagnostics) = expected_observations_compare(
-            t,
-            &screen,
-            pair.master.as_ref(),
-            fixture.path(),
-            &[&volatile_root],
-        )?;
-        let _ = writer.flush();
-        drop(writer);
+        let (matched, diagnostics) = session_try!(
+            expected_observations_compare(
+                t,
+                &screen,
+                session_try!(lifecycle.master(), applied.len()),
+                &fixture_path,
+                &[&volatile_root],
+            ),
+            applied.len()
+        );
         lifecycle.shutdown().map_err(|e| RunError {
-            message: e,
+            message: e.to_string(),
             timeout: true,
             readiness: false,
             delivered: applied.len(),
@@ -566,7 +578,7 @@ impl ScenarioRunner {
             ready: true,
             matched,
             sha: ORACLE_SHA.into(),
-            root: fixture.path().to_path_buf(),
+            root: fixture_path,
             session: format!("pty-{:?}", std::thread::current().id()),
             removed: true,
             diagnostics,
@@ -872,79 +884,6 @@ fn read_fixture_file(fixture: &Path, relative: &str) -> Result<Option<Vec<u8>>, 
         .map(Some)
         .map_err(|e| err(format!("fixture observation read failed: {e}")))
 }
-fn terminate_child(
-    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
-    deadline: Duration,
-) -> Result<(), String> {
-    child
-        .kill()
-        .map_err(|e| format!("child kill failed: {e}"))?;
-    let end = Instant::now() + deadline;
-    loop {
-        if child
-            .try_wait()
-            .map_err(|e| format!("child reap failed: {e}"))?
-            .is_some()
-        {
-            return Ok(());
-        }
-        if Instant::now() >= end {
-            return Err("child cleanup deadline exceeded".into());
-        }
-        std::thread::yield_now();
-    }
-}
-struct PtyChildLifecycle {
-    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
-    reader: Option<std::thread::JoinHandle<()>>,
-    deadline: Duration,
-}
-impl PtyChildLifecycle {
-    fn new(
-        child: Box<dyn portable_pty::Child + Send + Sync>,
-        reader: std::thread::JoinHandle<()>,
-        deadline: Duration,
-    ) -> Self {
-        Self {
-            child: Some(child),
-            reader: Some(reader),
-            deadline,
-        }
-    }
-    fn shutdown(&mut self) -> Result<(), String> {
-        let mut errors = Vec::new();
-        if let Some(child) = self.child.as_mut() {
-            if let Err(e) = terminate_child(child, self.deadline) {
-                errors.push(e);
-            }
-        }
-        self.child.take();
-        if let Some(reader) = self.reader.take() {
-            let end = Instant::now() + self.deadline;
-            while !reader.is_finished() && Instant::now() < end {
-                std::thread::yield_now();
-            }
-            if reader.is_finished() {
-                if reader.join().is_err() {
-                    errors.push("PTY output reader panicked".into());
-                }
-            } else {
-                drop(reader);
-                errors.push("PTY output reader cleanup deadline exceeded".into());
-            }
-        }
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors.join("; "))
-        }
-    }
-}
-impl Drop for PtyChildLifecycle {
-    fn drop(&mut self) {
-        let _ = self.shutdown();
-    }
-}
 fn encode(e: &InputEvent) -> Result<Vec<u8>, RunError> {
     use crate::trace::{KeyCode::*, NamedKey::*};
     Ok(match e {
@@ -986,5 +925,25 @@ fn err(s: impl Into<String>) -> RunError {
         timeout: false,
         readiness: false,
         delivered: 0,
+    }
+}
+
+fn finish_failed_session(
+    session: &mut PtySession,
+    primary: impl Into<String>,
+    timeout: bool,
+    readiness: bool,
+    delivered: usize,
+) -> RunError {
+    let primary = primary.into();
+    let message = match session.shutdown_with_primary_error(primary.clone()) {
+        Ok(_) => primary,
+        Err(error) => error.to_string(),
+    };
+    RunError {
+        message,
+        timeout,
+        readiness,
+        delivered,
     }
 }

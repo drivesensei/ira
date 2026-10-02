@@ -6,9 +6,30 @@
 use ira_parity::lifecycle::{CleanupEvent, PtySession, PtySessionConfig};
 use portable_pty::{CommandBuilder, PtySize};
 use std::path::PathBuf;
+use std::thread;
 use std::time::{Duration, Instant};
 
 const HELPER_MODE: &str = "IRA_PARITY_PTY_HELPER_MODE";
+
+#[test]
+fn helper_child_entry() {
+    match std::env::var(HELPER_MODE).as_deref() {
+        Ok("success") => println!("IRA_HELPER_READY_SUCCESS"),
+        Ok("hold") => {
+            println!("IRA_HELPER_READY_HOLD");
+            loop {
+                thread::park();
+            }
+        }
+        Ok("flood") => {
+            let block = "x".repeat(1024);
+            for _ in 0..256 {
+                println!("{block}");
+            }
+        }
+        _ => {}
+    }
+}
 
 fn helper(mode: &str) -> CommandBuilder {
     let mut command = CommandBuilder::new(std::env::current_exe().unwrap());
@@ -18,10 +39,7 @@ fn helper(mode: &str) -> CommandBuilder {
 }
 
 fn config() -> PtySessionConfig {
-    PtySessionConfig {
-        cleanup_deadline: Duration::from_secs(3),
-        reader_join_deadline: Duration::from_secs(2),
-    }
+    PtySessionConfig::new(Duration::from_secs(3), Duration::from_secs(2))
 }
 
 fn size() -> PtySize {
@@ -136,4 +154,5 @@ fn extracted_session_records_teardown_order_and_composes_cleanup_error() {
         fixture_path.exists(),
         "injected removal failure should preserve fixture"
     );
+    std::fs::remove_dir_all(&fixture_path).unwrap();
 }
