@@ -8,6 +8,9 @@ mod environment {
 mod normalize {
     pub use ira_parity::normalize::*;
 }
+mod lifecycle {
+    pub use ira_parity::lifecycle::*;
+}
 mod testing {
     pub struct ScriptedTarget;
     impl ScriptedTarget {

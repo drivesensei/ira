@@ -732,21 +732,20 @@ fn cleanup_error_is_reported_with_primary_error() {
     );
 }
 
-// GAP(G-F002-ADV-29) sev=medium kind=test-gap feature=F-002
+// GAP-FIXED(G-F002-ADV-29) sev=medium kind=test-gap feature=F-002
 //   what:     S8 timed-out children must be terminated, reaped, and PTY handles closed.
 //   tui-ref:  migration/specs/F-002.md S8
 //   oracle:   F-002 lifecycle contract
 //   repro:    Run a fake target that never exits before the scenario deadline.
 //   expected: Child is terminated/reaped and PTY handles are closed within cleanup deadline.
-//   actual:   Blocked because tools/ira-parity/Cargo.toml and runner are absent.
+//   actual:   Prior implementation did not exercise OS child/PTY cleanup.
 //   cover:    RED HARNESS CONTRACT: real_pty_session_timeout_kills_and_reaps_helper_child;
 //             real_pty_session_closes_master_and_slave_before_fixture_removal
+//   fixed-by: see migration/reports/F-002/dev-lifecycle-1.md
 #[test]
-#[ignore = "GAP G-F002-ADV-29"]
 fn deadline_terminates_reaps_child_and_closes_pty() {
-    // This remains an orchestration-only probe. ScriptedTarget reports these
-    // booleans itself and does not exercise the OS child or PTY; it cannot
-    // close G-F002-ADV-29. See migration/reports/F-002/lifecycle-red-1.md.
+    // Keep the orchestration assertion alongside the real child-backed
+    // lifecycle contract in f002_lifecycle_session.rs.
     let mut target = ScriptedTarget::hanging_child();
     let result = ScenarioRunner::new(RunOptions::with_deadlines(
         Duration::from_millis(25),
@@ -758,21 +757,20 @@ fn deadline_terminates_reaps_child_and_closes_pty() {
     assert!(target.pty_handles_are_closed());
 }
 
-// GAP(G-F002-ADV-30) sev=medium kind=test-gap feature=F-002
+// GAP-FIXED(G-F002-ADV-30) sev=medium kind=test-gap feature=F-002
 //   what:     S8 cleanup must drain/join output readers before removing the fixture.
 //   tui-ref:  migration/specs/F-002.md S8
 //   oracle:   F-002 lifecycle contract
 //   repro:    Timeout a child while stdout/stderr readers hold fixture-associated handles.
 //   expected: Readers are joined and handles closed before fixture deletion.
-//   actual:   Blocked because tools/ira-parity/Cargo.toml and runner are absent.
+//   actual:   Prior implementation did not join the real PTY output reader before fixture cleanup.
 //   cover:    RED HARNESS CONTRACT: real_pty_session_joins_reader_before_fixture_removal;
 //             real_pty_session_preserves_primary_and_cleanup_errors
+//   fixed-by: see migration/reports/F-002/dev-lifecycle-1.md
 #[test]
-#[ignore = "GAP G-F002-ADV-30"]
 fn timeout_drains_and_joins_readers_before_fixture_removal() {
-    // This remains an orchestration-only probe. ScriptedTarget reports these
-    // booleans itself and does not hold real handles; it cannot close
-    // G-F002-ADV-30. See migration/reports/F-002/lifecycle-red-1.md.
+    // Keep the orchestration assertion alongside the real child-backed
+    // lifecycle contract in f002_lifecycle_session.rs.
     let mut target = ScriptedTarget::hanging_with_open_readers();
     let result = ScenarioRunner::new(RunOptions::with_deadlines(
         Duration::from_millis(25),
