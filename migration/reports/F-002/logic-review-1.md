@@ -36,3 +36,18 @@ Oracle files read: `src/event.rs:40-65`, `src/main.rs:55-72`, `src/tui.rs:57-67`
 Open: G-F002-LOG-01 (high, assertion coverage), G-F002-LOG-02 (medium, screen text loss), G-F002-LOG-03 (high, external filesystem side effect), G-F002-LOG-04 (high, missing baseline fetch). Additional contract rows remain partial for paste fidelity, actionable diffs/golden metadata, and native-platform evidence. No fixes verified.
 
 Verdict: **DIVERGENT (4 demonstrated open GAPs; additional contract/platform requirements unproven)**. Confidence: high for the four failing probes and direct source discrepancies; medium for cross-platform behavior because only Linux was available.
+
+## Re-review against remediation `62db2ceba7e7d67b7db60cf280954853d297f9b3`
+
+All four original probes were copied into the remediation worktree and passed against its production library:
+
+- `baseline_resolution_fetches_missing_pinned_tag`: PASS; a fresh `--no-tags` clone fetched the pinned ref and verified its peeled commit.
+- `normalizer_preserves_text_after_csi_tilde_final`: PASS; CSI `~` now terminates the sequence and retains the following message.
+- `process_observation_assertions_are_compared`: PASS; an absent `exit_code` now produces a mismatch and `observations_match=false`.
+- `symlink_parent_escape_has_no_external_side_effect`: PASS; missing descendants below an external symlink are rejected before creation.
+
+Added and ran two further probes against the same remediation library: `repeated_expected_observations_are_all_checked` and `readiness_uses_the_declared_process_observation`; both pass. The runner checks each repeated expected entry and reports the failing one, and readiness compares the declared observation type before delivering events. The TUI PTY adapter explicitly rejects unsupported readiness kinds. Verdict for LOG-01..04: **all four resolved**, with `verified-by` markers in `tests/f002_logic.rs`.
+
+Verification against remediation: the four original probes passed together (**4/4**). The repeated-observation probe passed in a subsequent focused run. The strengthened process-readiness probe, now with a queued input event, passed individually and confirmed that input followed successful readiness. In the later six-test run, the five probes unrelated to fresh-clone setup passed; the baseline-fetch probe's local `git clone --no-tags` setup failed because `/dev/shm` ran out of quota copying Git hooks (the same baseline-fetch probe had passed in the original 4/4 run). A full suite attempt also hit `/dev/shm` quota during the adversarial test's nested frozen-baseline build, so it does not provide a complete suite verdict. The earlier separate ignored-suite run is Linux-only.
+
+The overall F-002 verdict remains **DIVERGENT / not yet equivalent**. Unresolved or unproven items include bracketed-paste event fidelity (`src/tui.rs:62-67`, `src/main.rs:65-68` versus `runner.rs::encode`), stable/complete golden event metadata, repeated-readiness/deadline/error cleanup interactions beyond these targeted probes, and native macOS/Windows ConPTY evidence. The remediation adds platform selection and observation support declarations, but no native runners were available in this worktree.
