@@ -1,11 +1,11 @@
 # Parity matrix
 
-Manager parity ledger derived from nine discovery inventories. Surface ownership is recorded in `migration/surface-ownership.tsv`; six terminal-host rows are BLOCKED pending signed intent mappings. The 2026-10-01 Phase 2 advisor review is reconciled in D-0010; all other rows remain NOT_STARTED.
+Manager parity ledger derived from nine discovery inventories. Surface ownership is recorded in `migration/surface-ownership.tsv`; six terminal-host rows are BLOCKED pending signed intent mappings. The 2026-10-01 Phase 2 advisor review is reconciled in D-0010; F-002 is in redesign red-test preparation, and remaining rows are NOT_STARTED.
 
 | ID | Area | Feature | Surface | TUI refs | Deps | Wave | Status | Owner | Evidence | Gaps |
 |---|---|---|---|---|---|---|---|---|---|---|
 | F-001 | foundation | Core crate and TUI/GPUI boundary | - | Cargo.toml; desktop/Cargo.toml; INV-DOCS-002 | - | 0 | VERIFIED | - | tests/boundary/test_f001_boundary.py (7 passed); cargo build --locked; desktop locked build; root tests (278 passed); migration/reports/F-001/{dev-1,logic-review,adversarial-review}.md; CI run 36937979352 (macOS + Windows); merge e346263 | - |
-| F-002 | foundation | Frozen-oracle scenario and differential parity harness | - | tools/ira-parity/**; migration/oracle/traces/**; migration/reports/F-002/** | F-001 | 0 | NOT_STARTED | - | tools/ira-parity/tests/f002_contract.rs (43 GAP tests committed; execution awaits crate manifest); migration/reports/F-002/adv-1.md; five harness traces | G-F002-ADV-01..43 |
+| F-002 | foundation | Frozen-oracle scenario and differential parity harness | - | tools/ira-parity/**; migration/oracle/traces/**; migration/reports/F-002/** | F-001 | 0 | RED_TESTS | - | Preserved implementation/review branch `migrate/F-002-review-fixes` @ `46811ea`: adversarial 6 passed; contract 27 passed/13 ignored; lifecycle helper PTY 4 passed; LOG-05/06 and extracted-session compile contract intentionally red; reports include architecture/platform rounds 2 | G-F002-ADV-01..30,32..37,39..46,49; G-F002-LOG-05..06 |
 | F-003 | foundation | Action registry and keymap engine | - | src/handler.rs; INV-INPUT-001 | F-001,F-002,F-004 | 0 | NOT_STARTED | - | - | - |
 | F-004 | foundation | Application state model | - | src/app.rs; INV-STATE-001 | F-001,F-002 | 0 | NOT_STARTED | - | - | - |
 | F-005 | foundation | Filesystem service and error taxonomy | - | src/services/filesystem.rs; INV-filesystem-001 | F-001,F-004 | 0 | NOT_STARTED | - | - | - |

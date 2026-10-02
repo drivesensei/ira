@@ -1,6 +1,6 @@
 # Migration state
 
-Updated: 2026-10-01 | Branch: main | HEAD: 4c02e95 (F-002 lifecycle red evidence integrated into feature branch)
+Updated: 2026-10-01 | Branch: main | HEAD: dc2ab8b (F-002 redesign red-test gates recorded)
 Phase: 3 Foundation | Current wave: 0 / F-002 redesign | Gate: FAIL (150 feature rows remain open; 86 open GAP annotations)
 
 ## Project coordinates
@@ -13,7 +13,7 @@ Phase: 3 Foundation | Current wave: 0 / F-002 redesign | Gate: FAIL (150 feature
 - Desktop CI: `.github/workflows/desktop-build.yml` is artifact compile/package only, not migration parity CI. No macOS/Windows parity run evidence yet.
 
 ## Counts
-Rows=151; 144 NOT_STARTED, 1 VERIFIED, 6 BLOCKED; 99 inventory entries; 418 canonical surface items (literal comma key alias normalized to `key:normal:comma`); 418 surface-owner rows; blind completion-audit clean rounds=0.
+Rows=151; 143 NOT_STARTED, 1 RED_TESTS, 1 VERIFIED, 6 BLOCKED; 99 inventory entries; 418 canonical surface items (literal comma key alias normalized to `key:normal:comma`); 418 surface-owner rows; blind completion-audit clean rounds=0.
 
 ## In flight
 | Agent | Role | Row(s) | Branch/worktree | Launched | Expect |
@@ -29,7 +29,7 @@ Rows=151; 144 NOT_STARTED, 1 VERIFIED, 6 BLOCKED; 99 inventory entries; 418 cano
 - Rows F-068..F-070, F-072..F-073 and F-088 are BLOCKED until terminal-host/OS behavior gets a signed parity mapping; no waiver/equivalence has UX, logic, and adversarial sign-offs yet. F-150 now tracks the missing migration CI.
 
 ## Next 5 actions
-1. Obtain adversarial re-verification of G50 at `5ae8bf3`; keep G27/29/30 open until actual lifecycle paths are proven.
+1. Keep the branch-level verified GAP transitions reviewer-owned; reconcile ADV marker states and do not close G27/29/30 without session-level proof.
 2. Complete and integrate S13/S14 red tests with the lifecycle and LOG-05/06 probes; keep the missing-session compile failure red; then launch the replacement developer for the serialized redesign slices.
 3. Implement and independently review the extracted PTY owner/teardown, typed golden bundle, and bracketed-paste behavior in serialized overlapping write sets.
 4. Integrate F-002 after reviewer GAP transitions are closed; then merge F-150 red tests and implement its native CI/license workflow.
