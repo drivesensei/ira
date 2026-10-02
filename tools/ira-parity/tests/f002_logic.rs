@@ -1,0 +1,153 @@
+//! Independent logic-review probes for the F-002 harness contract.
+
+use ira_parity::{
+    baseline::BaselineResolver,
+    environment::{ChildEnvironment, EnvironmentPolicy},
+    normalize::normalize_screen,
+    runner::{RunOptions, ScenarioRunner},
+    testing::ScriptedTarget,
+    trace::{parse_trace, ObservationKind},
+};
+use std::process::Command;
+
+// GAP(G-F002-LOG-01) sev=high kind=behavior-divergence feature=F-002
+//   what:     The oracle runner treats expected non-screen observations as matched without comparing them.
+//   tui-ref:  migration/specs/F-002.md S3, S5, S6; src/main.rs:65-68 (process event effects)
+//   oracle:   migration/oracle/traces/harness/initial_screen.toml (trace schema/contract)
+//   repro:    Declare process.exit_code=1 while ScriptedTarget returns no process exit code.
+//   expected: The declared process assertion mismatches (or fails with a diagnostic naming process).
+//   actual:   Runner reports observations_match=true because expected_observations_match only inspects screen text and dimensions.
+//   cover:    process_observation_assertions_are_compared
+#[test]
+fn process_observation_assertions_are_compared() {
+    let source = include_str!("../../../migration/oracle/traces/harness/initial_screen.toml")
+        .replace(
+            "kind = \"terminal_screen\"\nexpect = { contains = [\"Common folders\"] }",
+            "kind = \"process\"\nexpect = { exit_code = 1 }",
+        );
+    let trace = parse_trace(&source).expect("valid process observation trace");
+    assert_eq!(trace.observation_kinds(), vec![ObservationKind::Process]);
+    let mut target = ScriptedTarget::recording();
+    let result = ScenarioRunner::new(RunOptions::default())
+        .run_with_target(&trace, &mut target)
+        .expect("scripted run itself succeeds");
+    assert!(
+        !result.observations_match(),
+        "missing/mismatching process observation must fail"
+    );
+}
+
+// GAP(G-F002-LOG-02) sev=medium kind=behavior-divergence feature=F-002
+//   what:     CSI sequences terminated by nonalphabetic finals erase the first character of following UI text.
+//   tui-ref:  migration/specs/F-002.md S5; src/tui.rs:62-67 (terminal control sequences)
+//   oracle:   ANSI/VT screen stream emitted by the frozen TUI
+//   repro:    Normalize ESC [ 3 ~ followed by the literal message "Message".
+//   expected: The delete-key CSI sequence is removed and the full message remains.
+//   actual:   The normalizer treats '~' as payload until 'M', dropping that first message character.
+//   cover:    normalizer_preserves_text_after_csi_tilde_final
+#[test]
+fn normalizer_preserves_text_after_csi_tilde_final() {
+    assert_eq!(normalize_screen("\x1b[3~Message", &[]), "Message");
+}
+
+// GAP(G-F002-LOG-03) sev=high kind=security feature=F-002
+//   what:     A protected-root override through a symlink can create a directory outside the scenario root before rejection.
+//   tui-ref:  migration/specs/F-002.md S9; environment/config isolation contract
+//   oracle:   isolated scenario root policy in F-002 S9
+//   repro:    Point HOME at a nonexistent child of a symlink inside the run root that resolves outside it.
+//   expected: Reject before following the symlink or creating anything outside the run root.
+//   actual:   Canonicalization falls back to lexical containment for the missing leaf; create_dir_all follows the symlink, then later containment validation rejects.
+//   cover:    symlink_parent_escape_has_no_external_side_effect
+#[cfg(unix)]
+#[test]
+fn symlink_parent_escape_has_no_external_side_effect() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("scenario");
+    let external = temp.path().join("external");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&external).unwrap();
+    std::os::unix::fs::symlink(&external, root.join("redirect")).unwrap();
+
+    let result = ChildEnvironment::build_with_overrides(
+        &EnvironmentPolicy::unix_for_test(),
+        &root,
+        [("HOME", "redirect/created-outside")],
+    );
+    assert!(result.is_err(), "escaped protected root must be rejected");
+    assert!(
+        !external.join("created-outside").exists(),
+        "containment must be checked before creating the external path"
+    );
+}
+
+// GAP(G-F002-LOG-04) sev=high kind=behavior-divergence feature=F-002
+//   what:     Baseline resolution fails immediately when the pinned tag is absent locally instead of fetching it.
+//   tui-ref:  migration/specs/F-002.md S2, S7 (baseline acquisition from immutable tag)
+//   oracle:   tui-oracle-baseline tag peeled to 1cad4ce43cc72d52d4cc4eef920e0da22cb69568
+//   repro:    Clone a remote with --no-tags, then resolve the known tag through BaselineResolver.
+//   expected: Resolver fetches the baseline tag, verifies its peeled SHA, and proceeds.
+//   actual:   resolve() returns "tag ... not found" without attempting fetch.
+//   cover:    baseline_resolution_fetches_missing_pinned_tag
+#[test]
+fn baseline_resolution_fetches_missing_pinned_tag() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let bare = temp.path().join("remote.git");
+    let clone = temp.path().join("clone");
+    std::fs::create_dir_all(&source).unwrap();
+    let run = |dir: &std::path::Path, args: &[&str]| {
+        let result = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        result
+    };
+    run(&source, &["init"]);
+    run(
+        &source,
+        &["config", "user.email", "logic-review@example.invalid"],
+    );
+    run(&source, &["config", "user.name", "Logic Review"]);
+    std::fs::write(source.join("file"), "baseline").unwrap();
+    run(&source, &["add", "file"]);
+    run(&source, &["commit", "-m", "baseline"]);
+    let sha = String::from_utf8_lossy(&run(&source, &["rev-parse", "HEAD"]).stdout)
+        .trim()
+        .to_string();
+    run(&source, &["tag", "tui-oracle-baseline"]);
+    assert!(Command::new("git")
+        .args(["init", "--bare"])
+        .arg(&bare)
+        .output()
+        .unwrap()
+        .status
+        .success());
+    run(
+        &source,
+        &["remote", "add", "origin", bare.to_str().unwrap()],
+    );
+    run(&source, &["push", "origin", "HEAD", "--tags"]);
+    let clone_result = Command::new("git")
+        .args(["clone", "--no-tags"])
+        .arg(&bare)
+        .arg(&clone)
+        .output()
+        .unwrap();
+    assert!(clone_result.status.success());
+    assert!(!clone.join(".git/refs/tags/tui-oracle-baseline").exists());
+
+    let resolved = BaselineResolver::new(&clone)
+        .with_expected_sha(&sha)
+        .resolve();
+    assert!(
+        resolved.is_ok(),
+        "missing pinned tag should be fetched: {resolved:?}"
+    );
+}
