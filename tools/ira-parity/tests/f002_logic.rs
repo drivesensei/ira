@@ -3,12 +3,14 @@
 use ira_parity::{
     baseline::BaselineResolver,
     environment::{ChildEnvironment, EnvironmentPolicy},
+    golden::{GoldenMetadata, GoldenStore},
     normalize::normalize_screen,
     runner::{RunOptions, ScenarioRunner},
     testing::ScriptedTarget,
-    trace::{parse_trace, InputEvent, ObservationKind},
+    trace::{parse_trace, InputEvent, KeyCode, KeyPhase, NamedKey, ObservationKind},
 };
 use std::process::Command;
+use std::{collections::BTreeSet, fs, path::Path};
 
 // GAP-RESOLVED(G-F002-LOG-01) sev=high kind=behavior-divergence feature=F-002
 //   what:     The oracle runner treats expected non-screen observations as matched without comparing them.
@@ -206,5 +208,61 @@ fn readiness_uses_the_declared_process_observation() {
     assert_eq!(
         target.observed_kinds().first(),
         Some(&ObservationKind::Process)
+    );
+}
+
+fn staged_files(root: &Path) -> Vec<Vec<u8>> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            files.extend(staged_files(&path));
+        } else {
+            files.push(fs::read(path).unwrap());
+        }
+    }
+    files
+}
+
+// GAP(G-F002-LOG-06) sev=high kind=missing-feature feature=F-002
+//   what:     Golden staging writes the declared input trace but loses observations collected by the target.
+//   tui-ref:  migration/specs/F-002.md S6 and S10; migration/oracle/traces/harness/initial_screen.toml
+//   oracle:   live TraceTarget observation from the declared terminal_screen assertion
+//   repro:    Run a trace against ScriptedTarget (screen="Common folders\\nActions") and stage its candidate.
+//   expected: Staging contains the captured screen output as well as oracle/scenario/fixture/dimensions/event metadata.
+//   actual:   GoldenStore::capture_to_staging accepts only Trace and serializes trace.to_toml(); captured "Actions" is absent.
+//   cover:    golden_candidate_contains_captured_observations_and_input_evidence
+#[test]
+fn golden_candidate_contains_captured_observations_and_input_evidence() {
+    let mut trace = parse_trace(include_str!(
+        "../../../migration/oracle/traces/harness/initial_screen.toml"
+    ))
+    .unwrap();
+    trace = trace.with_events(vec![InputEvent::Key {
+        code: KeyCode::Named(NamedKey::Escape),
+        modifiers: BTreeSet::new(),
+        phase: KeyPhase::Press,
+    }]);
+    let mut target = ScriptedTarget::recording();
+    let run = ScenarioRunner::new(RunOptions::default())
+        .run_with_target(&trace, &mut target)
+        .unwrap();
+    assert!(run.observations_match());
+
+    let temp = tempfile::tempdir().unwrap();
+    let staging = temp.path().join("candidate");
+    GoldenStore::new(temp.path().join("approved"))
+        .capture_to_staging(&staging, &trace)
+        .unwrap();
+    let metadata = GoldenMetadata::load_from_staging(&staging).unwrap();
+    assert!(
+        metadata.events.contains("Escape"),
+        "logical event evidence must be retained"
+    );
+    assert!(
+        staged_files(&staging)
+            .iter()
+            .any(|contents| String::from_utf8_lossy(contents).contains("Actions")),
+        "candidate must include the target's captured screen, not only trace expectations"
     );
 }
