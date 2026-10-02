@@ -757,25 +757,41 @@ fn timeout_drains_and_joins_readers_before_fixture_removal() {
     assert!(target.fixture_removed_after_readers_joined());
 }
 
-// GAP-FIXED(G-F002-ADV-31) sev=medium kind=test-gap feature=F-002
-//   what:     S8 readiness must be observation-driven with absolute deadlines, never sleep-driven.
+// GAP(G-F002-ADV-31) sev=medium kind=test-gap feature=F-002
+//   what:     Runner readiness has no evidence that it waits on the trace's declared observation kind.
 //   tui-ref:  migration/specs/F-002.md S1, S3, S8; src/main.rs:26-56
 //   oracle:   migration/oracle/traces/harness/initial_screen.toml
-//   repro:    Wait for the screen assertion using output polling and a deadline.
-//   expected: Wait returns only after matching observation or bounded timeout.
-//   actual:   Blocked because tools/ira-parity/Cargo.toml and runner are absent.
-//   cover:    readiness_uses_output_polling_and_absolute_deadline
-//   fixed-by: 176d6de
+//   repro:    Declare filesystem readiness while a pending input is present.
+//   expected: Runner rejects or waits for the declared filesystem observation before applying input.
+//   actual:   Current runner reports ready via ScriptedTarget and applies input without observing filesystem.
+//   cover:    readiness_uses_declared_observation_kind_before_input
+//   reopened: prior test trusted hardcoded ScriptedTarget readiness booleans; it never inspected observation kind.
 #[test]
-fn readiness_uses_output_polling_and_absolute_deadline() {
-    let trace = trace_file("initial_screen.toml");
-    let mut target = ScriptedTarget::ready_after_observation();
-    let result = ScenarioRunner::new(RunOptions::default())
-        .run_with_target(&trace, &mut target)
-        .unwrap();
-    assert!(result.readiness_satisfied_before_first_input());
-    assert!(target.readiness_was_based_on_observation());
-    assert!(target.readiness_poll_deadline_is_absolute());
+fn readiness_uses_declared_observation_kind_before_input() {
+    let source = minimal_trace().replace(
+        "observation = { kind = \"terminal_screen\" }",
+        "observation = { kind = \"filesystem\", relative_path = \".\" }",
+    );
+    let trace = parse(&source).unwrap().with_events(vec![InputEvent::Key {
+        code: KeyCode::Character { character: 'q' },
+        modifiers: BTreeSet::new(),
+        phase: KeyPhase::Press,
+    }]);
+    let mut target = ScriptedTarget::recording();
+    let result = ScenarioRunner::new(RunOptions::default()).run_with_target(&trace, &mut target);
+    assert!(
+        result.is_err(),
+        "runner must not bypass unavailable filesystem readiness"
+    );
+    assert!(
+        target.applied_events().is_empty(),
+        "input was sent before declared readiness"
+    );
+    assert!(target
+        .observed_kinds()
+        .contains(&ObservationKind::Filesystem {
+            relative_path: ".".into()
+        }));
 }
 
 // GAP-FIXED(G-F002-ADV-32) sev=medium kind=test-gap feature=F-002
@@ -952,19 +968,27 @@ fn only_documented_os_environment_is_inherited() {
     }
 }
 
-// GAP-FIXED(G-F002-ADV-38) sev=medium kind=test-gap feature=F-002
-//   what:     S10 golden metadata must bind baseline, trace, fixture, inputs, OS, and date.
+// GAP(G-F002-ADV-38) sev=medium kind=test-gap feature=F-002
+//   what:     S10 staged golden metadata serialization is not verified against required fields and values.
 //   tui-ref:  migration/specs/F-002.md S10
 //   oracle:   migration/oracle/traces/harness/initial_screen.toml
-//   repro:    Build metadata from the live oracle scenario.
+//   repro:    Stage a golden candidate and inspect the written metadata.toml.
 //   expected: Serialized metadata includes every required field and exact baseline SHA.
-//   actual:   Blocked because tools/ira-parity/Cargo.toml and golden implementation are absent.
+//   actual:   Prior test only called has_field(), which checks a static allowlist and never reads serialization.
 //   cover:    golden_metadata_requires_oracle_sha_scenario_fixture_dimensions_events_os_and_date
-//   fixed-by: 176d6de
+//   reopened: previous assertion used GoldenMetadata::has_field's constant list, not staged serialized metadata.
 #[test]
 fn golden_metadata_requires_oracle_sha_scenario_fixture_dimensions_events_os_and_date() {
     let trace = trace_file("initial_screen.toml");
-    let metadata = GoldenMetadata::from_trace(ORACLE_SHA, &trace, "linux", "2026-10-01");
+    let temp = tempdir();
+    let approved = temp.path().join("approved");
+    let stage = temp.path().join("stage");
+    GoldenStore::new(&approved)
+        .capture_to_staging(&stage, &trace)
+        .unwrap();
+    let bytes = std::fs::read_to_string(stage.join("metadata.toml")).unwrap();
+    let serialized: toml::Value = toml::from_str(&bytes).unwrap();
+    let table = serialized.as_table().expect("metadata is a TOML table");
     for field in [
         "oracle_sha",
         "scenario_id",
@@ -974,9 +998,37 @@ fn golden_metadata_requires_oracle_sha_scenario_fixture_dimensions_events_os_and
         "os_profile",
         "capture_date",
     ] {
-        assert!(metadata.has_field(field), "missing {field}");
+        assert!(
+            table.contains_key(field),
+            "serialized metadata missing {field}: {bytes}"
+        );
     }
-    assert_eq!(metadata.oracle_sha(), ORACLE_SHA);
+    assert_eq!(table["oracle_sha"].as_str(), Some(ORACLE_SHA));
+    assert_eq!(
+        table["scenario_id"].as_str(),
+        Some(trace.scenario_id.as_str())
+    );
+    assert_eq!(table["fixture"].as_str(), Some(trace.fixture.kind.as_str()));
+    assert_eq!(table["dimensions"].as_str(), Some("90x24"));
+    let expected_os = if cfg!(target_os = "windows") {
+        "windows-msvc"
+    } else {
+        std::env::consts::OS
+    };
+    assert_eq!(table["os_profile"].as_str(), Some(expected_os));
+    let capture_date = table["capture_date"]
+        .as_str()
+        .expect("capture date is text");
+    assert!(
+        capture_date.len() == 10
+            && capture_date.as_bytes()[4] == b'-'
+            && capture_date.as_bytes()[7] == b'-'
+            && capture_date
+                .bytes()
+                .enumerate()
+                .all(|(i, b)| i == 4 || i == 7 || b.is_ascii_digit()),
+        "invalid capture date: {capture_date:?}"
+    );
 }
 
 // GAP-FIXED(G-F002-ADV-39) sev=medium kind=test-gap feature=F-002

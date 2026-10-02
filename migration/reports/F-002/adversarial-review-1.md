@@ -11,19 +11,20 @@ Attempts made:
 - Confirmed Windows-only coverage is cfg-gated and was not run here; no macOS/Windows native behavior is claimed.
 - Attempted an external protected-root side-effect probe; it passed (override rejected before directory creation), so no issue filed.
 
-Findings (open GAPs in `tools/ira-parity/tests/f002_adversarial.rs`):
+Findings (open GAPs in `tools/ira-parity/tests/f002_adversarial.rs` and `f002_contract.rs`):
 - `G-F002-ADV-44`, high, `expected_observation_content_is_compared`: `ScenarioRunner::run_with_target` ignores `ExpectedObservation.expect` and reports a match for mismatched screen contents.
 - `G-F002-ADV-45`, medium, `incompatible_trace_platform_is_rejected_before_start`: declared trace profiles are not checked against `RunOptions.platform`; a macOS-only trace runs under Linux.
 - `G-F002-ADV-46`, high, `readiness_observation_kind_is_enforced`: runner marks ready and proceeds without enforcing the declared readiness observation kind; a filesystem readiness assertion can be bypassed by terminal readiness.
 - `G-F002-ADV-49`, medium, `normalizer_discards_osc_title_sequences`: OSC title control bytes/payload leak into normalized screen text (`\x1b]0;host-title\x07...` becomes `ost-title\x07...`).
+- `G-F002-ADV-38`, medium, `golden_metadata_requires_oracle_sha_scenario_fixture_dimensions_events_os_and_date`: staged `metadata.toml` serializes `os_profile = "unknown"` and `capture_date = "unknown"` instead of the required platform/date. The revised test reads and checks actual serialized values.
 
 Verified fixes / passing probes:
 - All 13 ignored baseline/cache/cleanup tests passed; extra real success + cache-hit cleanup probe passed.
 - Existing supported-event live replay and unsupported repeat/release rejection passed on Linux.
 - Existing normalization, byte comparison, mismatch diagnostic, staging, ordinary-run, environment isolation, malformed trace, and tagged resize replay tests passed.
-- Existing GAP-FIXED `G-F002-ADV-31` is not fully verified: its observation/deadline assertions call `ScriptedTarget` methods that return hardcoded `true`. Reopen as test-gap until driven by observable behavior.
-- Existing GAP-FIXED `G-F002-ADV-38` is not fully verified: `GoldenMetadata::has_field` checks a static allowlist rather than serialized metadata fields. Reopen as test-gap until staged serialization is inspected.
-- Existing GAP-FIXED `G-F002-ADV-27`: success/cache-hit cleanup is now independently verified by the real baseline probe above; the prior labels for timeout/test failure all exercised the same injected early-error branch, so those specific lifecycle paths remain unproven.
+- `G-F002-ADV-31` was reopened in the contract test: it now declares filesystem readiness with pending input and fails because the runner accepts terminal readiness without observing the declared kind. The prior readiness/deadline assertions called `ScriptedTarget` methods returning hardcoded `true`.
+- `G-F002-ADV-38` was reopened in the contract test: it now reads staged `metadata.toml` and verifies fields/values; this exposes current `unknown` OS/date serialization.
+- `G-F002-ADV-27` stays open for unproven timeout/test-failure exit modes. The real baseline probe verifies successful and cache-hit cleanup, while previous “timeout”/“test-failure” labels exercise the same injected early-error branch.
 
 Mutation checks:
 - Bypassed executable digest comparison locally; `cache_hit_verifies_metadata_and_executable_digest` failed as intended. Restored source.
@@ -31,8 +32,8 @@ Mutation checks:
 - Changed returned readiness flag locally; readiness contract test failed as intended. Restored source.
 - `git diff` confirms no production-source changes.
 
-Reopened: `G-F002-ADV-31`, `G-F002-ADV-38`; `G-F002-ADV-27` partially remains open for unexercised failure modes. Original contract-test markers were not edited because review write scope is restricted to the new adversarial test file and this report; manager should update their lifecycle markers when integrating.
+Reopened: `G-F002-ADV-31`, `G-F002-ADV-38`; `G-F002-ADV-27` stays open for unexercised failure modes.
 
-Verdict: FINDINGS (4 new open GAPs; 3 prior GAP-FIXED notes need follow-up).
+Verdict: FINDINGS (5 open GAPs, including 31 and 38; 27 remains open for untested cleanup modes).
 
 Enrichment candidates: none.
