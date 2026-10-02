@@ -1,6 +1,6 @@
 # Migration state
 
-Updated: 2026-10-01 | Branch: main | HEAD: 40aa4e6 (F-002 lifecycle red tests recorded)
+Updated: 2026-10-01 | Branch: main | HEAD: 4c02e95 (F-002 lifecycle red evidence integrated into feature branch)
 Phase: 3 Foundation | Current wave: 0 / F-002 redesign | Gate: FAIL (150 feature rows remain open; 86 open GAP annotations)
 
 ## Project coordinates
