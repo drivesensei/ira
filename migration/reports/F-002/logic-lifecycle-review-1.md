@@ -59,6 +59,7 @@ Environment for all commands:
 - `cargo test --manifest-path tools/ira-parity/Cargo.toml --locked --test f002_lifecycle_logic gap_log_11 -- --test-threads=1`: 1 fail, elapsed 210.980603 ms.
 - `cargo test --manifest-path tools/ira-parity/Cargo.toml --locked --test f002_lifecycle_session --test f002_lifecycle_child -- --test-threads=1`: 6 + 4 pass.
 - `cargo test --manifest-path tools/ira-parity/Cargo.toml --locked --test f002_contract tagged_oracle_trace_replays_on_linux_macos_windows -- --exact --test-threads=1`: 1 pass on Linux against the frozen oracle (6.40 s).
-- Reviewer-file rustfmt and `git diff --check`: pass. Reviewer scope gate is run on the final committed range.
+- Final combined `f002_lifecycle_logic` run: 2 pass / 4 fail (LOG-07/08/09/11), zero ignored; LOG-07 returned 778,256 bytes, LOG-08 retained 73,745 bytes, LOG-11 elapsed 211.123838 ms.
+- Reviewer-file rustfmt, `git diff --check`, and `python3 scripts/scope_check.py reviewer --range d945cd9..HEAD`: pass (2 files).
 
 No LOG fixes were claimed by the developer in this slice. LOG-01..04 remain resolved, LOG-05/06 remain open outside this slice. No ADV markers changed or closed.
