@@ -51,3 +51,17 @@ Added and ran two further probes against the same remediation library: `repeated
 Verification against remediation: the four original probes passed together (**4/4**). The repeated-observation probe passed in a subsequent focused run. The strengthened process-readiness probe, now with a queued input event, passed individually and confirmed that input followed successful readiness. In the later six-test run, the five probes unrelated to fresh-clone setup passed; the baseline-fetch probe's local `git clone --no-tags` setup failed because `/dev/shm` ran out of quota copying Git hooks (the same baseline-fetch probe had passed in the original 4/4 run). A full suite attempt also hit `/dev/shm` quota during the adversarial test's nested frozen-baseline build, so it does not provide a complete suite verdict. The earlier separate ignored-suite run is Linux-only.
 
 The overall F-002 verdict remains **DIVERGENT / not yet equivalent**. Unresolved or unproven items include bracketed-paste event fidelity (`src/tui.rs:62-67`, `src/main.rs:65-68` versus `runner.rs::encode`), stable/complete golden event metadata, repeated-readiness/deadline/error cleanup interactions beyond these targeted probes, and native macOS/Windows ConPTY evidence. The remediation adds platform selection and observation support declarations, but no native runners were available in this worktree.
+
+## Additional red probes against `5ae8bf38346e7ff20f636f9928eebcf29bc97ab6`
+
+Added two reviewer probes, both run against that commit without production edits:
+
+- `tools/ira-parity/tests/f002_paste_protocol.rs::tests::paste_event_uses_bracketed_paste_protocol` fails: actual encoder bytes are exactly `pasted`; expected bytes are `ESC [ 2 0 0 ~ pasted ESC [ 2 0 1 ~`. The TUI enables bracketed paste in `src/tui.rs:61-67`, Crossterm emits a distinct paste event in `src/event.rs:50-64`, and `src/main.rs:65-68` routes that event to `app.handle_paste`. This is a demonstrated adapter divergence, G-F002-LOG-05.
+- `tools/ira-parity/tests/f002_logic.rs::golden_candidate_contains_captured_observations_and_input_evidence` fails after successfully collecting the scripted screen `Common folders\nActions` and staging the candidate: no staged file contains `Actions`. Metadata does retain the trace's `Escape` event, but S6/S10 require staged captured observation output alongside trace metadata. `GoldenStore::capture_to_staging` currently receives only the input `Trace` and writes `trace.to_toml()` to `initial_screen.toml`. This is a demonstrated missing capture artifact, G-F002-LOG-06.
+
+Commands (against the remediation worktree, commit `5ae8bf3`):
+
+- `TMPDIR=/dev/shm CARGO_TARGET_DIR=/home/vlad/.cache/ira-f002-logic-probes CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=0 cargo test -j1 --manifest-path tools/ira-parity/Cargo.toml --locked --test f002_paste_protocol -- --nocapture` — **1 failed as expected** (paste bytes).
+- Same environment with `--test f002_logic golden_candidate_contains_captured_observations_and_input_evidence -- --exact --nocapture` — **1 failed as expected** (captured screen absent; event metadata present).
+
+G-F002-LOG-01..04 remain resolved. G-F002-LOG-05 and G-F002-LOG-06 are new and open. No production code was changed. Existing cleanup GAPs and native cross-OS evidence remain open as described above.
