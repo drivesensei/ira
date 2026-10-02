@@ -62,7 +62,7 @@ fn tempdir() -> TempDir {
     TempDir::new()
 }
 
-// GAP(G-F002-ADV-01) sev=medium kind=test-gap feature=F-002
+// GAP-FIXED(G-F002-ADV-01) sev=medium kind=test-gap feature=F-002
 //   what:     S1 schema validation has no executable harness package yet.
 //   tui-ref:  migration/specs/F-002.md S1
 //   oracle:   tui-oracle-baseline 1cad4ce43cc72d52d4cc4eef920e0da22cb69568
@@ -70,8 +70,8 @@ fn tempdir() -> TempDir {
 //   expected: All logical events round-trip in source order without coalescing.
 //   actual:   Blocked because tools/ira-parity/Cargo.toml and parser are absent.
 //   cover:    trace_v1_round_trips_ordered_key_text_paste_resize_events
+//   fixed-by: 176d6de
 #[test]
-#[ignore = "GAP G-F002-ADV-01"]
 fn trace_v1_round_trips_ordered_key_text_paste_resize_events() {
     let trace = trace_file("all_event_types.toml");
     let events = trace.events();
@@ -89,7 +89,7 @@ fn trace_v1_round_trips_ordered_key_text_paste_resize_events() {
     assert_eq!(parse_trace(&trace.to_toml()).unwrap().events(), events);
 }
 
-// GAP(G-F002-ADV-02) sev=medium kind=test-gap feature=F-002
+// GAP-FIXED(G-F002-ADV-02) sev=medium kind=test-gap feature=F-002
 //   what:     S1 unknown schema versions cannot be exercised before the parser exists.
 //   tui-ref:  migration/specs/F-002.md S1
 //   oracle:   F-002 schema contract
@@ -97,15 +97,15 @@ fn trace_v1_round_trips_ordered_key_text_paste_resize_events() {
 //   expected: Parsing fails with an unsupported-version diagnostic.
 //   actual:   Blocked because tools/ira-parity/Cargo.toml and parser are absent.
 //   cover:    trace_rejects_unknown_version
+//   fixed-by: 176d6de
 #[test]
-#[ignore = "GAP G-F002-ADV-02"]
 fn trace_rejects_unknown_version() {
     let invalid = minimal_trace().replace("schema_version = 1", "schema_version = 999");
     let error = parse(&invalid).unwrap_err().to_string();
     assert!(error.contains("version"), "{error}");
 }
 
-// GAP(G-F002-ADV-03) sev=medium kind=test-gap feature=F-002
+// GAP-FIXED(G-F002-ADV-03) sev=medium kind=test-gap feature=F-002
 //   what:     S1 required fields, including observation readiness, lack parser coverage.
 //   tui-ref:  migration/specs/F-002.md S1, S3, S8
 //   oracle:   F-002 schema contract
@@ -113,8 +113,8 @@ fn trace_rejects_unknown_version() {
 //   expected: Every omitted field is rejected with its field name.
 //   actual:   Blocked because tools/ira-parity/Cargo.toml and parser are absent.
 //   cover:    trace_rejects_missing_required_fields_including_readiness
+//   fixed-by: 176d6de
 #[test]
-#[ignore = "GAP G-F002-ADV-03"]
 fn trace_rejects_missing_required_fields_including_readiness() {
     let source = minimal_trace();
     let invalid_cases = [
@@ -149,7 +149,7 @@ fn trace_rejects_missing_required_fields_including_readiness() {
     }
 }
 
-// GAP(G-F002-ADV-04) sev=medium kind=test-gap feature=F-002
+// GAP-FIXED(G-F002-ADV-04) sev=medium kind=test-gap feature=F-002
 //   what:     S1 malformed tagged events and unknown fields lack parser coverage.
 //   tui-ref:  migration/specs/F-002.md S1, S3
 //   oracle:   F-002 schema contract
@@ -157,8 +157,8 @@ fn trace_rejects_missing_required_fields_including_readiness() {
 //   expected: All malformed/unknown members fail closed with useful diagnostics.
 //   actual:   Blocked because tools/ira-parity/Cargo.toml and parser are absent.
 //   cover:    trace_rejects_malformed_tagged_event_and_unknown_field
+//   fixed-by: 176d6de
 #[test]
-#[ignore = "GAP G-F002-ADV-04"]
 fn trace_rejects_malformed_tagged_event_and_unknown_field() {
     let all_events = include_str!("../../../migration/oracle/traces/harness/all_event_types.toml");
     for malformed in [
@@ -173,7 +173,7 @@ fn trace_rejects_malformed_tagged_event_and_unknown_field() {
     }
 }
 
-// GAP(G-F002-ADV-05) sev=medium kind=test-gap feature=F-002
+// GAP-FIXED(G-F002-ADV-05) sev=medium kind=test-gap feature=F-002
 //   what:     S1 unsupported platform profiles lack parser coverage.
 //   tui-ref:  migration/specs/F-002.md S1, S4
 //   oracle:   F-002 schema contract
@@ -181,8 +181,8 @@ fn trace_rejects_malformed_tagged_event_and_unknown_field() {
 //   expected: Parser reports the unsupported profile instead of silently skipping it.
 //   actual:   Blocked because tools/ira-parity/Cargo.toml and parser are absent.
 //   cover:    trace_rejects_unsupported_platform_profile
+//   fixed-by: 176d6de
 #[test]
-#[ignore = "GAP G-F002-ADV-05"]
 fn trace_rejects_unsupported_platform_profile() {
     let invalid = minimal_trace().replace("\"linux\"", "\"plan9\"");
     let error = parse(&invalid).unwrap_err().to_string();
@@ -277,7 +277,7 @@ fn baseline_builds_once_for_job() {
     assert_eq!(first.executable_digest(), second.executable_digest());
 }
 
-// GAP(G-F002-ADV-10) sev=medium kind=test-gap feature=F-002
+// GAP-FIXED(G-F002-ADV-10) sev=medium kind=test-gap feature=F-002
 //   what:     S3 event order and every declared observation kind lack target-contract coverage.
 //   tui-ref:  migration/specs/F-002.md S3
 //   oracle:   migration/oracle/traces/harness/initial_screen.toml
@@ -285,8 +285,8 @@ fn baseline_builds_once_for_job() {
 //   expected: Target receives events in order and each declared observation exactly once.
 //   actual:   Blocked because tools/ira-parity/Cargo.toml and runner are absent.
 //   cover:    target_contract_applies_events_in_order_and_observes_each_declared_kind
+//   fixed-by: 176d6de
 #[test]
-#[ignore = "GAP G-F002-ADV-10"]
 fn target_contract_applies_events_in_order_and_observes_each_declared_kind() {
     let trace = trace_file("initial_screen.toml");
     let mut target = ScriptedTarget::recording();
@@ -297,7 +297,7 @@ fn target_contract_applies_events_in_order_and_observes_each_declared_kind() {
     assert_eq!(target.observed_kinds(), trace.observation_kinds());
 }
 
-// GAP(G-F002-ADV-11) sev=medium kind=test-gap feature=F-002
+// GAP-FIXED(G-F002-ADV-11) sev=medium kind=test-gap feature=F-002
 //   what:     S3 unsupported target observations must fail with a diagnostic.
 //   tui-ref:  migration/specs/F-002.md S3
 //   oracle:   F-002 schema contract
@@ -305,8 +305,8 @@ fn target_contract_applies_events_in_order_and_observes_each_declared_kind() {
 //   expected: Runner fails naming the unsupported observation kind and target.
 //   actual:   Blocked because tools/ira-parity/Cargo.toml and runner are absent.
 //   cover:    target_rejects_unsupported_observation_kind
+//   fixed-by: 176d6de
 #[test]
-#[ignore = "GAP G-F002-ADV-11"]
 fn target_rejects_unsupported_observation_kind() {
     let trace = Trace::parse_toml(minimal_trace())
         .unwrap()
@@ -320,7 +320,7 @@ fn target_rejects_unsupported_observation_kind() {
     assert!(error.contains("gpui_view_tree") && error.contains("unsupported"));
 }
 
-// GAP(G-F002-ADV-12) sev=medium kind=test-gap feature=F-002
+// GAP-FIXED(G-F002-ADV-12) sev=medium kind=test-gap feature=F-002
 //   what:     S3 domain snapshot names must remain feature-owned and UI-neutral.
 //   tui-ref:  migration/specs/F-002.md S3
 //   oracle:   F-002 schema contract
@@ -328,8 +328,8 @@ fn target_rejects_unsupported_observation_kind() {
 //   expected: Neutral names parse; GPUI types/action identifiers are not schema dependencies.
 //   actual:   Blocked because tools/ira-parity/Cargo.toml and schema are absent.
 //   cover:    target_keeps_domain_snapshot_names_ui_neutral
+//   fixed-by: 176d6de
 #[test]
-#[ignore = "GAP G-F002-ADV-12"]
 fn target_keeps_domain_snapshot_names_ui_neutral() {
     let trace = Trace::parse_toml(minimal_trace())
         .unwrap()
@@ -344,7 +344,7 @@ fn target_keeps_domain_snapshot_names_ui_neutral() {
         .any(|name| name.contains("gpui")));
 }
 
-// GAP(G-F002-ADV-13) sev=medium kind=test-gap feature=F-002
+// GAP-FIXED(G-F002-ADV-13) sev=medium kind=test-gap feature=F-002
 //   what:     S3 process stdout and stderr observations must stay distinct.
 //   tui-ref:  migration/specs/F-002.md S3
 //   oracle:   src/main.rs:38-45 (TUI writer selection); F-002 contract
@@ -352,8 +352,8 @@ fn target_keeps_domain_snapshot_names_ui_neutral() {
 //   expected: Process observation preserves each marker in its own stream field.
 //   actual:   Blocked because tools/ira-parity/Cargo.toml and target implementation are absent.
 //   cover:    target_keeps_process_stdout_and_stderr_distinct
+//   fixed-by: 176d6de
 #[test]
-#[ignore = "GAP G-F002-ADV-13"]
 fn target_keeps_process_stdout_and_stderr_distinct() {
     let mut target = ScriptedTarget::writing_stream_markers("stdout-marker", "stderr-marker");
     let observation = target.observe(&ObservationKind::Process).unwrap();
@@ -361,7 +361,7 @@ fn target_keeps_process_stdout_and_stderr_distinct() {
     assert_eq!(observation.stderr(), Some("stderr-marker"));
 }
 
-// GAP(G-F002-ADV-14) sev=medium kind=test-gap feature=F-002
+// GAP-FIXED(G-F002-ADV-14) sev=medium kind=test-gap feature=F-002
 //   what:     S4 Linux PTY event encoding/order, including readiness, lacks native coverage.
 //   tui-ref:  migration/specs/F-002.md S3-S4; src/event.rs:50-63
 //   oracle:   migration/oracle/traces/harness/initial_screen.toml
@@ -369,8 +369,8 @@ fn target_keeps_process_stdout_and_stderr_distinct() {
 //   expected: Each supported event reaches the child in sequence after screen readiness.
 //   actual:   Blocked because tools/ira-parity/Cargo.toml and PTY adapter are absent.
 //   cover:    pty_adapter_maps_supported_key_press_text_paste_and_resize_on_linux
+//   fixed-by: 176d6de
 #[test]
-#[ignore = "GAP G-F002-ADV-14"]
 #[cfg(target_os = "linux")]
 fn pty_adapter_maps_supported_key_press_text_paste_and_resize_on_linux() {
     let trace = trace_file("all_event_types.toml");
@@ -424,7 +424,7 @@ fn conpty_adapter_maps_supported_events_on_windows() {
     assert!(result.observations_match());
 }
 
-// GAP(G-F002-ADV-17) sev=medium kind=test-gap feature=F-002
+// GAP-FIXED(G-F002-ADV-17) sev=medium kind=test-gap feature=F-002
 //   what:     S3-S4 repeat/release phases must fail instead of being synthesized.
 //   tui-ref:  migration/specs/F-002.md S3-S4; src/event.rs:52-56
 //   oracle:   migration/oracle/traces/harness/reject_repeat.toml and reject_release.toml
@@ -432,8 +432,8 @@ fn conpty_adapter_maps_supported_events_on_windows() {
 //   expected: Explicit unsupported-event errors; no synthetic press is delivered.
 //   actual:   Blocked because tools/ira-parity/Cargo.toml and TUI adapter are absent.
 //   cover:    adapter_fails_explicitly_for_unsupported_repeat_and_release_phases
+//   fixed-by: 176d6de
 #[test]
-#[ignore = "GAP G-F002-ADV-17"]
 fn adapter_fails_explicitly_for_unsupported_repeat_and_release_phases() {
     for (trace_name, phase) in [
         ("reject_repeat.toml", "repeat"),
@@ -456,7 +456,7 @@ fn adapter_fails_explicitly_for_unsupported_repeat_and_release_phases() {
     }
 }
 
-// GAP(G-F002-ADV-18) sev=medium kind=test-gap feature=F-002
+// GAP-FIXED(G-F002-ADV-18) sev=medium kind=test-gap feature=F-002
 //   what:     S5 normalization must strip only terminal controls and declared volatile roots.
 //   tui-ref:  migration/specs/F-002.md S5
 //   oracle:   migration/oracle/traces/harness/initial_screen.toml
@@ -464,8 +464,8 @@ fn adapter_fails_explicitly_for_unsupported_repeat_and_release_phases() {
 //   expected: Only controls and the declared root are normalized.
 //   actual:   Blocked because tools/ira-parity/Cargo.toml and normalizer are absent.
 //   cover:    normalizer_removes_only_declared_volatile_roots_and_control_sequences
+//   fixed-by: 176d6de
 #[test]
-#[ignore = "GAP G-F002-ADV-18"]
 fn normalizer_removes_only_declared_volatile_roots_and_control_sequences() {
     let screen = "\x1b[2Jroot=/run/a tmp=/tmp/run-a keep=/tmp/other";
     let normalized = normalize_screen(screen, &["/tmp/run-a"]);
@@ -475,7 +475,7 @@ fn normalizer_removes_only_declared_volatile_roots_and_control_sequences() {
     assert!(normalized.contains("keep=/tmp/other"));
 }
 
-// GAP(G-F002-ADV-19) sev=medium kind=test-gap feature=F-002
+// GAP-FIXED(G-F002-ADV-19) sev=medium kind=test-gap feature=F-002
 //   what:     S5 must preserve user-visible names, ordering, selection, and messages.
 //   tui-ref:  migration/specs/F-002.md S5
 //   oracle:   migration/oracle/traces/harness/initial_screen.toml
@@ -483,8 +483,8 @@ fn normalizer_removes_only_declared_volatile_roots_and_control_sequences() {
 //   expected: Names/order/selection/message remain byte-for-byte equal after normalization.
 //   actual:   Blocked because tools/ira-parity/Cargo.toml and normalizer are absent.
 //   cover:    normalizer_preserves_names_order_selection_and_messages
+//   fixed-by: 176d6de
 #[test]
-#[ignore = "GAP G-F002-ADV-19"]
 fn normalizer_preserves_names_order_selection_and_messages() {
     let a = normalize_screen("alpha.txt\n> beta.txt\nDeleted alpha.txt", &["/tmp/run-a"]);
     let b = normalize_screen("alpha.txt\n> beta.txt\nDeleted alpha.txt", &["/tmp/run-b"]);
@@ -493,7 +493,7 @@ fn normalizer_preserves_names_order_selection_and_messages() {
     assert_eq!(a, b);
 }
 
-// GAP(G-F002-ADV-20) sev=medium kind=test-gap feature=F-002
+// GAP-FIXED(G-F002-ADV-20) sev=medium kind=test-gap feature=F-002
 //   what:     S5 filesystem and persisted observations must remain byte-exact.
 //   tui-ref:  migration/specs/F-002.md S5; AGENTS.md invariant 6
 //   oracle:   F-002 contract; owning feature captures
@@ -501,14 +501,14 @@ fn normalizer_preserves_names_order_selection_and_messages() {
 //   expected: Byte comparison detects the difference without normalization.
 //   actual:   Blocked because tools/ira-parity/Cargo.toml and comparator are absent.
 //   cover:    filesystem_and_persisted_observations_compare_exact_bytes
+//   fixed-by: 176d6de
 #[test]
-#[ignore = "GAP G-F002-ADV-20"]
 fn filesystem_and_persisted_observations_compare_exact_bytes() {
     assert!(compare_bytes(b"persisted\0\xff", b"persisted\0\xff").is_ok());
     assert!(compare_bytes(b"persisted\0\xff", b"persisted\0\xfe").is_err());
 }
 
-// GAP(G-F002-ADV-21) sev=medium kind=test-gap feature=F-002
+// GAP-FIXED(G-F002-ADV-21) sev=medium kind=test-gap feature=F-002
 //   what:     S6 mismatch diagnostics lack exact actionable-field coverage.
 //   tui-ref:  migration/specs/F-002.md S6
 //   oracle:   F-002 schema contract
@@ -516,8 +516,8 @@ fn filesystem_and_persisted_observations_compare_exact_bytes() {
 //   expected: Diagnostic names scenario, observation, expected, and actual.
 //   actual:   Blocked because tools/ira-parity/Cargo.toml and comparator are absent.
 //   cover:    mismatch_diff_names_scenario_observation_expected_and_actual
+//   fixed-by: 176d6de
 #[test]
-#[ignore = "GAP G-F002-ADV-21"]
 fn mismatch_diff_names_scenario_observation_expected_and_actual() {
     let error = compare_screen(
         "resize-small",
@@ -537,7 +537,7 @@ fn mismatch_diff_names_scenario_observation_expected_and_actual() {
     }
 }
 
-// GAP(G-F002-ADV-22) sev=medium kind=test-gap feature=F-002
+// GAP-FIXED(G-F002-ADV-22) sev=medium kind=test-gap feature=F-002
 //   what:     S6 candidate goldens must only be written to the chosen staging directory.
 //   tui-ref:  migration/specs/F-002.md S6, state/effects
 //   oracle:   migration/oracle/traces/harness/initial_screen.toml
@@ -545,8 +545,8 @@ fn mismatch_diff_names_scenario_observation_expected_and_actual() {
 //   expected: Candidate exists under staging; approved capture tree is unchanged.
 //   actual:   Blocked because tools/ira-parity/Cargo.toml and golden writer are absent.
 //   cover:    golden_capture_writes_only_to_selected_staging_root
+//   fixed-by: 176d6de
 #[test]
-#[ignore = "GAP G-F002-ADV-22"]
 fn golden_capture_writes_only_to_selected_staging_root() {
     let temp = tempdir();
     let approved = temp.path().join("approved");
@@ -561,7 +561,7 @@ fn golden_capture_writes_only_to_selected_staging_root() {
     assert_eq!(std::fs::read(marker).unwrap(), b"approved");
 }
 
-// GAP(G-F002-ADV-23) sev=medium kind=test-gap feature=F-002
+// GAP-FIXED(G-F002-ADV-23) sev=medium kind=test-gap feature=F-002
 //   what:     S6 ordinary test runs must not update approved goldens.
 //   tui-ref:  migration/specs/F-002.md S6, state/effects
 //   oracle:   migration/oracle/traces/harness/initial_screen.toml
@@ -569,8 +569,8 @@ fn golden_capture_writes_only_to_selected_staging_root() {
 //   expected: Approved bytes are unchanged and no candidate is written there.
 //   actual:   Blocked because tools/ira-parity/Cargo.toml and runner are absent.
 //   cover:    ordinary_run_does_not_modify_approved_goldens
+//   fixed-by: 176d6de
 #[test]
-#[ignore = "GAP G-F002-ADV-23"]
 fn ordinary_run_does_not_modify_approved_goldens() {
     let temp = tempdir();
     let golden = temp.path().join("golden.toml");
@@ -755,7 +755,7 @@ fn timeout_drains_and_joins_readers_before_fixture_removal() {
     assert!(target.fixture_removed_after_readers_joined());
 }
 
-// GAP(G-F002-ADV-31) sev=medium kind=test-gap feature=F-002
+// GAP-FIXED(G-F002-ADV-31) sev=medium kind=test-gap feature=F-002
 //   what:     S8 readiness must be observation-driven with absolute deadlines, never sleep-driven.
 //   tui-ref:  migration/specs/F-002.md S1, S3, S8; src/main.rs:26-56
 //   oracle:   migration/oracle/traces/harness/initial_screen.toml
@@ -763,8 +763,8 @@ fn timeout_drains_and_joins_readers_before_fixture_removal() {
 //   expected: Wait returns only after matching observation or bounded timeout.
 //   actual:   Blocked because tools/ira-parity/Cargo.toml and runner are absent.
 //   cover:    readiness_uses_output_polling_and_absolute_deadline
+//   fixed-by: 176d6de
 #[test]
-#[ignore = "GAP G-F002-ADV-31"]
 fn readiness_uses_output_polling_and_absolute_deadline() {
     let trace = trace_file("initial_screen.toml");
     let mut target = ScriptedTarget::ready_after_observation();
@@ -776,7 +776,7 @@ fn readiness_uses_output_polling_and_absolute_deadline() {
     assert!(target.readiness_poll_deadline_is_absolute());
 }
 
-// GAP(G-F002-ADV-32) sev=medium kind=test-gap feature=F-002
+// GAP-FIXED(G-F002-ADV-32) sev=medium kind=test-gap feature=F-002
 //   what:     S8 must send no event if the observation-based readiness deadline expires.
 //   tui-ref:  migration/specs/F-002.md S1, S3, S8
 //   oracle:   migration/oracle/traces/harness/initial_screen.toml
@@ -784,8 +784,8 @@ fn readiness_uses_output_polling_and_absolute_deadline() {
 //   expected: Readiness timeout occurs and target's applied-event list remains empty.
 //   actual:   Blocked because tools/ira-parity/Cargo.toml and runner are absent.
 //   cover:    readiness_timeout_sends_no_input
+//   fixed-by: 176d6de
 #[test]
-#[ignore = "GAP G-F002-ADV-32"]
 fn readiness_timeout_sends_no_input() {
     let trace = trace_file("initial_screen.toml").with_events(vec![InputEvent::Key {
         code: KeyCode::Character { character: 'q' },
@@ -801,7 +801,7 @@ fn readiness_timeout_sends_no_input() {
     assert!(target.applied_events().is_empty());
 }
 
-// GAP(G-F002-ADV-33) sev=medium kind=test-gap feature=F-002
+// GAP-FIXED(G-F002-ADV-33) sev=medium kind=test-gap feature=F-002
 //   what:     S9 poisoned Unix environment must not redirect protected roots.
 //   tui-ref:  migration/specs/F-002.md S9, config influence/persistence
 //   oracle:   F-002 environment contract
@@ -809,8 +809,8 @@ fn readiness_timeout_sends_no_input() {
 //   expected: Child uses only isolated roots within scenario root and allowlisted variables.
 //   actual:   Blocked because tools/ira-parity/Cargo.toml and environment builder are absent.
 //   cover:    poisoned_parent_environment_cannot_escape_isolated_roots_unix
+//   fixed-by: 176d6de
 #[test]
-#[ignore = "GAP G-F002-ADV-33"]
 #[cfg(unix)]
 fn poisoned_parent_environment_cannot_escape_isolated_roots_unix() {
     let policy = EnvironmentPolicy::unix_for_test();
@@ -867,7 +867,7 @@ fn poisoned_parent_environment_cannot_escape_isolated_roots_windows() {
     assert!(env.get("IRA_IMAGES").is_none());
 }
 
-// GAP(G-F002-ADV-35) sev=medium kind=test-gap feature=F-002
+// GAP-FIXED(G-F002-ADV-35) sev=medium kind=test-gap feature=F-002
 //   what:     S9 scenario overrides may not escape protected roots after path resolution.
 //   tui-ref:  migration/specs/F-002.md S9
 //   oracle:   F-002 environment contract
@@ -875,8 +875,8 @@ fn poisoned_parent_environment_cannot_escape_isolated_roots_windows() {
 //   expected: Both overrides are rejected before child launch.
 //   actual:   Blocked because tools/ira-parity/Cargo.toml and environment builder are absent.
 //   cover:    scenario_override_cannot_escape_protected_roots
+//   fixed-by: 176d6de
 #[test]
-#[ignore = "GAP G-F002-ADV-35"]
 fn scenario_override_cannot_escape_protected_roots() {
     for value in ["/outside/home", "../../outside/tmp"] {
         let error = ChildEnvironment::build_with_overrides(
@@ -893,7 +893,7 @@ fn scenario_override_cannot_escape_protected_roots() {
     }
 }
 
-// GAP(G-F002-ADV-36) sev=medium kind=test-gap feature=F-002
+// GAP-FIXED(G-F002-ADV-36) sev=medium kind=test-gap feature=F-002
 //   what:     S9 protected-root canonicalization must reject external symlink escapes.
 //   tui-ref:  migration/specs/F-002.md S9
 //   oracle:   F-002 environment contract
@@ -901,8 +901,8 @@ fn scenario_override_cannot_escape_protected_roots() {
 //   expected: Environment validation fails closed and does not follow the escape.
 //   actual:   Blocked because tools/ira-parity/Cargo.toml and environment builder are absent.
 //   cover:    protected_root_symlink_escape_is_rejected
+//   fixed-by: 176d6de
 #[test]
-#[ignore = "GAP G-F002-ADV-36"]
 fn protected_root_symlink_escape_is_rejected() {
     let temp = tempdir();
     let root = temp.path().join("run");
@@ -950,7 +950,7 @@ fn only_documented_os_environment_is_inherited() {
     }
 }
 
-// GAP(G-F002-ADV-38) sev=medium kind=test-gap feature=F-002
+// GAP-FIXED(G-F002-ADV-38) sev=medium kind=test-gap feature=F-002
 //   what:     S10 golden metadata must bind baseline, trace, fixture, inputs, OS, and date.
 //   tui-ref:  migration/specs/F-002.md S10
 //   oracle:   migration/oracle/traces/harness/initial_screen.toml
@@ -958,8 +958,8 @@ fn only_documented_os_environment_is_inherited() {
 //   expected: Serialized metadata includes every required field and exact baseline SHA.
 //   actual:   Blocked because tools/ira-parity/Cargo.toml and golden implementation are absent.
 //   cover:    golden_metadata_requires_oracle_sha_scenario_fixture_dimensions_events_os_and_date
+//   fixed-by: 176d6de
 #[test]
-#[ignore = "GAP G-F002-ADV-38"]
 fn golden_metadata_requires_oracle_sha_scenario_fixture_dimensions_events_os_and_date() {
     let trace = trace_file("initial_screen.toml");
     let metadata = GoldenMetadata::from_trace(ORACLE_SHA, &trace, "linux", "2026-10-01");
@@ -977,7 +977,7 @@ fn golden_metadata_requires_oracle_sha_scenario_fixture_dimensions_events_os_and
     assert_eq!(metadata.oracle_sha(), ORACLE_SHA);
 }
 
-// GAP(G-F002-ADV-39) sev=medium kind=test-gap feature=F-002
+// GAP-FIXED(G-F002-ADV-39) sev=medium kind=test-gap feature=F-002
 //   what:     S10 golden capture must stage candidates without replacing approved captures.
 //   tui-ref:  migration/specs/F-002.md S6, S10
 //   oracle:   migration/oracle/traces/harness/initial_screen.toml
@@ -985,8 +985,8 @@ fn golden_metadata_requires_oracle_sha_scenario_fixture_dimensions_events_os_and
 //   expected: Existing evidence bytes remain unchanged; candidate is separate and unapproved.
 //   actual:   Blocked because tools/ira-parity/Cargo.toml and golden implementation are absent.
 //   cover:    golden_capture_stages_without_replacing_approved_capture
+//   fixed-by: 176d6de
 #[test]
-#[ignore = "GAP G-F002-ADV-39"]
 fn golden_capture_stages_without_replacing_approved_capture() {
     let temp = tempdir();
     let approved = temp.path().join("approved");
@@ -1007,7 +1007,7 @@ fn golden_capture_stages_without_replacing_approved_capture() {
     );
 }
 
-// GAP(G-F002-ADV-40) sev=medium kind=test-gap feature=F-002
+// GAP-FIXED(G-F002-ADV-40) sev=medium kind=test-gap feature=F-002
 //   what:     S11 lacks live tagged-oracle replay coverage on each native runner.
 //   tui-ref:  migration/specs/F-002.md S11; F-150 platform obligation
 //   oracle:   migration/oracle/traces/harness/resize_small.toml
@@ -1015,8 +1015,8 @@ fn golden_capture_stages_without_replacing_approved_capture() {
 //   expected: Screen observation matches the approved trace on every native runner, without skip.
 //   actual:   Blocked because tools/ira-parity/Cargo.toml and native harness jobs are absent.
 //   cover:    tagged_oracle_trace_replays_on_linux_macos_windows
+//   fixed-by: 176d6de
 #[test]
-#[ignore = "GAP G-F002-ADV-40"]
 fn tagged_oracle_trace_replays_on_linux_macos_windows() {
     let trace = trace_file("resize_small.toml");
     let result = ScenarioRunner::new(RunOptions::for_current_platform())
@@ -1027,7 +1027,7 @@ fn tagged_oracle_trace_replays_on_linux_macos_windows() {
     assert!(result.baseline_sha() == ORACLE_SHA);
 }
 
-// GAP(G-F002-ADV-41) sev=medium kind=test-gap feature=F-002
+// GAP-FIXED(G-F002-ADV-41) sev=medium kind=test-gap feature=F-002
 //   what:     S11 malformed traces must fail before starting any child process.
 //   tui-ref:  migration/specs/F-002.md S1, S11
 //   oracle:   F-002 schema contract
@@ -1035,8 +1035,8 @@ fn tagged_oracle_trace_replays_on_linux_macos_windows() {
 //   expected: Parser/validator reports the malformed field and child start count remains zero.
 //   actual:   Blocked because tools/ira-parity/Cargo.toml and runner are absent.
 //   cover:    malformed_trace_fails_before_child_start
+//   fixed-by: 176d6de
 #[test]
-#[ignore = "GAP G-F002-ADV-41"]
 fn malformed_trace_fails_before_child_start() {
     let malformed = minimal_trace().replace("[readiness]", "[missing_readiness]");
     let mut target = ScriptedTarget::counting_starts();
@@ -1066,7 +1066,7 @@ fn parallel_scenarios_have_disjoint_roots_and_sessions() {
     assert!(a.fixture_removed() && b.fixture_removed());
 }
 
-// GAP(G-F002-ADV-43) sev=medium kind=test-gap feature=F-002
+// GAP-FIXED(G-F002-ADV-43) sev=medium kind=test-gap feature=F-002
 //   what:     S11 observation mismatch detection lacks mutation-sensitivity evidence.
 //   tui-ref:  migration/specs/F-002.md S6, S11
 //   oracle:   migration/oracle/traces/harness/initial_screen.toml
@@ -1074,8 +1074,8 @@ fn parallel_scenarios_have_disjoint_roots_and_sessions() {
 //   expected: Comparison fails and reports the changed observation.
 //   actual:   Blocked because tools/ira-parity/Cargo.toml and comparator are absent.
 //   cover:    changed_observation_fails_assertion_mutation
+//   fixed-by: 176d6de
 #[test]
-#[ignore = "GAP G-F002-ADV-43"]
 fn changed_observation_fails_assertion_mutation() {
     let expected = "Common folders\nActions";
     let actual = "Common folders\nActionz";
