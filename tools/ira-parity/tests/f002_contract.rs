@@ -757,15 +757,16 @@ fn timeout_drains_and_joins_readers_before_fixture_removal() {
     assert!(target.fixture_removed_after_readers_joined());
 }
 
-// GAP(G-F002-ADV-31) sev=medium kind=test-gap feature=F-002
+// GAP-RESOLVED(G-F002-ADV-31) sev=medium kind=test-gap feature=F-002
 //   what:     Runner readiness has no evidence that it waits on the trace's declared observation kind.
 //   tui-ref:  migration/specs/F-002.md S1, S3, S8; src/main.rs:26-56
 //   oracle:   migration/oracle/traces/harness/initial_screen.toml
 //   repro:    Declare filesystem readiness while a pending input is present.
 //   expected: Runner rejects or waits for the declared filesystem observation before applying input.
-//   actual:   Current runner reports ready via ScriptedTarget and applies input without observing filesystem.
+//   actual:   At initial review, runner accepted readiness without comparing the declared filesystem observation.
 //   cover:    readiness_uses_declared_observation_kind_before_input
 //   reopened: prior test trusted hardcoded ScriptedTarget readiness booleans; it never inspected observation kind.
+//   verified-by: adversarial reviewer 2026-10-01 against 62db2ce; filesystem bytes mismatching condition prevent input
 #[test]
 fn readiness_uses_declared_observation_kind_before_input() {
     let source = minimal_trace().replace(
@@ -968,7 +969,7 @@ fn only_documented_os_environment_is_inherited() {
     }
 }
 
-// GAP(G-F002-ADV-38) sev=medium kind=test-gap feature=F-002
+// GAP-RESOLVED(G-F002-ADV-38) sev=medium kind=test-gap feature=F-002
 //   what:     S10 staged golden metadata serialization is not verified against required fields and values.
 //   tui-ref:  migration/specs/F-002.md S10
 //   oracle:   migration/oracle/traces/harness/initial_screen.toml
@@ -977,6 +978,7 @@ fn only_documented_os_environment_is_inherited() {
 //   actual:   Prior test only called has_field(), which checks a static allowlist and never reads serialization.
 //   cover:    golden_metadata_requires_oracle_sha_scenario_fixture_dimensions_events_os_and_date
 //   reopened: previous assertion used GoldenMetadata::has_field's constant list, not staged serialized metadata.
+//   verified-by: adversarial reviewer 2026-10-01 against 62db2ce; staged TOML is checked field-by-field and value-by-value
 #[test]
 fn golden_metadata_requires_oracle_sha_scenario_fixture_dimensions_events_os_and_date() {
     let trace = trace_file("initial_screen.toml");
