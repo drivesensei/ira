@@ -140,3 +140,60 @@ fn successful_baseline_build_drop_removes_real_worktree() {
         "cache-hit path leaked worktree {cached_worktree:?}"
     );
 }
+
+// GAP(G-F002-ADV-50) sev=medium kind=edge-case feature=F-002
+//   what:     Baseline tag resolution uses an unqualified ref and can be shadowed by a conflicting refs/<tag>.
+//   tui-ref:  migration/specs/F-002.md S2, S7
+//   oracle:   tui-oracle-baseline exact peeled tag SHA
+//   repro:    Create tag `oracle` at commit A and direct ref `refs/oracle` at commit B, then resolve `oracle`.
+//   expected: Resolver reads refs/tags/oracle and accepts commit A independent of other refs.
+//   actual:   `rev-parse oracle^{commit}` resolves refs/oracle first and rejects the correct tag as wrong SHA.
+//   cover:    baseline_resolution_is_qualified_to_tag_namespace
+#[test]
+fn baseline_resolution_is_qualified_to_tag_namespace() {
+    use ira_parity::baseline::BaselineResolver;
+    use std::{path::Path, process::Command};
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    let repo = tempfile::tempdir().unwrap();
+    git(repo.path(), &["init", "--quiet"]);
+    git(repo.path(), &["config", "user.name", "review"]);
+    git(
+        repo.path(),
+        &["config", "user.email", "review@example.invalid"],
+    );
+    std::fs::write(repo.path().join("content"), "tagged baseline\n").unwrap();
+    git(repo.path(), &["add", "content"]);
+    git(repo.path(), &["commit", "--quiet", "-m", "tagged baseline"]);
+    let tag_sha = git(repo.path(), &["rev-parse", "HEAD"]);
+    git(repo.path(), &["tag", "oracle"]);
+
+    std::fs::write(repo.path().join("content"), "shadow ref\n").unwrap();
+    git(repo.path(), &["commit", "--quiet", "-am", "shadow ref"]);
+    let shadow_sha = git(repo.path(), &["rev-parse", "HEAD"]);
+    git(repo.path(), &["update-ref", "refs/oracle", &shadow_sha]);
+    assert_ne!(tag_sha, shadow_sha);
+
+    let result = BaselineResolver::new(repo.path())
+        .with_tag("oracle")
+        .with_expected_sha(&tag_sha)
+        .resolve();
+    assert!(
+        result.is_ok(),
+        "tag namespace should win over refs/oracle: {result:?}"
+    );
+}
