@@ -124,6 +124,100 @@ class Safety(unittest.TestCase):
         self.assertEqual(result['descendants'], 'UNVERIFIED')
         self.assertTrue((self.parent / 'run/home').exists())
 
+    def attack(self, operation):
+        import subprocess
+        attack_source = self.parent / 'attack.c'
+        attack_binary = self.parent / 'attack'
+        attack_source.write_text(r'''#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/stat.h>
+int main(int n, char **v) {
+    if(n != 3) return 11;
+    if(!strcmp(v[1], "root")) {
+        if(rename("../../run", "../../run.retained")) return 12;
+        if(symlink(v[2], "../../run")) return 13;
+    } else if(!strcmp(v[1], "directory")) {
+        if(rename("../home", "../home.retained")) return 14;
+        if(symlink(v[2], "../home")) return 15;
+    } else if(!strcmp(v[1], "regular")) {
+        if(rename("../receipt.json", "../receipt.retained.json")) return 16;
+        FILE *f = fopen("../receipt.json", "wx");
+        if(!f) return 17;
+        fputs("child replacement\n", f); fclose(f);
+    } else {
+        char original[64], retained[64];
+        snprintf(original, sizeof(original), "../%s", v[1]);
+        snprintf(retained, sizeof(retained), "../%s.retained", v[1]);
+        if(rename(original, retained)) return 18;
+        if(symlink(v[2], original)) return 19;
+    }
+    puts("child original output"); fflush(stdout);
+    return 0;
+}
+''')
+        build = [str(self.compiler), str(attack_source), '-o', str(attack_binary)]
+        subprocess.run(build, check=True, capture_output=True)
+        sentinel = self.parent / 'sentinel'
+        sentinel.write_bytes(b'owned outside-run sentinel\n')
+        if operation in ('root', 'directory'):
+            sentinel_dir = self.parent / 'sentinel-directory'
+            sentinel_dir.mkdir(mode=0o700)
+            # Victim receipt/output names are all owned benign sentinel fixtures.
+            for name in ('receipt.json', 'stdout', 'stderr'):
+                (sentinel_dir / name).write_bytes(b'owned directory sentinel\n')
+            argument = sentinel_dir
+            files = list(sentinel_dir.iterdir())
+        else:
+            argument, files = sentinel, [sentinel]
+        before = {str(f): launcher.digest(f) for f in files}
+        self.receipt.update(build_argv=build, argv=[str(attack_binary), operation, str(argument)])
+        self.receipt['artifacts']['binary'] = self.artifact(attack_binary)
+        self.receipt['artifacts']['sources'] = [self.artifact(attack_source)]
+        self.pin()
+        error = None
+        try:
+            self.launch()
+        except launcher.Rejected as exc:
+            error = exc
+        after = {str(f): launcher.digest(f) for f in files}
+        # Check sentinel safety before rejection so RED identifies real mutation.
+        self.assertEqual(before, after, 'launcher touched outside-run sentinel')
+        self.assertIsNotNone(error, 'launcher failed to reject child replacement')
+        retained_root = self.parent / ('run.retained' if operation == 'root' else 'run')
+        retained_receipt = retained_root / ('receipt.retained.json' if operation == 'regular' else
+                                           'receipt.json.retained' if operation == 'receipt.json' else 'receipt.json')
+        state = json.loads(retained_receipt.read_text())
+        self.assertEqual(state['status'], 'INCOMPLETE')
+        self.assertEqual(state['namespace_integrity'], 'COMPROMISED')
+        self.assertTrue(state['authority_errors'])
+        # Child original stdout is hashed by retained FD, never the sentinel path.
+        output = retained_root / ('stdout.retained' if operation == 'stdout' else 'stdout')
+        self.assertEqual(state['stdout_sha256'], launcher.digest(output))
+        stderr = retained_root / ('stderr.retained' if operation == 'stderr' else 'stderr')
+        self.assertEqual(state['stderr_sha256'], launcher.digest(stderr))
+        if operation in ('stdout', 'stderr'):
+            self.assertNotEqual(state[operation + '_sha256'], launcher.digest(sentinel))
+        self.assertEqual(state['exit_code'], 0)
+
+    def test_receipt_symlink_cannot_redirect_parent_write(self):
+        self.attack('receipt.json')
+
+    def test_receipt_regular_replacement_detected(self):
+        self.attack('regular')
+
+    def test_stdout_symlink_cannot_redirect_parent_hash(self):
+        self.attack('stdout')
+
+    def test_stderr_symlink_cannot_redirect_parent_hash(self):
+        self.attack('stderr')
+
+    def test_owned_directory_replacement_detected(self):
+        self.attack('directory')
+
+    def test_run_root_replacement_cannot_redirect_parent_write(self):
+        self.attack('root')
+
     def test_nonzero_exit_honest(self):
         self.receipt['argv'].append('exit7')
         self.pin()
