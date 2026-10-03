@@ -1,5 +1,5 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
-use gpui::{App, Application, Bounds, WindowBounds, WindowOptions, prelude::*, px, size};
+use gpui::{App, Application, Bounds, WindowBounds, WindowOptions, div, prelude::*, px, size};
 use ira_desktop::{
     actions,
     components::text_input,
@@ -19,6 +19,7 @@ struct Session {
     opening: bool,
     desktop: Option<gpui::WeakEntity<Desktop>>,
     shutdown: Option<Coordinator>,
+    shutdown_status: Option<gpui::WeakEntity<ShutdownStatus>>,
     gate: Rc<RefCell<Option<ApplicationQuitGate>>>,
     native_request: Option<QuitRequest>,
     native_error: Rc<RefCell<Option<String>>>,
@@ -26,6 +27,65 @@ struct Session {
     approved: bool,
 }
 impl gpui::Global for Session {}
+// This surface has no filesystem/domain/native-provider initialization.
+struct ShutdownStatus {
+    message: String,
+}
+impl Render for ShutdownStatus {
+    fn render(&mut self, _: &mut gpui::Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(self.message.clone())
+            .child(
+                div()
+                    .id("retry-shutdown")
+                    .child("Retry shutdown saves")
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(actions::RetryShutdown), cx)
+                    }),
+            )
+    }
+}
+fn prepare_shutdown_surface(cx: &mut App) -> bool {
+    if !cx.windows().is_empty() {
+        return true;
+    }
+    let result = cx.open_window(WindowOptions::default(), |window, cx| {
+        let status = cx.new(|_| ShutdownStatus {
+            message: "Shutdown pending: waiting for checked write receipts".into(),
+        });
+        cx.update_global::<Session, _>(|session, _| {
+            session.shutdown_status = Some(status.downgrade());
+        });
+        window.on_window_should_close(cx, |_, cx| {
+            let session = cx.global::<Session>();
+            session.shutdown.is_none() && !session.runtime.is_stopping()
+        });
+        status
+    });
+    match result {
+        Ok(_) => true,
+        Err(error) => {
+            eprintln!("Shutdown not started: cannot create status window: {error}");
+            false
+        }
+    }
+}
+fn start_checked_shutdown(cx: &mut App) {
+    if cx.global::<Session>().shutdown.is_some() || !prepare_shutdown_surface(cx) {
+        return;
+    }
+    cx.global::<Retirement>().begin_quit();
+    cx.update_global::<Session, _>(|session, _| {
+        session.opening = false;
+        session.runtime.stop(&[]);
+        session.shutdown = Some(Coordinator::new(&session.geometry));
+    });
+}
 fn open_main_window(cx: &mut App) {
     if cx.global::<Retirement>().quit_committed() {
         return;
@@ -105,27 +165,26 @@ fn open_loaded_window(geometry: Option<Geometry>, cx: &mut App) {
 }
 fn tick_shutdown(cx: &mut App) {
     let retirement = cx.global::<Retirement>().clone();
+    cx.update_global::<Session, _>(|session, _| {
+        if let Some(gate) = session.gate.borrow().as_ref() {
+            match gate.take_request() {
+                Ok(Some(request)) => session.native_request = Some(request),
+                Ok(None) => {}
+                Err(error) => {
+                    *session.native_error.borrow_mut() = Some(format!(
+                        "Shutdown paused: native termination gate {error:?}"
+                    ))
+                }
+            }
+        }
+    });
+    if cx.global::<Session>().native_request.is_some()
+        || cx.global::<Session>().runtime.is_stopping()
+    {
+        start_checked_shutdown(cx);
+    }
     let (desktop, message, approve, gate, request, errors) =
         cx.update_global::<Session, _>(|session, _| {
-            if let Some(gate) = session.gate.borrow().as_ref() {
-                match gate.take_request() {
-                    Ok(Some(request)) => session.native_request = Some(request),
-                    Ok(None) => {}
-                    Err(error) => {
-                        *session.native_error.borrow_mut() = Some(format!(
-                            "Shutdown paused: native termination gate {error:?}"
-                        ))
-                    }
-                }
-            }
-            if session.native_request.is_some() || session.runtime.is_stopping() {
-                if session.shutdown.is_none() {
-                    session.opening = false;
-                    retirement.begin_quit();
-                    session.runtime.stop(&[]);
-                    session.shutdown = Some(Coordinator::new(&session.geometry));
-                }
-            }
             let status = session
                 .shutdown
                 .as_mut()
@@ -169,6 +228,12 @@ fn tick_shutdown(cx: &mut App) {
             )
         });
     if let Some(message) = message {
+        if let Some(status) = cx.global::<Session>().shutdown_status.clone() {
+            let _ = status.update(cx, |this, cx| {
+                this.message = message.clone();
+                cx.notify();
+            });
+        }
         if let Some(desktop) = &desktop {
             let _ = desktop.update(cx, |this, cx| this.shutdown_feedback(message, cx));
         }
@@ -200,6 +265,8 @@ fn tick_shutdown(cx: &mut App) {
     }
 }
 fn register_platform_quit(cx: &mut App) {
+    // Global registration is required when the ordinary last window is closed.
+    cx.on_action(|_: &actions::Quit, cx| start_checked_shutdown(cx));
     // Late GPUI observer is cancellation/retention fallback only. It never
     // fabricates successful checked receipts within the pinned100ms budget.
     cx.on_app_quit(|cx| {
@@ -276,6 +343,7 @@ fn main() {
             opening: false,
             desktop: None,
             shutdown: None,
+            shutdown_status: None,
             gate: owned_gate,
             native_request: None,
             native_error: Rc::new(RefCell::new(None)),

@@ -1427,9 +1427,9 @@ impl Render for Desktop {
                 .bg(native_color(self.theme.bg))
                 .text_color(native_color(self.theme.text))
                 .on_key_down(cx.listener(Self::key))
-                .on_action(cx.listener(|this, _: &actions::Quit, _, _cx| {
+                .on_action(cx.listener(|_, _: &actions::Quit, _, cx| {
                     crate::lifecycle_trace("menu/keybinding Quit action");
-                    this.runtime.stop(&this.controls);
+                    cx.propagate();
                 }))
                 .on_action(
                     cx.listener(|this, _: &actions::Rename, _, cx| {
