@@ -880,3 +880,80 @@ fn editor_open_ticket_accepts_its_tab_focus_transition_and_rejects_later_generat
         assert!(!app.edit_focus);
     }
 }
+#[test]
+fn injected_transfer_provider_receives_native_paths_and_errors_are_observable() {
+    let tmp = TempFixture::new();
+    let source = tmp.0.join("Ж source.txt");
+    let dest = tmp.0.join("dest");
+    std::fs::write(&source, b"source").unwrap();
+    std::fs::create_dir(&dest).unwrap();
+    let calls = Arc::new(Mutex::new(Vec::<(PathBuf, PathBuf)>::new()));
+    let observed = calls.clone();
+    let mut app = tmp.app();
+    app.set_transfer_provider(Arc::new(move |src, dst| {
+        observed
+            .lock()
+            .unwrap()
+            .push((src.to_path_buf(), dst.to_path_buf()));
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "model mock provider denied",
+        ))
+    }));
+    app.spawn_transfer_jobs(
+        JobKind::Move,
+        vec![source.to_string_lossy().into_owned()],
+        dest.to_string_lossy().into_owned(),
+        OverwritePolicy::AutoRename,
+    );
+    until(&mut app, |a| {
+        matches!(a.jobs[0].status, JobStatus::Failed(_))
+    });
+    assert!(!calls.lock().unwrap().is_empty());
+    assert_eq!(calls.lock().unwrap()[0].0, source);
+    assert!(
+        matches!(&app.snapshot().jobs[0].status,JobStatus::Failed(error) if error.contains("model mock provider denied"))
+    );
+    assert_eq!(std::fs::read(source).unwrap(), b"source");
+    assert!(!dest.join("Ж source.txt").exists());
+}
+#[test]
+fn cancellation_reaches_injected_transfer_worker_and_restores_captured_source() {
+    let tmp = TempFixture::new();
+    let source = tmp.0.join("source.txt");
+    let dest = tmp.0.join("dest");
+    std::fs::write(&source, b"source").unwrap();
+    std::fs::create_dir(&dest).unwrap();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release = Mutex::new(release_rx);
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let mut app = tmp.app();
+    app.set_transfer_provider(Arc::new(move |src, dst| {
+        if calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+            entered_tx.send(()).unwrap();
+            release.lock().unwrap().recv().unwrap();
+        }
+        if std::fs::symlink_metadata(dst).is_ok() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "mock collision",
+            ));
+        }
+        std::fs::rename(src, dst)
+    }));
+    app.spawn_transfer_jobs(
+        JobKind::Move,
+        vec![source.to_string_lossy().into_owned()],
+        dest.to_string_lossy().into_owned(),
+        OverwritePolicy::AutoRename,
+    );
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    app.cancel_pending_work();
+    release_tx.send(()).unwrap();
+    until(&mut app, |a| {
+        matches!(a.jobs[0].status, JobStatus::Cancelled)
+    });
+    assert_eq!(std::fs::read(source).unwrap(), b"source");
+    assert!(!dest.join("source.txt").exists());
+}
