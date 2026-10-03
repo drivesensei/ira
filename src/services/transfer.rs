@@ -83,12 +83,21 @@ pub enum JobEvent {
     },
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+struct GateWaitTest {
+    entered: mpsc::Sender<()>,
+    released: mpsc::Receiver<()>,
+}
+
 /// Shared cancellation + pause state between the UI and the worker thread.
 #[derive(Debug)]
 pub struct JobControl {
     cancel: AtomicBool,
     pause: Mutex<bool>,
     resume: Condvar,
+    #[cfg(test)]
+    before_wait: Mutex<Option<GateWaitTest>>,
 }
 
 impl JobControl {
@@ -97,6 +106,8 @@ impl JobControl {
             cancel: AtomicBool::new(false),
             pause: Mutex::new(false),
             resume: Condvar::new(),
+            #[cfg(test)]
+            before_wait: Mutex::new(None),
         })
     }
 
@@ -129,6 +140,14 @@ impl JobControl {
         while *paused {
             if self.cancel.load(Ordering::Relaxed) {
                 return Err(JobError::Cancelled);
+            }
+            #[cfg(test)]
+            if let Some(hook) = self.before_wait.lock().take() {
+                let _ = hook.entered.send(());
+                // Bounded observation only; timeout/disconnect never cancels.
+                let _ = hook
+                    .released
+                    .recv_timeout(std::time::Duration::from_secs(5));
             }
             self.resume.wait(&mut paused);
         }
@@ -1665,3 +1684,7 @@ mod safety_tests;
 #[cfg(test)]
 #[path = "transfer_settlement_tests.rs"]
 mod settlement_tests;
+
+#[cfg(test)]
+#[path = "transfer_cancel_wake_tests.rs"]
+mod cancel_wake_tests;

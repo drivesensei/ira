@@ -37,7 +37,6 @@ fn opaque_seal_is_instance_bound_and_permanently_rejects_new_accepted_workers() 
     assert!(app.deletion.is_none());
     assert!(app.exit_work.is_empty());
     assert_eq!(std::fs::read(protected).unwrap(), b"owned sealed bytes");
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -127,7 +126,6 @@ fn actual_editor_ctrl_s_finishes_owned_write_synchronously_before_ctrl_c_quit() 
     )
     .unwrap();
     assert!(!app.running);
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

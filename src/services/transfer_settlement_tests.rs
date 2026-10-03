@@ -18,6 +18,24 @@ fn job(paths: Vec<String>, dest: String) -> Job {
     }
 }
 
+/// Failure release owns the original control and receipt before worker issue.
+/// Its bounded cleanup observation is never a successful cancel-wake witness.
+struct FailureRelease {
+    control: Arc<JobControl>,
+    receipt: mpsc::Receiver<u64>,
+    observed: bool,
+}
+impl Drop for FailureRelease {
+    fn drop(&mut self) {
+        self.control.request_cancel();
+        self.control.set_paused(false);
+        if !self.observed {
+            let _ = self.receipt.recv_timeout(Duration::from_secs(5));
+        }
+        // Retain unique root unconditionally even on ACK/disconnect/timeout.
+    }
+}
+
 #[test]
 fn cancelled_paused_transfer_receipt_follows_terminal_event_even_if_event_receiver_lost() {
     let root = owned_fixture("pause");
@@ -30,21 +48,32 @@ fn cancelled_paused_transfer_receipt_follows_terminal_event_even_if_event_receiv
     let (tx, rx) = mpsc::channel();
     // Started is sent by the real batch before it blocks in gate().
     let (terminal, receipt) = terminal_receipt(41);
+    let mut release = FailureRelease {
+        control: j.control.clone(),
+        receipt,
+        observed: false,
+    };
     spawn_job_tracked(&j, tx, terminal, None);
     assert!(matches!(
         rx.recv_timeout(Duration::from_secs(5)).unwrap(),
         JobEvent::Started { .. }
     ));
     assert!(matches!(
-        receipt.recv_timeout(Duration::from_millis(100)),
+        release.receipt.recv_timeout(Duration::from_millis(100)),
         Err(mpsc::RecvTimeoutError::Timeout)
     ));
     drop(rx);
     j.control.request_cancel();
-    assert_eq!(receipt.recv_timeout(Duration::from_secs(5)).unwrap(), 41);
+    assert_eq!(
+        release
+            .receipt
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap(),
+        41
+    );
+    release.observed = true;
     assert_eq!(fs::read(root.join("source")).unwrap(), b"owned source");
     assert_eq!(fs::read_dir(root.join("dest")).unwrap().count(), 0);
-    fs::remove_dir_all(root).unwrap();
 }
 
 fn owned_fixture(label: &str) -> std::path::PathBuf {
@@ -125,7 +154,6 @@ fn delete_cancellation_and_normal_empty_branch_acknowledge_the_exact_work_identi
         assert!(matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(),
             JobEvent::DeleteDone { cancelled: value, .. } if value == cancelled));
     }
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -148,5 +176,4 @@ fn missing_owned_delete_target_keeps_original_terminal_semantics_and_receipt() {
     assert!(
         matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), JobEvent::DeleteDone { cancelled: false, failed } if failed.is_empty())
     );
-    fs::remove_dir_all(root).unwrap();
 }

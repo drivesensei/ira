@@ -5,7 +5,7 @@ use crate::services::transfer::{JobKind, OverwritePolicy, WorkerTestHooks};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicUsize, Ordering},
     mpsc, Arc, Mutex,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -32,7 +32,6 @@ const WAIT: Duration = Duration::from_secs(5);
 const HELD: Duration = Duration::from_millis(100);
 struct Fixture {
     root: PathBuf,
-    completed: Arc<AtomicBool>,
 }
 impl Fixture {
     fn new() -> Self {
@@ -49,19 +48,11 @@ impl Fixture {
         fs::write(root.join("source"), b"positive owned bytes").unwrap();
         fs::write(root.join("delete"), b"owned deletion bytes").unwrap();
         fs::write(root.join("state"), b"old state sentinel").unwrap();
-        Self {
-            root,
-            completed: Arc::new(AtomicBool::new(false)),
-        }
+        Self { root }
     }
 }
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        if self.completed.load(Ordering::Acquire) {
-            fs::remove_dir_all(&self.root).unwrap();
-        }
-    }
-}
+// Retain ALL unique owned fixture paths. Neither helper nor ACK under attack
+// authenticates the detached worker's physical completion for deletion.
 struct ReleaseGuard {
     sender: Option<mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -124,7 +115,6 @@ fn exercise(
         fs::write(f.root.join("blocked"), b"old parent").unwrap();
     }
     let root = f.root.clone();
-    let completed = f.completed.clone();
     let cleanup_count = Arc::new(AtomicUsize::new(0));
     let count = cleanup_count.clone();
     let (entered_tx, entered_rx) = mpsc::channel();
@@ -277,7 +267,6 @@ fn exercise(
             hint: app.hint_offset,
             status: app.status.is_some(),
         };
-        completed.store(true, Ordering::Release);
         result_tx.send(observation).unwrap();
     });
     let mut guard = ReleaseGuard {
