@@ -342,3 +342,44 @@ fn published_replacement_is_captured_for_recovery_never_deleted() {
     assert_eq!(retained.len(), 1);
     assert_eq!(fs::read(retained[0].join("payload")).unwrap(), b"ACTOR");
 }
+
+#[cfg(unix)]
+#[test]
+fn move_overwrite_empty_directory_preserves_legacy_success() {
+    let f = Fixture::new();
+    fs::create_dir(f.path("src/tree")).unwrap();
+    fs::write(f.path("src/tree/source.txt"), b"SOURCE").unwrap();
+    fs::create_dir(f.path("dst/tree")).unwrap();
+    transfer(&f, JobKind::Move, "tree", OverwritePolicy::Overwrite).unwrap();
+    assert_eq!(fs::read(f.path("dst/tree/source.txt")).unwrap(), b"SOURCE");
+    assert!(!f.path("src/tree").exists());
+    assert_no_stages(&f);
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_move_atomic_rename_refuses_concurrent_destination_fill() {
+    let f = Fixture::new();
+    let src = f.path("src/tree");
+    let dst = f.path("dst/tree");
+    fs::create_dir(&src).unwrap();
+    fs::write(src.join("source"), b"SOURCE").unwrap();
+    fs::create_dir(&dst).unwrap();
+    let control = JobControl::new();
+    let (tx, _rx) = mpsc::channel();
+    let mut bytes = 0;
+    let context = TransferContext {
+        control: &control,
+        id: 1,
+        tx: &tx,
+        bytes: &mut bytes,
+        provider: &rename_no_replace,
+    };
+    let result = move_directory_over_directory(&src, &dst, &context, || {
+        fs::write(dst.join("actor"), b"PRECIOUS").unwrap();
+    });
+    assert!(result.is_err());
+    assert_eq!(fs::read(dst.join("actor")).unwrap(), b"PRECIOUS");
+    assert_eq!(fs::read(src.join("source")).unwrap(), b"SOURCE");
+    assert_no_stages(&f);
+}

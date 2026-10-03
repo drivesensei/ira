@@ -225,3 +225,85 @@ fn core_source_and_manifest_have_no_ui_dependencies_or_unsafe() {
         assert!(!include_str!("../Cargo.toml").contains(banned));
     }
 }
+
+#[cfg(unix)]
+fn empty_directory_move_fixture(oracle: bool) -> (bool, bool, bool, bool) {
+    let root = fixture("transfer");
+    let source = root.join("src");
+    let target = root.join("dst");
+    std::fs::create_dir_all(source.join("folder")).unwrap();
+    std::fs::create_dir_all(target.join("folder")).unwrap();
+    std::fs::write(source.join("folder/new"), b"new").unwrap();
+    let result = if oracle {
+        use oracle_transfer::*;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let job = Job {
+            id: 1,
+            kind: JobKind::Move,
+            overwrite: OverwritePolicy::Overwrite,
+            paths: vec![source.join("folder").to_str().unwrap().into()],
+            dest_dir: target.to_str().unwrap().into(),
+            label: String::new(),
+            total_bytes: None,
+            copied_bytes: 0,
+            current: String::new(),
+            status: JobStatus::Queued,
+            started_at: std::time::Instant::now(),
+            control: JobControl::new(),
+        };
+        spawn_job(&job, tx);
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap() {
+                JobEvent::Done { .. } => break true,
+                JobEvent::Failed { .. } => break false,
+                _ => {}
+            }
+        }
+    } else {
+        use services::transfer::*;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let job = Job {
+            id: 1,
+            kind: JobKind::Move,
+            overwrite: OverwritePolicy::Overwrite,
+            paths: vec![source.join("folder").to_str().unwrap().into()],
+            dest_dir: target.to_str().unwrap().into(),
+            label: String::new(),
+            total_bytes: None,
+            copied_bytes: 0,
+            current: String::new(),
+            status: JobStatus::Queued,
+            started_at: std::time::Instant::now(),
+            control: JobControl::new(),
+        };
+        spawn_job(&job, tx);
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap() {
+                JobEvent::Done { .. } => break true,
+                JobEvent::Failed { .. } => break false,
+                _ => {}
+            }
+        }
+    };
+    let outcome = (
+        result,
+        target.join("folder/new").exists(),
+        target.join("folder (2)/new").exists(),
+        source.join("folder/new").exists(),
+    );
+    std::fs::remove_dir_all(root).unwrap();
+    outcome
+}
+
+#[cfg(unix)]
+#[test]
+fn empty_directory_move_overwrite_matches_frozen_success() {
+    assert_eq!(
+        empty_directory_move_fixture(true),
+        (true, true, false, false)
+    );
+    assert_eq!(
+        empty_directory_move_fixture(false),
+        (true, true, false, false)
+    );
+}
