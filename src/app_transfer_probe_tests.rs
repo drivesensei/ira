@@ -324,3 +324,6 @@ fn viewing_destination_subfolder_preserves_current_entry() {
     assert!(app.panes[1].pending_select.is_none());
     assert!(app.file_list_settled(1));
 }
+
+#[path = "app_transfer_probe_occupancy_tests.rs"]
+mod occupancy;
