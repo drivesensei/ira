@@ -567,3 +567,7 @@ pub fn spawn_delete_job(paths: Vec<String>, tx: mpsc::Sender<JobEvent>) -> Arc<J
 #[cfg(test)]
 #[path = "transfer_tests.rs"]
 mod batch_tests;
+
+#[cfg(test)]
+#[path = "transfer_safety_tests.rs"]
+mod safety_tests;
