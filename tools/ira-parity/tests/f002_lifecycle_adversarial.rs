@@ -81,6 +81,10 @@ fn start(mode: &str, config: PtySessionConfig) -> PtySession {
     command.args(["--exact", "lifecycle_attack_helper", "--nocapture"]);
     command.env(MODE, mode);
     command.env(ROOT, fixture.path());
+    // This retention attack needs an inherited slave descriptor, not session-leader hangup.
+    if mode == "parent" {
+        command.set_controlling_tty(false);
+    }
     PtySession::spawn(
         command,
         fixture,

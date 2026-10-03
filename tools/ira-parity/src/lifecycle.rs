@@ -9,7 +9,10 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, RecvTimeoutError},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Condvar, Mutex, OnceLock,
+    },
     thread::JoinHandle,
     time::{Duration, Instant},
 };
@@ -27,6 +30,7 @@ pub enum CleanupEvent {
 pub struct PtySessionConfig {
     pub cleanup_deadline: Duration,
     pub reader_join_deadline: Duration,
+    reap_poll_gate: Option<Arc<AtomicBool>>,
     reader_failure_after_bytes: Option<usize>,
     fixture_remove_failure: bool,
     fixture_retention_capture: Option<Arc<Mutex<Option<PathBuf>>>>,
@@ -37,10 +41,18 @@ impl PtySessionConfig {
         Self {
             cleanup_deadline,
             reader_join_deadline,
+            reap_poll_gate: None,
             reader_failure_after_bytes: None,
             fixture_remove_failure: false,
             fixture_retention_capture: None,
         }
+    }
+
+    /// Deterministic scheduling seam: signals still run, but observed reaping
+    /// (foreground and deferred) waits until this gate opens. Normal runs have no gate.
+    pub fn with_reap_poll_gate(mut self, gate: Arc<AtomicBool>) -> Self {
+        self.reap_poll_gate = Some(gate);
+        self
     }
 
     pub fn with_reader_failure_after_bytes(mut self, n: usize) -> Self {
@@ -123,6 +135,7 @@ pub struct PtySession {
     fixture_removal_attempted: bool,
     fixture_remove_failure: bool,
     shutdown_attempted: bool,
+    cleanup_permit: Option<CleanupPermit>,
 }
 
 impl PtySession {
@@ -152,11 +165,12 @@ impl PtySession {
         reader_failure_after_bytes: Option<usize>,
         fixture_remove_failure: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let cleanup_permit = CleanupPermit::acquire()?;
         let fixture_path = fixture.path().to_path_buf();
         let pair = portable_pty::native_pty_system().openpty(size)?;
         let reader = pair.master.try_clone_reader()?;
         let child = pair.slave.spawn_command(command)?;
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(4096);
         let reader_tx = tx.clone();
         let failure_after = reader_failure_after_bytes;
         let reader_task = std::thread::spawn(move || {
@@ -208,6 +222,7 @@ impl PtySession {
             fixture_removal_attempted: false,
             fixture_remove_failure,
             shutdown_attempted: false,
+            cleanup_permit: Some(cleanup_permit),
         })
     }
 
@@ -394,7 +409,12 @@ impl PtySession {
         let Some(child) = self.child.as_mut() else {
             return true;
         };
-        match child.try_wait() {
+        let allowed = self
+            .config
+            .reap_poll_gate
+            .as_ref()
+            .is_none_or(|gate| gate.load(Ordering::Acquire));
+        match if allowed { child.try_wait() } else { Ok(None) } {
             Ok(Some(_)) => {
                 self.child.take();
                 return true;
@@ -406,23 +426,23 @@ impl PtySession {
             }
         }
 
-        // Child::kill on portable-pty's Unix implementation sleeps for up to
-        // 200ms. Its cloned signaler sends HUP directly without that grace;
-        // we provide our own grace inside this absolute deadline and escalate
-        // to SIGKILL if the child does not exit.
-        let mut signaler = child.clone_killer();
-        if let Err(error) = signaler.kill() {
-            cleanup.push(format!("child termination signal failed: {error}"));
+        // A scenario shutdown is a hard abort, not interactive graceful close.
+        // Send a nonblocking hard signal immediately; leave the entire absolute
+        // budget for OS scheduling/reaping (portable-pty Unix kill has a 200ms grace).
+        if let Err(error) = hard_terminate(child.as_mut()) {
+            cleanup.push(error);
         }
-        drop(signaler);
-
-        #[cfg(unix)]
-        let force_kill_at = Instant::now() + deadline.saturating_duration_since(Instant::now()) / 2;
-        #[cfg(unix)]
-        let mut force_kill_sent = false;
 
         loop {
-            let status = self.child.as_mut().map(|child| child.try_wait());
+            let allowed = self
+                .config
+                .reap_poll_gate
+                .as_ref()
+                .is_none_or(|gate| gate.load(Ordering::Acquire));
+            let status = self
+                .child
+                .as_mut()
+                .map(|child| if allowed { child.try_wait() } else { Ok(None) });
             match status {
                 Some(Ok(Some(_))) => {
                     self.child.take();
@@ -434,23 +454,6 @@ impl PtySession {
                     return false;
                 }
                 None => return true,
-            }
-
-            #[cfg(unix)]
-            if !force_kill_sent && Instant::now() >= force_kill_at {
-                if let Some(pid) = self.child.as_ref().and_then(|child| child.process_id()) {
-                    // SAFETY: pid is the direct child process returned by the
-                    // owned portable-pty Child handle.
-                    let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-                    if result != 0 {
-                        let error = std::io::Error::last_os_error();
-                        cleanup.push(format!("force-kill signal failed: {error}"));
-                    }
-                } else {
-                    cleanup.push("child process id unavailable for bounded force-kill".into());
-                    return false;
-                }
-                force_kill_sent = true;
             }
 
             if Instant::now() >= deadline {
@@ -557,6 +560,9 @@ impl PtySession {
                 .push("fixture retained because child or reader cleanup did not complete".into());
         }
 
+        if self.fixture.is_none() && self.child.is_none() && self.reader.is_none() {
+            self.cleanup_permit.take();
+        }
         if cleanup.is_empty() && primary.is_none() {
             Ok(ShutdownReport {
                 child_reaped,
@@ -584,26 +590,214 @@ impl Drop for PtySession {
                 || self.reader.is_some()
                 || self.fixture.is_some()
             {
-                retained_sessions()
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .push(RetainedSession {
-                        _fixture: self.fixture.take(),
-                        _child: self.child.take(),
-                        _reader: self.reader.take(),
-                    });
+                if let Some(permit) = self.cleanup_permit.take() {
+                    let queue = permit.queue.clone();
+                    queue
+                        .pending
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .push(RetainedSession {
+                            fixture: self.fixture.take(),
+                            child: self.child.take(),
+                            reader: self.reader.take(),
+                            rx: std::mem::replace(&mut self.rx, mpsc::channel().1),
+                            gate: self.config.reap_poll_gate.clone(),
+                            last_error: None,
+                            _permit: permit,
+                        });
+                    queue.wake.notify_one();
+                }
+            }
+        }
+    }
+}
+
+fn hard_terminate(child: &mut (dyn Child + Send + Sync)) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let pid = child
+            .process_id()
+            .ok_or("child process id unavailable for bounded hard abort")?;
+        // SAFETY: this PID belongs to the owned direct Child handle; no process-group/global signal.
+        if unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(format!("hard termination failed: {error}"));
+            }
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        child
+            .clone_killer()
+            .kill()
+            .map_err(|e| format!("hard termination failed: {e}"))
+    }
+}
+
+const MAX_CLEANUP_OWNERS: usize = 64;
+struct CleanupQueue {
+    pending: Mutex<Vec<RetainedSession>>,
+    wake: Condvar,
+    owners: AtomicUsize,
+}
+struct CleanupPermit {
+    queue: Arc<CleanupQueue>,
+}
+impl CleanupPermit {
+    fn acquire() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        static MANAGER: OnceLock<Mutex<Option<Arc<CleanupQueue>>>> = OnceLock::new();
+        let mut manager = MANAGER
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if manager.is_none() {
+            let queue = Arc::new(CleanupQueue {
+                pending: Mutex::new(Vec::with_capacity(MAX_CLEANUP_OWNERS)),
+                wake: Condvar::new(),
+                owners: AtomicUsize::new(0),
+            });
+            let worker = queue.clone();
+            // Start before spawning any child: thread-creation failure cannot abandon live resources.
+            std::thread::Builder::new()
+                .name("ira-parity-cleanup".into())
+                .spawn(move || worker.run())?;
+            *manager = Some(queue);
+        }
+        let queue = manager
+            .as_ref()
+            .ok_or("cleanup manager unavailable")?
+            .clone();
+        let mut owners = queue.owners.load(Ordering::Acquire);
+        loop {
+            if owners >= MAX_CLEANUP_OWNERS {
+                return Err("cleanup capacity exhausted; retained sessions must finish before spawning more".into());
+            }
+            match queue.owners.compare_exchange_weak(
+                owners,
+                owners + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => owners = actual,
+            }
+        }
+        Ok(Self { queue })
+    }
+}
+impl Drop for CleanupPermit {
+    fn drop(&mut self) {
+        self.queue.owners.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+impl CleanupQueue {
+    fn run(&self) {
+        let mut active = Vec::with_capacity(MAX_CLEANUP_OWNERS);
+        loop {
+            {
+                let mut inbox = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+                while inbox.is_empty() && active.is_empty() {
+                    inbox = self.wake.wait(inbox).unwrap_or_else(|p| p.into_inner());
+                }
+                active.extend(inbox.drain(..));
+            } // Never hold the enqueue lock across child polling, joining or filesystem work.
+            let mut i = 0;
+            while i < active.len() {
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| active[i].poll()));
+                match result {
+                    Ok(true) => {
+                        active.swap_remove(i);
+                    }
+                    Ok(false) => i += 1,
+                    Err(_) => {
+                        active[i].record_error(
+                            "deferred cleanup poll panicked; ownership retained".into(),
+                        );
+                        i += 1
+                    }
+                }
+            }
+            let inbox = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+            if inbox.is_empty() && !active.is_empty() {
+                drop(
+                    self.wake
+                        .wait_timeout(inbox, Duration::from_millis(50))
+                        .unwrap_or_else(|p| p.into_inner()),
+                );
             }
         }
     }
 }
 
 struct RetainedSession {
-    _fixture: Option<tempfile::TempDir>,
-    _child: Option<Box<dyn Child + Send + Sync>>,
-    _reader: Option<JoinHandle<()>>,
+    fixture: Option<tempfile::TempDir>,
+    child: Option<Box<dyn Child + Send + Sync>>,
+    reader: Option<JoinHandle<()>>,
+    rx: Receiver<ReaderMessage>,
+    gate: Option<Arc<AtomicBool>>,
+    last_error: Option<String>,
+    _permit: CleanupPermit,
 }
-
-fn retained_sessions() -> &'static Mutex<Vec<RetainedSession>> {
-    static RETAINED: OnceLock<Mutex<Vec<RetainedSession>>> = OnceLock::new();
-    RETAINED.get_or_init(|| Mutex::new(Vec::new()))
+impl RetainedSession {
+    fn record_error(&mut self, error: String) {
+        if self.last_error.as_ref() != Some(&error) {
+            eprintln!("ira-parity deferred cleanup: {error}");
+            self.last_error = Some(error);
+        }
+    }
+    fn poll(&mut self) -> bool {
+        // Drain queued output so an abandoned session never accumulates bytes after Drop.
+        for _ in 0..4096 {
+            if self.rx.try_recv().is_err() {
+                break;
+            }
+        }
+        if self
+            .gate
+            .as_ref()
+            .is_some_and(|g| !g.load(Ordering::Acquire))
+        {
+            return false;
+        }
+        if let Some(child) = self.child.as_mut() {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    self.child.take();
+                }
+                Ok(None) => {
+                    if let Err(e) = hard_terminate(child.as_mut()) {
+                        self.record_error(e);
+                    }
+                    return false;
+                }
+                Err(e) => {
+                    self.record_error(format!("deferred child reap failed: {e}"));
+                    return false;
+                }
+            }
+        }
+        if let Some(reader) = self.reader.as_ref() {
+            if !reader.is_finished() {
+                return false;
+            }
+            if self.reader.take().is_some_and(|r| r.join().is_err()) {
+                self.record_error("deferred output reader panicked".into());
+            }
+        }
+        if let Some(fixture) = self.fixture.as_ref() {
+            match std::fs::remove_dir_all(fixture.path()) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    self.record_error(format!("deferred fixture removal failed: {e}"));
+                    return false;
+                }
+            }
+            self.fixture.take();
+        }
+        true
+    }
 }
