@@ -214,7 +214,8 @@ fn concurrent_sessions_for_one_file_do_not_share_the_temporary_write() {
 fn characterize_inherited_editor_tmp_symlink_write_hazard_only_on_temp_fixture() {
     // Frozen App::save_edit (src/app.rs1400): fs::write follows an existing
     // sibling .ira-tmp symlink, then rename installs the link over the document.
-    // This is an inherited hazard characterization, NOT a safety-fix assertion.
+    // Keep the frozen pre-fix oracle explicit alongside the new safety regression.
+    // These operations are the old source block, executed only on owned fixtures.
     use std::os::unix::fs::symlink;
     let f = Fixture::new("tmp-symlink-oracle");
     let file = f.file("file", b"document");
@@ -222,10 +223,62 @@ fn characterize_inherited_editor_tmp_symlink_write_hazard_only_on_temp_fixture()
     let tmp = f.0.join("file.ira-tmp");
     symlink(&victim, &tmp).unwrap();
     let doc = open_document(9, &file).unwrap();
-    save_document(&snapshot(&doc, 1, "replacement")).unwrap();
+    fs::write(&tmp, b"replacement").unwrap();
+    fs::set_permissions(&tmp, doc.permissions.clone()).unwrap();
+    fs::rename(&tmp, &doc.canonical_path).unwrap();
     assert_eq!(fs::read(&victim).unwrap(), b"replacement");
     assert!(fs::symlink_metadata(&file)
         .unwrap()
         .file_type()
         .is_symlink());
+}
+
+#[cfg(unix)]
+#[test]
+fn save_ignores_legacy_temp_symlink_and_preserves_victim() {
+    use std::os::unix::fs::symlink;
+    let f = Fixture::new("safe-temp-symlink");
+    let file = f.file("file", b"document");
+    let victim = f.file("victim", b"unrelated");
+    let tmp = f.0.join("file.ira-tmp");
+    symlink(&victim, &tmp).unwrap();
+    let doc = open_document(10, &file).unwrap();
+    let result = save_document(&snapshot(&doc, 1, "replacement"));
+    assert_eq!(
+        fs::read(&victim).unwrap(),
+        b"unrelated",
+        "victim must survive"
+    );
+    assert_eq!(fs::read(&file).unwrap(), b"replacement");
+    assert!(!fs::symlink_metadata(&file)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(fs::read_link(&tmp).unwrap(), victim);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn save_ignores_legacy_regular_temp_and_keeps_its_bytes() {
+    let f = Fixture::new("safe-temp-file");
+    let file = f.file("file", b"document");
+    let tmp = f.file("file.ira-tmp", b"unowned");
+    let doc = open_document(11, &file).unwrap();
+    let result = save_document(&snapshot(&doc, 1, "replacement"));
+    assert_eq!(fs::read(&file).unwrap(), b"replacement");
+    assert_eq!(fs::read(&tmp).unwrap(), b"unowned");
+    assert!(result.is_ok());
+}
+
+#[test]
+fn failed_rename_removes_only_exclusively_created_staging() {
+    let f = Fixture::new("failed-rename");
+    let file = f.file("file", b"document");
+    let mut doc = open_document(12, &file).unwrap();
+    doc.mtime = None;
+    fs::remove_file(&file).unwrap();
+    fs::create_dir(&file).unwrap();
+    assert!(save_document(&snapshot(&doc, 1, "replacement")).is_err());
+    assert!(file.is_dir());
+    assert!(!f.0.join("file.ira-tmp").exists());
 }
