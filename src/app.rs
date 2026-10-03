@@ -25,7 +25,9 @@ use crate::{
         folders::list_common_folders,
         list_files::{list_files_bounded, list_files_chunked, FEntry, LISTING_CHUNK},
         overlay::{self, Overlay},
-        state::{load_state, load_state_from, try_save_state, try_save_state_to, SessionState, SizeEntry},
+        state::{
+            load_state, load_state_from, try_save_state, try_save_state_to, SessionState, SizeEntry,
+        },
         thumbnails::{
             preview_kind, prune_cache, spawn_workers, PreviewKind, PreviewSurface, Rendered,
             ThumbEvent, ThumbRequest, WorkerQueues, JOB_QUEUE_HI_CAP, JOB_QUEUE_LO_CAP,
@@ -4153,9 +4155,7 @@ impl App {
             self.set_status(error.to_string(), true);
         }
     }
-    pub fn try_persist_state(
-        &self,
-    ) -> Result<(), crate::services::persistence::PersistenceError> {
+    pub fn try_persist_state(&self) -> Result<(), crate::services::persistence::PersistenceError> {
         let state = SessionState {
             split: self.split,
             active_pane: self.active_pane,
