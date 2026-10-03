@@ -111,7 +111,12 @@ impl ActionSink {
             .tree
             .try_lock()
             .map_err(|_| Rejection::Backpressure)?;
-        if slot.stamp.window != tree.stamp.window || tree.stamp.revision < slot.stamp.revision {
+        if slot.stamp.window != tree.stamp.window
+            || tree.stamp.revision < slot.stamp.revision
+            || (tree.stamp.document == slot.stamp.document
+                && tree.stamp.focus == slot.stamp.focus
+                && tree.stamp.text_revision < slot.stamp.text_revision)
+        {
             return Err(Rejection::Stale);
         }
         *slot = tree;
