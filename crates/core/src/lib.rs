@@ -1,6 +1,8 @@
-//! UI-neutral crate boundary shared by the IRA terminal and desktop apps.
-//!
-//! Feature logic will be introduced here by its owning migration rows. This
-//! initial boundary intentionally exposes no application behavior.
-
+//! UI-neutral behavior extracted from the frozen IRA terminal oracle.
 #![forbid(unsafe_code)]
+
+pub mod cursor;
+pub mod domain;
+pub mod services;
+pub mod theme;
+pub mod utils;
