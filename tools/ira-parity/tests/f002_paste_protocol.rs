@@ -2,6 +2,13 @@
 //! integration-test crate gives the test access to its private encoder without
 //! widening the production API solely for review.
 
+mod runner {
+    pub use crate::{Observation, RunCapture};
+}
+#[allow(dead_code)] // Included encoder probe compiles unrelated golden methods.
+mod golden {
+    include!("../src/golden.rs");
+}
 mod baseline {
     pub use ira_parity::baseline::{Baseline, BaselineResolver, ORACLE_SHA};
 }
@@ -65,7 +72,8 @@ include!("../src/runner.rs");
 mod tests {
     use super::*;
 
-    // GAP(G-F002-LOG-05) sev=high kind=behavior-divergence feature=F-002
+    // GAP-FIXED(G-F002-LOG-05) sev=high kind=behavior-divergence feature=F-002
+    //   fixed-by: typed actual observation bundles and explicit bracketed paste protocol (T-006)
     //   what:     Logical paste is encoded as ordinary terminal input bytes instead of a bracketed-paste event.
     //   tui-ref:  migration/specs/F-002.md S3-S5; src/tui.rs:61-67; src/event.rs:52-64; src/main.rs:65-68
     //   oracle:   frozen TUI enables bracketed paste and dispatches Crossterm Paste to app.handle_paste.
@@ -73,6 +81,7 @@ mod tests {
     //   expected: PTY bytes are CSI 200~ + payload + CSI 201~ so Crossterm emits one Paste event.
     //   actual:   runner.rs::encode currently writes only the payload bytes, which Crossterm reads as ordinary key events.
     //   cover:    paste_event_uses_bracketed_paste_protocol
+    #[cfg(unix)]
     #[test]
     fn paste_event_uses_bracketed_paste_protocol() {
         let event = InputEvent::Paste {

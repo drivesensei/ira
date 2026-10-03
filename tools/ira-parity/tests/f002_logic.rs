@@ -224,7 +224,8 @@ fn staged_files(root: &Path) -> Vec<Vec<u8>> {
     files
 }
 
-// GAP(G-F002-LOG-06) sev=high kind=missing-feature feature=F-002
+// GAP-FIXED(G-F002-LOG-06) sev=high kind=missing-feature feature=F-002
+//   fixed-by: typed actual observation bundles and explicit bracketed paste protocol (T-006)
 //   what:     Golden staging writes the declared input trace but loses observations collected by the target.
 //   tui-ref:  migration/specs/F-002.md S6 and S10; migration/oracle/traces/harness/initial_screen.toml
 //   oracle:   live TraceTarget observation from the declared terminal_screen assertion
@@ -245,14 +246,14 @@ fn golden_candidate_contains_captured_observations_and_input_evidence() {
     }]);
     let mut target = ScriptedTarget::recording();
     let run = ScenarioRunner::new(RunOptions::default())
-        .run_with_target(&trace, &mut target)
+        .run_capture_with_target(&trace, &mut target)
         .unwrap();
-    assert!(run.observations_match());
+    assert!(run.result.observations_match());
 
     let temp = tempfile::tempdir().unwrap();
     let staging = temp.path().join("candidate");
     GoldenStore::new(temp.path().join("approved"))
-        .capture_to_staging(&staging, &trace)
+        .capture_run_to_staging(&staging, &run)
         .unwrap();
     let metadata = GoldenMetadata::load_from_staging(&staging).unwrap();
     assert!(

@@ -1,4 +1,11 @@
 //! S14 edge contract for the frozen TUI PTY encoder.
+mod runner {
+    pub use crate::{Observation, RunCapture};
+}
+#[allow(dead_code)] // Included encoder probe compiles unrelated golden methods.
+mod golden {
+    include!("../src/golden.rs");
+}
 mod baseline {
     pub use ira_parity::baseline::*;
 }
@@ -65,7 +72,8 @@ mod tests {
         }
     }
 
-    // GAP(G-F002-ADV-55) sev=high kind=behavior-divergence feature=F-002
+    // GAP-FIXED(G-F002-ADV-55) sev=high kind=behavior-divergence feature=F-002
+    //   fixed-by: typed actual observation bundles and explicit bracketed paste protocol (T-006)
     //   what:     Unix paste must preserve multiline and safe escape-looking payloads inside bracketed-paste framing.
     //   tui-ref:  migration/specs/F-002.md S3,S14; frozen Crossterm 0.29 Unix parser
     //   oracle:   Live Linux PTY probe is recorded in migration/reports/F-002/capture-paste-red-1.md.
@@ -73,6 +81,7 @@ mod tests {
     //   expected: CSI 200~ + exact payload + CSI 201~ for every safe payload.
     //   actual:   encode(Paste) currently returns the raw payload without framing.
     //   cover:    unix_paste_frames_newline_and_safe_escape_looking_payloads
+    #[cfg(unix)]
     #[test]
     fn unix_paste_frames_newline_and_safe_escape_looking_payloads() {
         let payloads = [
@@ -94,7 +103,8 @@ mod tests {
         }
     }
 
-    // GAP(G-F002-ADV-56) sev=high kind=edge-case feature=F-002
+    // GAP-FIXED(G-F002-ADV-56) sev=high kind=edge-case feature=F-002
+    //   fixed-by: typed actual observation bundles and explicit bracketed paste protocol (T-006)
     //   what:     Unix paste must reject a payload containing the exact closing delimiter.
     //   tui-ref:  migration/specs/F-002.md S14; Crossterm terminates at the first ESC[201~.
     //   oracle:   Frozen parser cannot represent the delimiter as payload content.
@@ -102,6 +112,7 @@ mod tests {
     //   expected: Explicit unsupported/invalid-paste diagnostic, with no bytes delivered.
     //   actual:   Current encoder accepts it and would let Crossterm truncate/misframe input.
     //   cover:    unix_paste_rejects_the_exact_closing_marker
+    #[cfg(unix)]
     #[test]
     fn unix_paste_rejects_the_exact_closing_marker() {
         let result = encode(&event("prefix\x1b[201~suffix"));
@@ -116,7 +127,8 @@ mod tests {
             .contains("paste"));
     }
 
-    // GAP(G-F002-ADV-57) sev=medium kind=edge-case feature=F-002
+    // GAP-FIXED(G-F002-ADV-57) sev=medium kind=edge-case feature=F-002
+    //   fixed-by: typed actual observation bundles and explicit bracketed paste protocol (T-006)
     //   what:     Ordinary Text must remain ordinary terminal input, not acquire paste framing.
     //   tui-ref:  migration/specs/F-002.md S3,S14
     //   oracle:   Text is a separate logical event from Crossterm Paste.

@@ -115,9 +115,9 @@ pub trait TraceTarget {
 }
 #[derive(Clone, Default)]
 pub struct Observation {
-    pub(crate) screen: Option<String>,
-    pub(crate) stdout: Option<String>,
-    pub(crate) stderr: Option<String>,
+    pub screen: Option<String>,
+    pub stdout: Option<String>,
+    pub stderr: Option<String>,
     pub bytes: Option<Vec<u8>>,
     pub exit_code: Option<i32>,
     pub value: Option<toml::Value>,
@@ -171,6 +171,11 @@ impl RunResult {
         &self.diagnostics
     }
 }
+/// Observations retained before shutdown removes the isolated fixture.
+pub struct RunCapture {
+    pub result: RunResult,
+    pub bundle: crate::golden::ObservationBundle,
+}
 pub struct ScenarioRunner {
     opts: RunOptions,
 }
@@ -216,7 +221,16 @@ impl ScenarioRunner {
         t: &Trace,
         target: &mut T,
     ) -> Result<RunResult, RunError> {
+        self.run_capture_with_target(t, target)
+            .map(|capture| capture.result)
+    }
+    pub fn run_capture_with_target<T: TraceTarget>(
+        &self,
+        t: &Trace,
+        target: &mut T,
+    ) -> Result<RunCapture, RunError> {
         self.validate_for_target(t, target.name())?;
+        let mut records = Vec::new();
         let mut required = vec![t.readiness.observation.clone()];
         required.extend(t.observation_kinds());
         for kind in required {
@@ -298,15 +312,18 @@ impl ScenarioRunner {
                     diagnostics.join("; ")
                 )));
             }
-            return Ok(RunResult {
-                events: applied,
-                ready: false,
-                matched: false,
-                sha: ORACLE_SHA.into(),
-                root,
-                session: format!("{:p}", target),
-                removed: true,
-                diagnostics,
+            return Ok(RunCapture {
+                bundle: self.capture_bundle(t, records),
+                result: RunResult {
+                    events: applied,
+                    ready: false,
+                    matched: false,
+                    sha: ORACLE_SHA.into(),
+                    root,
+                    session: format!("{:p}", target),
+                    removed: true,
+                    diagnostics,
+                },
             });
         }
         for ev in t.events() {
@@ -334,7 +351,9 @@ impl ScenarioRunner {
                     delivered: applied.len(),
                 });
             }
-            target.apply(ev)?;
+            if let Err(error) = target.apply(ev) {
+                return Err(with_cleanup_error(error, target.shutdown()));
+            }
             applied.push(ev.clone())
         }
         if let Err(error) = target.wait_for_observation(scenario_deadline) {
@@ -352,23 +371,51 @@ impl ScenarioRunner {
         let mut matched = true;
         let mut diagnostics = readiness_diagnostics;
         for expected in t.expected_observations() {
-            let o = target.observe(&expected.kind)?;
+            let o = match target.observe(&expected.kind) {
+                Ok(o) => o,
+                Err(e) => return Err(with_cleanup_error(e, target.shutdown())),
+            };
+            let record =
+                match crate::golden::ObservationRecord::from_observation(&expected.kind, &o) {
+                    Ok(record) => record,
+                    Err(error) => return Err(with_cleanup_error(err(error), target.shutdown())),
+                };
+            records.push(record);
             let (this_match, problems) =
                 compare_expected_observation(t, expected, &o, &[root.to_string_lossy().as_ref()]);
             matched &= this_match;
             diagnostics.extend(problems);
         }
         target.shutdown()?;
-        Ok(RunResult {
-            events: applied,
-            ready: true,
-            matched,
-            sha: ORACLE_SHA.into(),
-            root,
-            session: format!("{:p}", target),
-            removed: true,
-            diagnostics,
+        Ok(RunCapture {
+            bundle: self.capture_bundle(t, records),
+            result: RunResult {
+                events: applied,
+                ready: true,
+                matched,
+                sha: ORACLE_SHA.into(),
+                root,
+                session: format!("{:p}", target),
+                removed: true,
+                diagnostics,
+            },
         })
+    }
+    fn capture_bundle(
+        &self,
+        t: &Trace,
+        records: Vec<crate::golden::ObservationRecord>,
+    ) -> crate::golden::ObservationBundle {
+        crate::golden::ObservationBundle::new(
+            crate::golden::GoldenMetadata::from_trace(
+                ORACLE_SHA,
+                t,
+                &self.opts.platform,
+                &crate::golden::current_capture_date(),
+            ),
+            t.events().to_vec(),
+            records,
+        )
     }
     pub fn run_source_with_target<T: TraceTarget>(
         &self,
@@ -387,6 +434,12 @@ impl ScenarioRunner {
         ))
     }
     pub fn run_oracle_trace(&self, t: &Trace) -> Result<RunResult, RunError> {
+        self.run_oracle_mode(t, false).map(|capture| capture.result)
+    }
+    pub fn run_oracle_capture(&self, t: &Trace) -> Result<RunCapture, RunError> {
+        self.run_oracle_mode(t, true)
+    }
+    fn run_oracle_mode(&self, t: &Trace, capture: bool) -> Result<RunCapture, RunError> {
         self.validate_for_target(t, "tui-pty")?;
         // Fail unsupported event/key profiles before allocating a worktree or
         // starting the oracle process.
@@ -397,7 +450,7 @@ impl ScenarioRunner {
             .with_expected_sha(ORACLE_SHA)
             .resolve_and_build()
             .map_err(|e| err(e.to_string()))?;
-        let result = self.run_oracle_with_baseline(t, &baseline);
+        let result = self.run_oracle_with_baseline(t, &baseline, capture);
         match baseline.cleanup() {
             Ok(()) => result,
             Err(cleanup) => match result {
@@ -414,7 +467,8 @@ impl ScenarioRunner {
         &self,
         t: &Trace,
         baseline: &crate::baseline::Baseline,
-    ) -> Result<RunResult, RunError> {
+        capture: bool,
+    ) -> Result<RunCapture, RunError> {
         let fixture = tempfile::Builder::new()
             .prefix("ira-parity-fixture-")
             .tempdir()
@@ -579,7 +633,16 @@ impl ScenarioRunner {
             ),
             applied.len()
         );
-        let shutdown = if matched {
+        let records = session_try!(
+            capture_oracle_observations(
+                t,
+                &screen,
+                session_try!(lifecycle.master(), applied.len()),
+                &fixture_path
+            ),
+            applied.len()
+        );
+        let shutdown = if matched || capture {
             lifecycle.shutdown().map(|_| ())
         } else {
             lifecycle
@@ -594,7 +657,7 @@ impl ScenarioRunner {
                 delivered: applied.len(),
             });
         }
-        if !matched {
+        if !matched && !capture {
             return Err(RunError {
                 message: diagnostics.join("; "),
                 timeout: Instant::now() >= end,
@@ -602,15 +665,18 @@ impl ScenarioRunner {
                 delivered: applied.len(),
             });
         }
-        Ok(RunResult {
-            events: applied,
-            ready: true,
-            matched,
-            sha: ORACLE_SHA.into(),
-            root: fixture_path,
-            session: format!("pty-{:?}", std::thread::current().id()),
-            removed: true,
-            diagnostics,
+        Ok(RunCapture {
+            bundle: self.capture_bundle(t, records),
+            result: RunResult {
+                events: applied,
+                ready: true,
+                matched,
+                sha: ORACLE_SHA.into(),
+                root: fixture_path,
+                session: format!("pty-{:?}", std::thread::current().id()),
+                removed: true,
+                diagnostics,
+            },
         })
     }
 }
@@ -886,6 +952,34 @@ fn expected_observations_compare(
     }
     Ok((matched, diagnostics))
 }
+fn capture_oracle_observations(
+    trace: &Trace,
+    bytes: &[u8],
+    master: &dyn portable_pty::MasterPty,
+    fixture: &Path,
+) -> Result<Vec<crate::golden::ObservationRecord>, RunError> {
+    let mut records = Vec::new();
+    for expected in trace.expected_observations() {
+        let mut observation = Observation::default();
+        match &expected.kind {
+            ObservationKind::TerminalScreen => {
+                observation.screen = Some(String::from_utf8_lossy(bytes).into_owned());
+                let size = master.get_size().map_err(|e| err(e.to_string()))?;
+                observation.dimensions = Some((size.cols, size.rows));
+            }
+            ObservationKind::Filesystem { relative_path }
+            | ObservationKind::PersistedBytes { relative_path } => {
+                observation.bytes = read_fixture_file(fixture, relative_path)?
+            }
+            _ => return Err(err("unsupported TUI capture observation")),
+        }
+        records.push(
+            crate::golden::ObservationRecord::from_observation(&expected.kind, &observation)
+                .map_err(err)?,
+        );
+    }
+    Ok(records)
+}
 fn read_fixture_file(fixture: &Path, relative: &str) -> Result<Option<Vec<u8>>, RunError> {
     use std::path::Component;
     let relative = Path::new(relative);
@@ -916,7 +1010,25 @@ fn read_fixture_file(fixture: &Path, relative: &str) -> Result<Option<Vec<u8>>, 
 fn encode(e: &InputEvent) -> Result<Vec<u8>, RunError> {
     use crate::trace::{KeyCode::*, NamedKey::*};
     Ok(match e {
-        InputEvent::Text { value } | InputEvent::Paste { value } => value.as_bytes().to_vec(),
+        InputEvent::Text { value } => value.as_bytes().to_vec(),
+        InputEvent::Paste { value } => {
+            if cfg!(windows) {
+                return Err(err(
+                    "unsupported paste: frozen Windows native Crossterm has no Paste event path",
+                ));
+            }
+            if value.contains("\x1b[201~") {
+                return Err(err(
+                    "unsupported paste payload: contains bracketed-paste closing marker",
+                ));
+            }
+            [
+                b"\x1b[200~".as_slice(),
+                value.as_bytes(),
+                b"\x1b[201~".as_slice(),
+            ]
+            .concat()
+        }
         InputEvent::Resize { .. } => vec![],
         InputEvent::Key {
             code,

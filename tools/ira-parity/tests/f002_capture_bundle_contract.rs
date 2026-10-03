@@ -243,7 +243,8 @@ fn s13_bundle_order_is_stable_and_manifest_is_published_last() {
     assert!(result.is_err());
     assert!(!interrupted.path().join("manifest.toml").exists());
 }
-// GAP(G-F002-ADV-51) sev=high kind=test-gap feature=F-002
+// GAP-FIXED(G-F002-ADV-51) sev=high kind=test-gap feature=F-002
+//   fixed-by: typed actual observation bundles and explicit bracketed paste protocol (T-006)
 //   what:     Staged golden output must contain the target's observed value, not only the trace input/expectation.
 //   tui-ref:  migration/specs/F-002.md S6,S13
 //   oracle:   Observe(kind) value is the capture evidence; trace expectations are separate inputs.
@@ -251,7 +252,8 @@ fn s13_bundle_order_is_stable_and_manifest_is_published_last() {
 //   expected: Loaded bundle contains the target's actual observation despite the expectation mismatch.
 //   actual:   No RunCapture/run_capture_with_target/capture_run_to_staging seam exists; the current run result drops observations.
 //   cover:    s13_capture_uses_actual_observation_not_trace_expectation
-// GAP(G-F002-ADV-52) sev=high kind=data-compat feature=F-002
+// GAP-FIXED(G-F002-ADV-52) sev=high kind=data-compat feature=F-002
+//   fixed-by: typed actual observation bundles and explicit bracketed paste protocol (T-006)
 //   what:     Byte observations require lossless tagged encoding, including NUL and invalid UTF-8 bytes.
 //   tui-ref:  migration/specs/F-002.md S5,S13
 //   oracle:   PersistedBytes observations are byte-exact; TOML text alone cannot encode arbitrary bytes.
@@ -259,7 +261,8 @@ fn s13_bundle_order_is_stable_and_manifest_is_published_last() {
 //   expected: Reloaded byte payload is identical byte-for-byte.
 //   actual:   ObservationValue::Bytes and ObservationBundle do not exist.
 //   cover:    s13_byte_observations_round_trip_nul_and_invalid_utf8
-// GAP(G-F002-ADV-53) sev=high kind=data-compat feature=F-002
+// GAP-FIXED(G-F002-ADV-53) sev=high kind=data-compat feature=F-002
+//   fixed-by: typed actual observation bundles and explicit bracketed paste protocol (T-006)
 //   what:     Captured paths need reversible identity; lossy strings or normalization merge distinct paths.
 //   tui-ref:  migration/specs/F-002.md S5,S13; AGENTS.md invariant 5
 //   oracle:   Paths retain platform OsString identity; NFC/NFD are distinct on Linux and raw Unix bytes may be invalid UTF-8.
@@ -267,7 +270,8 @@ fn s13_bundle_order_is_stable_and_manifest_is_published_last() {
 //   expected: Loaded relative_path preserves PathBuf identity; the lossy kind string never becomes serialized path authority.
 //   actual:   Current ObservationKind relative_path is String and no reversible record path codec/bundle loader exists.
 //   cover:    s13_paths_round_trip_without_unicode_normalization_or_loss
-// GAP(G-F002-ADV-54) sev=medium kind=edge-case feature=F-002
+// GAP-FIXED(G-F002-ADV-54) sev=medium kind=edge-case feature=F-002
+//   fixed-by: typed actual observation bundles and explicit bracketed paste protocol (T-006)
 //   what:     Observation order must be stable and a failed/incomplete write must not publish a complete manifest.
 //   tui-ref:  migration/specs/F-002.md S13
 //   oracle:   Golden staging publication is deterministic and manifest-last or atomically renamed.
