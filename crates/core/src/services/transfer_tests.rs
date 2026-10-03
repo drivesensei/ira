@@ -338,18 +338,28 @@ fn cancel_mid_copy_removes_partial_destination() {
     let control = job.control.clone();
     spawn_job(&job, tx);
 
-    // Pause as soon as the partial dst appears: the worker parks at its
+    // Pause as soon as the private staged payload appears: the worker parks at its
     // next 256KB gate with the partial file still on disk.
     let mut partial_seen = false;
     for _ in 0..1000 {
-        if std::fs::symlink_metadata(base.join("dst").join("big.bin")).is_ok() {
+        if std::fs::read_dir(base.join("dst"))
+            .unwrap()
+            .flatten()
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".ira-transfer-")
+                    && entry.path().join("payload").exists()
+            })
+        {
             control.set_paused(true);
             partial_seen = true;
             break;
         }
         std::thread::sleep(Duration::from_millis(2));
     }
-    assert!(partial_seen, "partial destination must exist mid-copy");
+    assert!(partial_seen, "private staged payload must exist mid-copy");
     std::thread::sleep(Duration::from_millis(50)); // let the worker park
     control.request_cancel();
 
@@ -359,6 +369,8 @@ fn cancel_mid_copy_removes_partial_destination() {
         std::fs::symlink_metadata(base.join("dst").join("big.bin")).is_err(),
         "partial destination must be removed on cancel"
     );
+    assert_eq!(std::fs::metadata(&src).unwrap().len(), 64 * 1024 * 1024);
+    assert_eq!(std::fs::read_dir(base.join("dst")).unwrap().count(), 0);
     let _ = std::fs::remove_dir_all(&base);
 }
 

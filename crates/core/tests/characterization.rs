@@ -200,9 +200,9 @@ fn collision_auto_rename_matches_source_and_preserves_existing() {
 }
 #[test]
 fn characterize_g0016_overwrite_directory_failure_deletes_existing_destination() {
-    // Existing oracle defect, preserved rather than silently repaired by extraction.
+    // Frozen oracle retains the defect; D-003 deliberately fixes both live applications.
     assert_eq!(transfer_fixture(true, true), (false, false, false, true));
-    assert_eq!(transfer_fixture(false, true), (false, false, false, true));
+    assert_eq!(transfer_fixture(false, true), (false, true, false, true));
 }
 #[test]
 fn core_source_and_manifest_have_no_ui_dependencies_or_unsafe() {
