@@ -39,8 +39,12 @@ pub(crate) struct Cached {
 pub(crate) struct State {
     pub(crate) cache: Mutex<Cached>,
     pub(crate) closing: AtomicBool,
+    pub(crate) sink: ActionSink,
 }
 impl State {
+    pub(crate) fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Acquire) || self.sink.is_closing()
+    }
     pub(crate) fn tree(&self) -> Result<Arc<SemanticTree>> {
         if self.closing.load(Ordering::Acquire) {
             return Err(unavailable());
@@ -107,6 +111,7 @@ pub(crate) fn make_state(
         None
     };
     Arc::new(State {
+        sink: ActionSink::channel(tree.clone(), 1).0,
         cache: Mutex::new(Cached { tree, prepared: p }),
         closing: AtomicBool::new(false),
     })

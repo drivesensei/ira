@@ -216,6 +216,17 @@ impl ActionSink {
             .map(|slot| slot.frame.clone())
             .map_err(|_| Rejection::Backpressure)
     }
+    /// Bounded attachment preflight; current() remains available for retirement.
+    fn attachment_tree(&self) -> Result<Arc<SemanticTree>, Rejection> {
+        if self.is_closing() {
+            return Err(Rejection::Closing);
+        }
+        let tree = self.current()?;
+        if self.is_closing() {
+            return Err(Rejection::Closing);
+        }
+        Ok(tree)
+    }
     pub fn current(&self) -> Result<Arc<SemanticTree>, Rejection> {
         self.shared
             .tree

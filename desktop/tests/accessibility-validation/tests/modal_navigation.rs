@@ -2,7 +2,7 @@
 //! Source equality prevents this host-side adapter probe drifting from production logic.
 #![allow(non_snake_case, non_upper_case_globals, clippy::useless_conversion)]
 use ira_accessibility_validation::accessibility::{
-    Rejection,
+    ActionSink, Rejection,
     model::{self, *},
 };
 use ira_core::{
@@ -30,7 +30,7 @@ mod native_navigation_probe {
     #[rustfmt::skip]
         pub     fn Navigate(&self, direction: NavigateDirection) -> Result<IRawElementProviderFragment> {
         let cache = self.state.cache.try_lock().map_err(|_| unavailable())?;
-        if self.state.closing.load(Ordering::Acquire) {
+        if self.state.is_closing() {
             return Err(unavailable());
         }
         let direction = match direction {
@@ -211,6 +211,12 @@ fn offscreen_100k_navigation_preserves_complete_logical_tree_without_modal() {
 struct MacState {
     tree: std::cell::RefCell<Arc<SemanticTree>>,
     attached: std::cell::Cell<bool>,
+    sink: ActionSink,
+}
+impl MacState {
+    fn is_attached(&self) -> bool {
+        self.attached.get() && !self.sink.is_closing()
+    }
 }
 struct MacIvars {
     state: std::rc::Weak<MacState>,
@@ -225,7 +231,7 @@ impl MacProvider {
     }
     fn node(&self) -> Option<Node> {
         let state = self.ivars().state.upgrade()?;
-        if !state.attached.get() {
+        if !state.is_attached() {
             return None;
         };
 
@@ -281,6 +287,7 @@ fn mac_retained_background_metadata_is_unavailable_during_modal() {
     let state = std::rc::Rc::new(MacState {
         tree: std::cell::RefCell::new(current.clone()),
         attached: std::cell::Cell::new(true),
+        sink: ActionSink::channel(current.clone(), 1).0,
     });
     let retained = MacProvider {
         ivars: MacIvars {
@@ -372,5 +379,74 @@ fn indexed_sibling_destination_cannot_escape_modal_even_if_index_is_stale() {
             NavigationDirection::PreviousSibling
         ),
         Err(Rejection::Stale)
+    );
+}
+
+#[test]
+fn sink_close_after_attachment_disables_retained_native_callbacks() {
+    let s = fixture(3);
+    let state = make_state(&s, &mut AccessibilityModel::default(), true);
+    let tree = state.tree().unwrap();
+    let provider = Provider {
+        state: state.clone(),
+        id: tree.root,
+    };
+    assert!(provider.Navigate(NavigateDirection_FirstChild).is_ok());
+    state.sink.close();
+    assert!(
+        !state.closing.load(Ordering::Acquire),
+        "sink closure is independent of native teardown flag"
+    );
+    assert_eq!(
+        provider.Navigate(NavigateDirection_FirstChild),
+        Err(Error::Unavailable)
+    );
+    let mac = std::rc::Rc::new(MacState {
+        tree: std::cell::RefCell::new(tree.clone()),
+        attached: std::cell::Cell::new(true),
+        sink: ActionSink::channel(tree.clone(), 1).0,
+    });
+    let retained = MacProvider {
+        ivars: MacIvars {
+            state: std::rc::Rc::downgrade(&mac),
+            id: tree.root,
+        },
+    };
+    assert!(retained.node().is_some());
+    mac.sink.close();
+    assert!(
+        mac.attached.get(),
+        "sink closure is independent of native teardown flag"
+    );
+    assert!(retained.node().is_none());
+}
+#[test]
+fn callback_lifetime_predicates_match_native_source() {
+    fn body<'a>(source: &'a str, needle: &str) -> &'a str {
+        let start = source.find(needle).unwrap();
+        let open = start + source[start..].find('{').unwrap();
+        let end = open + source[open..].find('}').unwrap();
+        &source[open..=end]
+    }
+    let compact = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    assert_eq!(
+        compact(body(
+            include_str!("../../../src/platform/accessibility/windows.rs"),
+            "fn is_closing(&self)"
+        )),
+        compact(body(
+            include_str!("modal_navigation/support.rs"),
+            "fn is_closing(&self)"
+        ))
+    );
+    assert_eq!(
+        compact(body(
+            include_str!("../../../src/platform/accessibility/macos.rs"),
+            "fn is_attached(&self)"
+        )),
+        compact(body(
+            include_str!("modal_navigation.rs"),
+            "fn is_attached(&self)"
+        ))
     );
 }
