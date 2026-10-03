@@ -34,8 +34,8 @@ impl fmt::Display for PersistenceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} ({:?}, {}): {}",
-            "Persistence failed", self.path, self.stage, self.message
+            "Persistence failed ({:?}, {}): {}",
+            self.path, self.stage, self.message
         )
     }
 }
