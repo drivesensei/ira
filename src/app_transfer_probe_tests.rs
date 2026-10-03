@@ -1,5 +1,46 @@
 use super::*;
 
+// Serialize these synthetic blockers, while still allowing real peer probes to
+// compete for the production lane. Admission is driven by actual host ticks.
+static FIXTURE_LOCK: Mutex<()> = Mutex::new(());
+fn fixture_lock() -> std::sync::MutexGuard<'static, ()> {
+    FIXTURE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+fn drive_until_callback<T>(
+    app: &mut App,
+    rx: &mpsc::Receiver<T>,
+    budget: Duration,
+) -> Result<T, mpsc::TryRecvError> {
+    let deadline = Instant::now() + budget;
+    loop {
+        app.tick();
+        match rx.try_recv() {
+            Ok(value) => return Ok(value),
+            Err(mpsc::TryRecvError::Disconnected) => return Err(mpsc::TryRecvError::Disconnected),
+            Err(mpsc::TryRecvError::Empty) if Instant::now() >= deadline => {
+                return Err(mpsc::TryRecvError::Empty)
+            }
+            Err(mpsc::TryRecvError::Empty) => thread::yield_now(),
+        }
+    }
+}
+fn drive_until_spawn_attempt(app: &mut App) {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        app.tick();
+        if app.transfer_probe_finished.is_some() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "owned spawn failure was never admitted"
+        );
+        thread::yield_now();
+    }
+}
+
 fn running_app() -> App {
     let mut app = App::default();
     app.jobs.push(Job {
@@ -26,10 +67,13 @@ fn running_app() -> App {
 
 #[test]
 fn tick_returns_while_transfer_metadata_is_blocked() {
+    let _fixture = fixture_lock();
     let mut app = running_app();
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
-    let (tick_tx, tick_rx) = mpsc::channel();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let returned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed_returned = Arc::clone(&returned);
     let release_rx = Arc::new(Mutex::new(release_rx));
     app.transfer_probe_test = Some(Arc::new(move |_| {
         entered_tx.send(()).unwrap();
@@ -40,15 +84,31 @@ fn tick_returns_while_transfer_metadata_is_blocked() {
             .unwrap();
         true
     }));
-    // Always release before reporting failure, including channel/time-out errors.
+    // Controller always releases, even if admission or the original 50ms check fails.
     let controller = thread::spawn(move || {
         let entered = entered_rx.recv_timeout(Duration::from_secs(1)).is_ok();
-        let returned = entered && tick_rx.recv_timeout(Duration::from_millis(50)).is_ok();
+        let _ = ready_tx.send(());
+        let deadline = Instant::now() + Duration::from_millis(50);
+        while entered
+            && !observed_returned.load(std::sync::atomic::Ordering::Acquire)
+            && Instant::now() < deadline
+        {
+            thread::yield_now();
+        }
+        let returned = entered && observed_returned.load(std::sync::atomic::Ordering::Acquire);
         let _ = release_tx.send(());
         (entered, returned)
     });
-    app.tick();
-    let _ = tick_tx.send(());
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        returned.store(false, std::sync::atomic::Ordering::Release);
+        app.tick();
+        returned.store(true, std::sync::atomic::Ordering::Release);
+        if ready_rx.try_recv().is_ok() || Instant::now() >= deadline {
+            break;
+        }
+        thread::yield_now();
+    }
     let (entered, returned) = controller.join().unwrap();
     assert!(entered, "metadata seam must have been entered");
     assert!(returned, "tick blocked until metadata release");
@@ -111,6 +171,7 @@ fn queue_result(app: &mut App, exists: bool) {
 
 #[test]
 fn accepted_probe_preserves_reveal_and_settles_selected_row() {
+    let _fixture = fixture_lock();
     let fixture = Fixture::new();
     let mut app = fixture.app();
     queue_result(&mut app, true);
@@ -125,6 +186,7 @@ fn accepted_probe_preserves_reveal_and_settles_selected_row() {
 
 #[test]
 fn user_navigation_while_probe_pending_does_not_yank_cursor_or_selection() {
+    let _fixture = fixture_lock();
     let fixture = Fixture::new();
     let mut app = fixture.app();
     queue_result(&mut app, true);
@@ -139,6 +201,7 @@ fn user_navigation_while_probe_pending_does_not_yank_cursor_or_selection() {
 
 #[test]
 fn navigation_away_does_not_refresh_current_folder() {
+    let _fixture = fixture_lock();
     let fixture = Fixture::new();
     let mut app = fixture.app();
     queue_result(&mut app, true);
@@ -150,6 +213,7 @@ fn navigation_away_does_not_refresh_current_folder() {
 
 #[test]
 fn away_and_back_or_new_listing_invalidates_probe_for_that_pane() {
+    let _fixture = fixture_lock();
     let fixture = Fixture::new();
     let mut app = fixture.app();
     queue_result(&mut app, true);
@@ -163,6 +227,7 @@ fn away_and_back_or_new_listing_invalidates_probe_for_that_pane() {
 
 #[test]
 fn changed_sync_identity_rejects_old_destination_reveal_or_refresh_time() {
+    let _fixture = fixture_lock();
     for dimension in 0..3 {
         let fixture = Fixture::new();
         let mut app = fixture.app();
@@ -181,6 +246,7 @@ fn changed_sync_identity_rejects_old_destination_reveal_or_refresh_time() {
 
 #[test]
 fn superseded_generation_does_not_clear_current_pending_probe() {
+    let _fixture = fixture_lock();
     let fixture = Fixture::new();
     let mut app = fixture.app();
     queue_result(&mut app, true);
@@ -194,6 +260,7 @@ fn superseded_generation_does_not_clear_current_pending_probe() {
 
 #[test]
 fn terminal_events_invalidate_probe_before_late_install() {
+    let _fixture = fixture_lock();
     for event in [
         JobEvent::Done { id: 1 },
         JobEvent::Cancelled { id: 1 },
@@ -219,6 +286,7 @@ fn terminal_events_invalidate_probe_before_late_install() {
 
 #[test]
 fn direct_terminal_state_rejects_queued_result() {
+    let _fixture = fixture_lock();
     let fixture = Fixture::new();
     let mut app = fixture.app();
     queue_result(&mut app, true);
@@ -231,6 +299,7 @@ fn direct_terminal_state_rejects_queued_result() {
 
 #[test]
 fn missing_destination_preserves_listing_and_attempt_throttle() {
+    let _fixture = fixture_lock();
     let fixture = Fixture::new();
     let mut app = fixture.app();
     queue_result(&mut app, false);
@@ -247,12 +316,12 @@ fn missing_destination_preserves_listing_and_attempt_throttle() {
     }
     assert!(called_rx.try_recv().is_err());
     app.transfer_probe_last_attempt = None;
-    app.tick();
-    called_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    drive_until_callback(&mut app, &called_rx, Duration::from_secs(1)).unwrap();
 }
 
 #[test]
 fn pending_probe_bounds_in_flight_work_including_paused_job() {
+    let _fixture = fixture_lock();
     let mut app = running_app();
     app.jobs[0].status = JobStatus::Paused;
     app.transfer_probe_pending = Some(app.transfer_generation);
@@ -266,12 +335,12 @@ fn pending_probe_bounds_in_flight_work_including_paused_job() {
     }
     assert!(called_rx.try_recv().is_err());
     app.transfer_probe_pending = None;
-    app.tick();
-    called_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    drive_until_callback(&mut app, &called_rx, Duration::from_secs(1)).unwrap();
 }
 
 #[test]
 fn superseded_probe_does_not_retarget_new_transfer() {
+    let _fixture = fixture_lock();
     let fixture = Fixture::new();
     let mut app = fixture.app();
     queue_result(&mut app, true);
@@ -298,6 +367,7 @@ fn superseded_probe_does_not_retarget_new_transfer() {
 
 #[test]
 fn viewing_destination_subfolder_preserves_current_entry() {
+    let _fixture = fixture_lock();
     let fixture = Fixture::new();
     let mut app = fixture.app();
     let inside = fixture.0.join("inside");

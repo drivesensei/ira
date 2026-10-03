@@ -2,9 +2,11 @@ use super::*;
 
 #[test]
 fn terminal_events_do_not_accumulate_blocked_metadata_workers() {
+    let _fixture = fixture_lock();
     let mut app = running_app();
     let (entered_tx, entered_rx) = mpsc::channel();
     let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let release_guard = ReleaseGate(Arc::clone(&gate));
     let worker_gate = gate.clone();
     let (finished_tx, finished_rx) = mpsc::channel();
     app.transfer_probe_test = Some(Arc::new(move |_| {
@@ -17,7 +19,9 @@ fn terminal_events_do_not_accumulate_blocked_metadata_workers() {
         finished_tx.send(()).unwrap();
         false
     }));
-    let mut count = 0;
+    let mut count = usize::from(
+        drive_until_callback(&mut app, &entered_rx, Duration::from_millis(100)).is_ok(),
+    );
     for id in 2..8 {
         let mut other = running_app().jobs.pop().unwrap();
         other.id = id;
@@ -33,20 +37,20 @@ fn terminal_events_do_not_accumulate_blocked_metadata_workers() {
             count += 1;
         }
     }
-    let (lock, changed) = &*gate;
-    *lock.lock().unwrap() = true;
-    changed.notify_all();
+    release_guard.release();
     for _ in 0..count {
         finished_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     }
-    assert!(count <= 1, "{count} simultaneous blocked metadata workers after unrelated terminal events; pending invalidation lost physical occupancy");
+    assert_eq!(count, 1, "{count} simultaneous blocked metadata workers after unrelated terminal events; fixture must enter exactly once");
 }
 
 #[test]
 fn root_drop_and_recreate_do_not_accumulate_blocked_workers() {
+    let _fixture = fixture_lock();
     let (entered_tx, entered_rx) = mpsc::channel();
     let (finished_tx, finished_rx) = mpsc::channel();
     let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let release_guard = ReleaseGate(Arc::clone(&gate));
     let worker_gate = gate.clone();
     let probe: TransferProbeTest = Arc::new(move |_| {
         entered_tx.send(()).unwrap();
@@ -59,23 +63,24 @@ fn root_drop_and_recreate_do_not_accumulate_blocked_workers() {
         false
     });
     let mut count = 0;
-    for _ in 0..6 {
+    for index in 0..6 {
         let mut app = running_app();
         app.transfer_probe_test = Some(probe.clone());
-        app.tick();
-        if entered_rx.recv_timeout(Duration::from_millis(100)).is_ok() {
-            count += 1;
-        }
+        let entered = if index == 0 {
+            drive_until_callback(&mut app, &entered_rx, Duration::from_millis(100)).is_ok()
+        } else {
+            app.tick();
+            entered_rx.recv_timeout(Duration::from_millis(100)).is_ok()
+        };
+        count += usize::from(entered);
         drop(app);
     }
-    let (lock, changed) = &*gate;
-    *lock.lock().unwrap() = true;
-    changed.notify_all();
+    release_guard.release();
     for _ in 0..count {
         finished_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     }
-    assert!(
-        count <= 1,
+    assert_eq!(
+        count, 1,
         "{count} physical workers survive root drop/recreate"
     );
 }
@@ -110,6 +115,7 @@ fn wait_worker_finished(app: &App) {
 
 #[test]
 fn paused_latest_request_retries_after_obsolete_physical_worker_exits() {
+    let _fixture = fixture_lock();
     let mut app = running_app();
     let (entered_tx, entered_rx) = mpsc::channel();
     let gate = ReleaseGate(Arc::new((Mutex::new(false), std::sync::Condvar::new())));
@@ -123,8 +129,7 @@ fn paused_latest_request_retries_after_obsolete_physical_worker_exits() {
             .unwrap();
         false
     }));
-    app.tick();
-    let first = entered_rx.recv_timeout(Duration::from_secs(1));
+    let first = drive_until_callback(&mut app, &entered_rx, Duration::from_secs(1));
     app.jobs[0].status = JobStatus::Paused;
     app.transfer_dest.as_mut().unwrap().dest_dir = "latest-destination".into();
     app.transfer_dest.as_mut().unwrap().reveal_path = "latest-destination/item.txt".into();
@@ -169,31 +174,35 @@ fn paused_latest_request_retries_after_obsolete_physical_worker_exits() {
 
 #[test]
 fn worker_panic_without_reply_releases_slot_and_unwedges_pending() {
+    let _fixture = fixture_lock();
     let mut app = running_app();
     let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let calls = Arc::clone(&count);
+    let (started_tx, started_rx) = mpsc::channel();
     app.transfer_probe_test = Some(Arc::new(move |_| {
+        started_tx.send(()).unwrap();
         if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
             panic!("fixture metadata callback panic");
         }
         false
     }));
-    app.tick();
+    drive_until_callback(&mut app, &started_rx, Duration::from_secs(1)).unwrap();
     wait_worker_finished(&app);
     app.tick();
     assert!(app.transfer_probe_pending.is_none());
     assert!(app.transfer_probe_finished.is_none());
     app.transfer_probe_last_attempt = None;
-    app.tick();
+    drive_until_callback(&mut app, &started_rx, Duration::from_secs(1)).unwrap();
     wait_worker_finished(&app);
     assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
 #[test]
 fn spawn_failure_releases_admission_and_retries_without_fake_reply() {
+    let _fixture = fixture_lock();
     let mut app = running_app();
     app.transfer_probe_spawn_error = true;
-    app.tick();
+    drive_until_spawn_attempt(&mut app);
     assert!(app.transfer_probe_pending.is_none());
     wait_worker_finished(&app);
     app.transfer_probe_spawn_error = false;
@@ -203,7 +212,6 @@ fn spawn_failure_releases_admission_and_retries_without_fake_reply() {
         called_tx.send(()).unwrap();
         false
     }));
-    app.tick();
-    called_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    drive_until_callback(&mut app, &called_rx, Duration::from_secs(1)).unwrap();
     wait_worker_finished(&app);
 }
