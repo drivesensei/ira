@@ -803,3 +803,80 @@ fn duplicate_mutation_envelope_is_ignored_and_window_sequences_restart() {
     assert!(app.dispatch_envelope(current).unwrap());
     assert!(!app.running);
 }
+// Independent T020 probes G-0032/G-0033, strengthened to explicit rejection.
+#[test]
+fn conflicting_equal_draft_revision_is_rejected_before_old_save_completion() {
+    let tmp = TempFixture::new();
+    let mut app = editor_fixture(&tmp);
+    open_editor(&mut app);
+    let id = app.edit.as_ref().unwrap().document_id;
+    assert!(app.update_editor_draft(id, 1, "first".into()));
+    let saved = crate::editor::save_document(&app.editor_save_snapshot().unwrap()).unwrap();
+    assert!(!app.update_editor_draft(id, 1, "second".into()));
+    assert_eq!(app.edit.as_ref().unwrap().content, "first");
+    assert!(app.apply_save_result(id, 1, Ok(saved)));
+    assert!(!app.edit.as_ref().unwrap().dirty);
+    assert_eq!(std::fs::read(tmp.0.join("edit.txt")).unwrap(), b"first");
+}
+#[test]
+fn late_editor_open_cannot_steal_newer_help_focus() {
+    let tmp = TempFixture::new();
+    let mut app = editor_fixture(&tmp);
+    app.open_edit();
+    let request = app.pending_editor_request().unwrap();
+    let document = crate::editor::open_document(request.document_id, &request.target.path).unwrap();
+    app.dispatch(crate::input::Input::Action(crate::input::Command::ShowHelp))
+        .unwrap();
+    assert!(app.keybindings_visible);
+    assert_ne!(request.focus_generation, app.focus_generation);
+    assert!(!app.apply_open_editor(request, Ok(document)));
+    assert!(!app.edit_focus);
+    assert_eq!(app.input_context(), crate::input::InputContext::Help);
+}
+#[test]
+fn identical_equal_draft_revision_is_idempotent_without_dirty_or_notification_change() {
+    let tmp = TempFixture::new();
+    let mut app = editor_fixture(&tmp);
+    open_editor(&mut app);
+    let id = app.edit.as_ref().unwrap().document_id;
+    assert!(app.update_editor_draft(id, 1, "same".into()));
+    let completion = crate::editor::save_document(&app.editor_save_snapshot().unwrap()).unwrap();
+    assert!(app.apply_save_result(id, 1, Ok(completion)));
+    let revision = app.revision;
+    assert!(app.update_editor_draft(id, 1, "same".into()));
+    assert_eq!(app.revision, revision);
+    assert!(!app.edit.as_ref().unwrap().dirty);
+    assert!(!app.update_editor_draft(id, 1, "conflicting".into()));
+    assert_eq!(app.revision, revision);
+    assert_eq!(app.edit.as_ref().unwrap().content, "same");
+}
+#[test]
+fn editor_open_ticket_accepts_its_tab_focus_transition_and_rejects_later_generations() {
+    let tmp = TempFixture::new();
+    let mut app = editor_fixture(&tmp);
+    app.dispatch(crate::input::Input::Key(KeyEvent::new(
+        KeyCode::Tab,
+        KeyModifiers::NONE,
+    )))
+    .unwrap();
+    let request = app.pending_editor_request().unwrap();
+    assert_eq!(request.focus_generation, app.focus_generation);
+    let document = crate::editor::open_document(request.document_id, &request.target.path).unwrap();
+    assert!(app.apply_open_editor(request, Ok(document)));
+    app.close_edit();
+    app.edit_focus = false;
+    for stale_generation in 0..3 {
+        app.open_edit();
+        let request = app.pending_editor_request().unwrap();
+        let document =
+            crate::editor::open_document(request.document_id, &request.target.path).unwrap();
+        match stale_generation {
+            0 => app.focus_generation += 1,
+            1 => app.document_generation += 1,
+            _ => app.window_generation += 1,
+        };
+        assert!(!app.apply_open_editor(request, Ok(document)));
+        assert!(app.pending_editor_request().is_none());
+        assert!(!app.edit_focus);
+    }
+}
