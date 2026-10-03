@@ -117,31 +117,48 @@ impl PersistenceRetry {
             return rx;
         }
         let retry = self.clone();
-        thread::spawn(move || {
-            let mut ledger = retry.shared.lock().unwrap_or_else(|e| e.into_inner());
-            for failed in retry.sealed.iter() {
-                let key = failed.payload.key();
-                // Never overwrite a newer accepted state with an older retry.
-                if ledger.latest.get(&key) != Some(&failed.epoch) {
-                    continue;
-                }
-                if !ledger.failed.iter().any(|f| f.epoch == failed.epoch) {
-                    continue;
-                }
-                match failed.payload.write() {
-                    Ok(()) => ledger.failed.retain(|f| f.epoch != failed.epoch),
-                    Err(error) => {
-                        if let Some(f) = ledger.failed.iter_mut().find(|f| f.epoch == failed.epoch)
-                        {
-                            f.error = error;
+        let failed_retry = self.clone();
+        let failed_reply = tx.clone();
+        let spawned = thread::Builder::new()
+            .name("ira-persistence-retry".into())
+            .spawn(move || {
+                let mut ledger = retry.shared.lock().unwrap_or_else(|e| e.into_inner());
+                for failed in retry.sealed.iter() {
+                    let key = failed.payload.key();
+                    // Never overwrite a newer accepted state with an older retry.
+                    if ledger.latest.get(&key) != Some(&failed.epoch) {
+                        continue;
+                    }
+                    if !ledger.failed.iter().any(|f| f.epoch == failed.epoch) {
+                        continue;
+                    }
+                    match failed.payload.write() {
+                        Ok(()) => ledger.failed.retain(|f| f.epoch != failed.epoch),
+                        Err(error) => {
+                            if let Some(f) =
+                                ledger.failed.iter_mut().find(|f| f.epoch == failed.epoch)
+                            {
+                                f.error = error;
+                            }
                         }
                     }
                 }
-            }
-            let outcome = ledger.outcome(&retry.shared);
-            retry.busy.store(false, Ordering::Release);
-            let _ = tx.send(outcome);
-        });
+                let outcome = ledger.outcome(&retry.shared);
+                retry.busy.store(false, Ordering::Release);
+                let _ = tx.send(outcome);
+            });
+        if let Err(error) = spawned {
+            failed_retry.busy.store(false, Ordering::Release);
+            let _ = failed_reply.send(Err(PersistenceFailure {
+                epoch: failed_retry.epoch,
+                errors: vec![PersistenceError {
+                    path: None,
+                    stage: "retry spawn",
+                    message: error.to_string(),
+                }],
+                retry: failed_retry,
+            }));
+        }
         rx
     }
 }
