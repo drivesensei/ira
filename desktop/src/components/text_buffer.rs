@@ -196,7 +196,12 @@ impl TextBuffer {
     }
     fn replace_raw(&mut self, r: Range<usize>, text: &str) {
         self.state.text.replace_range(r.clone(), text);
-        let b = r.start + text.len();
+        let inserted_end = r.start + text.len();
+        let b = if self.boundary(inserted_end) == inserted_end {
+            inserted_end
+        } else {
+            self.next(inserted_end)
+        };
         self.state.selection = b..b;
         self.state.reversed = false;
     }
@@ -231,7 +236,7 @@ impl TextBuffer {
             .unwrap_or_else(|| self.selection());
         let start = r.start;
         self.replace_raw(r, text);
-        self.state.marked = Some(start..start + text.len());
+        self.state.marked = (!text.is_empty()).then_some(start..start + text.len());
         if let Some(s) = selection {
             let temp = Self::new(text);
             let rel = temp.from_utf16(s);

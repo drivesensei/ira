@@ -107,4 +107,13 @@ fn empty_and_out_of_range_selection_remain_safe() {
     assert_eq!(b.text(), "");
     assert_eq!(b.selection(), 0..0);
 }
-#[test] fn inserted_base_character_keeps_caret_on_combining_grapheme_boundary(){let mut b=TextBuffer::new("\u{301}x");b.select(0,0);b.replace(None,"e",false);assert_eq!(b.text(),"e\u{301}x");assert_eq!(b.caret(),3);b.delete(false);assert_eq!(b.text(),"x");}
+#[test]
+fn inserted_base_character_keeps_caret_on_combining_grapheme_boundary() {
+    let mut b = TextBuffer::new("\u{301}x");
+    b.select(0, 0);
+    b.replace(None, "e", false);
+    assert_eq!(b.text(), "e\u{301}x");
+    assert_eq!(b.caret(), 3);
+    b.delete(false);
+    assert_eq!(b.text(), "x");
+}
