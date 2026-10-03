@@ -1,70 +1,59 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
-
-use gpui::{
-    App, Application, Bounds, ClickEvent, Context, Render, Window, WindowBounds, WindowOptions,
-    div, prelude::*, px, rgb, size,
-};
-
-struct IraDesktop {
-    button_was_clicked: bool,
+use gpui::{App, Application, Bounds, WindowBounds, WindowOptions, prelude::*, px, size};
+use ira_desktop::{actions, components::text_input, runtime::Runtime, views::Desktop};
+struct Session {
+    runtime: Runtime,
+    next_window: u64,
 }
-
-impl Render for IraDesktop {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let label = if self.button_was_clicked {
-            "Button clicked"
-        } else {
-            "Hello from IRA"
-        };
-
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .justify_center()
-            .items_center()
-            .gap_4()
-            .bg(rgb(0x171923))
-            .text_color(rgb(0xf4f4f5))
-            .child(div().text_2xl().child("IRA Desktop"))
-            .child(
-                div()
-                    .id("hello-button")
-                    .px_4()
-                    .py_2()
-                    .rounded_md()
-                    .bg(rgb(0x5b6ee1))
-                    .cursor_pointer()
-                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                        this.button_was_clicked = true;
-                        cx.notify();
-                    }))
-                    .child("Click me"),
-            )
-            .child(div().child(label))
-    }
-}
-
+impl gpui::Global for Session {}
 fn open_main_window(cx: &mut App) {
-    let bounds = Bounds::centered(None, size(px(640.0), px(420.0)), cx);
-    cx.open_window(
+    let runtime = cx.update_global::<Session, _>(|session, _| {
+        let generation = session.next_window;
+        session.next_window += 1;
+        session.runtime.attach(generation)
+    });
+    let bounds = Bounds::centered(None, size(px(1080.), px(720.)), cx);
+    match cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             ..Default::default()
         },
-        |_window, cx| {
-            cx.new(|_cx| IraDesktop {
-                button_was_clicked: false,
-            })
+        |window, cx| {
+            let entity = cx.new(|cx| Desktop::new(runtime, cx));
+            entity.update(cx, |this, cx| this.focus_main(window, cx));
+            let weak = entity.downgrade();
+            window.on_window_should_close(cx, move |_, cx| {
+                let _ = weak.update(cx, |this, _| this.close());
+                true
+            });
+            entity
         },
-    )
-    .expect("failed to open IRA desktop window");
-
-    cx.activate(true);
+    ) {
+        Ok(_) => cx.activate(true),
+        Err(error) => eprintln!("Failed to open IRA desktop window: {error}"),
+    }
 }
-
 fn main() {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "--version" || arg == "-V") {
+        println!("ira 0.1.21");
+        return;
+    }
+    if args.iter().any(|arg| arg == "--check-terminal") {
+        println!(
+            "IRA desktop host: GPUI 0.2.2\nTerminal graphics protocols are replaced by native desktop previews."
+        );
+        return;
+    }
     let app = Application::new();
     app.on_reopen(open_main_window);
-    app.run(|cx: &mut App| open_main_window(cx));
+    app.run(|cx| {
+        actions::register(cx);
+        text_input::register(cx);
+        cx.set_global(Session {
+            runtime: Runtime::start(0),
+            next_window: 1,
+        });
+        open_main_window(cx)
+    });
 }

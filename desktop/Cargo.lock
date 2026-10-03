@@ -2807,6 +2807,7 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "ira-core",
+ "unicode-segmentation",
 ]
 
 [[package]]
