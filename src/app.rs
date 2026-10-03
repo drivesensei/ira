@@ -16,7 +16,7 @@ use ratatui_image::picker::Picker;
 use crate::{
     domain::data::Folder,
     services::{
-        bookmarks::{next_free_shortcut, read_bookmarks, write_bookmarks},
+        bookmarks::{next_free_shortcut, read_bookmarks, try_write_bookmarks},
         drives::{eject_drive, list_drives, mount_drive},
         file_info::{
             build_info_fast, build_info_full, dir_size, on_disk_bytes, size_line_final, DirSize,
@@ -25,7 +25,7 @@ use crate::{
         folders::list_common_folders,
         list_files::{list_files_bounded, list_files_chunked, FEntry, LISTING_CHUNK},
         overlay::{self, Overlay},
-        state::{load_state, load_state_from, save_state, save_state_to, SessionState, SizeEntry},
+        state::{load_state, load_state_from, try_save_state, try_save_state_to, SessionState, SizeEntry},
         thumbnails::{
             preview_kind, prune_cache, spawn_workers, PreviewKind, PreviewSurface, Rendered,
             ThumbEvent, ThumbRequest, WorkerQueues, JOB_QUEUE_HI_CAP, JOB_QUEUE_LO_CAP,
@@ -2281,7 +2281,7 @@ impl App {
         self.theme_preset = self.theme_preset.next();
         self.theme = self.theme_loader.theme_for(self.theme_preset);
         self.set_status(format!("Switched to {}", self.theme_preset.label()), false);
-        self.persist_state();
+        self.persist_state_with_feedback();
     }
 
     /// Cycles the active pane's sort mode (Name → Size → Modified → Kind),
@@ -2971,7 +2971,7 @@ impl App {
         self.show_hidden = !self.show_hidden;
         self.list_files_for_pane(0);
         self.list_files_for_pane(1);
-        self.persist_state();
+        self.persist_state_with_feedback();
     }
 
     // ---- Rename (modal text editor) ----
@@ -3280,7 +3280,7 @@ impl App {
                     );
                     // A completed measurement is worth keeping across
                     // restarts; save immediately so a crash keeps it too.
-                    self.persist_state();
+                    self.persist_state_with_feedback();
                 }
                 InfoEvent::Meta { path, lines } => {
                     if let Some(dialog) = self.info.as_mut() {
@@ -3890,9 +3890,11 @@ impl App {
         self.bookmarks = Some(loaded);
     }
 
-    fn persist_bookmarks(&self) {
+    fn persist_bookmarks(&mut self) {
         if let Some(bookmarks) = &self.bookmarks {
-            write_bookmarks(bookmarks);
+            if let Err(error) = try_write_bookmarks(bookmarks) {
+                self.set_status(error.to_string(), true);
+            }
         }
     }
 
@@ -3999,6 +4001,18 @@ impl App {
     /// Persists the current session state (split layout, pane folders and
     /// folder sizes) as `key=value` lines.
     pub fn persist_state(&self) {
+        if let Err(error) = self.try_persist_state() {
+            eprintln!("{error}");
+        }
+    }
+    fn persist_state_with_feedback(&mut self) {
+        if let Err(error) = self.try_persist_state() {
+            self.set_status(error.to_string(), true);
+        }
+    }
+    pub fn try_persist_state(
+        &self,
+    ) -> Result<(), crate::services::persistence::PersistenceError> {
         let state = SessionState {
             split: self.split,
             active_pane: self.active_pane,
@@ -4013,8 +4027,8 @@ impl App {
             sizes: self.size_entries(),
         };
         match &self.state_path {
-            Some(p) => save_state_to(p, &state),
-            None => save_state(&state),
+            Some(p) => try_save_state_to(p, &state),
+            None => try_save_state(&state),
         }
     }
     pub fn recalculate_dialog_size(&mut self) {

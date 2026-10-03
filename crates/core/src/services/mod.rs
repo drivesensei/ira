@@ -6,3 +6,5 @@ pub mod list_files;
 pub mod state;
 pub mod transfer;
 pub mod windows_drives_labels;
+
+pub mod persistence;

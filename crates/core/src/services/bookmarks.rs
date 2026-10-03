@@ -30,6 +30,7 @@ pub fn next_free_shortcut(bookmarks: &[Folder]) -> Option<char> {
 }
 
 /// Path to the persisted bookmarks file (`~/.config/ira/bookmarks`).
+#[cfg(not(test))]
 fn bookmarks_file() -> Option<PathBuf> {
     dirs_next::config_dir().map(|d| d.join("ira").join("bookmarks"))
 }
@@ -67,24 +68,33 @@ pub fn read_bookmarks_from(path: &std::path::Path) -> Vec<(String, String)> {
 
 /// Persists bookmarks as `label\tpath` lines.
 pub fn write_bookmarks(bookmarks: &[Folder]) {
-    let Some(path) = bookmarks_file() else {
-        return;
-    };
-    write_bookmarks_to(&path, bookmarks);
+    let _ = try_write_bookmarks(bookmarks);
 }
-
-/// Writes the legacy format to a caller-owned file.
 pub fn write_bookmarks_to(path: &std::path::Path, bookmarks: &[Folder]) {
-    if let Some(dir) = path.parent() {
-        let _ = fs::create_dir_all(dir);
-    }
+    let _ = try_write_bookmarks_to(path, bookmarks);
+}
+pub fn try_write_bookmarks(
+    bookmarks: &[Folder],
+) -> Result<(), super::persistence::PersistenceError> {
+    let path = bookmarks_file().ok_or_else(super::persistence::PersistenceError::not_configured)?;
+    try_write_bookmarks_to(&path, bookmarks)
+}
+pub fn try_write_bookmarks_to(
+    path: &std::path::Path,
+    bookmarks: &[Folder],
+) -> Result<(), super::persistence::PersistenceError> {
     let content: String = bookmarks
         .iter()
         .map(|b| format!("{}\t{}\n", b.label, b.path))
         .collect();
-    let _ = fs::write(path, content);
+    super::persistence::publish(path, content.as_bytes())
 }
 
 #[cfg(test)]
 #[path = "bookmarks_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+fn bookmarks_file() -> Option<PathBuf> {
+    Some(super::persistence::test_path("bookmarks"))
+}
