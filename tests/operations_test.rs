@@ -2180,7 +2180,7 @@ fn transfer_reveals_folder_live_in_destination_pane() {
     let dst = base.join("dst");
     std::fs::create_dir_all(src.join("photos")).unwrap();
     std::fs::create_dir_all(&dst).unwrap();
-    // Make the copy take long enough to observe the live reveal.
+    // Keep real progress observable before the atomic publication.
     for i in 0..2000 {
         std::fs::write(
             src.join("photos").join(format!("p{i:04}.jpg")),
@@ -2206,37 +2206,37 @@ fn transfer_reveals_folder_live_in_destination_pane() {
     app.confirm_pending();
     assert!(app.transfer_dest.is_some(), "live sync armed");
 
-    // Deterministic stall: let the folder be created, then pause the worker
-    // mid-copy (it parks at a 256KB chunk gate with partial content).
+    // Preserve the original pause timing: the worker parks at its chunk gate
+    // with partially copied private content, before atomic publication.
     std::thread::sleep(Duration::from_millis(80));
     app.jobs[0].control.set_paused(true);
 
-    // The reveal must happen while the transfer is stalled: the destination
-    // listing refresh (1s cadence) shows the folder and the cursor lands on
-    // it via the reveal target.
-    let mut revealed_while_stalled = false;
+    // D012: private staging must not expose a partially copied public folder.
+    // The copy board still reports real bytes while the worker is paused.
     for _ in 0..300 {
         app.tick();
-        let idx = app.panes[1].state.selected();
-        if idx
-            .and_then(|i| app.panes[1].files.get(i))
-            .is_some_and(|f| f.label == "photos")
-        {
-            revealed_while_stalled = true;
-            break;
-        }
+        assert!(
+            !dst.join("photos").exists(),
+            "no public folder before commit"
+        );
+        assert!(!app.panes[1].files.iter().any(|f| f.label == "photos"));
+        assert!(matches!(
+            app.jobs[0].status,
+            JobStatus::Running | JobStatus::Paused
+        ));
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(
-        revealed_while_stalled,
-        "folder must be revealed live while the transfer is paused"
+        app.jobs[0].copied_bytes > 0,
+        "paused copy reports real progress"
     );
+    assert!(app.jobs[0].copied_bytes < app.jobs[0].total_bytes.unwrap());
 
-    // Resume: the copy completes, live sync clears, folder present.
+    // Resume: publication succeeds and the settled listing selects the folder.
     app.jobs[0].control.set_paused(false);
     for _ in 0..4000 {
         app.tick();
-        if app.transfer_dest.is_none() {
+        if app.transfer_dest.is_none() && app.file_list_settled(1) {
             break;
         }
         std::thread::sleep(Duration::from_millis(5));
@@ -2245,7 +2245,21 @@ fn transfer_reveals_folder_live_in_destination_pane() {
         app.transfer_dest.is_none(),
         "live sync cleared on completion"
     );
-    assert!(app.panes[1].files.iter().any(|f| f.label == "photos"));
+    assert!(matches!(app.jobs[0].status, JobStatus::Done));
+    assert!(app.file_list_settled(1), "postcommit listing must settle");
+    assert!(dst.join("photos/p1999.jpg").is_file());
+    assert_eq!(std::fs::read_dir(dst.join("photos")).unwrap().count(), 2000);
+    assert_eq!(app.jobs[0].copied_bytes, app.jobs[0].total_bytes.unwrap());
+    assert_eq!(app.panes[1].files.len(), 1);
+    assert_eq!(
+        app.panes[1]
+            .state
+            .selected()
+            .and_then(|i| app.panes[1].files.get(i))
+            .map(|f| f.label.as_str()),
+        Some("photos"),
+        "the successfully committed folder must be revealed and selected"
+    );
 
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -2257,7 +2271,7 @@ fn navigating_the_destination_pane_during_a_transfer_is_not_yanked_back() {
     let dst = base.join("dst");
     std::fs::create_dir_all(src.join("photos")).unwrap();
     std::fs::create_dir_all(&dst).unwrap();
-    // A source big enough that "photos" streams in while we browse.
+    // A source big enough to keep private staging active while we browse.
     for i in 0..2000 {
         std::fs::write(
             src.join("photos").join(format!("p{i:04}.jpg")),
@@ -2293,22 +2307,27 @@ fn navigating_the_destination_pane_during_a_transfer_is_not_yanked_back() {
         "the transfer must still be live: a finished copy would not re-list"
     );
 
-    // Wait for the live reveal to land the cursor on the incoming folder.
-    let mut revealed = false;
+    // D012: no partial public item; populate the real existing destination
+    // listing while private work and visible byte progress remain live.
     for _ in 0..300 {
         app.tick();
-        if app.panes[1]
-            .state
-            .selected()
-            .and_then(|i| app.panes[1].files.get(i))
-            .is_some_and(|f| f.label == "photos")
-        {
-            revealed = true;
-            break;
-        }
+        assert!(
+            !dst.join("photos").exists(),
+            "no public folder before commit"
+        );
+        assert!(!app.panes[1].files.iter().any(|f| f.label == "photos"));
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(revealed, "incoming folder is revealed live");
+    assert!(
+        app.jobs[0].copied_bytes > 0,
+        "paused copy reports real progress"
+    );
+    assert!(app.jobs[0].copied_bytes < app.jobs[0].total_bytes.unwrap());
+    assert!(matches!(
+        app.jobs[0].status,
+        JobStatus::Running | JobStatus::Paused
+    ));
+    assert!(app.panes[1].files.iter().any(|f| f.label == "aaa.txt"));
 
     // The user takes the cursor over: focus the destination pane and jump to
     // the top of the list.
@@ -2343,6 +2362,19 @@ fn navigating_the_destination_pane_during_a_transfer_is_not_yanked_back() {
 
     app.jobs[0].control.set_paused(false);
     wait_for_jobs(&mut app);
+    for _ in 0..300 {
+        app.tick();
+        if app.file_list_settled(1) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(matches!(app.jobs[0].status, JobStatus::Done));
+    assert!(app.file_list_settled(1), "postcommit listing must settle");
+    assert!(dst.join("photos/p1999.jpg").is_file());
+    assert_eq!(std::fs::read_dir(dst.join("photos")).unwrap().count(), 2000);
+    assert_eq!(app.jobs[0].copied_bytes, app.jobs[0].total_bytes.unwrap());
+    assert!(app.panes[1].files.iter().any(|f| f.label == "photos"));
     assert_eq!(
         label_at(&app).as_deref(),
         Some("aaa.txt"),
