@@ -142,6 +142,8 @@ impl Runtime {
             Box::new(crate::platform::drives),
             move || {
                 let mut app = App::new();
+                #[cfg(target_os = "windows")]
+                app.set_transfer_provider(Arc::new(crate::platform::rename_no_replace));
                 let font_family = text.all_font_names().into_iter().find(|family| {
                     let id = text.resolve_font(&gpui::font(family.clone()));
                     ['\u{f07b}', '\u{e718}', '\u{e0b6}']
@@ -290,35 +292,21 @@ impl Runtime {
             let mut last_tick = Instant::now();
             publish(&app, &publication, &loader, &font_family);
             while !stop.load(Ordering::Acquire) && app.running {
-                let attached = attached.load(Ordering::Acquire);
-                if app.window_generation != attached {
-                    let old_window = app.window_generation;
-                    let abandoned = app.take_host_requests();
-                    app.attach_window(attached);
-                    for request in abandoned {
-                        if matches!(request, HostRequest::RefreshDrives) {
-                            route_host(
-                                &app,
-                                request,
-                                app.ack_sequence,
-                                &editor_tx,
-                                &drive_tx,
-                                &completed,
-                            );
-                        } else {
-                            let _ = completed.send(Completion::Rejected {
-                                sequence: app.ack_sequence,
-                                window_generation: old_window,
-                                reason: "Native request belongs to a replaced window".into(),
-                            });
-                        }
-                    }
+                if synchronize_attachment(
+                    &mut app,
+                    attached.load(Ordering::Acquire),
+                    &editor_tx,
+                    &drive_tx,
+                    &completed,
+                ) {
                     publish(&app, &publication, &loader, &font_family);
                 }
                 for result in editor_results.try_iter() {
                     match result {
                         EditorResult::Drives(epoch, generation, result)
-                            if epoch == app.window_generation && generation > drive_generation =>
+                            if epoch == app.window_generation
+                                && epoch == attached.load(Ordering::Acquire)
+                                && generation > drive_generation =>
                         {
                             drive_generation = generation;
                             match result {
@@ -329,12 +317,14 @@ impl Runtime {
                             }
                         }
                         EditorResult::Opened(epoch, request, result)
-                            if epoch == app.window_generation =>
+                            if epoch == app.window_generation
+                                && epoch == attached.load(Ordering::Acquire) =>
                         {
                             app.apply_open_editor(request, result);
                         }
                         EditorResult::Saved(epoch, id, revision, result)
-                            if epoch == app.window_generation =>
+                            if epoch == app.window_generation
+                                && epoch == attached.load(Ordering::Acquire) =>
                         {
                             app.apply_save_result(id, revision, result);
                         }
@@ -344,6 +334,13 @@ impl Runtime {
                 }
                 match commands.recv_timeout(Duration::from_millis(20)) {
                     Ok(envelope) => {
+                        synchronize_attachment(
+                            &mut app,
+                            attached.load(Ordering::Acquire),
+                            &editor_tx,
+                            &drive_tx,
+                            &completed,
+                        );
                         let sequence = envelope.sequence;
                         let window_generation = envelope.window_generation;
                         if let Err(reason) = apply(&mut app, envelope) {
@@ -460,6 +457,9 @@ impl Runtime {
         self.pending.len()
     }
     pub fn try_snapshot(&self) -> Option<Publication> {
+        if self.attached_window.load(Ordering::Acquire) != self.window_generation {
+            return None;
+        }
         self.latest.try_take()
     }
     pub fn effect_guard(&self, window_generation: u64) -> EffectGuard {
@@ -470,6 +470,9 @@ impl Runtime {
         }
     }
     pub fn try_completion(&self) -> Option<Completion> {
+        if self.attached_window.load(Ordering::Acquire) != self.window_generation {
+            return None;
+        }
         let completion = self.completions.try_lock().ok()?.try_recv().ok()?;
         if let Completion::Host {
             sequence,
@@ -727,4 +730,31 @@ impl EffectGuard {
         self.attached.load(Ordering::Acquire) == self.window_generation
             && !self.stopping.load(Ordering::Acquire)
     }
+}
+
+fn synchronize_attachment(
+    app: &mut App,
+    epoch: u64,
+    editor: &mpsc::Sender<(u64, HostRequest)>,
+    drives: &mpsc::Sender<u64>,
+    completed: &mpsc::Sender<Completion>,
+) -> bool {
+    if app.window_generation == epoch {
+        return false;
+    }
+    let old_window = app.window_generation;
+    let abandoned = app.take_host_requests();
+    app.attach_window(epoch);
+    for request in abandoned {
+        if matches!(request, HostRequest::RefreshDrives) {
+            route_host(app, request, app.ack_sequence, editor, drives, completed);
+        } else {
+            let _ = completed.send(Completion::Rejected {
+                sequence: app.ack_sequence,
+                window_generation: old_window,
+                reason: "Native request belongs to a replaced window".into(),
+            });
+        }
+    }
+    true
 }

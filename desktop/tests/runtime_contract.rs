@@ -697,3 +697,81 @@ fn recurring_drive_worker_does_not_block_input_and_rejects_old_window_results() 
         std::thread::sleep(Duration::from_millis(5));
     }
 }
+
+#[test]
+fn detached_view_cannot_consume_new_window_mailboxes() {
+    let fixture = Fixture::new();
+    let app = fixture.app();
+    let old = Runtime::with_factory(7, move || app);
+    let mut reopened = old.attach(8);
+    assert!(old.try_snapshot().is_none());
+    assert!(old.try_completion().is_none());
+    reopened.enqueue(Command::Input(Input::Tick), None);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        assert!(old.try_snapshot().is_none());
+        assert!(old.try_completion().is_none());
+        if reopened.try_snapshot().is_some_and(|publication| {
+            publication.snapshot.window_generation == 8 && publication.snapshot.ack_sequence >= 1
+        }) {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    reopened.stop(&[]);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !matches!(reopened.try_completion(), Some(Completion::Closed)) {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn first_reopened_command_refreshes_epoch_after_blocked_receive() {
+    for _ in 0..10 {
+        let fixture = Fixture::new();
+        let app = fixture.app();
+        let old = Runtime::with_factory(7, move || app);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if old.try_snapshot().is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        let mut reopened = old.attach(8);
+        let sequence = reopened.enqueue(Command::SetFocus(99), None);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(Completion::Rejected {
+                sequence: rejected,
+                window_generation: 8,
+                reason,
+            }) = reopened.try_completion()
+            {
+                assert_ne!(
+                    rejected, sequence,
+                    "First current-window command was rejected: {reason}"
+                );
+            }
+            if reopened.try_snapshot().is_some_and(|publication| {
+                publication.snapshot.window_generation == 8
+                    && publication.snapshot.focus_generation == 99
+                    && publication.snapshot.ack_sequence >= sequence
+            }) {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        reopened.stop(&[]);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !matches!(reopened.try_completion(), Some(Completion::Closed)) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
