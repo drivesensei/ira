@@ -42,9 +42,13 @@ pub struct PreparedHost {
     pub converted_frames: usize,
 }
 impl PreparedHost {
-    pub fn new(native: bool, retirement: Retirement) -> Self {
-        Self {
-            worker: Some(Worker::new()),
+    pub fn try_new(
+        native: bool,
+        retirement: Retirement,
+    ) -> Result<Self, super::accessibility_worker::Pressure> {
+        let worker = Worker::try_new()?;
+        Ok(Self {
+            worker: Some(worker),
             semantic: None,
             key: None,
             sequence: 0,
@@ -67,7 +71,7 @@ impl PreparedHost {
             native: native && cfg!(any(target_os = "macos", target_os = "windows")),
             index_lookups: std::cell::Cell::new(0),
             converted_frames: 0,
-        }
+        })
     }
     pub fn can_accept_snapshot(&self) -> bool {
         self.retired.len() < 24

@@ -12,7 +12,7 @@ use ira_core::observable::Snapshot;
 use std::{
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -55,33 +55,81 @@ struct Mailbox {
     seed: Option<(Arc<SemanticTree>, RequestKey)>,
     retired: Vec<Retirement>,
 }
+const PHYSICAL_LIMIT: usize = 4;
+static PHYSICAL_OWNERS: AtomicUsize = AtomicUsize::new(0);
+#[derive(Debug)]
+pub struct Pressure;
+#[derive(Clone)]
+pub struct CompletionTicket(Arc<AtomicBool>);
+impl CompletionTicket {
+    pub fn is_complete(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+struct PhysicalPermit(CompletionTicket);
+impl Drop for PhysicalPermit {
+    fn drop(&mut self) {
+        self.0.0.store(true, Ordering::Release);
+        PHYSICAL_OWNERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 struct Shared {
     mailbox: Mutex<Mailbox>,
     wake: Condvar,
     stopping: AtomicBool,
     latest: AtomicU64,
+    _permit: PhysicalPermit,
 }
 /// One running preparation, one pending semantic request, one pending geometry
 /// request and one completed result. At most32 ownership-retirement messages.
 pub struct Worker {
     shared: Arc<Shared>,
-}
-impl Default for Worker {
-    fn default() -> Self {
-        Self::new()
-    }
+    handed_off: bool,
 }
 impl Worker {
-    pub fn new() -> Self {
+    pub fn has_capacity() -> bool {
+        PHYSICAL_OWNERS.load(Ordering::Acquire) < PHYSICAL_LIMIT
+    }
+    pub fn reclamation_complete() -> bool {
+        PHYSICAL_OWNERS.load(Ordering::Acquire) == 0
+    }
+    pub fn completion_ticket(&self) -> CompletionTicket {
+        self.shared._permit.0.clone()
+    }
+    /// Admission reserves both live preparation and its future physical close.
+    /// Failure creates no thread and captures no semantic ownership.
+    pub fn try_new() -> Result<Self, Pressure> {
+        let mut observed = PHYSICAL_OWNERS.load(Ordering::Acquire);
+        loop {
+            if observed >= PHYSICAL_LIMIT {
+                return Err(Pressure);
+            }
+            match PHYSICAL_OWNERS.compare_exchange_weak(
+                observed,
+                observed + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(next) => observed = next,
+            }
+        }
+        Ok(Self::from_reserved())
+    }
+    fn from_reserved() -> Self {
         let shared = Arc::new(Shared {
             mailbox: Mutex::new(Mailbox::default()),
             wake: Condvar::new(),
             stopping: AtomicBool::new(false),
             latest: AtomicU64::new(0),
+            _permit: PhysicalPermit(CompletionTicket(Arc::new(AtomicBool::new(false)))),
         });
         let worker = shared.clone();
         thread::spawn(move || run(worker));
-        Self { shared }
+        Self {
+            shared,
+            handed_off: false,
+        }
     }
     /// Failure returns the exact request: callers must retain its heavy ownership.
     pub fn request(&self, request: Box<SemanticRequest>) -> Result<(), Box<SemanticRequest>> {
@@ -165,20 +213,37 @@ impl Worker {
         self.shared.stopping.store(true, Ordering::Release);
         self.shared.wake.notify_one();
     }
-    /// Close bypasses queues and running work. The handoff thread owns final UI
-    /// pins immediately; it never joins the preparation thread or waits on UI.
-    pub fn close_with<T: Send + 'static>(&self, pins: T) {
-        self.shared.stopping.store(true, Ordering::Release);
-        self.shared.wake.notify_one();
-        thread::spawn(move || drop(pins));
+    /// Consuming close guarantees only one helper for this admitted window.
+    /// Its permit survives native queue removal and every blocked destructor.
+    pub fn close_with<T: Send + 'static>(mut self, pins: T) {
+        self.cancel();
+        self.handed_off = true;
+        thread::spawn(move || {
+            drop(pins);
+            // run() owns all model/mailbox cleanup. Keep the final Shared pin on
+            // this background helper until preparation physically exits.
+            while Arc::strong_count(&self.shared) > 1 {
+                thread::sleep(Duration::from_millis(1));
+            }
+            drop(self);
+        });
     }
 }
 impl Drop for Worker {
     fn drop(&mut self) {
-        self.shared.stopping.store(true, Ordering::Release);
-        self.shared.wake.notify_one();
+        self.cancel();
+        if !self.handed_off {
+            let shared = self.shared.clone();
+            thread::spawn(move || {
+                while Arc::strong_count(&shared) > 1 {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                drop(shared);
+            });
+        }
     }
 }
+
 fn run(shared: Arc<Shared>) {
     let mut model = AccessibilityModel::default();
     let mut baseline: Option<Arc<PreparedFrame>> = None;
@@ -332,6 +397,20 @@ fn run(shared: Arc<Shared>) {
 
 #[cfg(test)]
 mod tests {
+    fn test_worker() -> super::Worker {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Ok(worker) = super::Worker::try_new() {
+                return worker;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "test admission exceeded physical cleanup deadline"
+            );
+            std::thread::yield_now();
+        }
+    }
+
     use super::*;
     use crate::platform::accessibility::model::{Role, Target};
     use ira_core::{application::App, services::list_files::FEntry};
@@ -382,7 +461,7 @@ mod tests {
     }
     #[test]
     fn footer_projection_uses_host_revision_without_core_mutation() {
-        let worker = Worker::new();
+        let worker = test_worker();
         let first = request(1, "Enter: rename · Right: open · /: search · Space: select");
         let core_revision = first.snapshot.revision;
         assert!(worker.request(first).is_ok());
@@ -473,7 +552,7 @@ mod tests {
     }
     #[test]
     fn discarded_preparation_is_not_notification_baseline() {
-        let worker = Worker::new();
+        let worker = test_worker();
         let installed = semantic(&worker, 1, "installed");
         let id = installed
             .index
@@ -508,7 +587,7 @@ mod tests {
     }
     #[test]
     fn layout_pressure_cannot_overwrite_unconsumed_new_semantics() {
-        let worker = Worker::new();
+        let worker = test_worker();
         let old = semantic(&worker, 1, "old");
         let registry = Arc::new(MaterializedNodes::default());
         let held = worker.shared.mailbox.lock().unwrap();
@@ -559,7 +638,7 @@ mod tests {
 
     #[test]
     fn full_pending_mailbox_never_discards_caller_ownership() {
-        let worker = Worker::new();
+        let worker = test_worker();
         let shared = worker.shared.clone();
         let lock = shared.mailbox.lock().unwrap();
         let input = request(3, "pending");
@@ -584,7 +663,7 @@ mod tests {
                 let _ = self.tx.send(thread::current().id() != self.thread);
             }
         }
-        let worker = Worker::new();
+        let worker = test_worker();
         let (tx, rx) = std::sync::mpsc::channel();
         let mut probe = Probe {
             thread: thread::current().id(),
@@ -605,5 +684,167 @@ mod tests {
             tx,
         });
         assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod physical_reclamation_tests {
+    use super::*;
+    static EXCLUSIVE_FOUR_SLOT_PROBE: Mutex<()> = Mutex::new(());
+    fn reserve_four_atomically(deadline: Instant) -> Vec<Worker> {
+        loop {
+            if PHYSICAL_OWNERS
+                .compare_exchange(0, 4, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return (0..4).map(|_| Worker::from_reserved()).collect();
+            }
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn actual_close_handoffs_keep_four_permits_until_blocked_pins_finish() {
+        let _exclusive = EXCLUSIVE_FOUR_SLOT_PROBE.lock().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let workers = reserve_four_atomically(deadline);
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        struct Release(Arc<(Mutex<bool>, Condvar)>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                *self.0.0.lock().unwrap() = true;
+                self.0.1.notify_all();
+            }
+        }
+        struct Hold {
+            gate: Arc<(Mutex<bool>, Condvar)>,
+            entered: std::sync::mpsc::Sender<thread::ThreadId>,
+        }
+        impl Drop for Hold {
+            fn drop(&mut self) {
+                self.entered.send(thread::current().id()).unwrap();
+                let mut open = self.gate.0.lock().unwrap();
+                while !*open {
+                    open = self.gate.1.wait(open).unwrap();
+                }
+            }
+        }
+        let release = Release(gate.clone());
+        let tickets: Vec<_> = workers.iter().map(Worker::completion_ticket).collect();
+        let (entered, receiver) = std::sync::mpsc::channel();
+        for worker in workers {
+            worker.close_with(Hold {
+                gate: gate.clone(),
+                entered: entered.clone(),
+            });
+        }
+        for _ in 0..4 {
+            assert_ne!(
+                receiver.recv_timeout(Duration::from_secs(3)).unwrap(),
+                thread::current().id()
+            );
+        }
+        for _ in 0..8 {
+            assert!(
+                Worker::try_new().is_err(),
+                "unfinished physical ownership must reject admission"
+            );
+        }
+        assert_eq!(PHYSICAL_OWNERS.load(Ordering::Acquire), 4);
+        assert!(!Worker::has_capacity());
+        assert!(!crate::views::accessibility_retirement::Retirement::default().can_open());
+        let mut deferred = crate::views::accessibility::Host::headless();
+        assert!(!deferred.can_accept_snapshot());
+        let snapshot = Arc::new(ira_core::application::App::default().snapshot());
+        deferred.begin_prepared(snapshot.clone(), None, "deferred".into());
+        assert_eq!(
+            Arc::strong_count(&snapshot),
+            1,
+            "pressure must not capture semantic ownership"
+        );
+        deferred.close();
+        assert!(tickets.iter().all(|ticket| !ticket.is_complete()));
+        drop(release);
+        while !tickets.iter().all(CompletionTicket::is_complete) {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+    }
+    #[test]
+    fn actual_preparation_cleanup_keeps_four_permits_until_retired_rows_finish() {
+        let _exclusive = EXCLUSIVE_FOUR_SLOT_PROBE.lock().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let workers = reserve_four_atomically(deadline);
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        struct Release(Arc<(Mutex<bool>, Condvar)>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                *self.0.0.lock().unwrap() = true;
+                self.0.1.notify_all();
+            }
+        }
+        struct Hold {
+            gate: Arc<(Mutex<bool>, Condvar)>,
+            entered: std::sync::mpsc::Sender<thread::ThreadId>,
+        }
+        impl Drop for Hold {
+            fn drop(&mut self) {
+                self.entered.send(thread::current().id()).unwrap();
+                let mut open = self.gate.0.lock().unwrap();
+                while !*open {
+                    open = self.gate.1.wait(open).unwrap();
+                }
+            }
+        }
+        let release = Release(gate.clone());
+        let tickets: Vec<_> = workers.iter().map(Worker::completion_ticket).collect();
+        let (entered, receiver) = std::sync::mpsc::channel();
+        for worker in workers {
+            let mut payload = Hold {
+                gate: gate.clone(),
+                entered: entered.clone(),
+            };
+            loop {
+                match worker.retire(payload) {
+                    Ok(()) => break,
+                    Err(returned) => payload = returned,
+                }
+                assert!(Instant::now() < deadline);
+                thread::yield_now();
+            }
+            worker.close_with(());
+        }
+        for _ in 0..4 {
+            assert_ne!(
+                receiver.recv_timeout(Duration::from_secs(3)).unwrap(),
+                thread::current().id()
+            );
+        }
+        for _ in 0..8 {
+            assert!(
+                Worker::try_new().is_err(),
+                "unfinished physical ownership must reject admission"
+            );
+        }
+        assert_eq!(PHYSICAL_OWNERS.load(Ordering::Acquire), 4);
+        assert!(!Worker::has_capacity());
+        assert!(!crate::views::accessibility_retirement::Retirement::default().can_open());
+        let mut deferred = crate::views::accessibility::Host::headless();
+        assert!(!deferred.can_accept_snapshot());
+        let snapshot = Arc::new(ira_core::application::App::default().snapshot());
+        deferred.begin_prepared(snapshot.clone(), None, "deferred".into());
+        assert_eq!(
+            Arc::strong_count(&snapshot),
+            1,
+            "pressure must not capture semantic ownership"
+        );
+        deferred.close();
+        assert!(tickets.iter().all(|ticket| !ticket.is_complete()));
+        drop(release);
+        while !tickets.iter().all(CompletionTicket::is_complete) {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
     }
 }

@@ -83,6 +83,7 @@ pub struct Host {
     model: AccessibilityModel,
     prepared: Option<super::accessibility_prepared::PreparedHost>,
     compatibility: bool,
+    admission: Option<(bool, super::accessibility_retirement::Retirement)>,
     authority: Authority,
     pub tree: Option<Arc<SemanticTree>>,
     pub frame: Rc<RefCell<LayoutSnapshot>>,
@@ -103,9 +104,12 @@ impl Host {
     fn configured(native: bool, retirement: super::accessibility_retirement::Retirement) -> Self {
         Self {
             model: AccessibilityModel::default(),
-            prepared: Some(super::accessibility_prepared::PreparedHost::new(
-                native, retirement,
-            )),
+            prepared: super::accessibility_prepared::PreparedHost::try_new(
+                native,
+                retirement.clone(),
+            )
+            .ok(),
+            admission: Some((native, retirement)),
             compatibility: false,
             authority: Authority::default(),
             tree: None,
@@ -131,12 +135,22 @@ impl Host {
         let mut host = Self::configured(false, Default::default());
         host.prepared.take();
         host.compatibility = true;
+        host.admission = None;
         host
     }
     pub fn with_retirement(retirement: super::accessibility_retirement::Retirement) -> Self {
         Self::configured(true, retirement)
     }
     pub fn poll(&mut self) -> bool {
+        let mut admitted = false;
+        if self.prepared.is_none()
+            && let Some((native, retirement)) = &self.admission
+        {
+            self.prepared =
+                super::accessibility_prepared::PreparedHost::try_new(*native, retirement.clone())
+                    .ok();
+            admitted = self.prepared.is_some();
+        }
         let changed = self.prepared.as_mut().is_some_and(|host| host.poll());
         if changed && let Some(host) = &mut self.prepared {
             if let Some(old) = self.tree.take() {
@@ -144,7 +158,7 @@ impl Host {
             }
             self.tree = host.tree();
         }
-        changed
+        changed || admitted
     }
     pub fn begin_prepared(
         &mut self,
@@ -186,9 +200,11 @@ impl Host {
         self.compatibility
     }
     pub fn can_accept_snapshot(&self) -> bool {
-        self.prepared
-            .as_ref()
-            .is_none_or(|h| h.can_accept_snapshot())
+        self.compatibility
+            || self
+                .prepared
+                .as_ref()
+                .is_some_and(|h| h.can_accept_snapshot())
     }
     pub fn retire_native_text(&mut self, text: NativeTextSnapshot) {
         if let Some(host) = &mut self.prepared {
@@ -359,6 +375,7 @@ impl Host {
         self.prepared.as_ref()?.installed_for_test()
     }
     pub fn close(&mut self) {
+        self.admission = None;
         if let Some(mut host) = self.prepared.take() {
             if let Some(tree) = self.tree.take() {
                 host.retire_pin(tree);
@@ -573,6 +590,12 @@ mod reviewer_async_focus_probe {
         app.panes[0].state.select(Some(0));
         let snapshot = Arc::new(app.snapshot());
         let mut host = Host::headless();
+        let admission_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !host.can_accept_snapshot() {
+            host.poll();
+            assert!(std::time::Instant::now() < admission_deadline);
+            std::thread::yield_now();
+        }
         host.begin_prepared(snapshot.clone(), None, "footer".into());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while host.tree.is_none() {
@@ -650,6 +673,12 @@ mod reviewer_novel_focus_probe {
         app.panes[0].state.select(Some(0));
         let snapshot = Arc::new(app.snapshot());
         let mut host = Host::headless();
+        let admission_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !host.can_accept_snapshot() {
+            host.poll();
+            assert!(std::time::Instant::now() < admission_deadline);
+            std::thread::yield_now();
+        }
         host.begin_prepared(snapshot.clone(), None, "footer".into());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while host.tree.is_none() {

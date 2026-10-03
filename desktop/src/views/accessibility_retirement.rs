@@ -22,7 +22,7 @@ impl gpui::Global for Retirement {}
 impl Retirement {
     /// Reopen is deferred at this finite capacity; existing ownership is never discarded.
     pub fn can_open(&self) -> bool {
-        !self.1.get() && self.0.borrow().len() < 4
+        !self.1.get() && self.0.borrow().len() < 4 && Worker::has_capacity()
     }
     pub fn begin_quit(&self) {
         self.1.set(true);
@@ -31,7 +31,7 @@ impl Retirement {
         self.1.get()
     }
     pub fn is_empty(&self) -> bool {
-        self.0.borrow().is_empty()
+        self.0.borrow().is_empty() && Worker::reclamation_complete()
     }
     pub fn close(&self, bridge: NativeBridge, sink: ActionSink, worker: Worker, pins: Pins) {
         sink.close();
