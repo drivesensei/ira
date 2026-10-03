@@ -245,7 +245,7 @@ impl App {
         }
         Ok(())
     }
-    fn drain_existing_paths(&mut self) {
+    pub(super) fn drain_existing_paths(&mut self) {
         while let Ok(reply) = self.existing_paths.rx.try_recv() {
             if self.existing_paths.pending.as_ref() != Some(&(reply.id, reply.scope.clone())) {
                 continue;
