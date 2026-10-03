@@ -6,3 +6,10 @@ publish = false
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+dirs-next = "=2.0.0"
+parking_lot = "=0.12.5"
+
+[dev-dependencies]
+unicode-width = "=0.2.2"

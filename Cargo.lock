@@ -719,6 +719,10 @@ dependencies = [
 [[package]]
 name = "ira-core"
 version = "0.1.0"
+dependencies = [
+ "dirs-next",
+ "parking_lot",
+]
 
 [[package]]
 name = "is-docker"
