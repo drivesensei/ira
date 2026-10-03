@@ -722,6 +722,8 @@ version = "0.1.0"
 dependencies = [
  "dirs-next",
  "parking_lot",
+ "serde",
+ "toml",
 ]
 
 [[package]]
