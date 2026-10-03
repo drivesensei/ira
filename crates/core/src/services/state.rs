@@ -53,7 +53,7 @@ impl Default for SessionState {
 
 /// Path to the session-state file (`~/.config/ira/state`).
 #[cfg(not(test))]
-fn state_file() -> Option<PathBuf> {
+pub(crate) fn state_file() -> Option<PathBuf> {
     dirs_next::config_dir().map(|d| d.join("ira").join("state"))
 }
 
@@ -210,6 +210,6 @@ fn parse_folder(value: &str) -> Option<Folder> {
 mod tests;
 
 #[cfg(test)]
-fn state_file() -> Option<PathBuf> {
+pub(crate) fn state_file() -> Option<PathBuf> {
     Some(super::persistence::test_path("state"))
 }

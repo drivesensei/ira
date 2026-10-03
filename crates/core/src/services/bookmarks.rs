@@ -31,7 +31,7 @@ pub fn next_free_shortcut(bookmarks: &[Folder]) -> Option<char> {
 
 /// Path to the persisted bookmarks file (`~/.config/ira/bookmarks`).
 #[cfg(not(test))]
-fn bookmarks_file() -> Option<PathBuf> {
+pub(crate) fn bookmarks_file() -> Option<PathBuf> {
     dirs_next::config_dir().map(|d| d.join("ira").join("bookmarks"))
 }
 
@@ -95,6 +95,6 @@ pub fn try_write_bookmarks_to(
 mod tests;
 
 #[cfg(test)]
-fn bookmarks_file() -> Option<PathBuf> {
+pub(crate) fn bookmarks_file() -> Option<PathBuf> {
     Some(super::persistence::test_path("bookmarks"))
 }
