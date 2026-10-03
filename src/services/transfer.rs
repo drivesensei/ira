@@ -32,7 +32,7 @@ pub enum OverwritePolicy {
     AutoRename,
     /// Never overwrite: colliding destinations are skipped and reported.
     SkipExisting,
-    /// Replace existing destination files outright (folders merge).
+    /// Replace existing destination files; existing directories are refused.
     Overwrite,
 }
 
@@ -167,7 +167,21 @@ const MAX_ENTRIES: u64 = 200_000; // pre-scan cap; above this show indeterminate
 
 /// Spawns ONE worker thread for the whole batch; it processes `job.paths`
 /// sequentially and reports progress on `tx`. Returns immediately.
+/// Host-supplied atomic entry rename: must refuse every existing destination,
+/// preserve source and destination on failure, and never follow entry symlinks.
+/// It must support files and directories without copying across volumes.
+pub type NoReplaceProvider = dyn Fn(&Path, &Path) -> std::io::Result<()> + Send + Sync;
+
 pub fn spawn_job(job: &Job, tx: mpsc::Sender<JobEvent>) {
+    spawn_job_with_provider(job, tx, Arc::new(rename_no_replace));
+}
+
+/// Additive host hook for platforms needing a native no-replace primitive.
+pub fn spawn_job_with_provider(
+    job: &Job,
+    tx: mpsc::Sender<JobEvent>,
+    provider: Arc<NoReplaceProvider>,
+) {
     let id = job.id;
     let kind = job.kind;
     let control = job.control.clone();
@@ -176,7 +190,7 @@ pub fn spawn_job(job: &Job, tx: mpsc::Sender<JobEvent>) {
     let policy = job.overwrite;
 
     thread::spawn(move || {
-        let result = run_batch(
+        let result = run_batch_with_provider(
             id,
             kind,
             &paths,
@@ -184,6 +198,7 @@ pub fn spawn_job(job: &Job, tx: mpsc::Sender<JobEvent>) {
             policy,
             &control,
             &tx,
+            provider.as_ref(),
         );
         let event = match result {
             Ok(()) => JobEvent::Done { id },
@@ -236,6 +251,7 @@ fn resolve_destination(
 /// order with one shared byte counter. Per-item I/O failures are counted
 /// and skipped (the rest still transfers); the job ends Failed with a
 /// summary if any item failed.
+#[cfg(test)]
 fn run_batch(
     id: u64,
     kind: JobKind,
@@ -244,6 +260,28 @@ fn run_batch(
     policy: OverwritePolicy,
     control: &JobControl,
     tx: &mpsc::Sender<JobEvent>,
+) -> Result<(), JobError> {
+    run_batch_with_provider(
+        id,
+        kind,
+        paths,
+        dest_dir,
+        policy,
+        control,
+        tx,
+        &rename_no_replace,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn run_batch_with_provider(
+    id: u64,
+    kind: JobKind,
+    paths: &[String],
+    dest_dir: &Path,
+    policy: OverwritePolicy,
+    control: &JobControl,
+    tx: &mpsc::Sender<JobEvent>,
+    provider: &NoReplaceProvider,
 ) -> Result<(), JobError> {
     // Pre-scan totals (capped): any oversized/unreadable tree -> indeterminate.
     let mut total = 0u64;
@@ -261,6 +299,7 @@ fn run_batch(
 
     let mut bytes = 0u64;
     let mut failed = 0usize;
+    let mut failure_details = Vec::new();
     for p in paths {
         control.gate()?;
         let src = Path::new(p);
@@ -273,38 +312,24 @@ fn run_batch(
             });
             continue;
         };
-        // Overwrite policy: replace the existing destination file before
-        // copying (create_new would otherwise refuse). Folders merge.
-        if policy == OverwritePolicy::Overwrite
-            && fs::symlink_metadata(&dst).is_ok_and(|m| !m.is_dir())
-        {
-            fs::remove_file(&dst)?;
-        }
-        let result = match kind {
-            JobKind::Copy => copy_entry(src, &dst, control, id, tx, &mut bytes),
-            JobKind::Move => match fs::rename(src, &dst) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == ErrorKind::CrossesDevices => {
-                    copy_entry(src, &dst, control, id, tx, &mut bytes)?;
-                    remove_tree(src)
-                }
-                Err(e) => Err(JobError::Io(e.to_string())),
-            },
+        let mut context = TransferContext {
+            control,
+            id,
+            tx,
+            bytes: &mut bytes,
+            provider,
         };
+        let result = transfer_entry(src, &dst, kind, policy, &mut context);
         match result {
             Ok(()) => {}
             Err(JobError::Cancelled) => {
-                // Cancelled mid-item: remove the partial destination we
-                // created so neither a truncated copy nor a half-moved tree
-                // is left behind. The source is untouched.
-                let _ = remove_tree(&dst);
+                // Staged copies clean only their private working directory.
                 return Err(JobError::Cancelled);
             }
             Err(JobError::Io(msg)) => {
                 failed += 1;
-                // Item failed: remove our partial destination (never the
-                // source) so no truncated file is mistaken for a copy.
-                let _ = remove_tree(&dst);
+                failure_details.push(format!("{p}: {msg}"));
+                // A failed item never authorizes deleting the public path.
                 let _ = tx.send(JobEvent::Progress {
                     id,
                     copied_bytes: bytes,
@@ -322,12 +347,248 @@ fn run_batch(
 
     if failed > 0 {
         return Err(JobError::Io(format!(
-            "{} of {} items failed",
+            "{} of {} items failed; {}",
             failed,
-            paths.len()
+            paths.len(),
+            failure_details.join("; ")
         )));
     }
     Ok(())
+}
+
+/// Atomically moves an entry without replacing a destination created by another actor.
+/// The safe Unix backend is the already pinned rustix publication primitive.
+fn rename_no_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
+    #[cfg(not(windows))]
+    {
+        ira_core::services::transfer::rename_no_replace(src, dst)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        fn wide(path: &Path) -> std::io::Result<Vec<u16>> {
+            let mut value: Vec<u16> = path.as_os_str().encode_wide().collect();
+            if value.contains(&0) {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "path contains embedded NUL",
+                ));
+            }
+            value.push(0);
+            Ok(value)
+        }
+        let from = wide(src)?;
+        let to = wide(dst)?;
+        // SAFETY: both buffers are live NUL-terminated UTF-16 strings. Flags 0
+        // forbids replacement and cross-volume copy; the OS moves entries.
+        let moved = unsafe { winapi::um::winbase::MoveFileExW(from.as_ptr(), to.as_ptr(), 0) };
+        if moved == 0 {
+            // SAFETY: capture this thread's error immediately after the failed call.
+            let error = unsafe { winapi::um::errhandlingapi::GetLastError() };
+            return Err(std::io::Error::from_raw_os_error(error as i32));
+        }
+        Ok(())
+    }
+}
+
+static NEXT_STAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+fn create_stage(parent: &Path) -> Result<std::path::PathBuf, JobError> {
+    loop {
+        let sequence = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
+        let stage = parent.join(format!(".ira-transfer-{}-{sequence}", std::process::id()));
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&stage) {
+            Ok(()) => return Ok(stage),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+struct TransferContext<'a> {
+    control: &'a JobControl,
+    id: u64,
+    tx: &'a mpsc::Sender<JobEvent>,
+    bytes: &'a mut u64,
+    provider: &'a NoReplaceProvider,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StagePoint {
+    PayloadReady,
+    BackupCaptured,
+    BeforePublication,
+    Published,
+    BeforeSourceRemoval,
+}
+
+fn copy_staged(
+    src: &Path,
+    dst: &Path,
+    replace: bool,
+    context: &mut TransferContext<'_>,
+    mut before_publish: impl FnMut(&Path),
+) -> Result<(), JobError> {
+    transfer_staged(
+        src,
+        dst,
+        JobKind::Copy,
+        replace,
+        context,
+        false,
+        |point, payload| {
+            if point == StagePoint::PayloadReady {
+                before_publish(payload);
+            }
+            Ok(())
+        },
+    )
+}
+fn transfer_staged(
+    src: &Path,
+    dst: &Path,
+    kind: JobKind,
+    replace: bool,
+    context: &mut TransferContext<'_>,
+    force_copy_move: bool,
+    mut hook: impl FnMut(StagePoint, &Path) -> Result<(), JobError>,
+) -> Result<(), JobError> {
+    let stage = create_stage(
+        dst.parent()
+            .ok_or_else(|| JobError::Io("destination has no parent".into()))?,
+    )?;
+    let payload = stage.join("payload");
+    let backup = stage.join("backup");
+    let mut source_moved = false;
+    let mut published = false;
+    let mut backup_captured = false;
+    let result = (|| {
+        if kind == JobKind::Move && !force_copy_move {
+            match (context.provider)(src, &payload) {
+                Ok(()) => source_moved = true,
+                Err(error) if error.kind() == ErrorKind::CrossesDevices => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if !source_moved {
+            copy_entry(
+                src,
+                &payload,
+                context.control,
+                context.id,
+                context.tx,
+                context.bytes,
+            )?;
+        }
+        hook(StagePoint::PayloadReady, &payload)?;
+        context.control.gate()?;
+        if replace {
+            // Capture first; no path-check followed by deletion of a public entry.
+            (context.provider)(dst, &backup)?;
+            backup_captured = true;
+            // The object actually captured can differ from the earlier lookup.
+            // Existing directories are refused, then restored without clobbering.
+            if fs::symlink_metadata(&backup)?.is_dir() {
+                return Err(std::io::Error::new(
+                    ErrorKind::AlreadyExists,
+                    "captured destination is a directory",
+                )
+                .into());
+            }
+            hook(StagePoint::BackupCaptured, &payload)?;
+        }
+        hook(StagePoint::BeforePublication, &payload)?;
+        context.control.gate()?;
+        (context.provider)(&payload, dst)?;
+        published = true;
+        hook(StagePoint::Published, &payload)?;
+        if kind == JobKind::Move && !source_moved {
+            hook(StagePoint::BeforeSourceRemoval, &payload)?;
+            remove_tree(src)?;
+        }
+        Ok(())
+    })();
+    if let Err(primary) = result {
+        let mut recovery = Vec::new();
+        // A published path can have been replaced by another actor. Capture it
+        // atomically and retain it; never blindly delete it during rollback.
+        let mut retain = published;
+        if published {
+            if let Err(error) = (context.provider)(dst, &payload) {
+                recovery.push(format!("published entry recovery failed: {error}"));
+            }
+        }
+        if backup_captured {
+            if let Err(error) = (context.provider)(&backup, dst) {
+                retain = true;
+                recovery.push(format!("destination restore failed: {error}"));
+            }
+        }
+        if source_moved && !published {
+            if let Err(error) = (context.provider)(&payload, src) {
+                retain = true;
+                recovery.push(format!("source restore failed: {error}"));
+            }
+        }
+        // Even a provider which reports an error after creating a backup must
+        // not cause that backup to be destroyed by generic staging cleanup.
+        if fs::symlink_metadata(&backup).is_ok() {
+            retain = true;
+        }
+        if retain {
+            return Err(JobError::Io(format!(
+                "{primary:?}; {}; recoverable transfer data retained at {}",
+                recovery.join("; "),
+                stage.display()
+            )));
+        }
+        return match fs::remove_dir_all(&stage) {
+            Ok(()) => Err(primary),
+            Err(cleanup) => Err(JobError::Io(format!(
+                "{primary:?}; staging cleanup failed at {}: {cleanup}",
+                stage.display()
+            ))),
+        };
+    }
+    // Backup destruction is allowed only after publication and move-source
+    // deletion have both committed successfully. It is inside the private root.
+    fs::remove_dir_all(&stage).map_err(|cleanup| {
+        JobError::Io(format!(
+            "staging cleanup failed at {}: {cleanup}",
+            stage.display()
+        ))
+    })
+}
+fn transfer_entry(
+    src: &Path,
+    dst: &Path,
+    kind: JobKind,
+    policy: OverwritePolicy,
+    context: &mut TransferContext<'_>,
+) -> Result<(), JobError> {
+    let destination = match fs::symlink_metadata(dst) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if policy == OverwritePolicy::Overwrite
+        && destination.as_ref().is_some_and(fs::Metadata::is_dir)
+    {
+        return Err(std::io::Error::new(
+            ErrorKind::AlreadyExists,
+            "destination directory already exists",
+        )
+        .into());
+    }
+    let replace = policy == OverwritePolicy::Overwrite && destination.is_some();
+    if kind == JobKind::Copy {
+        copy_staged(src, dst, replace, context, |_| {})
+    } else {
+        transfer_staged(src, dst, kind, replace, context, false, |_, _| Ok(()))
+    }
 }
 
 /// Windows fallback for symlink sources: creating symlinks needs
@@ -617,7 +878,7 @@ mod batch_tests {
         let mut paths = Vec::new();
         for i in 0..30 {
             let p = base.join("src").join(format!("f{i}.txt"));
-            std::fs::write(&p, vec![b'x'; 100]);
+            std::fs::write(&p, vec![b'x'; 100]).unwrap();
             paths.push(p.to_string_lossy().into_owned());
         }
 
@@ -699,7 +960,7 @@ mod batch_tests {
         let mut paths = Vec::new();
         for i in 0..5 {
             let p = base.join("src").join(format!("m{i}"));
-            std::fs::write(&p, "data");
+            std::fs::write(&p, "data").unwrap();
             paths.push(p.to_string_lossy().into_owned());
         }
 
@@ -909,18 +1170,28 @@ mod batch_tests {
         let control = job.control.clone();
         spawn_job(&job, tx);
 
-        // Pause as soon as the partial dst appears: the worker parks at its
+        // Pause as soon as the private staged payload appears: the worker parks at its
         // next 256KB gate with the partial file still on disk.
         let mut partial_seen = false;
         for _ in 0..1000 {
-            if std::fs::symlink_metadata(base.join("dst").join("big.bin")).is_ok() {
+            if std::fs::read_dir(base.join("dst"))
+                .unwrap()
+                .flatten()
+                .any(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".ira-transfer-")
+                        && entry.path().join("payload").exists()
+                })
+            {
                 control.set_paused(true);
                 partial_seen = true;
                 break;
             }
             std::thread::sleep(Duration::from_millis(2));
         }
-        assert!(partial_seen, "partial destination must exist mid-copy");
+        assert!(partial_seen, "private staged payload must exist mid-copy");
         std::thread::sleep(Duration::from_millis(50)); // let the worker park
         control.request_cancel();
 
@@ -930,6 +1201,8 @@ mod batch_tests {
             std::fs::symlink_metadata(base.join("dst").join("big.bin")).is_err(),
             "partial destination must be removed on cancel"
         );
+        assert_eq!(std::fs::metadata(&src).unwrap().len(), 64 * 1024 * 1024);
+        assert_eq!(std::fs::read_dir(base.join("dst")).unwrap().count(), 0);
         let _ = std::fs::remove_dir_all(&base);
     }
 

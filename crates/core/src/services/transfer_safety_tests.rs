@@ -6,18 +6,43 @@ static NEXT: AtomicU64 = AtomicU64::new(1);
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!("ira-overwrite-safety-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        let root = std::env::temp_dir().join(format!(
+            "ira-overwrite-safety-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::create_dir(&root).unwrap();
         fs::create_dir(root.join("src")).unwrap();
         fs::create_dir(root.join("dst")).unwrap();
         Self(root)
     }
-    fn path(&self, relative: &str) -> PathBuf { self.0.join(relative) }
+    fn path(&self, relative: &str) -> PathBuf {
+        self.0.join(relative)
+    }
 }
-impl Drop for Fixture { fn drop(&mut self) { fs::remove_dir_all(&self.0).unwrap(); } }
-fn transfer(f: &Fixture, kind: JobKind, name: &str, policy: OverwritePolicy) -> Result<(), JobError> {
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.0).unwrap();
+    }
+}
+fn transfer(
+    f: &Fixture,
+    kind: JobKind,
+    name: &str,
+    policy: OverwritePolicy,
+) -> Result<(), JobError> {
     let (tx, _rx) = mpsc::channel();
-    run_batch(1, kind, &[f.path(&format!("src/{name}")).to_string_lossy().into_owned()], &f.path("dst"), policy, &JobControl::new(), &tx)
+    run_batch(
+        1,
+        kind,
+        &[f.path(&format!("src/{name}"))
+            .to_string_lossy()
+            .into_owned()],
+        &f.path("dst"),
+        policy,
+        &JobControl::new(),
+        &tx,
+    )
 }
 #[test]
 fn overwrite_directory_failure_preserves_existing_tree_and_source() {
@@ -28,7 +53,10 @@ fn overwrite_directory_failure_preserves_existing_tree_and_source() {
         fs::create_dir(f.path("dst/tree")).unwrap();
         fs::write(f.path("dst/tree/precious.txt"), b"PRECIOUS").unwrap();
         assert!(transfer(&f, kind, "tree", OverwritePolicy::Overwrite).is_err());
-        assert_eq!(fs::read(f.path("dst/tree/precious.txt")).unwrap(), b"PRECIOUS");
+        assert_eq!(
+            fs::read(f.path("dst/tree/precious.txt")).unwrap(),
+            b"PRECIOUS"
+        );
         assert_eq!(fs::read(f.path("src/tree/source.txt")).unwrap(), b"SOURCE");
     }
 }
@@ -59,6 +87,258 @@ fn failed_overwrite_preserves_destination_symlink_and_its_target() {
     fs::write(f.path("precious.txt"), b"PRECIOUS").unwrap();
     create_symlink("../precious.txt", f.path("dst/absent.txt")).unwrap();
     assert!(transfer(&f, JobKind::Copy, "absent.txt", OverwritePolicy::Overwrite).is_err());
-    assert_eq!(fs::read_link(f.path("dst/absent.txt")).unwrap(), Path::new("../precious.txt"));
+    assert_eq!(
+        fs::read_link(f.path("dst/absent.txt")).unwrap(),
+        Path::new("../precious.txt")
+    );
     assert_eq!(fs::read(f.path("precious.txt")).unwrap(), b"PRECIOUS");
+}
+
+fn assert_no_stages(f: &Fixture) {
+    assert!(fs::read_dir(f.path("dst")).unwrap().all(|entry| !entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".ira-transfer-")));
+}
+#[test]
+fn staged_publication_race_preserves_intervening_file_and_directory() {
+    for directory in [false, true] {
+        let f = Fixture::new();
+        let src = f.path("src/tree");
+        if directory {
+            fs::create_dir(&src).unwrap();
+            fs::write(src.join("source.txt"), b"SOURCE").unwrap();
+        } else {
+            fs::write(&src, b"SOURCE").unwrap();
+        }
+        let dst = resolve_destination(&src, &f.path("dst"), OverwritePolicy::AutoRename).unwrap();
+        let control = JobControl::new();
+        let (tx, _rx) = mpsc::channel();
+        let mut bytes = 0;
+        let mut context = TransferContext {
+            control: &control,
+            id: 1,
+            tx: &tx,
+            bytes: &mut bytes,
+            provider: &rename_no_replace,
+        };
+        let result = copy_staged(&src, &dst, false, &mut context, |_| {
+            // Replace an intervening destination again before publication.
+            if directory {
+                fs::create_dir(&dst).unwrap();
+                fs::write(dst.join("actor.txt"), b"FIRST").unwrap();
+            } else {
+                fs::write(&dst, b"FIRST").unwrap();
+            }
+            fs::rename(&dst, f.path("actor-backup")).unwrap();
+            if directory {
+                fs::create_dir(&dst).unwrap();
+                fs::write(dst.join("actor.txt"), b"SECOND").unwrap();
+            } else {
+                fs::write(&dst, b"SECOND").unwrap();
+            }
+        });
+        assert!(result.is_err());
+        let current = if directory {
+            dst.join("actor.txt")
+        } else {
+            dst.clone()
+        };
+        assert_eq!(fs::read(current).unwrap(), b"SECOND");
+        assert!(src.exists());
+        assert_no_stages(&f);
+    }
+}
+#[test]
+fn cancellation_before_publication_preserves_source_existing_target_and_cleans_stage() {
+    let f = Fixture::new();
+    let src = f.path("src/file.txt");
+    let dst = f.path("dst/file.txt");
+    fs::write(&src, b"SOURCE").unwrap();
+    fs::write(&dst, b"PRECIOUS").unwrap();
+    let control = JobControl::new();
+    let (tx, _rx) = mpsc::channel();
+    let mut bytes = 0;
+    let mut context = TransferContext {
+        control: &control,
+        id: 1,
+        tx: &tx,
+        bytes: &mut bytes,
+        provider: &rename_no_replace,
+    };
+    let result = copy_staged(&src, &dst, true, &mut context, |payload| {
+        assert_eq!(fs::read(payload).unwrap(), b"SOURCE");
+        assert_eq!(fs::read(&dst).unwrap(), b"PRECIOUS");
+        control.request_cancel();
+    });
+    assert!(matches!(result, Err(JobError::Cancelled)));
+    assert_eq!(fs::read(src).unwrap(), b"SOURCE");
+    assert_eq!(fs::read(dst).unwrap(), b"PRECIOUS");
+    assert_no_stages(&f);
+}
+#[cfg(unix)]
+#[test]
+fn directory_partial_copy_failure_cleans_only_private_stage() {
+    let f = Fixture::new();
+    fs::create_dir(f.path("src/tree")).unwrap();
+    fs::write(f.path("src/tree/good.txt"), b"SOURCE").unwrap();
+    let _listener = std::os::unix::net::UnixListener::bind(f.path("src/tree/socket")).unwrap();
+    assert!(transfer(&f, JobKind::Copy, "tree", OverwritePolicy::AutoRename).is_err());
+    assert_eq!(fs::read(f.path("src/tree/good.txt")).unwrap(), b"SOURCE");
+    assert!(!f.path("dst/tree").exists());
+    assert_no_stages(&f);
+}
+
+#[test]
+fn directory_over_file_preserves_legacy_success_with_recoverable_backup() {
+    for kind in [JobKind::Copy, JobKind::Move] {
+        let f = Fixture::new();
+        fs::create_dir(f.path("src/tree")).unwrap();
+        fs::write(f.path("src/tree/source.txt"), b"SOURCE").unwrap();
+        fs::write(f.path("dst/tree"), b"PRECIOUS").unwrap();
+        transfer(&f, kind, "tree", OverwritePolicy::Overwrite).unwrap();
+        assert_eq!(fs::read(f.path("dst/tree/source.txt")).unwrap(), b"SOURCE");
+        assert_eq!(f.path("src/tree").exists(), kind == JobKind::Copy);
+        assert_no_stages(&f);
+    }
+}
+
+fn recovery_transfer(
+    f: &Fixture,
+    kind: JobKind,
+    force_copy_move: bool,
+    hook: impl FnMut(StagePoint, &Path) -> Result<(), JobError>,
+) -> Result<(), JobError> {
+    let control = JobControl::new();
+    let (tx, _rx) = mpsc::channel();
+    let mut bytes = 0;
+    let mut context = TransferContext {
+        control: &control,
+        id: 1,
+        tx: &tx,
+        bytes: &mut bytes,
+        provider: &rename_no_replace,
+    };
+    transfer_staged(
+        &f.path("src/file"),
+        &f.path("dst/file"),
+        kind,
+        true,
+        &mut context,
+        force_copy_move,
+        hook,
+    )
+}
+fn stages(f: &Fixture) -> Vec<PathBuf> {
+    fs::read_dir(f.path("dst"))
+        .unwrap()
+        .filter_map(|entry| {
+            let entry = entry.unwrap();
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".ira-transfer-")
+                .then(|| entry.path())
+        })
+        .collect()
+}
+#[test]
+fn publication_failure_restores_backup_and_fast_move_source() {
+    for kind in [JobKind::Copy, JobKind::Move] {
+        let f = Fixture::new();
+        fs::write(f.path("src/file"), b"SOURCE").unwrap();
+        fs::write(f.path("dst/file"), b"PRECIOUS").unwrap();
+        let result = recovery_transfer(&f, kind, false, |point, _| {
+            if point == StagePoint::BeforePublication {
+                return Err(JobError::Io("injected publication failure".into()));
+            }
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read(f.path("src/file")).unwrap(), b"SOURCE");
+        assert_eq!(fs::read(f.path("dst/file")).unwrap(), b"PRECIOUS");
+        assert_no_stages(&f);
+    }
+}
+#[test]
+fn restoration_collision_preserves_actor_and_retains_recoverable_backup() {
+    for kind in [JobKind::Copy, JobKind::Move] {
+        let f = Fixture::new();
+        fs::write(f.path("src/file"), b"SOURCE").unwrap();
+        fs::write(f.path("dst/file"), b"PRECIOUS").unwrap();
+        let result = recovery_transfer(&f, kind, false, |point, _| {
+            if point == StagePoint::BackupCaptured {
+                fs::write(f.path("dst/file"), b"ACTOR").unwrap();
+            }
+            Ok(())
+        });
+        let error = result.unwrap_err();
+        assert_eq!(fs::read(f.path("src/file")).unwrap(), b"SOURCE");
+        assert_eq!(fs::read(f.path("dst/file")).unwrap(), b"ACTOR");
+        let retained = stages(&f);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(fs::read(retained[0].join("backup")).unwrap(), b"PRECIOUS");
+        assert!(format!("{error:?}").contains(&retained[0].display().to_string()));
+    }
+}
+#[test]
+fn unexpected_captured_directory_is_restored_without_deleting_contents() {
+    for kind in [JobKind::Copy, JobKind::Move] {
+        let f = Fixture::new();
+        fs::write(f.path("src/file"), b"SOURCE").unwrap();
+        fs::write(f.path("dst/file"), b"PRECIOUS").unwrap();
+        let result = recovery_transfer(&f, kind, false, |point, _| {
+            if point == StagePoint::PayloadReady {
+                fs::rename(f.path("dst/file"), f.path("actor-saved-file")).unwrap();
+                fs::create_dir(f.path("dst/file")).unwrap();
+                fs::write(f.path("dst/file/actor"), b"ACTOR").unwrap();
+            }
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read(f.path("src/file")).unwrap(), b"SOURCE");
+        assert_eq!(fs::read(f.path("dst/file/actor")).unwrap(), b"ACTOR");
+        assert_eq!(fs::read(f.path("actor-saved-file")).unwrap(), b"PRECIOUS");
+        assert_no_stages(&f);
+    }
+}
+#[test]
+fn move_source_delete_failure_restores_target_and_retains_published_payload() {
+    let f = Fixture::new();
+    fs::write(f.path("src/file"), b"SOURCE").unwrap();
+    fs::write(f.path("dst/file"), b"PRECIOUS").unwrap();
+    let result = recovery_transfer(&f, JobKind::Move, true, |point, _| {
+        if point == StagePoint::BeforeSourceRemoval {
+            return Err(JobError::Io("injected source removal failure".into()));
+        }
+        Ok(())
+    });
+    let error = result.unwrap_err();
+    assert_eq!(fs::read(f.path("src/file")).unwrap(), b"SOURCE");
+    assert_eq!(fs::read(f.path("dst/file")).unwrap(), b"PRECIOUS");
+    let retained = stages(&f);
+    assert_eq!(retained.len(), 1);
+    assert_eq!(fs::read(retained[0].join("payload")).unwrap(), b"SOURCE");
+    assert!(format!("{error:?}").contains(&retained[0].display().to_string()));
+}
+#[test]
+fn published_replacement_is_captured_for_recovery_never_deleted() {
+    let f = Fixture::new();
+    fs::write(f.path("src/file"), b"SOURCE").unwrap();
+    fs::write(f.path("dst/file"), b"PRECIOUS").unwrap();
+    let result = recovery_transfer(&f, JobKind::Copy, false, |point, _| {
+        if point == StagePoint::Published {
+            fs::rename(f.path("dst/file"), f.path("actor-saved-payload")).unwrap();
+            fs::write(f.path("dst/file"), b"ACTOR").unwrap();
+            return Err(JobError::Io("injected commit failure".into()));
+        }
+        Ok(())
+    });
+    assert!(result.is_err());
+    assert_eq!(fs::read(f.path("dst/file")).unwrap(), b"PRECIOUS");
+    assert_eq!(fs::read(f.path("actor-saved-payload")).unwrap(), b"SOURCE");
+    let retained = stages(&f);
+    assert_eq!(retained.len(), 1);
+    assert_eq!(fs::read(retained[0].join("payload")).unwrap(), b"ACTOR");
 }
