@@ -1,0 +1,10 @@
+{
+  "oracle": "1cad4ce43cc72d52d4cc4eef920e0da22cb69568",
+  "source": "tests/operations_test.rs",
+  "functions": [
+    "transfer_reveals_folder_live_in_destination_pane",
+    "navigating_the_destination_pane_during_a_transfer_is_not_yanked_back"
+  ],
+  "sha256": "72ad8934661b96009f362fd4a1ccb8d4761db34949031955e55dc8265ae9f6ee",
+  "decision": "D012 safe-publication exception; these frozen assertions remain historical evidence, not executable current-stage expectations."
+}
