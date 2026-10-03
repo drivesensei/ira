@@ -26,3 +26,28 @@ fn pinned_class_names_and_void_pointer_encoding_remain_exact_in_diagnostics() {
     assert_eq!(bounded_structure(b"^v"), "^v");
     assert_eq!(bounded_structure(&[]), "");
 }
+
+#[test]
+fn diagnostic_write_failure_is_ignored_without_panicking() {
+    struct FailedWriter {
+        calls: usize,
+    }
+    impl std::io::Write for FailedWriter {
+        fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+            self.calls += 1;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "owned diagnostic fixture",
+            ))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = FailedWriter { calls: 0 };
+    write_structure(
+        &mut writer,
+        format_args!("Native deferred quit structure: stage=platform_ivar"),
+    );
+    assert_eq!(writer.calls, 1);
+}

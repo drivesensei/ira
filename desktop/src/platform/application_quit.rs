@@ -26,6 +26,17 @@ fn bounded_structure(value: &[u8]) -> String {
     output
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn write_structure(output: &mut impl std::io::Write, arguments: std::fmt::Arguments<'_>) {
+    // Diagnostics cannot replace a safety rejection or unwind from gate Drop.
+    // A closed/broken stderr is deliberately ignored; guard results remain authoritative.
+    let _ = writeln!(output, "{arguments}");
+}
+#[cfg(target_os = "macos")]
+fn emit_structure(arguments: std::fmt::Arguments<'_>) {
+    write_structure(&mut std::io::stderr().lock(), arguments);
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct QuitRequest {
     gate: u64,
@@ -221,19 +232,19 @@ mod mac {
     }
     pub(super) fn platform(object: &AnyObject) -> Result<*mut c_void, QuitError> {
         let Some(ivar) = object.class().instance_variable(c"platform") else {
-            eprintln!(
+            emit_structure(format_args!(
                 "Native deferred quit structure: stage=platform_ivar class={} ivar_present=false",
                 bounded_structure(object.class().name().to_bytes()),
-            );
+            ));
             return Err(QuitError::UnsupportedDelegate);
         };
         if ivar.type_encoding().to_bytes() != <*mut c_void>::ENCODING.to_string().as_bytes() {
-            eprintln!(
+            emit_structure(format_args!(
                 "Native deferred quit structure: stage=platform_encoding class={} ivar_present=true actual={} expected={}",
                 bounded_structure(object.class().name().to_bytes()),
                 bounded_structure(ivar.type_encoding().to_bytes()),
                 bounded_structure(<*mut c_void>::ENCODING.to_string().as_bytes()),
-            );
+            ));
             return Err(QuitError::UnsupportedDelegate);
         }
         // SAFETY: exact pinned class and encoding are checked by install;
@@ -333,45 +344,45 @@ mod mac {
             let mtm = MainThreadMarker::new().ok_or(QuitError::WrongThread)?;
             let app = NSApplication::sharedApplication(mtm);
             if app.class().name() != c"GPUIApplication" {
-                eprintln!(
+                emit_structure(format_args!(
                     "Native deferred quit structure: stage=application_class actual={} expected=GPUIApplication",
                     bounded_structure(app.class().name().to_bytes()),
-                );
+                ));
                 return Err(QuitError::UnsupportedDelegate);
             }
             let Some(original) = app.delegate() else {
-                eprintln!(
+                emit_structure(format_args!(
                     "Native deferred quit structure: stage=delegate_present app_class=GPUIApplication delegate_present=false"
-                );
+                ));
                 return Err(QuitError::MissingDelegate);
             };
             if original.respondsToSelector(sel!(applicationShouldTerminate:)) {
-                eprintln!(
+                emit_structure(format_args!(
                     "Native deferred quit structure: stage=termination_hook delegate_class={} existing_hook=true",
                     bounded_structure(original_object(&original).class().name().to_bytes()),
-                );
+                ));
                 return Err(QuitError::ExistingTerminationHook);
             }
             if original_object(&original).class().name() != c"GPUIApplicationDelegate" {
-                eprintln!(
+                emit_structure(format_args!(
                     "Native deferred quit structure: stage=delegate_class actual={} expected=GPUIApplicationDelegate",
                     bounded_structure(original_object(&original).class().name().to_bytes()),
-                );
+                ));
                 return Err(QuitError::UnsupportedDelegate);
             }
             let original_platform = platform(original_object(&original))?;
             if original_platform.is_null() {
-                eprintln!(
+                emit_structure(format_args!(
                     "Native deferred quit structure: stage=platform_pointer delegate_class=GPUIApplicationDelegate delegate_platform_null=true app_platform_checked=false"
-                );
+                ));
                 return Err(QuitError::UnsupportedDelegate);
             }
             let app_platform = platform(app.as_ref())?;
             if app_platform != original_platform {
-                eprintln!(
+                emit_structure(format_args!(
                     "Native deferred quit structure: stage=platform_pointer app_class=GPUIApplication delegate_class=GPUIApplicationDelegate delegate_platform_null=false app_platform_null={} platform_equal=false",
                     app_platform.is_null(),
-                );
+                ));
                 return Err(QuitError::UnsupportedDelegate);
             }
             static NEXT_GATE: AtomicU64 = AtomicU64::new(1);
