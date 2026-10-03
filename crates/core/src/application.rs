@@ -5,10 +5,7 @@ use crate::{
     domain::data::Folder,
     model::*,
     services::{
-        bookmarks::{
-            next_free_shortcut, read_bookmarks, read_bookmarks_from, write_bookmarks,
-            write_bookmarks_to,
-        },
+        bookmarks::{next_free_shortcut, read_bookmarks, read_bookmarks_from},
         drives::{eject_drive, mount_drive},
         file_info::{
             build_info_fast, build_info_full, dir_size, on_disk_bytes, size_line_final, DirSize,
@@ -16,7 +13,7 @@ use crate::{
         },
         folders::list_common_folders,
         list_files::{list_files_bounded, list_files_chunked, FEntry, LISTING_CHUNK},
-        state::{load_state, load_state_from, save_state, save_state_to, SessionState, SizeEntry},
+        state::{load_state, load_state_from, SessionState, SizeEntry},
         transfer::{
             spawn_delete_job, spawn_job, spawn_job_with_provider, Job, JobControl, JobEvent,
             JobKind, JobStatus, NoReplaceProvider, OverwritePolicy,
@@ -99,6 +96,7 @@ enum PersistenceRequest {
     State(Option<PathBuf>, SessionState),
     Bookmarks(Option<PathBuf>, Vec<Folder>),
     Barrier(mpsc::Sender<()>),
+    CheckedBarrier(mpsc::Sender<Result<PersistenceReceipt, PersistenceFailure>>),
 }
 #[derive(PartialEq, Eq)]
 struct PaneTickSemantics {
@@ -292,23 +290,7 @@ impl Default for App {
         let (transfer_probe_tx, transfer_probe_rx) = mpsc::channel();
         let (startup_tx, startup_rx) = mpsc::channel();
         let (persistence_tx, persistence_rx) = mpsc::channel();
-        thread::spawn(move || {
-            while let Ok(request) = persistence_rx.recv() {
-                match request {
-                    PersistenceRequest::State(path, state) => match path {
-                        Some(p) => save_state_to(&p, &state),
-                        None => save_state(&state),
-                    },
-                    PersistenceRequest::Bookmarks(path, bookmarks) => match path {
-                        Some(p) => write_bookmarks_to(&p, &bookmarks),
-                        None => write_bookmarks(&bookmarks),
-                    },
-                    PersistenceRequest::Barrier(reply) => {
-                        let _ = reply.send(());
-                    }
-                }
-            }
-        });
+        thread::spawn(move || application_persistence::worker(persistence_rx));
         let (operation_result_tx, operation_result_rx) = mpsc::channel();
         let (bounded_tx, bounded_rx) = mpsc::channel();
         let (job_tx, job_rx) = mpsc::channel();
@@ -3925,6 +3907,18 @@ impl App {
 }
 
 impl App {
+    /// Checked receipt of all earlier accepted writes. Retain this original
+    /// receiver across timeouts. Failure owns a sealed persistence-only retry.
+    pub fn checked_persistence_barrier(
+        &self,
+    ) -> mpsc::Receiver<Result<PersistenceReceipt, PersistenceFailure>> {
+        let (tx, rx) = mpsc::channel();
+        let _ = self
+            .persistence_tx
+            .send(PersistenceRequest::CheckedBarrier(tx));
+        rx
+    }
+
     /// Queue a lossless persistence barrier; the host waits off the command lane.
     pub fn persistence_barrier(&self) -> mpsc::Receiver<()> {
         let (tx, rx) = mpsc::channel();
@@ -4089,3 +4083,11 @@ impl App {
 #[cfg(test)]
 #[path = "application_transfer_probe_tests.rs"]
 mod transfer_probe_tests;
+
+#[path = "application_persistence.rs"]
+mod application_persistence;
+pub use application_persistence::{PersistenceFailure, PersistenceReceipt, PersistenceRetry};
+
+#[cfg(test)]
+#[path = "application_persistence_tests.rs"]
+mod persistence_tests;

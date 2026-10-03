@@ -52,6 +52,7 @@ impl Default for SessionState {
 }
 
 /// Path to the session-state file (`~/.config/ira/state`).
+#[cfg(not(test))]
 fn state_file() -> Option<PathBuf> {
     dirs_next::config_dir().map(|d| d.join("ira").join("state"))
 }
@@ -74,18 +75,20 @@ pub fn load_state_from(path: &Path) -> SessionState {
 
 /// Persists the session state as `key=value` lines.
 pub fn save_state(state: &SessionState) {
-    let Some(path) = state_file() else {
-        return;
-    };
-    save_state_to(&path, state);
+    let _ = try_save_state(state);
 }
-
-/// Saves the session state to an explicit path (tests use a temp file).
 pub fn save_state_to(path: &Path, state: &SessionState) {
-    if let Some(dir) = path.parent() {
-        let _ = fs::create_dir_all(dir);
-    }
-    let _ = fs::write(path, serialize_state(state));
+    let _ = try_save_state_to(path, state);
+}
+pub fn try_save_state(state: &SessionState) -> Result<(), super::persistence::PersistenceError> {
+    let path = state_file().ok_or_else(super::persistence::PersistenceError::not_configured)?;
+    try_save_state_to(&path, state)
+}
+pub fn try_save_state_to(
+    path: &Path,
+    state: &SessionState,
+) -> Result<(), super::persistence::PersistenceError> {
+    super::persistence::publish(path, serialize_state(state).as_bytes())
 }
 
 /// Renders the state as `key=value` lines. Size entries take the form
@@ -305,4 +308,9 @@ mod tests {
         assert!(parse_size_entry("1\t2\t3\t2\t5\t/p").is_none()); // bad complete flag
         assert!(parse_size_entry("1\t2\t3\t1\t5\t").is_none()); // empty path
     }
+}
+
+#[cfg(test)]
+fn state_file() -> Option<PathBuf> {
+    Some(super::persistence::test_path("state"))
 }
