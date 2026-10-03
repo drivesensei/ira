@@ -1,7 +1,10 @@
 //! AppKit accessibility elements attached to GPUI's actual NSView. All AppKit use is main-thread-only.
 use super::{
-    AccessibilityIntent, ActionSink, Rejection,
-    model::{Action, Capability, Node, NodeId, Rect, Role, SemanticTree},
+    AccessibilityIntent, ActionSink, PublishedOutcome, Rejection, RetiredPublication,
+    model::{
+        Action, Capability, FrameKey, MaterializedNodes, Node, NodeId, PreparedFrame, Rect, Role,
+        SemanticTree,
+    },
 };
 use objc2::{
     DefinedClass, MainThreadOnly, Message, define_class, msg_send, rc::Retained, runtime::AnyObject,
@@ -28,6 +31,9 @@ pub enum BridgeError {
 }
 struct MacState {
     tree: RefCell<Arc<SemanticTree>>,
+    prepared: RefCell<Option<Arc<PreparedFrame>>>,
+    materialized: Arc<MaterializedNodes>,
+    cleanup_cursor: Cell<Option<NodeId>>,
     frames: RefCell<BTreeMap<NodeId, NSRect>>,
     elements: RefCell<BTreeMap<NodeId, Retained<AxElement>>>,
     view: Retained<NSView>,
@@ -89,13 +95,13 @@ define_class!(
         })() }
         #[unsafe(method_id(accessibilityChildren))]
         fn ax_children(&self)->Option<Retained<NSArray>> { (|| {
-            let state=self.ivars().state.upgrade()?; let node=self.node()?;
+            let state=self.ivars().state.upgrade()?; let node=state.tree.borrow().nodes.get(&self.ivars().id)?.clone();
             let elements:Vec<Retained<AnyObject>>=node.children.iter().filter_map(|id|state.element(*id).map(|e|e.into_super().into_super().into_super())).collect();
             Some(NSArray::from_retained_slice(&elements))
         })() }
         #[unsafe(method_id(accessibilitySelectedChildren))]
         fn ax_selected_children(&self)->Option<Retained<NSArray>> { (|| {
-            let state=self.ivars().state.upgrade()?; let node=self.node()?;
+            let state=self.ivars().state.upgrade()?; let node=state.tree.borrow().nodes.get(&self.ivars().id)?.clone();
             let ids:Vec<_>=node.children.iter().copied().filter(|id|state.tree.borrow().nodes.get(id).is_some_and(|n|n.selected)).collect();
             let elements:Vec<Retained<AnyObject>>=ids.into_iter().filter_map(|id|state.element(id).map(|e|e.into_super().into_super().into_super())).collect();
             Some(NSArray::from_retained_slice(&elements))
@@ -108,6 +114,11 @@ define_class!(
         #[unsafe(method_id(accessibilityHitTest:))]
         fn ax_hit_test(&self,point:NSPoint)->Option<Retained<AnyObject>> { (|| {
             let state=self.ivars().state.upgrade()?; if !state.attached.get() {return None;}
+            if let Some(frame)=state.prepared.borrow().as_ref() {
+                let frames=state.frames.borrow();
+                let id=frame.geometry.ordered_ids().find(|id|frames.get(id).is_some_and(|r|point.x>=r.origin.x && point.x<r.origin.x+r.size.width && point.y>=r.origin.y && point.y<r.origin.y+r.size.height))?;
+                drop(frames); return state.element(id).map(|e|e.into_super().into_super().into_super());
+            }
             let tree=state.tree.borrow();
             fn visit(state:&MacState,tree:&SemanticTree,id:NodeId,p:NSPoint)->Option<NodeId> {
                 let node=tree.nodes.get(&id)?;
@@ -188,7 +199,12 @@ impl AxElement {
             return None;
         };
 
-        state.tree.borrow().nodes.get(&self.ivars().id).cloned()
+        state
+            .tree
+            .borrow()
+            .nodes
+            .get(&self.ivars().id)
+            .map(Node::clone_metadata)
     }
     fn dispatch(&self, action: Action) -> bool {
         let Some(state) = self.ivars().state.upgrade() else {
@@ -216,6 +232,7 @@ impl MacState {
         if let Some(e) = self.elements.borrow().get(&id) {
             return Some(e.clone());
         }
+        self.materialized.record(id).ok()?;
         let mtm = MainThreadMarker::new()?;
         let e = AxElement::new(id, Rc::downgrade(self), mtm);
         self.elements.borrow_mut().insert(id, e.clone());
@@ -280,6 +297,9 @@ impl NativeBridge {
         let tree = sink.current().map_err(BridgeError::Dispatch)?;
         let state = Rc::new(MacState {
             tree: RefCell::new(tree.clone()),
+            prepared: RefCell::new(None),
+            materialized: Arc::new(MaterializedNodes::default()),
+            cleanup_cursor: Cell::new(None),
             frames: RefCell::new(BTreeMap::new()),
             elements: RefCell::new(BTreeMap::new()),
             view,
@@ -288,6 +308,10 @@ impl NativeBridge {
         });
         let root = AxElement::new(tree.root, Rc::downgrade(&state), mtm);
         state.elements.borrow_mut().insert(tree.root, root.clone());
+        state
+            .materialized
+            .record(tree.root)
+            .map_err(BridgeError::Dispatch)?;
         let children = NSArray::from_slice(&[&*root as &AnyObject]);
         // SAFETY: the array contains valid NSAccessibility-conforming objects retained by state.
         unsafe {
@@ -377,7 +401,126 @@ impl NativeBridge {
         }
         Ok(())
     }
-    pub fn detach(&mut self) {
+    pub fn invalidate_geometry(&mut self) -> Result<(), BridgeError> {
+        if MainThreadMarker::new().is_none() {
+            return Err(BridgeError::WrongThread);
+        }
+        self.state.frames.borrow_mut().clear();
+        Ok(())
+    }
+    pub fn materialized_nodes(&self) -> Arc<MaterializedNodes> {
+        self.state.materialized.clone()
+    }
+    /// Prepared production path: no logical-tree enumeration or native-cache retain scan.
+    pub fn publish_prepared(
+        &mut self,
+        frame: Arc<PreparedFrame>,
+        expected: FrameKey,
+    ) -> Result<PublishedOutcome<BridgeError>, BridgeError> {
+        if MainThreadMarker::new().is_none() {
+            return Err(BridgeError::WrongThread);
+        }
+        if self.detached {
+            return Err(BridgeError::Dispatch(Rejection::Closing));
+        }
+        if frame.key != expected || !frame.notifications.materialized_only {
+            return Err(BridgeError::Dispatch(Rejection::Stale));
+        }
+        let mut frames = BTreeMap::new();
+        for (id, geometry) in &frame.geometry.nodes {
+            frames.insert(*id, native_rect(&self.state.view, geometry.visible)?);
+        }
+        let converted_frames = frames.len();
+        let retired = self
+            .state
+            .materialized
+            .with_revision(frame.notifications.materialization_revision, || {
+                self.state.sink.install_prepared(&frame, expected, || {
+                    self.state.tree.replace(frame.semantic.tree.clone());
+                    self.state.prepared.replace(Some(frame.clone()));
+                    self.state.frames.replace(frames);
+                })
+            })
+            .map_err(BridgeError::Dispatch)?;
+        // Native objects are lazily unavailable immediately, then reclaimed in bounded batches.
+        let cursor = self.state.cleanup_cursor.get();
+        let ids: Vec<_> = self
+            .state
+            .elements
+            .borrow()
+            .range((
+                cursor.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
+                std::ops::Bound::Unbounded,
+            ))
+            .take(64)
+            .map(|(id, _)| *id)
+            .collect();
+        let cleanup_visits = ids.len();
+        self.state.cleanup_cursor.set(if ids.len() == 64 {
+            ids.last().copied()
+        } else {
+            None
+        });
+        for id in ids {
+            if !frame.semantic.tree.nodes.contains_key(&id) {
+                self.state.elements.borrow_mut().remove(&id);
+            }
+        }
+        let plan = &frame.notifications;
+        let mut notification_visits = 0;
+        // SAFETY: every recipient is a live main-thread NSAccessibility object; state is installed.
+        unsafe {
+            if let Some(id) = plan.focused {
+                notification_visits += 1;
+                if let Some(e) = self.state.element(id) {
+                    NSAccessibilityPostNotification(
+                        &e,
+                        NSAccessibilityFocusedUIElementChangedNotification,
+                    );
+                }
+            }
+            if plan.layout_changed || plan.structure_changed {
+                notification_visits += 1;
+                NSAccessibilityPostNotification(
+                    &self.root,
+                    NSAccessibilityLayoutChangedNotification,
+                );
+            }
+            for id in &plan.selected_parents {
+                notification_visits += 1;
+                if let Some(e) = self.state.element(*id) {
+                    NSAccessibilityPostNotification(
+                        &e,
+                        NSAccessibilitySelectedChildrenChangedNotification,
+                    );
+                }
+            }
+            for id in plan.values.keys() {
+                notification_visits += 1;
+                if let Some(e) = self.state.elements.borrow().get(id).cloned() {
+                    NSAccessibilityPostNotification(&e, NSAccessibilityValueChangedNotification);
+                }
+            }
+            for id in &plan.text_selections {
+                notification_visits += 1;
+                if let Some(e) = self.state.elements.borrow().get(id).cloned() {
+                    NSAccessibilityPostNotification(
+                        &e,
+                        NSAccessibilitySelectedTextChangedNotification,
+                    );
+                }
+            }
+        }
+        Ok(PublishedOutcome {
+            publication_seq: frame.publication_seq,
+            retired,
+            notification_error: None,
+            converted_frames,
+            notification_visits,
+            cleanup_visits,
+        })
+    }
+    fn detach_attachment(&mut self) {
         if self.detached {
             return;
         }
@@ -402,6 +545,48 @@ impl NativeBridge {
                 .setAccessibilityElement(self.previous_element);
         }
         self.state.frames.borrow_mut().clear();
+    }
+    /// Keep this bridge on the native thread until native_retirement_complete().
+    /// Keep materialized_nodes() on the worker until after the bridge is dropped.
+    pub fn detach_prepared(&mut self) -> Result<RetiredPublication, BridgeError> {
+        if MainThreadMarker::new().is_none() {
+            return Err(BridgeError::WrongThread);
+        }
+        self.detach_attachment();
+        let retired = self
+            .state
+            .sink
+            .close_and_retire()
+            .map_err(BridgeError::Dispatch)?;
+        let empty = self.state.sink.current().map_err(BridgeError::Dispatch)?;
+        self.state.tree.replace(empty);
+        self.state.prepared.take();
+        Ok(retired)
+    }
+    pub fn drain_native_retirement(&mut self, budget: usize) -> Result<usize, BridgeError> {
+        if MainThreadMarker::new().is_none() {
+            return Err(BridgeError::WrongThread);
+        }
+        if !self.detached {
+            return Err(BridgeError::Dispatch(Rejection::Closing));
+        }
+        let mut elements = self.state.elements.borrow_mut();
+        let mut visits = 0;
+        while visits < budget && elements.pop_first().is_some() {
+            visits += 1;
+        }
+        Ok(visits)
+    }
+    pub fn native_retirement_complete(&self) -> bool {
+        self.detached && self.state.elements.borrow().is_empty()
+    }
+    pub fn detach(&mut self) {
+        // Compatibility path may reclaim all client-enumerated objects; production
+        // uses detach_prepared plus bounded native retirement on subsequent UI turns.
+        if self.detached {
+            return;
+        }
+        self.detach_attachment();
         self.state.elements.borrow_mut().clear();
     }
 }

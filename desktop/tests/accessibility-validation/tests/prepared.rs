@@ -43,6 +43,7 @@ fn key(s: &Snapshot) -> RequestKey {
         focus_generation: s.focus_generation,
         native_text_revision: 0,
         host_focus_revision: 0,
+        host_presentation_revision: 0,
     }
 }
 fn frame(
@@ -286,4 +287,302 @@ fn transactional_install_rejects_unacked_base_without_changing_cache_or_sink() {
         .unwrap();
     assert_eq!(retirement.frame.unwrap().publication_seq, 1);
     assert_eq!(cache.get(), 2);
+}
+
+#[test]
+fn actual_host_footer_is_always_present_and_diffed_without_core_revision_change() {
+    let s = fixture(1);
+    assert!(s.status.is_none());
+    let mut m = AccessibilityModel::default();
+    let mut k = key(&s);
+    k.host_presentation_revision = 1;
+    let p = Arc::new(
+        m.prepare_with_presentation(
+            &s,
+            None,
+            k,
+            None,
+            &HostPresentationSnapshot {
+                revision: 1,
+                footer: Arc::from("actual fallback"),
+            },
+        )
+        .unwrap(),
+    );
+    let id = p
+        .index
+        .lookup(&Target::Window, Some(Role::Status), None)
+        .unwrap();
+    assert_eq!(p.tree.nodes[&id].value.as_deref(), Some("actual fallback"));
+    let one = frame(p, None, 1, layout(&s, 1));
+    k.host_presentation_revision = 2;
+    let p = Arc::new(
+        m.prepare_with_presentation(
+            &s,
+            None,
+            k,
+            None,
+            &HostPresentationSnapshot {
+                revision: 2,
+                footer: Arc::from("actual local feedback"),
+            },
+        )
+        .unwrap(),
+    );
+    assert_eq!(p.tree.stamp.revision, one.semantic.tree.stamp.revision);
+    assert_eq!(
+        p.index.lookup(&Target::Window, Some(Role::Status), None),
+        Some(id)
+    );
+    let two = frame(p, Some(&one), 2, layout(&s, 2));
+    assert_eq!(
+        two.notifications.values[&id].0.as_deref(),
+        Some("actual fallback")
+    );
+    assert_eq!(
+        two.notifications.values[&id].1.as_deref(),
+        Some("actual local feedback")
+    );
+    assert!(matches!(
+        m.prepare_with_presentation(
+            &s,
+            None,
+            k,
+            None,
+            &HostPresentationSnapshot {
+                revision: 1,
+                footer: Arc::from("stale")
+            }
+        ),
+        Err(Rejection::Stale)
+    ));
+}
+#[test]
+fn worker_materialized_filter_and_membership_race_are_explicit() {
+    let mut s = fixture(10_000);
+    let mut m = AccessibilityModel::default();
+    let one = frame(
+        Arc::new(m.prepare(&s, None, key(&s), None).unwrap()),
+        None,
+        1,
+        layout(&s, 1),
+    );
+    let id = one
+        .semantic
+        .index
+        .lookup(
+            &Target::Entry {
+                pane: 0,
+                path: "/synthetic/0".into(),
+                listing_generation: 5,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+    let registry = MaterializedNodes::default();
+    registry.record(id).unwrap();
+    let mut rows = s.panes[0].rows.to_vec();
+    for row in &mut rows {
+        row.selected = true;
+    }
+    s.panes[0].rows = rows.into();
+    s.revision += 1;
+    let mut two = frame(
+        Arc::new(m.prepare(&s, None, key(&s), None).unwrap()),
+        Some(&one),
+        2,
+        layout(&s, 2),
+    );
+    assert_eq!(two.notifications.selected_items.len(), 10_000);
+    registry.prepare_notifications(&mut two).unwrap();
+    assert_eq!(two.notifications.selected_items.len(), 1);
+    assert!(two.notifications.selected_items.contains_key(&id));
+    assert_eq!(
+        registry.with_revision(two.notifications.materialization_revision, || Ok(7)),
+        Ok(7)
+    );
+    registry
+        .record(NodeId {
+            window: 17,
+            serial: u64::MAX,
+        })
+        .unwrap();
+    assert_eq!(
+        registry.with_revision(two.notifications.materialization_revision, || Ok(7)),
+        Err(Rejection::Stale)
+    );
+}
+
+#[test]
+fn cancelled_100k_projection_stops_before_visiting_remaining_rows() {
+    use std::cell::Cell;
+    let s = fixture(100_000);
+    let mut m = AccessibilityModel::default();
+    let visits = Cell::new(0);
+    let cancelled = || {
+        visits.set(visits.get() + 1);
+        visits.get() >= 3
+    };
+    assert!(matches!(
+        m.prepare_with_presentation_cancellable(
+            &s,
+            None,
+            key(&s),
+            None,
+            &HostPresentationSnapshot {
+                revision: 0,
+                footer: Arc::from("actual")
+            },
+            &cancelled
+        ),
+        Err(Rejection::Stale)
+    ));
+    assert!(
+        m.retained_identity_count() < 100,
+        "cancelled model retained {} identities",
+        m.retained_identity_count()
+    );
+    assert_eq!(visits.get(), 3);
+    let p = m
+        .prepare_with_presentation(
+            &s,
+            None,
+            key(&s),
+            None,
+            &HostPresentationSnapshot {
+                revision: 0,
+                footer: Arc::from("actual"),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        p.tree
+            .nodes
+            .values()
+            .filter(|n| matches!(n.target, Target::Entry { .. }))
+            .count(),
+        100_000
+    );
+}
+#[test]
+fn metadata_queries_and_close_transfer_do_not_copy_or_destroy_logical_children() {
+    use ira_accessibility_validation::accessibility::ActionSink;
+    let s = fixture(10_000);
+    let t = Arc::new(AccessibilityModel::default().project(&s, None, &layout(&s, 0)));
+    let list = t.nodes.values().find(|n| n.role == Role::List).unwrap();
+    assert_eq!(list.children.len(), 10_000);
+    assert!(list.clone_metadata().children.is_empty());
+    let (sink, _rx) = ActionSink::channel(t.clone(), 2);
+    let before = Arc::strong_count(&t);
+    let retired = sink.close_and_retire().unwrap();
+    assert!(sink.is_closing());
+    assert!(Arc::ptr_eq(&retired.tree, &t));
+    assert!(sink.current().unwrap().nodes.is_empty());
+    assert_eq!(Arc::strong_count(&t), before);
+}
+
+#[test]
+fn thirty_layout_publications_have_zero_logical_diff_visits_at_10k_and_100k() {
+    use ira_accessibility_validation::accessibility::ActionSink;
+    use std::time::Instant;
+    for count in [10_000, 100_000] {
+        let s = fixture(count);
+        let mut m = AccessibilityModel::default();
+        let p = Arc::new(m.prepare(&s, None, key(&s), None).unwrap());
+        let (sink, _rx) = ActionSink::channel(p.tree.clone(), 2);
+        let baseline = PreparedFrame::compatibility_baseline(p.tree.clone(), key(&s)).unwrap();
+        let mut last = Arc::new(baseline);
+        let mut times = Vec::new();
+        let registry = MaterializedNodes::default();
+        for seq in 1..=30 {
+            let mut l = layout(&s, seq);
+            for i in 0..40 {
+                let id = p
+                    .index
+                    .lookup(
+                        &Target::Entry {
+                            pane: 0,
+                            path: PathBuf::from(format!("/synthetic/{i}")),
+                            listing_generation: 5,
+                        },
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                let r = Rect {
+                    x: 0.,
+                    y: i as f64 * 10.,
+                    width: 100.,
+                    height: 10.,
+                };
+                l.record(id, r, r);
+            }
+            let mut next = frame(p.clone(), Some(&last), seq, l);
+            registry.prepare_notifications(&mut next).unwrap();
+            assert_eq!(next.notifications.semantic_visits, 0);
+            assert_eq!(next.geometry.nodes.len(), 40);
+            let next = Arc::new(next);
+            let start = Instant::now();
+            let retirement = sink.install_prepared(&next, next.key, || {}).unwrap();
+            times.push(start.elapsed().as_nanos());
+            assert_eq!(retirement.tree.nodes.len(), p.tree.nodes.len());
+            last = next;
+        }
+        times.sort_unstable();
+        println!(
+            "rows={count} runs=30 sparse=40 logical_diff_visits=0 coherent_install_ns p50={} p95={} max={}",
+            times[15], times[28], times[29]
+        );
+    }
+}
+#[test]
+fn queued_actions_capture_all_prepared_key_fields_and_reject_host_only_changes() {
+    use ira_accessibility_validation::accessibility::{AccessibilityIntent, ActionSink};
+    let s = fixture(1);
+    let mut m = AccessibilityModel::default();
+    let p = Arc::new(m.prepare(&s, None, key(&s), None).unwrap());
+    let (sink, rx) = ActionSink::channel(p.tree.clone(), 2);
+    let baseline = PreparedFrame::compatibility_baseline(p.tree.clone(), key(&s)).unwrap();
+    let one = Arc::new(frame(p.clone(), Some(&baseline), 1, layout(&s, 1)));
+    sink.install_prepared(&one, one.key, || {}).unwrap();
+    let id = p
+        .index
+        .lookup(
+            &Target::Entry {
+                pane: 0,
+                path: "/synthetic/0".into(),
+                listing_generation: 5,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+    let intent = AccessibilityIntent {
+        node: id,
+        stamp: p.tree.stamp,
+        action: Action::Focus,
+    };
+    sink.try_dispatch(intent.clone()).unwrap();
+    assert_eq!(rx.try_next().unwrap().unwrap().prepared_key, Some(p.key));
+    sink.try_dispatch(intent).unwrap();
+    let mut k = p.key;
+    k.host_presentation_revision += 1;
+    let next = Arc::new(
+        m.prepare_with_presentation(
+            &s,
+            None,
+            k,
+            None,
+            &HostPresentationSnapshot {
+                revision: k.host_presentation_revision,
+                footer: Arc::from("updated native footer"),
+            },
+        )
+        .unwrap(),
+    );
+    assert_eq!(next.tree.stamp, p.tree.stamp);
+    let two = Arc::new(frame(next, Some(&one), 2, layout(&s, 2)));
+    sink.install_prepared(&two, two.key, || {}).unwrap();
+    assert!(matches!(rx.try_next().unwrap(), Err(Rejection::Stale)));
 }

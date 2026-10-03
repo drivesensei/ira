@@ -178,6 +178,30 @@ pub struct Node {
     pub text_selection: Option<Range<usize>>,
     pub marked_text: Option<Range<usize>>,
 }
+impl Node {
+    /// Native scalar queries never copy a list's complete children vector.
+    pub fn clone_metadata(&self) -> Self {
+        Self {
+            id: self.id,
+            parent: self.parent,
+            role: self.role,
+            name: self.name.clone(),
+            value: self.value.clone(),
+            help: self.help.clone(),
+            children: Vec::new(),
+            enabled: self.enabled,
+            focusable: self.focusable,
+            selected: self.selected,
+            read_only: self.read_only,
+            busy: self.busy,
+            capabilities: self.capabilities.clone(),
+            target: self.target.clone(),
+            geometry: self.geometry,
+            text_selection: self.text_selection.clone(),
+            marked_text: self.marked_text.clone(),
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stamp {
     pub window: u64,
@@ -317,6 +341,19 @@ impl AccessibilityModel {
         text: Option<&NativeTextSnapshot>,
         layout: &LayoutSnapshot,
     ) -> SemanticTree {
+        self.project_cancellable(s, text, layout, &|| false)
+            .expect("uncancelled projection")
+    }
+    fn project_cancellable(
+        &mut self,
+        s: &Snapshot,
+        text: Option<&NativeTextSnapshot>,
+        layout: &LayoutSnapshot,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<SemanticTree, super::Rejection> {
+        if cancelled() {
+            return Err(super::Rejection::Stale);
+        }
         if self.window != Some(s.window_generation) {
             self.registry.clear();
             self.next = 0;
@@ -379,6 +416,9 @@ impl AccessibilityModel {
                 }
             ));
             for (i, row) in p.rows.iter().enumerate() {
+                if i % 64 == 0 && cancelled() {
+                    return Err(super::Rejection::Stale);
+                }
                 let path = PathBuf::from(&row.entry.path);
                 let row_id = self.add(
                     &mut t,
@@ -452,7 +492,10 @@ impl AccessibilityModel {
                 Target::Window,
             );
             let mut occurrences = BTreeMap::<(PathBuf, char), usize>::new();
-            for p in places.iter().flatten() {
+            for (i, p) in places.iter().flatten().enumerate() {
+                if i % 64 == 0 && cancelled() {
+                    return Err(super::Rejection::Stale);
+                }
                 let path = PathBuf::from(&p.path);
                 let next = occurrences.entry((path.clone(), p.shortcut)).or_default();
                 let occurrence = *next;
@@ -485,6 +528,9 @@ impl AccessibilityModel {
                 Target::Window,
             );
             for (i, job) in s.jobs.iter().enumerate() {
+                if i % 64 == 0 && cancelled() {
+                    return Err(super::Rejection::Stale);
+                }
                 let id = self.add(
                     &mut t,
                     Identity::Job(job.id),
@@ -663,7 +709,10 @@ impl AccessibilityModel {
         }
         let coherent = layout.window_generation == s.window_generation
             && layout.semantic_revision == s.revision;
-        for n in t.nodes.values_mut() {
+        for (i, n) in t.nodes.values_mut().enumerate() {
+            if i % 64 == 0 && cancelled() {
+                return Err(super::Rejection::Stale);
+            }
             if coherent {
                 n.geometry = layout.nodes.get(&n.id).copied().filter(|g| {
                     g.bounds.valid()
@@ -674,19 +723,25 @@ impl AccessibilityModel {
         }
         if let Some(modal) = t.active_modal {
             t.nodes.get_mut(&root).unwrap().children = vec![modal];
-            let background: Vec<_> = t
-                .nodes
-                .keys()
-                .copied()
-                .filter(|id| !t.in_modal_scope(*id))
-                .collect();
-            for id in background {
+            let mut background = Vec::new();
+            for (i, id) in t.nodes.keys().enumerate() {
+                if i % 64 == 0 && cancelled() {
+                    return Err(super::Rejection::Stale);
+                }
+                if !t.in_modal_scope(*id) {
+                    background.push(*id);
+                }
+            }
+            for (i, id) in background.into_iter().enumerate() {
+                if i % 64 == 0 && cancelled() {
+                    return Err(super::Rejection::Stale);
+                }
                 let n = t.nodes.get_mut(&id).unwrap();
                 n.enabled = false;
                 n.capabilities.clear();
             }
         }
-        t
+        Ok(t)
     }
 }
 
@@ -715,6 +770,7 @@ pub struct RequestKey {
     pub focus_generation: u64,
     pub native_text_revision: u64,
     pub host_focus_revision: u64,
+    pub host_presentation_revision: u64,
 }
 impl RequestKey {
     pub fn stamp(self) -> Stamp {
@@ -726,6 +782,12 @@ impl RequestKey {
             text_revision: self.native_text_revision,
         }
     }
+}
+/// Actual native-rendered chrome, captured by the runtime rather than inferred here.
+#[derive(Clone, Debug)]
+pub struct HostPresentationSnapshot {
+    pub revision: u64,
+    pub footer: Arc<str>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameKey {
@@ -740,9 +802,12 @@ pub struct TargetIndex {
     targets: BTreeMap<Target, SelectorIndex>,
 }
 impl TargetIndex {
-    fn build(tree: &SemanticTree) -> Self {
+    fn build(tree: &SemanticTree, cancelled: &dyn Fn() -> bool) -> Result<Self, super::Rejection> {
         let mut index = Self::default();
-        for node in tree.nodes.values() {
+        for (i, node) in tree.nodes.values().enumerate() {
+            if i % 64 == 0 && cancelled() {
+                return Err(super::Rejection::Stale);
+            }
             let selectors = index.targets.entry(node.target.clone()).or_default();
             for role in [None, Some(node.role)] {
                 selectors.entry((role, None)).or_insert(node.id);
@@ -753,7 +818,7 @@ impl TargetIndex {
                 }
             }
         }
-        index
+        Ok(index)
     }
     pub fn lookup(
         &self,
@@ -770,23 +835,66 @@ pub struct PreparedSemantic {
     pub tree: Arc<SemanticTree>,
     pub index: TargetIndex,
     hit_order: BTreeMap<NodeId, usize>,
+    pub selection_containers: std::collections::BTreeSet<NodeId>,
+    pub siblings: BTreeMap<NodeId, (Option<NodeId>, Option<NodeId>)>,
 }
 impl PreparedSemantic {
     /// Pure worker preparation. Never build an index on the foreground publication path.
     pub fn from_tree(tree: Arc<SemanticTree>, key: RequestKey) -> Result<Self, super::Rejection> {
+        Self::from_tree_cancellable(tree, key, &|| false)
+    }
+    fn from_tree_cancellable(
+        tree: Arc<SemanticTree>,
+        key: RequestKey,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Self, super::Rejection> {
         if tree.stamp != key.stamp() {
             return Err(super::Rejection::Stale);
         }
-        let index = TargetIndex::build(&tree);
+        let index = TargetIndex::build(&tree, cancelled)?;
+        let mut selection_containers = std::collections::BTreeSet::new();
+        let mut siblings = BTreeMap::new();
+        for (visit, node) in tree.nodes.values().enumerate() {
+            if visit % 64 == 0 && cancelled() {
+                return Err(super::Rejection::Stale);
+            }
+            if node.capabilities.contains(&Capability::Selection)
+                && let Some(parent) = node.parent
+            {
+                selection_containers.insert(parent);
+            }
+            for (i, id) in node.children.iter().enumerate() {
+                if i % 64 == 0 && cancelled() {
+                    return Err(super::Rejection::Stale);
+                }
+                siblings.insert(
+                    *id,
+                    (
+                        i.checked_sub(1).map(|i| node.children[i]),
+                        node.children.get(i + 1).copied(),
+                    ),
+                );
+            }
+        }
         let mut hit_order = BTreeMap::new();
         let mut stack = vec![(tree.active_modal.unwrap_or(tree.root), false)];
+        let mut visits = 0usize;
         while let Some((id, visited)) = stack.pop() {
+            if visits.is_multiple_of(64) && cancelled() {
+                return Err(super::Rejection::Stale);
+            }
+            visits += 1;
             if visited {
                 hit_order.insert(id, hit_order.len());
             } else if let Some(node) = tree.nodes.get(&id) {
                 stack.push((id, true));
                 // LIFO visits the last logical child first, matching legacy hit_test.
-                stack.extend(node.children.iter().map(|child| (*child, false)));
+                for (i, child) in node.children.iter().enumerate() {
+                    if i % 64 == 0 && cancelled() {
+                        return Err(super::Rejection::Stale);
+                    }
+                    stack.push((*child, false));
+                }
             }
         }
         Ok(Self {
@@ -794,10 +902,80 @@ impl PreparedSemantic {
             tree,
             index,
             hit_order,
+            selection_containers,
+            siblings,
         })
     }
 }
 impl AccessibilityModel {
+    pub fn retained_identity_count(&self) -> usize {
+        self.registry.len()
+    }
+    pub fn prepare_with_presentation(
+        &mut self,
+        snapshot: &Snapshot,
+        text: Option<&NativeTextSnapshot>,
+        key: RequestKey,
+        host_focused: Option<NodeId>,
+        presentation: &HostPresentationSnapshot,
+    ) -> Result<PreparedSemantic, super::Rejection> {
+        self.prepare_with_presentation_cancellable(
+            snapshot,
+            text,
+            key,
+            host_focused,
+            presentation,
+            &|| false,
+        )
+    }
+    pub fn prepare_with_presentation_cancellable(
+        &mut self,
+        snapshot: &Snapshot,
+        text: Option<&NativeTextSnapshot>,
+        key: RequestKey,
+        host_focused: Option<NodeId>,
+        presentation: &HostPresentationSnapshot,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<PreparedSemantic, super::Rejection> {
+        if key.host_presentation_revision != presentation.revision {
+            return Err(super::Rejection::Stale);
+        }
+        let mut tree =
+            self.project_cancellable(snapshot, text, &LayoutSnapshot::default(), cancelled)?;
+        if let Some(id) = host_focused
+            && tree
+                .nodes
+                .get(&id)
+                .is_some_and(|n| n.enabled && n.focusable)
+            && tree.in_modal_scope(id)
+        {
+            tree.focused = Some(id);
+        }
+        let identity = Identity::Named("status".into());
+        let id = self.id(identity.clone(), snapshot.window_generation);
+        if !tree.nodes.contains_key(&id) {
+            let root = tree.root;
+            self.add(
+                &mut tree,
+                identity,
+                Some(root),
+                Role::Status,
+                presentation.footer.to_string(),
+                Target::Window,
+            );
+        }
+        let node = tree.nodes.get_mut(&id).expect("status just projected");
+        node.name = presentation.footer.to_string();
+        node.value = Some(presentation.footer.clone());
+        node.read_only = true;
+        if let Some(modal) = tree.active_modal {
+            node.enabled = false;
+            node.capabilities.clear();
+            let root = tree.root;
+            tree.nodes.get_mut(&root).expect("projected root").children = vec![modal];
+        }
+        PreparedSemantic::from_tree_cancellable(Arc::new(tree), key, cancelled)
+    }
     /// Registry deliberately retains window-lifetime identities across arbitrary refiltering.
     /// Its memory is O(unique identities visited in this window), not O(visible rows).
     pub fn prepare(
@@ -818,6 +996,9 @@ pub struct SparseGeometry {
     hit_order: Vec<NodeId>,
 }
 impl SparseGeometry {
+    pub fn ordered_ids(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.hit_order.iter().copied()
+    }
     pub fn hit_test(&self, x: f64, y: f64) -> Option<NodeId> {
         self.hit_test_with_visits(x, y).0
     }
@@ -834,6 +1015,9 @@ impl SparseGeometry {
 pub type ValueChange = (Option<Arc<str>>, Option<Arc<str>>);
 #[derive(Debug, Default)]
 pub struct NotificationPlan {
+    pub semantic_visits: usize,
+    pub materialized_only: bool,
+    pub materialization_revision: Option<u64>,
     pub focused: Option<NodeId>,
     pub layout_changed: bool,
     pub structure_changed: bool,
@@ -861,6 +1045,19 @@ pub fn prepare_frame(
     layout: LayoutSnapshot,
     publication_seq: u64,
 ) -> Result<PreparedFrame, super::Rejection> {
+    prepare_frame_cancellable(base, semantic, key, layout, publication_seq, &|| false)
+}
+pub fn prepare_frame_cancellable(
+    base: Option<&PreparedFrame>,
+    semantic: Arc<PreparedSemantic>,
+    key: FrameKey,
+    layout: LayoutSnapshot,
+    publication_seq: u64,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<PreparedFrame, super::Rejection> {
+    if cancelled() {
+        return Err(super::Rejection::Stale);
+    }
     if semantic.key != key.request
         || layout.window_generation != key.request.window_generation
         || layout.semantic_revision != key.request.semantic_revision
@@ -874,7 +1071,10 @@ pub fn prepare_frame(
         return Err(super::Rejection::Stale);
     }
     let mut geometry = SparseGeometry::default();
-    for (id, g) in layout.nodes {
+    for (visit, (id, g)) in layout.nodes.into_iter().enumerate() {
+        if visit % 64 == 0 && cancelled() {
+            return Err(super::Rejection::Stale);
+        }
         if semantic.hit_order.contains_key(&id)
             && g.bounds.valid()
             && g.visible.valid()
@@ -899,36 +1099,52 @@ pub fn prepare_frame(
         notifications.structure_changed =
             old.nodes.len() != tree.nodes.len() || old.active_modal != tree.active_modal;
         let mut parents = std::collections::BTreeSet::new();
-        for (id, node) in &tree.nodes {
-            if let Some(before) = old.nodes.get(id) {
-                if before.children != node.children {
+        if !Arc::ptr_eq(old, tree) {
+            for (visit, (id, node)) in tree.nodes.iter().enumerate() {
+                notifications.semantic_visits += 1;
+                if visit % 64 == 0 && cancelled() {
+                    return Err(super::Rejection::Stale);
+                }
+                if let Some(before) = old.nodes.get(id) {
+                    if before.children.len() != node.children.len()
+                        || before.children.iter().zip(&node.children).enumerate().any(
+                            |(i, (before, after))| (i % 64 == 0 && cancelled()) || before != after,
+                        )
+                    {
+                        if cancelled() {
+                            return Err(super::Rejection::Stale);
+                        }
+                        notifications.structure_changed = true;
+                    }
+                    if before.selected != node.selected {
+                        parents.insert(node.parent.unwrap_or(tree.root));
+                        notifications
+                            .selected_items
+                            .insert(*id, (before.selected, node.selected));
+                    }
+                    if before.value != node.value {
+                        notifications
+                            .values
+                            .insert(*id, (before.value.clone(), node.value.clone()));
+                    }
+                    if before.text_selection != node.text_selection {
+                        notifications.text_selections.push(*id);
+                    }
+                } else {
                     notifications.structure_changed = true;
                 }
-                if before.selected != node.selected {
-                    parents.insert(node.parent.unwrap_or(tree.root));
-                    notifications
-                        .selected_items
-                        .insert(*id, (before.selected, node.selected));
+            }
+            notifications.selected_parents.extend(parents);
+            for (visit, id) in old.nodes.keys().enumerate() {
+                notifications.semantic_visits += 1;
+                if visit % 64 == 0 && cancelled() {
+                    return Err(super::Rejection::Stale);
                 }
-                if before.value != node.value {
-                    notifications
-                        .values
-                        .insert(*id, (before.value.clone(), node.value.clone()));
+                if !tree.nodes.contains_key(id) {
+                    notifications.removed.push(*id);
                 }
-                if before.text_selection != node.text_selection {
-                    notifications.text_selections.push(*id);
-                }
-            } else {
-                notifications.structure_changed = true;
             }
         }
-        notifications.selected_parents.extend(parents);
-        notifications.removed.extend(
-            old.nodes
-                .keys()
-                .filter(|id| !tree.nodes.contains_key(id))
-                .copied(),
-        );
     } else {
         notifications.focused = tree.focused;
         notifications.layout_changed = true;
@@ -971,5 +1187,61 @@ impl PreparedFrame {
         frame.publication_seq = 0;
         frame.notifications = NotificationPlan::default();
         Ok(frame)
+    }
+}
+
+/// Native materialization membership. Foreground inserts one ID at a time; only the
+/// preparation worker copies/enumerates the set. No native handles cross this seam.
+#[derive(Default)]
+pub struct MaterializedNodes {
+    ids: std::sync::Mutex<std::collections::BTreeSet<NodeId>>,
+    revision: std::sync::atomic::AtomicU64,
+}
+impl MaterializedNodes {
+    pub fn record(&self, id: NodeId) -> Result<(), super::Rejection> {
+        let mut ids = self
+            .ids
+            .try_lock()
+            .map_err(|_| super::Rejection::Backpressure)?;
+        if ids.insert(id) {
+            self.revision
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+        Ok(())
+    }
+    /// Freeze membership during the coherent native/sink commit; callbacks never wait.
+    pub fn with_revision<T>(
+        &self,
+        expected: Option<u64>,
+        commit: impl FnOnce() -> Result<T, super::Rejection>,
+    ) -> Result<T, super::Rejection> {
+        let _ids = self
+            .ids
+            .try_lock()
+            .map_err(|_| super::Rejection::Backpressure)?;
+        if expected != Some(self.revision.load(std::sync::atomic::Ordering::Acquire)) {
+            return Err(super::Rejection::Stale);
+        }
+        commit()
+    }
+    pub fn prepare_notifications(&self, frame: &mut PreparedFrame) -> Result<(), super::Rejection> {
+        let ids = self
+            .ids
+            .lock()
+            .map_err(|_| super::Rejection::Backpressure)?;
+        frame.notifications.values.retain(|id, _| ids.contains(id));
+        frame
+            .notifications
+            .selected_items
+            .retain(|id, _| ids.contains(id));
+        frame
+            .notifications
+            .text_selections
+            .retain(|id| ids.contains(id));
+        // Removed IDs are worker-only metadata; native cleanup uses a bounded cache cursor.
+        frame.notifications.materialized_only = true;
+        frame.notifications.materialization_revision =
+            Some(self.revision.load(std::sync::atomic::Ordering::Acquire));
+        Ok(())
     }
 }

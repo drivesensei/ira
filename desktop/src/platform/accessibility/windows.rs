@@ -2,8 +2,11 @@
 //! actions enqueue generation-checked commands and never enter the actor or GPUI entities.
 #![allow(non_snake_case)]
 use super::{
-    AccessibilityIntent, ActionSink, Rejection,
-    model::{Action, Capability, Node, NodeId, Rect, Role, SemanticTree},
+    AccessibilityIntent, ActionSink, PublishedOutcome, Rejection, RetiredPublication,
+    model::{
+        Action, Capability, FrameKey, MaterializedNodes, Node, NodeId, PreparedFrame, Rect, Role,
+        SemanticTree,
+    },
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::{
@@ -37,10 +40,12 @@ use windows::{
 const SUBCLASS_ID: usize = 0x4952414158;
 struct Cached {
     tree: Arc<SemanticTree>,
+    prepared: Option<Arc<PreparedFrame>>,
     frames: BTreeMap<NodeId, Rect>,
 }
 struct State {
     cache: Mutex<Cached>,
+    materialized: Arc<MaterializedNodes>,
     sink: ActionSink,
     hwnd: isize,
     closing: AtomicBool,
@@ -71,11 +76,12 @@ impl State {
             .map(|c| c.tree.clone())
             .map_err(|_| unavailable())
     }
-    fn simple(self: &Arc<Self>, id: NodeId) -> IRawElementProviderSimple {
-        new_provider(self.clone(), id)
+    fn simple(self: &Arc<Self>, id: NodeId) -> Result<IRawElementProviderSimple> {
+        self.materialized.record(id).map_err(dispatch_error)?;
+        Ok(new_provider(self.clone(), id))
     }
     fn fragment(self: &Arc<Self>, id: NodeId) -> Result<IRawElementProviderFragment> {
-        self.simple(id).cast()
+        self.simple(id)?.cast()
     }
     fn send(&self, id: NodeId, action: Action) -> Result<()> {
         let tree = self.tree()?;
@@ -120,10 +126,13 @@ impl Provider_Impl {
         if !tree.in_modal_scope(self.id) && self.id != tree.root {
             return Err(unavailable());
         };
-        tree.nodes.get(&self.id).cloned().ok_or_else(unavailable)
+        tree.nodes
+            .get(&self.id)
+            .map(Node::clone_metadata)
+            .ok_or_else(unavailable)
     }
     fn unknown<I: Interface>(&self) -> Result<IUnknown> {
-        let p = self.state.simple(self.id);
+        let p = self.state.simple(self.id)?;
         p.cast::<I>()?.cast()
     }
 }
@@ -150,18 +159,21 @@ impl IRawElementProviderSimple_Impl for Provider_Impl {
                 self.unknown::<IInvokeProvider>()
             }
             UIA_SelectionPatternId
-                if n.role == Role::List
-                    && n.children.iter().any(|id| {
-                        self.state
-                            .tree()
-                            .ok()
-                            .and_then(|t| {
-                                t.nodes
-                                    .get(id)
-                                    .map(|n| n.capabilities.contains(&Capability::Selection))
+                if n.role == Role::List && {
+                    let cache = self.state.cache.try_lock().map_err(|_| unavailable())?;
+                    cache.prepared.as_ref().map_or_else(
+                        || {
+                            cache.tree.nodes.get(&self.id).is_some_and(|n| {
+                                n.children.iter().any(|id| {
+                                    cache.tree.nodes.get(id).is_some_and(|n| {
+                                        n.capabilities.contains(&Capability::Selection)
+                                    })
+                                })
                             })
-                            .unwrap_or(false)
-                    }) =>
+                        },
+                        |f| f.semantic.selection_containers.contains(&self.id),
+                    )
+                } =>
             {
                 self.unknown::<ISelectionProvider>()
             }
@@ -224,25 +236,46 @@ impl IRawElementProviderSimple_Impl for Provider_Impl {
 #[allow(non_upper_case_globals)] // Exact pinned Win32 constant names in patterns.
 impl IRawElementProviderFragment_Impl for Provider_Impl {
     fn Navigate(&self, direction: NavigateDirection) -> Result<IRawElementProviderFragment> {
-        let n = self.node()?;
         let tree = self.state.tree()?;
+        let n = tree.nodes.get(&self.id).ok_or_else(unavailable)?;
+        let prepared = self
+            .state
+            .cache
+            .try_lock()
+            .map_err(|_| unavailable())?
+            .prepared
+            .clone();
         let id = match direction {
             NavigateDirection_Parent => n.parent,
             NavigateDirection_FirstChild => n.children.first().copied(),
             NavigateDirection_LastChild => n.children.last().copied(),
             NavigateDirection_NextSibling | NavigateDirection_PreviousSibling => {
-                n.parent.and_then(|p| tree.nodes.get(&p)).and_then(|p| {
-                    p.children
-                        .iter()
-                        .position(|id| *id == self.id)
-                        .and_then(|i| {
+                if let Some(frame) = &prepared {
+                    frame
+                        .semantic
+                        .siblings
+                        .get(&self.id)
+                        .and_then(|(previous, next)| {
                             if direction == NavigateDirection_NextSibling {
-                                p.children.get(i + 1).copied()
+                                *next
                             } else {
-                                i.checked_sub(1).and_then(|i| p.children.get(i).copied())
+                                *previous
                             }
                         })
-                })
+                } else {
+                    n.parent.and_then(|p| tree.nodes.get(&p)).and_then(|p| {
+                        p.children
+                            .iter()
+                            .position(|id| *id == self.id)
+                            .and_then(|i| {
+                                if direction == NavigateDirection_NextSibling {
+                                    p.children.get(i + 1).copied()
+                                } else {
+                                    i.checked_sub(1).and_then(|i| p.children.get(i).copied())
+                                }
+                            })
+                    })
+                }
             }
             _ => return Err(Error::from_hresult(E_INVALIDARG)),
         }
@@ -278,13 +311,24 @@ impl IRawElementProviderFragment_Impl for Provider_Impl {
     }
     fn FragmentRoot(&self) -> Result<IRawElementProviderFragmentRoot> {
         let t = self.state.tree()?;
-        self.state.simple(t.root).cast()
+        self.state.simple(t.root)?.cast()
     }
 }
 impl IRawElementProviderFragmentRoot_Impl for Provider_Impl {
     fn ElementProviderFromPoint(&self, x: f64, y: f64) -> Result<IRawElementProviderFragment> {
-        self.node()?;
         let cache = self.state.cache.try_lock().map_err(|_| unavailable())?;
+        if self.state.closing.load(Ordering::Acquire) || !cache.tree.nodes.contains_key(&self.id) {
+            return Err(unavailable());
+        }
+        if let Some(frame) = &cache.prepared {
+            let id = frame
+                .geometry
+                .ordered_ids()
+                .find(|id| cache.frames.get(id).is_some_and(|r| r.contains(x, y)))
+                .ok_or_else(unsupported)?;
+            drop(cache);
+            return self.state.fragment(id);
+        }
         fn hit(cache: &Cached, id: NodeId, x: f64, y: f64) -> Option<NodeId> {
             let n = cache.tree.nodes.get(&id)?;
             for c in n.children.iter().rev() {
@@ -332,13 +376,14 @@ impl IInvokeProvider_Impl for Provider_Impl {
 }
 impl ISelectionProvider_Impl for Provider_Impl {
     fn GetSelection(&self) -> Result<*mut SAFEARRAY> {
-        let n = self.node()?;
+        self.node()?;
         let t = self.state.tree()?;
+        let n = t.nodes.get(&self.id).ok_or_else(unavailable)?;
         let values: Vec<IUnknown> = n
             .children
             .iter()
             .filter(|id| t.nodes.get(id).is_some_and(|n| n.selected))
-            .map(|id| self.state.simple(*id).cast())
+            .map(|id| self.state.simple(*id)?.cast())
             .collect::<Result<_>>()?;
         interfaces(&values)
     }
@@ -366,7 +411,7 @@ impl ISelectionItemProvider_Impl for Provider_Impl {
     }
     fn SelectionContainer(&self) -> Result<IRawElementProviderSimple> {
         let n = self.node()?;
-        Ok(self.state.simple(n.parent.ok_or_else(unavailable)?))
+        self.state.simple(n.parent.ok_or_else(unavailable)?)
     }
 }
 impl IScrollItemProvider_Impl for Provider_Impl {
@@ -439,8 +484,9 @@ unsafe extern "system" fn subclass(
         && lparam.0 as i32 == UiaRootObjectId
         && !state.closing.load(Ordering::Acquire)
     {
-        if let Ok(t) = state.tree() {
-            let provider = state.simple(t.root);
+        if let Ok(t) = state.tree()
+            && let Ok(provider) = state.simple(t.root)
+        {
             // SAFETY: provider lifetime is transferred by UIA's marshaling; actual HWND belongs to this callback.
             return unsafe { UiaReturnRawElementProvider(hwnd, wparam, lparam, &provider) };
         }
@@ -487,9 +533,11 @@ impl NativeBridge {
         let state = Arc::new(State {
             cache: Mutex::new(Cached {
                 tree,
+                prepared: None,
                 frames: BTreeMap::new(),
             }),
             sink,
+            materialized: Arc::new(MaterializedNodes::default()),
             hwnd: raw.hwnd.get(),
             closing: AtomicBool::new(false),
             hook_owned: AtomicBool::new(true),
@@ -554,6 +602,7 @@ impl NativeBridge {
             let old = slot.tree.clone();
             *slot = Cached {
                 tree: tree.clone(),
+                prepared: None,
                 frames,
             };
             old
@@ -563,7 +612,7 @@ impl NativeBridge {
             if let Some(id) = tree.focused {
                 unsafe {
                     UiaRaiseAutomationEvent(
-                        &self.state.simple(id),
+                        &self.state.simple(id)?,
                         UIA_AutomationFocusChangedEventId,
                     )
                 }?;
@@ -571,7 +620,7 @@ impl NativeBridge {
         }
         for (id, n) in &tree.nodes {
             if let Some(before) = old.nodes.get(id) {
-                let provider = self.state.simple(*id);
+                let provider = self.state.simple(*id)?;
                 // SAFETY: provider is independently retained; no cache/sink lock is held across UIA calls.
                 if before.selected != n.selected {
                     unsafe {
@@ -606,7 +655,7 @@ impl NativeBridge {
             // SAFETY: ChildrenInvalidated has no required runtime-id payload.
             unsafe {
                 UiaRaiseStructureChangedEvent(
-                    &self.state.simple(tree.root),
+                    &self.state.simple(tree.root)?,
                     StructureChangeType_ChildrenInvalidated,
                     std::ptr::null_mut(),
                     0,
@@ -614,6 +663,156 @@ impl NativeBridge {
             }?;
         }
         Ok(())
+    }
+    pub fn invalidate_geometry(&mut self) -> Result<()> {
+        if unsafe { GetCurrentThreadId() } != self.state.thread {
+            return Err(Error::from_hresult(RPC_E_WRONG_THREAD));
+        }
+        self.state
+            .cache
+            .try_lock()
+            .map_err(|_| unavailable())?
+            .frames
+            .clear();
+        Ok(())
+    }
+    pub fn materialized_nodes(&self) -> Arc<MaterializedNodes> {
+        self.state.materialized.clone()
+    }
+    /// UI-thread conversion and coherent sparse commit; immutable callbacks use try_lock.
+    pub fn publish_prepared(
+        &mut self,
+        frame: Arc<PreparedFrame>,
+        expected: FrameKey,
+    ) -> Result<PublishedOutcome<Error>> {
+        if unsafe { GetCurrentThreadId() } != self.state.thread {
+            return Err(Error::from_hresult(RPC_E_WRONG_THREAD));
+        }
+        if self.state.closing.load(Ordering::Acquire) {
+            return Err(unavailable());
+        }
+        if frame.key != expected || !frame.notifications.materialized_only {
+            return Err(dispatch_error(Rejection::Stale));
+        }
+        let hwnd = HWND(self.state.hwnd as *mut _);
+        let mut origin = POINT::default();
+        // SAFETY: live HWND conversion runs on its creating thread, never on the worker.
+        if !unsafe { ClientToScreen(hwnd, &mut origin) }.as_bool() {
+            return Err(Error::from_win32());
+        }
+        let dpi = unsafe { GetDpiForWindow(hwnd) };
+        if dpi == 0 {
+            return Err(Error::from_win32());
+        }
+        let scale = dpi as f64 / 96.0;
+        let frames: BTreeMap<_, _> = frame
+            .geometry
+            .nodes
+            .iter()
+            .map(|(id, g)| {
+                (
+                    *id,
+                    Rect {
+                        x: origin.x as f64 + g.visible.x * scale,
+                        y: origin.y as f64 + g.visible.y * scale,
+                        width: g.visible.width * scale,
+                        height: g.visible.height * scale,
+                    },
+                )
+            })
+            .collect();
+        let converted_frames = frames.len();
+        let retired = {
+            let mut cache = self.state.cache.try_lock().map_err(|_| unavailable())?;
+            self.state
+                .materialized
+                .with_revision(frame.notifications.materialization_revision, || {
+                    self.state.sink.install_prepared(&frame, expected, || {
+                        *cache = Cached {
+                            tree: frame.semantic.tree.clone(),
+                            prepared: Some(frame.clone()),
+                            frames,
+                        };
+                    })
+                })
+                .map_err(dispatch_error)?
+        };
+        let mut notification_visits = 0;
+        // Delivery failure follows commit: return installed outcome so runtime still ACKs it.
+        let notification_error = (|| -> Result<()> {
+            let plan = &frame.notifications;
+            if let Some(id) = plan.focused {
+                notification_visits += 1;
+                unsafe {
+                    UiaRaiseAutomationEvent(
+                        &self.state.simple(id)?,
+                        UIA_AutomationFocusChangedEventId,
+                    )
+                }?;
+            }
+            for (id, (before, after)) in &plan.selected_items {
+                notification_visits += 1;
+                unsafe {
+                    UiaRaiseAutomationPropertyChangedEvent(
+                        &self.state.simple(*id)?,
+                        UIA_SelectionItemIsSelectedPropertyId,
+                        &VARIANT::from(*before),
+                        &VARIANT::from(*after),
+                    )
+                }?;
+            }
+            for (id, (before, after)) in &plan.values {
+                notification_visits += 1;
+                unsafe {
+                    UiaRaiseAutomationPropertyChangedEvent(
+                        &self.state.simple(*id)?,
+                        UIA_ValueValuePropertyId,
+                        &VARIANT::from(before.as_deref().unwrap_or("")),
+                        &VARIANT::from(after.as_deref().unwrap_or("")),
+                    )
+                }?;
+            }
+            if plan.structure_changed {
+                notification_visits += 1;
+                unsafe {
+                    UiaRaiseStructureChangedEvent(
+                        &self.state.simple(frame.semantic.tree.root)?,
+                        StructureChangeType_ChildrenInvalidated,
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                }?;
+            }
+            Ok(())
+        })()
+        .err();
+        Ok(PublishedOutcome {
+            publication_seq: frame.publication_seq,
+            retired,
+            notification_error,
+            converted_frames,
+            notification_visits,
+            cleanup_visits: 0,
+        })
+    }
+    /// Windows has no retained native-element map; pure ownership still retires on worker.
+    pub fn detach_prepared(&mut self) -> Result<RetiredPublication> {
+        self.detach()?;
+        let mut cache = self.state.cache.try_lock().map_err(|_| unavailable())?;
+        let retired = self.state.sink.close_and_retire().map_err(dispatch_error)?;
+        cache.tree = self.state.sink.current().map_err(dispatch_error)?;
+        cache.prepared = None;
+        cache.frames.clear();
+        Ok(retired)
+    }
+    pub fn drain_native_retirement(&mut self, _budget: usize) -> Result<usize> {
+        if unsafe { GetCurrentThreadId() } != self.state.thread {
+            return Err(Error::from_hresult(RPC_E_WRONG_THREAD));
+        }
+        Ok(0)
+    }
+    pub fn native_retirement_complete(&self) -> bool {
+        self.state.closing.load(Ordering::Acquire)
     }
     pub fn detach(&mut self) -> Result<()> {
         if unsafe { GetCurrentThreadId() } != self.state.thread {
