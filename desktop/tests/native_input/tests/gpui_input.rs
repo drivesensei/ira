@@ -200,3 +200,29 @@ fn multiline_utf16_candidate_bounds_and_mouse_hit_use_correct_line(cx: &mut Test
         assert_eq!(index, 4);
     });
 }
+#[gpui::test]
+fn silent_host_sync_advances_revision_without_changed_and_set_text_stays_eventful(
+    cx: &mut TestAppContext,
+) {
+    use ira_native_input_validation::text_input::{InputEvent, InputEventKind};
+    use std::{cell::RefCell, rc::Rc};
+    let (input, cx) =
+        cx.add_window_view(|_, cx| TextInput::new("old", InputOptions::default(), cx));
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let output = events.clone();
+    let _subscription = cx.update(|_, cx| {
+        cx.subscribe(&input, move |_, e: &InputEvent, _| {
+            output.borrow_mut().push(e.clone())
+        })
+    });
+    input.update(cx, |input, cx| input.sync_text("new", cx));
+    assert!(events.borrow().is_empty());
+    assert_eq!(input.read_with(cx, |i, _| i.stamp().value_revision), 1);
+    input.update(cx, |input, cx| input.set_text("edited", cx));
+    assert_eq!(events.borrow().len(), 1);
+    assert!(matches!(&events.borrow()[0].kind,InputEventKind::Changed(s) if s.text=="edited"));
+    assert_eq!(events.borrow()[0].stamp.value_revision, 2);
+    input.update(cx, |input, cx| input.sync_text("edited", cx));
+    assert_eq!(events.borrow().len(), 1);
+    assert_eq!(input.read_with(cx, |i, _| i.stamp().value_revision), 2);
+}
