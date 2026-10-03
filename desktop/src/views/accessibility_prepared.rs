@@ -125,6 +125,17 @@ impl PreparedHost {
         focused: Option<NodeId>,
         footer: Arc<str>,
     ) {
+        self.observe_native(snapshot, text, key, (focused, None), footer);
+    }
+    pub fn observe_native(
+        &mut self,
+        snapshot: Arc<Snapshot>,
+        text: Option<NativeTextSnapshot>,
+        key: RequestKey,
+        focus: (Option<NodeId>, Option<Target>),
+        footer: Arc<str>,
+    ) {
+        let (focused, focused_target) = focus;
         self.flush();
         if self.key != Some(key) {
             self.key = Some(key);
@@ -161,6 +172,7 @@ impl PreparedHost {
             snapshot,
             text,
             focused,
+            focused_target,
             presentation: HostPresentationSnapshot {
                 revision: key.host_presentation_revision,
                 footer,
@@ -220,6 +232,16 @@ impl PreparedHost {
         }
         self.index_lookups.set(self.index_lookups.get() + 1);
         semantic.index.lookup(target, role, capability)
+    }
+    /// Resolve observed native focus through the retained window-lifetime identity index.
+    /// This is not action authorization: the worker validates enabled/modal scope against
+    /// the new projection, and action lookup still requires the exact current key.
+    pub fn focus_id(&self, target: &Target, window_generation: u64) -> Option<NodeId> {
+        let semantic = self.semantic.as_ref()?;
+        if semantic.key.window_generation != window_generation {
+            return None;
+        }
+        semantic.index.lookup(target, None, None)
     }
     pub fn tree(&self) -> Option<Arc<SemanticTree>> {
         self.semantic.as_ref().map(|s| s.tree.clone())

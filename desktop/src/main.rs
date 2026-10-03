@@ -12,6 +12,7 @@ struct Session {
     next_window: u64,
     geometry: Writer,
     opening: bool,
+    desktop: Option<gpui::WeakEntity<Desktop>>,
 }
 impl gpui::Global for Session {}
 fn open_main_window(cx: &mut App) {
@@ -67,6 +68,7 @@ fn open_loaded_window(geometry: Option<Geometry>, cx: &mut App) {
         |window, cx| {
             let entity = cx.new(|cx| Desktop::new(runtime, geometry_writer, cx));
             entity.update(cx, |this, cx| this.focus_main(window, cx));
+            cx.update_global::<Session, _>(|session, _| session.desktop = Some(entity.downgrade()));
             let weak = entity.downgrade();
             window.on_window_should_close(cx, move |_, cx| {
                 ira_desktop::lifecycle_trace("OS window should-close callback");
@@ -82,6 +84,37 @@ fn open_loaded_window(geometry: Option<Geometry>, cx: &mut App) {
         }
         Err(error) => eprintln!("Failed to open IRA desktop window: {error}"),
     }
+}
+fn register_platform_quit(cx: &mut App) {
+    // GPUI's platform quit event is irrevocable and has a 100ms observer budget.
+    // Start business cancellation before GPUI clears windows; no foreground spawn,
+    // worker join, or assumption that NSApp termination returns Application::run.
+    cx.on_app_quit(|cx| {
+        let retirement = cx.global::<Retirement>().clone();
+        retirement.begin_quit();
+        let (runtime, desktop, barrier) = cx.update_global::<Session, _>(|session, _| {
+            session.opening = false;
+            (
+                session.runtime.attach(0),
+                session.desktop.take(),
+                session.geometry.barrier(),
+            )
+        });
+        runtime.stop(&[]);
+        if let Some(desktop) = desktop {
+            let _ = desktop.update(cx, |this, _| this.close());
+        }
+        retirement.pump(64);
+        let deadline = std::time::Instant::now() + gpui::SHUTDOWN_TIMEOUT;
+        cx.background_executor().spawn(async move {
+            let _ =
+                barrier.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+            while !runtime.shutdown_complete() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        })
+    })
+    .detach();
 }
 fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
@@ -120,8 +153,43 @@ fn main() {
             next_window: 1,
             geometry: Writer::new(geometry::path()),
             opening: false,
+            desktop: None,
         });
+        register_platform_quit(cx);
         open_main_window(cx)
     });
     keeper.retain_at_process_exit();
+}
+
+#[cfg(test)]
+mod quit_tests {
+    use super::*;
+    #[gpui::test]
+    fn pinned_platform_quit_stops_actor_and_acknowledges_fixture_free_persistence(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let runtime = Runtime::with_factory(7, ira_core::application::App::default);
+        let witness = runtime.attach(7);
+        let guard = witness.effect_guard(7);
+        let retirement = Retirement::default();
+        cx.update(|cx| {
+            cx.set_global(retirement.clone());
+            cx.set_global(Session {
+                runtime,
+                next_window: 8,
+                geometry: Writer::new(None),
+                opening: true,
+                desktop: None,
+            });
+            register_platform_quit(cx);
+            cx.shutdown();
+        });
+        assert!(retirement.quit_committed());
+        assert!(!retirement.can_open());
+        assert!(!guard.is_current());
+        assert!(
+            witness.shutdown_complete(),
+            "platform observer must await actual persistence ACK when it finishes within GPUI's budget"
+        );
+    }
 }

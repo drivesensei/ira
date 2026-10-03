@@ -157,12 +157,19 @@ impl Host {
             self.begin(&s, text.as_ref());
             return;
         }
-        let focused = self
-            .focused_target
-            .as_ref()
-            .and_then(|target| self.id(target, None, None));
+        let focused = self.focused_target.as_ref().and_then(|target| {
+            self.prepared
+                .as_ref()?
+                .focus_id(target, key.window_generation)
+        });
         if let Some(host) = &mut self.prepared {
-            host.observe(s.clone(), text, key, focused, footer);
+            host.observe_native(
+                s.clone(),
+                text,
+                key,
+                (focused, self.focused_target.clone()),
+                footer,
+            );
         }
         self.poll();
         self.frame = Rc::new(RefCell::new(LayoutSnapshot {
@@ -537,5 +544,170 @@ mod authority_tests {
             focused.host_presentation_revision
         );
         assert_eq!(footer.host_focus_revision, focused.host_focus_revision);
+    }
+}
+
+#[cfg(test)]
+mod reviewer_async_focus_probe {
+    use super::*;
+    use ira_core::{
+        application::App as CoreApp, domain::data::Folder, services::list_files::FEntry,
+    };
+    #[test]
+    fn actual_host_retains_observed_place_focus_across_pending_semantics() {
+        let mut app = CoreApp::default();
+        app.window_generation = 7;
+        app.bookmarks = Some(vec![Folder::new(
+            "Bookmark".into(),
+            "/fixture/bookmark".into(),
+            'b',
+        )]);
+        app.panes[0].files = vec![FEntry {
+            path: "/fixture/file".into(),
+            label: "file".into(),
+            is_dir: false,
+            size: 1,
+            modified: None,
+        }];
+        app.panes[0].selected = vec![false];
+        app.panes[0].state.select(Some(0));
+        let snapshot = Arc::new(app.snapshot());
+        let mut host = Host::headless();
+        host.begin_prepared(snapshot.clone(), None, "footer".into());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while host.tree.is_none() {
+            host.poll();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let target = Target::Place {
+            kind: crate::platform::accessibility::model::PlaceKind::Bookmark,
+            path: "/fixture/bookmark".into(),
+            shortcut: 'b',
+            occurrence: 0,
+        };
+        let expected = host.id(&target, None, None).unwrap();
+        let mut next = (*snapshot).clone();
+        next.revision += 1;
+        let next = Arc::new(next);
+        let pending = host.observe(&next, None, "footer".into());
+        host.prepared
+            .as_mut()
+            .unwrap()
+            .observe(next.clone(), None, pending, None, "footer".into());
+        // A real UI can observe new focus before its previous semantic request completes.
+        assert!(host.id(&target, None, None).is_none());
+        host.focused_target = Some(target.clone());
+        host.begin_prepared(next.clone(), None, "footer".into());
+        let key = host.authoritative_key().unwrap();
+        loop {
+            host.poll();
+            if host
+                .prepared
+                .as_ref()
+                .unwrap()
+                .semantic
+                .as_ref()
+                .is_some_and(|s| s.key == key)
+            {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            host.tree.as_ref().unwrap().focused,
+            Some(expected),
+            "latest actual bookmark focus must override semantic pane cursor even with an intermediate frame pending"
+        );
+        host.close();
+    }
+}
+
+#[cfg(test)]
+mod reviewer_novel_focus_probe {
+    use super::*;
+    use ira_core::{
+        application::App as CoreApp, domain::data::Folder, services::list_files::FEntry,
+    };
+    #[test]
+    fn actual_host_resolves_newly_added_place_focus_on_latest_tree() {
+        let mut app = CoreApp::default();
+        app.window_generation = 7;
+        app.bookmarks = Some(vec![Folder::new(
+            "Bookmark".into(),
+            "/fixture/bookmark".into(),
+            'b',
+        )]);
+        app.panes[0].files = vec![FEntry {
+            path: "/fixture/file".into(),
+            label: "file".into(),
+            is_dir: false,
+            size: 1,
+            modified: None,
+        }];
+        app.panes[0].selected = vec![false];
+        app.panes[0].state.select(Some(0));
+        let snapshot = Arc::new(app.snapshot());
+        let mut host = Host::headless();
+        host.begin_prepared(snapshot.clone(), None, "footer".into());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while host.tree.is_none() {
+            host.poll();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let target = Target::Place {
+            kind: crate::platform::accessibility::model::PlaceKind::Bookmark,
+            path: "/fixture/bookmark".into(),
+            shortcut: 'b',
+            occurrence: 0,
+        };
+        let mut next = (*snapshot).clone();
+        next.revision += 1;
+        next.bookmarks.as_mut().unwrap().push(Folder::new(
+            "New bookmark".into(),
+            "/fixture/new-bookmark".into(),
+            'c',
+        ));
+        let next = Arc::new(next);
+        let pending = host.observe(&next, None, "footer".into());
+        host.prepared
+            .as_mut()
+            .unwrap()
+            .observe(next.clone(), None, pending, None, "footer".into());
+        // A real UI can observe new focus before its previous semantic request completes.
+        assert!(host.id(&target, None, None).is_none());
+        let target = Target::Place {
+            kind: crate::platform::accessibility::model::PlaceKind::Bookmark,
+            path: "/fixture/new-bookmark".into(),
+            shortcut: 'c',
+            occurrence: 0,
+        };
+        host.focused_target = Some(target.clone());
+        host.begin_prepared(next.clone(), None, "footer".into());
+        let key = host.authoritative_key().unwrap();
+        loop {
+            host.poll();
+            if host
+                .prepared
+                .as_ref()
+                .unwrap()
+                .semantic
+                .as_ref()
+                .is_some_and(|s| s.key == key)
+            {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let expected = host.id(&target, None, None).unwrap();
+        assert_eq!(
+            host.tree.as_ref().unwrap().focused,
+            Some(expected),
+            "latest actual bookmark focus must override semantic pane cursor even with an intermediate frame pending"
+        );
+        host.close();
     }
 }

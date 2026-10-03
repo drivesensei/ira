@@ -2288,10 +2288,20 @@ mod crossing_tests {
             assert!(std::time::Instant::now() < deadline);
             std::thread::yield_now();
         }
-        view.update_in(cx, |view, _, _| {
+        let shutdown = view.update_in(cx, |view, _, _| {
+            let witness = view.runtime.attach(view.runtime.window_generation);
             view.runtime.stop(&view.controls);
             view.close();
+            witness
         });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !shutdown.shutdown_complete() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture persistence must acknowledge before deletion"
+            );
+            std::thread::yield_now();
+        }
         assert_eq!(
             std::fs::read(fixture.join("fixture.txt")).unwrap(),
             "文😀e\u{301}\nfixture".as_bytes()

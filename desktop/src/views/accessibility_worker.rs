@@ -5,7 +5,7 @@ use crate::platform::accessibility::{
     model::{
         AccessibilityModel, FrameKey, HostPresentationSnapshot, LayoutSnapshot, MaterializedNodes,
         NativeTextSnapshot, NodeId, PreparedFrame, PreparedSemantic, RequestKey, SemanticTree,
-        prepare_frame_cancellable,
+        Target, prepare_frame_cancellable,
     },
 };
 use ira_core::observable::Snapshot;
@@ -24,6 +24,7 @@ pub struct SemanticRequest {
     pub snapshot: Arc<Snapshot>,
     pub text: Option<NativeTextSnapshot>,
     pub focused: Option<NodeId>,
+    pub focused_target: Option<Target>,
     pub presentation: HostPresentationSnapshot,
 }
 pub struct LayoutRequest {
@@ -254,6 +255,27 @@ fn run(shared: Arc<Shared>) {
                     &request.presentation,
                     &cancelled,
                 )
+                .and_then(|prepared| {
+                    // Newly rendered controls can receive native focus before they existed
+                    // in the previous index. Resolve against this fresh worker projection,
+                    // then reuse provider policy for enabled/modal-scope validation.
+                    let focused = request
+                        .focused_target
+                        .as_ref()
+                        .and_then(|target| prepared.index.lookup(target, None, None));
+                    if focused.is_some() && focused != request.focused {
+                        model.prepare_with_presentation_cancellable(
+                            &request.snapshot,
+                            request.text.as_ref(),
+                            request.key,
+                            focused,
+                            &request.presentation,
+                            &cancelled,
+                        )
+                    } else {
+                        Ok(prepared)
+                    }
+                })
                 .map(Arc::new);
             if let Ok(value) = &value {
                 semantic_pin = Some(value.clone());
@@ -341,6 +363,7 @@ mod tests {
             snapshot,
             text: None,
             focused: None,
+            focused_target: None,
             presentation: HostPresentationSnapshot {
                 revision: sequence,
                 footer: footer.into(),

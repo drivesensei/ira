@@ -137,6 +137,7 @@ pub struct Runtime {
     completions: Arc<Mutex<Receiver<Completion>>>,
     attached_window: Arc<AtomicU64>,
     stopping: Arc<AtomicBool>,
+    shutdown_complete: Arc<AtomicBool>,
     pub window_generation: u64,
     next_sequence: Arc<AtomicU64>,
     pending: VecDeque<Envelope>,
@@ -216,6 +217,8 @@ impl Runtime {
         let (completed, completions) = mpsc::channel();
         let latest = Arc::new(Latest::default());
         let stopping = Arc::new(AtomicBool::new(false));
+        let shutdown_complete = Arc::new(AtomicBool::new(false));
+        let actor_shutdown_complete = shutdown_complete.clone();
         let publication = latest.clone();
         let stop = stopping.clone();
         let attached_window = Arc::new(AtomicU64::new(window_generation));
@@ -399,9 +402,11 @@ impl Runtime {
             cancel_all(&app);
             app.persist_state();
             // Persistence drain is off both GPUI and command lanes and has an explicit bound.
-            let _ = app
+            let persisted = app
                 .persistence_barrier()
-                .recv_timeout(Duration::from_secs(2));
+                .recv_timeout(Duration::from_secs(2))
+                .is_ok();
+            actor_shutdown_complete.store(persisted, Ordering::Release);
             let _ = completed.send(Completion::Closed);
         });
         Self {
@@ -410,6 +415,7 @@ impl Runtime {
             completions: Arc::new(Mutex::new(completions)),
             attached_window,
             stopping,
+            shutdown_complete,
             window_generation,
             next_sequence: Arc::new(AtomicU64::new(1)),
             pending: VecDeque::new(),
@@ -451,6 +457,7 @@ impl Runtime {
             completions: self.completions.clone(),
             attached_window: self.attached_window.clone(),
             stopping: self.stopping.clone(),
+            shutdown_complete: self.shutdown_complete.clone(),
             window_generation,
             next_sequence: self.next_sequence.clone(),
             pending: VecDeque::new(),
@@ -505,6 +512,11 @@ impl Runtime {
             });
         }
         Some(completion)
+    }
+    /// Cheap acknowledgment after actor cancellation and a successful persistence barrier.
+    /// Clones share it across window epochs; reading it never consumes UI completions.
+    pub fn shutdown_complete(&self) -> bool {
+        self.shutdown_complete.load(Ordering::Acquire)
     }
     /// Does not enqueue, lock or join. Known worker controls are canceled immediately.
     pub fn stop(&self, controls: &[Arc<JobControl>]) {
