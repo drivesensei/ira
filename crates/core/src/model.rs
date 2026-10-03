@@ -260,6 +260,7 @@ pub struct EntryTarget {
 }
 #[derive(Debug, Clone)]
 pub struct OpenEditorRequest {
+    pub window_generation: u64,
     pub document_id: u64,
     pub target: EntryTarget,
     pub document_generation: u64,

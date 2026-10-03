@@ -528,6 +528,7 @@ impl App {
 
     /// Opens the keybindings help dialog (closed by any key).
     pub fn show_keybindings(&mut self) {
+        self.cancel_pending_editor();
         self.keybindings_visible = true;
     }
 
@@ -2942,6 +2943,7 @@ impl App {
         };
         self.document_generation = self.document_generation.wrapping_add(1);
         let request = OpenEditorRequest {
+            window_generation: self.window_generation,
             document_id: self.next_document_id,
             target,
             document_generation: self.document_generation,
@@ -2986,7 +2988,15 @@ impl App {
         let Some(edit) = self.edit.as_mut() else {
             return false;
         };
-        if edit.document_id != document_id || edit_revision < edit.edit_revision || edit.read_only {
+        if edit.document_id != document_id || edit_revision < edit.edit_revision {
+            return false;
+        }
+        // Revision identifies immutable content: identical replay is idempotent,
+        // but conflicting reuse must not let an older save clear dirty text.
+        if edit_revision == edit.edit_revision {
+            return edit.content == content;
+        }
+        if edit.read_only {
             return false;
         }
         if edit.content != content {
@@ -3022,10 +3032,20 @@ impl App {
         request: OpenEditorRequest,
         result: Result<crate::editor::EditorDocument, crate::editor::EditorError>,
     ) -> bool {
-        if self.pending_editor.as_ref().map(|r| r.document_id) != Some(request.document_id)
+        if self.pending_editor.as_ref().map(|r| r.document_id) != Some(request.document_id) {
+            return false;
+        }
+        if request.window_generation != self.window_generation
             || request.document_generation != self.document_generation
+            || request.focus_generation != self.focus_generation
             || self.resolve_target(&request.target).is_none()
         {
+            self.cancel_pending_editor();
+            return false;
+        }
+        if result.as_ref().is_ok_and(|document| {
+            document.id != request.document_id || document.listed_path != request.target.path
+        }) {
             return false;
         }
         self.pending_editor = None;
@@ -3143,6 +3163,7 @@ impl App {
             return Ok(());
         }
         let context_before = self.input_context();
+        let focus_before = self.focus_generation;
         match input {
             crate::input::Input::Key(key) => {
                 if key.phase == crate::input::KeyPhase::Press {
@@ -3153,8 +3174,24 @@ impl App {
             crate::input::Input::Tick => self.tick(),
             crate::input::Input::Action(command) => self.apply_command(command),
         };
-        if self.input_context() != context_before {
+        if self.input_context() != context_before && self.focus_generation == focus_before {
             self.focus_generation = self.focus_generation.wrapping_add(1);
+        }
+        // A Tab request owns the editor focus transition made by THIS command.
+        // Stamp its queued ticket once; later unrelated focus changes invalidate it.
+        if self.input_context() == crate::input::InputContext::Editor {
+            if let Some(request) = &mut self.pending_editor {
+                if request.focus_generation == focus_before {
+                    request.focus_generation = self.focus_generation;
+                    for host_request in &mut self.host_requests {
+                        if let HostRequest::OpenEditor(queued) = host_request {
+                            if queued.document_id == request.document_id {
+                                queued.focus_generation = request.focus_generation;
+                            }
+                        }
+                    }
+                }
+            }
         }
         self.revision = self.revision.wrapping_add(1);
         Ok(())
@@ -3720,5 +3757,18 @@ impl App {
 impl App {
     pub fn pending_editor_request(&self) -> Option<OpenEditorRequest> {
         self.pending_editor.clone()
+    }
+}
+
+impl App {
+    fn cancel_pending_editor(&mut self) {
+        let Some(request) = self.pending_editor.take() else {
+            return;
+        };
+        self.host_requests.retain(|r|!matches!(r,HostRequest::OpenEditor(queued) if queued.document_id==request.document_id) && !matches!(r,HostRequest::EditorKey{document_id,..}|HostRequest::EditorPaste{document_id,..} if *document_id==request.document_id));
+        self.document_generation = self.document_generation.wrapping_add(1);
+        if self.edit.is_none() {
+            self.edit_focus = false;
+        }
     }
 }
