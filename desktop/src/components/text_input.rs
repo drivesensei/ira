@@ -158,11 +158,19 @@ impl TextInput {
     pub fn snapshot(&self) -> BufferSnapshot {
         self.buffer.snapshot()
     }
-    pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
+    /// Replace draft/history from a host snapshot without emitting an input event.
+    /// Changed text advances value_revision so pending save results become stale.
+    pub fn sync_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
         let text = text.into();
         let text = self.normalize(&text);
         self.buffer = TextBuffer::new(text);
         self.lines.clear();
+        self.update_revision();
+        cx.notify();
+    }
+    /// Eventful replacement for explicit host edit commands; use sync_text for projection.
+    pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
+        self.sync_text(text, cx);
         self.changed(cx);
     }
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -201,7 +209,7 @@ impl TextInput {
     fn editable(&self) -> bool {
         self.options.access == InputAccess::Editable
     }
-    fn changed(&mut self, cx: &mut Context<Self>) {
+    fn update_revision(&mut self) {
         if self.last_text != self.buffer.text() {
             self.revision = self
                 .revision
@@ -210,6 +218,9 @@ impl TextInput {
             self.last_text = self.buffer.text().to_owned();
             self.lines.clear();
         }
+    }
+    fn changed(&mut self, cx: &mut Context<Self>) {
+        self.update_revision();
         self.emit(InputEventKind::Changed(self.snapshot()), cx);
         cx.notify();
         cx.stop_propagation();
