@@ -998,6 +998,7 @@ impl Desktop {
         let snapshot = self.snapshot.as_ref()?;
         let mut modal = div()
             .id("ira-modal")
+            .debug_selector(|| "ira-modal".into())
             .absolute()
             .top(px(90.))
             .left(px(220.))
@@ -1864,6 +1865,61 @@ mod crossing_tests {
         });
         std::fs::remove_dir_all(fixture).unwrap();
     }
+    #[gpui::test]
+    fn measured_help_modal_preserves_absolute_overlay_and_visible_ax_geometry(
+        cx: &mut TestAppContext,
+    ) {
+        let mut app = App::default();
+        app.window_generation = 7;
+        app.show_keybindings();
+        let runtime = Runtime::with_factory(7, move || app);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let publication = loop {
+            if let Some(value) = runtime.try_snapshot() {
+                break value;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            let mut view = Desktop::new(runtime, crate::platform::geometry::Writer::new(None), cx);
+            view.accessibility = accessibility::Host::headless();
+            view.snapshot = Some(publication.snapshot);
+            view
+        });
+        let bounds = cx
+            .debug_bounds("ira-modal")
+            .expect("actual common modal painted");
+        assert_eq!(
+            bounds.origin.y,
+            px(90.),
+            "measurement must preserve caller absolute top"
+        );
+        assert_eq!(
+            bounds.origin.x,
+            px(220.),
+            "measurement must preserve caller absolute left"
+        );
+        view.update_in(cx, |view, window, _| {
+            assert!(
+                bounds.bottom() <= window.bounds().size.height,
+                "modal must remain on-screen"
+            );
+            let tree = view.accessibility.tree.as_ref().unwrap();
+            let modal = tree
+                .nodes
+                .values()
+                .find(|n| n.role == AxRole::Dialog && n.target == AxTarget::Modal)
+                .unwrap();
+            assert!(
+                modal.geometry.is_some(),
+                "actual AX dialog must have visible clipped bounds"
+            );
+            view.runtime.stop(&view.controls);
+            view.close();
+        });
+    }
+
     #[gpui::test]
     fn pending_editor_does_not_create_empty_native_input_or_advance_ticket(
         cx: &mut TestAppContext,

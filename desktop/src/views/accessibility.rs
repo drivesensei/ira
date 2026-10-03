@@ -96,8 +96,8 @@ impl Host {
             return element.into_any_element();
         };
         let frame = self.frame.clone();
+        // Preserve caller positioning: common modals are absolute overlays.
         element
-            .relative()
             .child(
                 canvas(
                     move |bounds, window, _| {
