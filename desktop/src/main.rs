@@ -36,8 +36,14 @@ struct ShutdownStatus {
 }
 impl Render for ShutdownStatus {
     fn render(&mut self, _: &mut gpui::Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+        use ira_desktop::views::native_color;
+        // Built-in recovery colors require no theme/config filesystem initialization.
+        let theme = ira_core::theme::ThemePreset::default().theme();
         div()
             .size_full()
+            .bg(native_color(theme.bg))
+            .text_color(native_color(theme.text))
+            .text_size(px(14.))
             .p_4()
             .flex()
             .flex_col()
@@ -46,6 +52,14 @@ impl Render for ShutdownStatus {
             .child(
                 div()
                     .id("retry-shutdown")
+                    .flex_none()
+                    .p_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(native_color(theme.accent))
+                    .bg(native_color(theme.surface))
+                    .text_color(native_color(theme.text))
+                    .cursor_pointer()
                     .child("Retry shutdown saves")
                     .on_click(|_, window, cx| {
                         window.dispatch_action(Box::new(actions::RetryShutdown), cx)
