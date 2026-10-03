@@ -1,10 +1,7 @@
 //! Persistence-only receipts and sealed retries; no business commands are retained.
 use super::*;
 use crate::services::persistence::PersistenceError;
-use crate::services::{
-    bookmarks::{try_write_bookmarks, try_write_bookmarks_to},
-    state::{try_save_state, try_save_state_to},
-};
+use crate::services::{bookmarks::try_write_bookmarks_to, state::try_save_state_to};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PersistenceReceipt {
     pub epoch: u64,
@@ -45,9 +42,9 @@ impl Payload {
     fn write(&self) -> Result<(), PersistenceError> {
         match self {
             Self::State(Some(p), s) => try_save_state_to(p, s),
-            Self::State(None, s) => try_save_state(s),
+            Self::State(None, _) => Err(PersistenceError::not_configured()),
             Self::Bookmarks(Some(p), b) => try_write_bookmarks_to(p, b),
-            Self::Bookmarks(None, b) => try_write_bookmarks(b),
+            Self::Bookmarks(None, _) => Err(PersistenceError::not_configured()),
         }
     }
 }

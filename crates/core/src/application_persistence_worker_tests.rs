@@ -81,3 +81,21 @@ fn retry_admission_is_bounded_across_receipts_and_replays_only_sealed_payload() 
     assert!(fs::read(&path).unwrap().starts_with(b"split=1\n"));
     fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn unavailable_sealed_destination_reports_error_without_resolving_a_new_path_on_retry() {
+    let shared = Arc::new(Mutex::new(Ledger::default()));
+    shared
+        .lock()
+        .unwrap()
+        .write(Payload::State(None, SessionState::default()));
+    let failure = shared.lock().unwrap().outcome(&shared).unwrap_err();
+    assert_eq!(failure.errors[0].stage, "resolve");
+    let retried = failure
+        .retry
+        .retry()
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(retried.errors[0], PersistenceError::not_configured());
+}

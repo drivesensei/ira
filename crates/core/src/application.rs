@@ -3000,7 +3000,9 @@ impl App {
     fn persist_bookmarks(&self) {
         if let Some(bookmarks) = &self.bookmarks {
             let _ = self.persistence_tx.send(PersistenceRequest::Bookmarks(
-                self.bookmarks_path.clone(),
+                self.bookmarks_path
+                    .clone()
+                    .or_else(crate::services::bookmarks::bookmarks_file),
                 bookmarks.clone(),
             ));
         }
@@ -3125,9 +3127,12 @@ impl App {
             theme: Some(self.theme_preset.id().to_string()),
             sizes: self.size_entries(),
         };
-        let _ = self
-            .persistence_tx
-            .send(PersistenceRequest::State(self.state_path.clone(), state));
+        let _ = self.persistence_tx.send(PersistenceRequest::State(
+            self.state_path
+                .clone()
+                .or_else(crate::services::state::state_file),
+            state,
+        ));
     }
     pub fn recalculate_dialog_size(&mut self) {
         let Some(dialog) = self.info.as_ref() else {
