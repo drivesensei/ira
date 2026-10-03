@@ -14,6 +14,13 @@ fn stop_wins_initial_attachment_tick_and_ready_drive_completion_boundaries() {
         let held = gate.clone();
         let once = AtomicBool::new(false);
         let (tx, rx) = mpsc::channel();
+        let expected_epoch = if unit == ActorUnit::Attachment { 6 } else { 7 };
+        let expired_status = (unit == ActorUnit::Tick).then(|| ira_core::model::Status {
+            text: "owned expired notice must remain when tick is rejected".into(),
+            is_error: false,
+            raised: Instant::now() - (ira_core::model::STATUS_TTL + Duration::from_secs(1)),
+        });
+        let expected_status = expired_status.clone();
         let _hook = HookScope::install(Arc::new(move |observed, phase, app| {
             if observed != unit {
                 return;
@@ -22,18 +29,42 @@ fn stop_wins_initial_attachment_tick_and_ready_drive_completion_boundaries() {
                 held.block();
             }
             if phase == ActorPhase::Canceled {
-                let _ = tx.send((app.ack_sequence, app.jobs.len(), app.drives.clone()));
+                // Read actual App state at the stopped handoff; no fake tick/attach counter.
+                let _ = tx.send((
+                    app.ack_sequence,
+                    app.jobs.len(),
+                    app.drives.clone(),
+                    app.window_generation,
+                    app.status.clone(),
+                ));
             }
         }));
         let _release = ReleaseOnDrop(gate.clone());
-        let runtime = Runtime::with_drive_probe(7, move || owned_app(&owned, false), || Ok(vec![]));
+        let runtime = Runtime::with_drive_probe(
+            7,
+            move || {
+                let mut app = owned_app(&owned, false); // All owned paths assigned before seeds.
+                app.window_generation = expected_epoch; // Initial attachment has REAL epoch work.
+                app.status = expired_status; // Actual core tick must expire this non-idle notice.
+                app
+            },
+            || Ok(vec![]),
+        );
         gate.wait();
         runtime.stop(&[]);
         gate.release();
-        let (ack, jobs, drives) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (ack, jobs, drives, epoch, status) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(ack, 0);
         assert_eq!(jobs, 0);
         assert!(drives.is_none());
+        assert_eq!(
+            epoch, expected_epoch,
+            "rejected attachment must not install Runtime epoch7"
+        );
+        assert_eq!(
+            status, expected_status,
+            "rejected tick must not expire the owned notice"
+        );
         finish(&runtime);
         assert!(!runtime.effect_guard(7).is_current());
     }
