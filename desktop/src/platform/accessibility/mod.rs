@@ -35,6 +35,7 @@ pub struct ResolvedAction {
     pub stamp: Stamp,
     pub target: Target,
     pub action: Action,
+    pub prepared_key: Option<model::RequestKey>,
 }
 struct PublicationState {
     tree: Arc<SemanticTree>,
@@ -46,6 +47,10 @@ pub struct RetiredPublication {
     pub tree: Arc<SemanticTree>,
     pub frame: Option<Arc<PreparedFrame>>,
 }
+struct QueuedIntent {
+    intent: AccessibilityIntent,
+    prepared_key: Option<model::RequestKey>,
+}
 struct Shared {
     tree: Mutex<PublicationState>,
     closing: AtomicBool,
@@ -53,11 +58,11 @@ struct Shared {
 #[derive(Clone)]
 pub struct ActionSink {
     shared: Arc<Shared>,
-    sender: SyncSender<AccessibilityIntent>,
+    sender: SyncSender<QueuedIntent>,
 }
 pub struct ActionReceiver {
     shared: Arc<Shared>,
-    receiver: Receiver<AccessibilityIntent>,
+    receiver: Receiver<QueuedIntent>,
 }
 fn resolve(tree: &SemanticTree, intent: &AccessibilityIntent) -> Result<ResolvedAction, Rejection> {
     if intent.stamp != tree.stamp {
@@ -80,6 +85,7 @@ fn resolve(tree: &SemanticTree, intent: &AccessibilityIntent) -> Result<Resolved
         stamp: intent.stamp,
         target: node.target.clone(),
         action: intent.action.clone(),
+        prepared_key: None,
     })
 }
 impl ActionSink {
@@ -111,7 +117,11 @@ impl ActionSink {
             .try_lock()
             .map_err(|_| Rejection::Backpressure)?;
         resolve(&tree.tree, &intent)?;
-        self.sender.try_send(intent).map_err(|e| match e {
+        let queued = QueuedIntent {
+            intent,
+            prepared_key: tree.frame.as_ref().map(|f| f.key.request),
+        };
+        self.sender.try_send(queued).map_err(|e| match e {
             TrySendError::Full(_) => Rejection::Backpressure,
             TrySendError::Disconnected(_) => Rejection::Closing,
         })
@@ -195,6 +205,27 @@ impl ActionSink {
             .map(|t| t.tree.clone())
             .map_err(|_| Rejection::Backpressure)
     }
+    /// Close first, then transfer large pure ownership to the worker. A callback
+    /// holding the gate causes bounded backpressure; retry without waiting on UI.
+    pub fn close_and_retire(&self) -> Result<RetiredPublication, Rejection> {
+        self.close();
+        let mut slot = self
+            .shared
+            .tree
+            .try_lock()
+            .map_err(|_| Rejection::Backpressure)?;
+        let empty = Arc::new(SemanticTree {
+            stamp: slot.tree.stamp,
+            layout_revision: slot.tree.layout_revision,
+            root: slot.tree.root,
+            focused: None,
+            active_modal: None,
+            nodes: std::collections::BTreeMap::new(),
+        });
+        let tree = std::mem::replace(&mut slot.tree, empty);
+        let frame = slot.frame.take();
+        Ok(RetiredPublication { tree, frame })
+    }
     pub fn close(&self) {
         self.shared.closing.store(true, Ordering::Release);
     }
@@ -206,16 +237,34 @@ impl ActionReceiver {
     /// Validate again at dequeue; queued actions may be stale after a new snapshot/window teardown.
     pub fn try_next(&self) -> Option<Result<ResolvedAction, Rejection>> {
         match self.receiver.try_recv() {
-            Ok(intent) => Some(if self.shared.closing.load(Ordering::Acquire) {
+            Ok(queued) => Some(if self.shared.closing.load(Ordering::Acquire) {
                 Err(Rejection::Closing)
             } else {
                 self.shared
                     .tree
                     .try_lock()
                     .map_err(|_| Rejection::Backpressure)
-                    .and_then(|tree| resolve(&tree.tree, &intent))
+                    .and_then(|tree| {
+                        if queued.prepared_key != tree.frame.as_ref().map(|f| f.key.request) {
+                            return Err(Rejection::Stale);
+                        }
+                        let mut resolved = resolve(&tree.tree, &queued.intent)?;
+                        resolved.prepared_key = queued.prepared_key;
+                        Ok(resolved)
+                    })
             }),
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
         }
     }
+}
+
+/// A successful native commit always returns this, even if notification delivery failed.
+/// ACK publication_seq before handling the optional delivery error; retire on worker.
+pub struct PublishedOutcome<E> {
+    pub publication_seq: u64,
+    pub retired: RetiredPublication,
+    pub notification_error: Option<E>,
+    pub converted_frames: usize,
+    pub notification_visits: usize,
+    pub cleanup_visits: usize,
 }
