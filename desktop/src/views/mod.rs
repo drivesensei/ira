@@ -1,4 +1,5 @@
 pub mod accessibility;
+pub mod accessibility_bridge;
 pub mod accessibility_prepared;
 pub mod accessibility_retirement;
 pub mod accessibility_worker;

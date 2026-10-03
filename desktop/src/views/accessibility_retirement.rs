@@ -1,6 +1,7 @@
 //! App-owned main-thread native retirement. Pure pins survive every bounded retry.
+use super::accessibility_bridge::NativeBridge;
 use super::accessibility_worker::Worker;
-use crate::platform::accessibility::{ActionSink, NativeBridge};
+use crate::platform::accessibility::ActionSink;
 use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,

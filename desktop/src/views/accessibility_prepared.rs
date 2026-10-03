@@ -1,10 +1,11 @@
 //! Foreground adapter: indexed lookup, sparse paint capture and coherent worker ACKs.
+use super::accessibility_bridge::NativeBridge;
 use super::{
     accessibility_retirement::{Pins, Retirement},
     accessibility_worker::{LayoutRequest, PreparedResult, SemanticRequest, Worker},
 };
 use crate::platform::accessibility::{
-    ActionReceiver, ActionSink, NativeBridge,
+    ActionReceiver, ActionSink,
     model::{
         Capability, FrameKey, HostPresentationSnapshot, LayoutSnapshot, MaterializedNodes,
         NativeTextSnapshot, NodeId, PreparedFrame, PreparedSemantic, RequestKey, Role,
@@ -63,7 +64,7 @@ impl PreparedHost {
             bridge: None,
             materialized: Arc::new(MaterializedNodes::default()),
             retirement,
-            native,
+            native: native && cfg!(any(target_os = "macos", target_os = "windows")),
             index_lookups: std::cell::Cell::new(0),
             converted_frames: 0,
         }
