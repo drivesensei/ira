@@ -418,3 +418,15 @@ fn native_wrong_thread_rejects_before_reading_raw_handle() {
     .join()
     .unwrap();
 }
+
+#[test]
+fn older_host_draft_publication_cannot_rollback_current_text() {
+    let mut initial = tree(&fixture());
+    initial.stamp.text_revision = 7;
+    let initial = Arc::new(initial);
+    let (sink, _rx) = ActionSink::channel(initial.clone(), 1);
+    let mut older = (*initial).clone();
+    older.stamp.text_revision = 6;
+    assert_eq!(sink.publish(Arc::new(older)), Err(Rejection::Stale));
+    assert_eq!(sink.current().unwrap().stamp.text_revision, 7);
+}
