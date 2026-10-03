@@ -1,6 +1,6 @@
 //! One background owner; foreground reads never wait for the actor.
 use ira_core::{
-    application::{App, PersistenceFailure},
+    application::{App, PersistenceFailure, WorkSettlement},
     editor::{EditorDocument, EditorError, EditorSession, SaveCompletion},
     input::{Input, KeyCode, KeyEvent, KeyModifiers},
     model::{EntryTarget, HostRequest, OpenEditorRequest},
@@ -44,6 +44,10 @@ enum ActorPhase {
 type ActorHook = Arc<dyn Fn(ActorUnit, ActorPhase, &App) + Send + Sync>;
 #[cfg(test)]
 thread_local! { static ACTOR_HOOK: std::cell::RefCell<Option<ActorHook>> = const { std::cell::RefCell::new(None) }; }
+#[cfg(test)]
+type EditorHook = Arc<dyn Fn() + Send + Sync>;
+#[cfg(test)]
+thread_local! { static EDITOR_HOOK: std::cell::RefCell<Option<EditorHook>> = const { std::cell::RefCell::new(None) }; }
 struct ActorAdmission {
     stop: Arc<AtomicBool>,
     #[cfg(test)]
@@ -223,6 +227,7 @@ pub enum ShutdownState {
     Success { epoch: u64 },
     Failure(Arc<PersistenceFailure>),
     Disconnected,
+    WorkError(String),
 }
 pub struct Runtime {
     sender: SyncSender<Envelope>,
@@ -339,6 +344,8 @@ impl Runtime {
         let attached = attached_window.clone();
         #[cfg(test)]
         let hook = ACTOR_HOOK.with(|slot| slot.borrow().clone());
+        #[cfg(test)]
+        let editor_hook = EDITOR_HOOK.with(|slot| slot.borrow().clone());
         thread::spawn(move || {
             let admission = ActorAdmission {
                 stop: stop.clone(),
@@ -359,7 +366,18 @@ impl Runtime {
                 app.attach_window(window_generation);
                 admission.finish(&mut app, ActorUnit::Attachment);
             }
-            let (editor_tx, editor_rx) = mpsc::channel::<(u64, HostRequest)>();
+            let (editor_sender, editor_rx) = mpsc::channel::<(u64, u64, HostRequest)>();
+            let editor_settlement = Arc::new(EditorSettlement {
+                #[cfg(test)]
+                hook: editor_hook,
+                ..EditorSettlement::default()
+            });
+            let editor_tx = EditorDispatch {
+                sender: std::cell::RefCell::new(Some(editor_sender)),
+                issued: std::cell::Cell::new(0),
+                error: std::cell::RefCell::new(None),
+                settlement: editor_settlement.clone(),
+            };
             let (editor_done, editor_results) = mpsc::channel();
             let (drive_tx, drive_rx) = mpsc::channel::<u64>();
             let drive_stop = stop.clone();
@@ -395,46 +413,19 @@ impl Runtime {
             let mut drive_generation = 0;
             let editor_stop = stop.clone();
             let editor_attached = attached.clone();
-            thread::spawn(move || {
-                let mut sessions = std::collections::HashMap::new();
-                while let Ok((epoch, request)) = editor_rx.recv() {
-                    if editor_stop.load(Ordering::Acquire) {
-                        break;
-                    }
-                    if editor_attached.load(Ordering::Acquire) != epoch {
-                        continue;
-                    }
-                    let result = match request {
-                        HostRequest::OpenEditor(request) => {
-                            let result = ira_core::editor::open_document(
-                                request.document_id,
-                                &request.target.path,
-                            );
-                            sessions.clear();
-                            if let Ok(document) = &result {
-                                sessions.insert(document.id, EditorSession::new(document.clone()));
-                            }
-                            EditorResult::Opened(epoch, request, result)
-                        }
-                        HostRequest::SaveEditor(snapshot) => {
-                            let result = sessions
-                                .get(&snapshot.document_id)
-                                .ok_or_else(|| EditorError("Editor session closed".into()))
-                                .and_then(|session| session.save(&snapshot));
-                            EditorResult::Saved(
-                                epoch,
-                                snapshot.document_id,
-                                snapshot.edit_revision,
-                                result,
-                            )
-                        }
-                        _ => continue,
-                    };
-                    if editor_done.send(result).is_err() {
-                        break;
-                    }
-                }
-            });
+            if let Err(error) = thread::Builder::new().spawn(move || {
+                editor_worker(
+                    editor_rx,
+                    editor_done,
+                    editor_stop,
+                    editor_attached,
+                    editor_settlement,
+                );
+            }) {
+                *editor_tx.error.borrow_mut() =
+                    Some(format!("Editor worker spawn failed: {error}"));
+                editor_tx.sender.borrow_mut().take();
+            }
             let mut chooser = chooser_runtime::ActorChooser::default();
             let (chooser_pending_tx, chooser_pending_rx) = mpsc::channel();
             let mut last_tick = Instant::now();
@@ -674,16 +665,40 @@ impl Runtime {
                 "actor terminating: core running false"
             });
             stop.store(true, Ordering::Release);
-            app.cancel_pending_work();
+            let core_seal = app.begin_shutdown_settlement();
             cancel_all(&app);
+            let editor_cutoff = editor_tx.seal();
             *actor_shutdown.lock().unwrap() = ShutdownState::Pending;
-            // A stop during async startup must not publish uninitialized defaults
-            // over the saved session. Original startup receipt stays owned offUI.
-            while app.is_initializing() {
-                app.tick();
+            // Original startup, active jobs and both serial lanes are independent.
+            // Poll all of them fairly; never tick, route hosts or apply stale results.
+            loop {
+                let core = app.poll_shutdown_settlement(&core_seal, 64);
+                let editor = editor_tx.poll(editor_cutoff);
+                let error = match (&core, &editor) {
+                    (WorkSettlement::Error(error), _) => Some(error.clone()),
+                    (_, Err(error)) => Some(error.clone()),
+                    _ => None,
+                };
+                if let Some(error) = error {
+                    *actor_shutdown.lock().unwrap() = ShutdownState::WorkError(error);
+                } else if matches!(&core, WorkSettlement::Settled(receipt) if core_seal.accepts(receipt))
+                    && matches!(editor, Ok(true))
+                {
+                    break;
+                } else {
+                    *actor_shutdown.lock().unwrap() = ShutdownState::Pending;
+                }
+                // Discard only bounded ordinary-result records; these confer no
+                // settlement authority and cannot resurrect business state/effects.
+                for _ in 0..64 {
+                    if editor_results.try_recv().is_err() {
+                        break;
+                    }
+                }
+                // A retry during work wait cannot manufacture an acknowledgement.
+                let _ = retry_requests.try_recv();
                 thread::sleep(Duration::from_millis(20));
             }
-            app.cancel_pending_work();
             app.persist_state();
             // Keep this ORIGINAL receipt and owner after timeout; only a checked
             // write success acknowledges the final accepted snapshot.
@@ -1141,6 +1156,125 @@ pub fn apply(app: &mut App, envelope: Envelope) -> Result<(), String> {
     Ok(())
 }
 
+// One actor-owned FIFO issuer and independent worker publication. Epochs remain
+// business-result guards; they never identify acknowledgements.
+#[derive(Default)]
+struct EditorSettlement {
+    #[cfg(test)]
+    hook: Option<EditorHook>,
+    through: AtomicU64,
+    exited: AtomicBool,
+}
+struct EditorExit(Arc<EditorSettlement>);
+impl Drop for EditorExit {
+    fn drop(&mut self) {
+        self.0.exited.store(true, Ordering::Release);
+    }
+}
+struct EditorDispatch {
+    sender: std::cell::RefCell<Option<mpsc::Sender<(u64, u64, HostRequest)>>>,
+    issued: std::cell::Cell<u64>,
+    error: std::cell::RefCell<Option<String>>,
+    settlement: Arc<EditorSettlement>,
+}
+impl EditorDispatch {
+    fn submit(&self, epoch: u64, request: HostRequest) {
+        if self.error.borrow().is_some() {
+            return;
+        }
+        let Some(sequence) = self.issued.get().checked_add(1) else {
+            *self.error.borrow_mut() = Some("Editor settlement sequence exhausted".into());
+            self.sender.borrow_mut().take();
+            return;
+        };
+        // Accounting precedes send; a failed delivery never leaves a silent hole.
+        self.issued.set(sequence);
+        let delivered = self
+            .sender
+            .borrow()
+            .as_ref()
+            .is_some_and(|sender| sender.send((sequence, epoch, request)).is_ok());
+        if !delivered {
+            *self.error.borrow_mut() = Some("Editor request channel disconnected or sealed".into());
+            self.sender.borrow_mut().take();
+        }
+    }
+    fn seal(&self) -> u64 {
+        self.sender.borrow_mut().take();
+        self.issued.get()
+    }
+    fn poll(&self, cutoff: u64) -> Result<bool, String> {
+        if let Some(error) = &*self.error.borrow() {
+            return Err(error.clone());
+        }
+        if self.settlement.through.load(Ordering::Acquire) >= cutoff {
+            return Ok(true);
+        }
+        if self.settlement.exited.load(Ordering::Acquire)
+            && self.settlement.through.load(Ordering::Acquire) < cutoff
+        {
+            return Err("Editor worker exited before sealed acknowledgement".into());
+        }
+        Ok(false)
+    }
+}
+fn editor_worker(
+    requests: Receiver<(u64, u64, HostRequest)>,
+    results: mpsc::Sender<EditorResult>,
+    stop: Arc<AtomicBool>,
+    attached: Arc<AtomicU64>,
+    settlement: Arc<EditorSettlement>,
+) {
+    let _exit = EditorExit(settlement.clone());
+    let mut sessions = std::collections::HashMap::new();
+    let mut expected = 1u64;
+    while let Ok((sequence, epoch, request)) = requests.recv() {
+        if sequence != expected {
+            break;
+        }
+        let result = if stop.load(Ordering::Acquire) || attached.load(Ordering::Acquire) != epoch {
+            None // Queued stopped/stale work is skipped, then acknowledged in FIFO order.
+        } else {
+            Some(match request {
+                HostRequest::OpenEditor(request) => {
+                    let result =
+                        ira_core::editor::open_document(request.document_id, &request.target.path);
+                    sessions.clear();
+                    if let Ok(document) = &result {
+                        sessions.insert(document.id, EditorSession::new(document.clone()));
+                    }
+                    EditorResult::Opened(epoch, request, result)
+                }
+                HostRequest::SaveEditor(snapshot) => {
+                    let result = sessions
+                        .get(&snapshot.document_id)
+                        .ok_or_else(|| EditorError("Editor session closed".into()))
+                        .and_then(|session| {
+                            #[cfg(test)]
+                            if let Some(hook) = &settlement.hook {
+                                hook();
+                            }
+                            session.save(&snapshot)
+                        });
+                    EditorResult::Saved(epoch, snapshot.document_id, snapshot.edit_revision, result)
+                }
+                _ => break,
+            })
+        };
+        // Save returned after staging rename/cleanup and post-save metadata.
+        settlement.through.store(sequence, Ordering::Release);
+        if let Some(result) = result {
+            // Even a disconnected business-result consumer cannot strand queued
+            // stopped items; the receipt lane remains independent of this channel.
+            let _ = results.send(result);
+        }
+        let Some(next) = expected.checked_add(1) else {
+            break;
+        };
+        expected = next;
+    }
+}
+
 enum EditorResult {
     Drives(
         u64,
@@ -1154,7 +1288,7 @@ fn route_host(
     app: &App,
     request: HostRequest,
     sequence: u64,
-    editor: &mpsc::Sender<(u64, HostRequest)>,
+    editor: &EditorDispatch,
     drives: &mpsc::Sender<u64>,
     completed: &mpsc::Sender<Completion>,
 ) {
@@ -1164,7 +1298,7 @@ fn route_host(
         request,
         HostRequest::OpenEditor(_) | HostRequest::SaveEditor(_)
     ) {
-        let _ = editor.send((app.window_generation, request));
+        editor.submit(app.window_generation, request);
     } else {
         let input_generation = matches!(
             request,
@@ -1196,7 +1330,7 @@ impl EffectGuard {
 fn synchronize_attachment(
     app: &mut App,
     epoch: u64,
-    editor: &mpsc::Sender<(u64, HostRequest)>,
+    editor: &EditorDispatch,
     drives: &mpsc::Sender<u64>,
     completed: &mpsc::Sender<Completion>,
     admission: &ActorAdmission,
@@ -1259,3 +1393,7 @@ impl Runtime {
 #[cfg(test)]
 #[path = "runtime_stop_admission_tests.rs"]
 mod stop_admission_tests;
+
+#[cfg(test)]
+#[path = "runtime_settlement_tests.rs"]
+mod settlement_tests;

@@ -51,6 +51,7 @@ impl Coordinator {
                     .collect::<Vec<_>>()
                     .join("; ")
             )),
+            Some(ShutdownState::WorkError(error)) => Status::PendingError(format!("Shutdown paused: {error}")),
             Some(ShutdownState::Disconnected) => {
                 Status::PendingError("Shutdown paused: persistence receipt disconnected".into())
             }
@@ -58,7 +59,7 @@ impl Coordinator {
                 Status::Ready
             }
             _ if self.started.elapsed() >= Duration::from_secs(2) => Status::PendingError(
-                "Shutdown paused: checked persistence or geometry receipt not confirmed".into(),
+                "Shutdown paused: accepted work, original startup, checked persistence or geometry not confirmed".into(),
             ),
             _ => Status::Waiting,
         }
