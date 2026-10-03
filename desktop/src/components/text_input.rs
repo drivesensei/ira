@@ -27,12 +27,15 @@ actions!(
         Cancel,
         Quit,
         Save,
-        Traverse
+        Traverse,
+        SearchTop,
+        SearchBottom
     ]
 );
 #[derive(Clone, Debug)]
 pub struct InputOptions {
     pub multiline: bool,
+    pub search: bool,
     pub placeholder: SharedString,
     pub access: InputAccess,
     pub document_generation: u64,
@@ -55,6 +58,7 @@ impl Default for InputOptions {
     fn default() -> Self {
         Self {
             multiline: false,
+            search: false,
             placeholder: "".into(),
             access: InputAccess::Editable,
             document_generation: 0,
@@ -70,6 +74,15 @@ pub enum InputEventKind {
     Quit,
     Save(String),
     Traverse,
+    SearchNavigate(SearchNavigation),
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchNavigation {
+    Open,
+    Previous,
+    Next,
+    Top,
+    Bottom,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputEvent {
@@ -84,10 +97,14 @@ pub fn register(cx: &mut App) {
         KeyBinding::new("right", Right, Some("IraNativeInput")),
         KeyBinding::new("shift-left", SelectLeft, Some("IraNativeInput")),
         KeyBinding::new("shift-right", SelectRight, Some("IraNativeInput")),
-        KeyBinding::new("up", Up, Some("IraNativeInput")),
-        KeyBinding::new("down", Down, Some("IraNativeInput")),
-        KeyBinding::new("shift-up", SelectUp, Some("IraNativeInput")),
-        KeyBinding::new("shift-down", SelectDown, Some("IraNativeInput")),
+        KeyBinding::new("up", Up, Some("IraNativeEditor")),
+        KeyBinding::new("up", Up, Some("IraNativeSearch")),
+        KeyBinding::new("alt-up", SearchTop, Some("IraNativeSearch")),
+        KeyBinding::new("down", Down, Some("IraNativeEditor")),
+        KeyBinding::new("down", Down, Some("IraNativeSearch")),
+        KeyBinding::new("alt-down", SearchBottom, Some("IraNativeSearch")),
+        KeyBinding::new("shift-up", SelectUp, Some("IraNativeEditor")),
+        KeyBinding::new("shift-down", SelectDown, Some("IraNativeEditor")),
         KeyBinding::new("home", Home, Some("IraNativeInput")),
         KeyBinding::new("end", End, Some("IraNativeInput")),
         KeyBinding::new("ctrl-a", Home, Some("IraNativeEditor")),
@@ -191,6 +208,7 @@ impl TextInput {
                 .checked_add(1)
                 .expect("input revision exhausted");
             self.last_text = self.buffer.text().to_owned();
+            self.lines.clear();
         }
         self.emit(InputEventKind::Changed(self.snapshot()), cx);
         cx.notify();
@@ -260,6 +278,11 @@ impl TextInput {
         self.changed(cx);
     }
     fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
+        if self.options.search {
+            self.emit(InputEventKind::SearchNavigate(SearchNavigation::Open), cx);
+            cx.stop_propagation();
+            return;
+        }
         self.buffer.horizontal(true, false);
         self.changed(cx);
     }
@@ -272,12 +295,25 @@ impl TextInput {
         self.changed(cx);
     }
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+        if self.options.search {
+            self.emit(
+                InputEventKind::SearchNavigate(SearchNavigation::Previous),
+                cx,
+            );
+            cx.stop_propagation();
+            return;
+        }
         if self.options.multiline {
             self.buffer.vertical(false, false);
             self.changed(cx);
         }
     }
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
+        if self.options.search {
+            self.emit(InputEventKind::SearchNavigate(SearchNavigation::Next), cx);
+            cx.stop_propagation();
+            return;
+        }
         if self.options.multiline {
             self.buffer.vertical(true, false);
             self.changed(cx);
@@ -351,6 +387,14 @@ impl TextInput {
     }
     fn save(&mut self, _: &Save, _: &mut Window, cx: &mut Context<Self>) {
         self.emit(InputEventKind::Save(self.buffer.text().to_string()), cx);
+        cx.stop_propagation();
+    }
+    fn search_top(&mut self, _: &SearchTop, _: &mut Window, cx: &mut Context<Self>) {
+        self.emit(InputEventKind::SearchNavigate(SearchNavigation::Top), cx);
+        cx.stop_propagation();
+    }
+    fn search_bottom(&mut self, _: &SearchBottom, _: &mut Window, cx: &mut Context<Self>) {
+        self.emit(InputEventKind::SearchNavigate(SearchNavigation::Bottom), cx);
         cx.stop_propagation();
     }
     fn traverse(&mut self, _: &Traverse, _: &mut Window, cx: &mut Context<Self>) {
@@ -586,7 +630,7 @@ impl Element for InputElement {
         cx: &mut App,
     ) {
         let focus = self.input.read(cx).focus_handle.clone();
-        if self.input.read(cx).editable() {
+        if self.input.read(cx).options.access != InputAccess::Disabled {
             w.handle_input(
                 &focus,
                 ElementInputHandler::new(bounds, self.input.clone()),
@@ -599,10 +643,11 @@ impl Element for InputElement {
         for (_, line, b) in &paint.lines {
             let _ = line.paint(b.origin, w.line_height(), w, cx);
         }
-        if focus.is_focused(w) {
-            if let Some(caret) = paint.caret.take() {
-                w.paint_quad(caret);
-            }
+        if focus.is_focused(w)
+            && self.input.read(cx).options.access != InputAccess::Disabled
+            && let Some(caret) = paint.caret.take()
+        {
+            w.paint_quad(caret);
         }
         let lines = std::mem::take(&mut paint.lines);
         self.input.update(cx, |input, _| input.lines = lines);
@@ -616,6 +661,8 @@ impl Render for TextInput {
                 "IraDisabledInput"
             } else if self.options.multiline {
                 "IraNativeInput IraNativeEditor"
+            } else if self.options.search {
+                "IraNativeInput IraNativeSearch"
             } else {
                 "IraNativeInput"
             })
@@ -644,6 +691,8 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::quit))
             .on_action(cx.listener(Self::save))
             .on_action(cx.listener(Self::traverse))
+            .on_action(cx.listener(Self::search_top))
+            .on_action(cx.listener(Self::search_bottom))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, w, cx| {
