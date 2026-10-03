@@ -108,7 +108,7 @@ async fn registered_browse_actions_use_one_retained_receiver_and_shutdown_bypass
         replacement
             .update(cx, |_, window, _| window.activate_window())
             .unwrap();
-        assert_eq!(cx.active_window(), Some(replacement.into()));
+        assert!(cx.active_window() == Some(replacement.into()));
         cx.dispatch_action(&actions::BrowseFolder);
         tick_chooser(cx);
         assert!(cx.global::<Session>().chooser.active().is_some());
