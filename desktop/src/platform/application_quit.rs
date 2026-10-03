@@ -410,8 +410,8 @@ mod mac {
                     self.proxy.ivars().requests.phase.set(Phase::Cancelling);
                     self.app.reply(false);
                 }
-                // A synchronous cancellation may have installed another delegate.
-                if self.check_delegate().is_ok() {
+                // Cancellation can change delegate OR platform ownership.
+                if self.check_delegate().is_ok() && self.synchronize_returned_loop().is_ok() {
                     self.app.set_delegate(&self.proxy.ivars().original);
                 }
             }
