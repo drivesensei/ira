@@ -669,6 +669,7 @@ pub fn apply(app: &mut App, envelope: Envelope) -> Result<(), String> {
                     if let Some(slot) = app.panes[target.pane].selected.get_mut(index) {
                         *slot = selected;
                     }
+                    app.invalidate_pane_projection(target.pane);
                 }
                 TargetVerb::SelectOnly => {
                     let index = app.panes[target.pane]
@@ -680,6 +681,7 @@ pub fn apply(app: &mut App, envelope: Envelope) -> Result<(), String> {
                     if let Some(slot) = app.panes[target.pane].selected.get_mut(index) {
                         *slot = true;
                     }
+                    app.invalidate_pane_projection(target.pane);
                 }
                 TargetVerb::Open => app
                     .dispatch(Input::Key(KeyEvent::new(

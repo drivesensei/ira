@@ -806,10 +806,15 @@ fn accessibility_selected_is_idempotent_exclusive_and_generation_checked() {
     use ira_desktop::platform::accessibility::model::Action;
     let fixture = Fixture::new();
     let mut app = fixture.app();
+    let old = app.snapshot();
     let first = ax_entry(&app, Action::SetSelected(true));
     apply(&mut app, envelope(1, first)).unwrap();
     assert_eq!(app.panes[0].selected, vec![true, false]);
     assert_eq!(app.panes[0].state.selected(), Some(0));
+    let new = app.snapshot();
+    assert!(!old.panes[0].rows[0].selected);
+    assert!(new.panes[0].rows[0].selected);
+    assert!(!Arc::ptr_eq(&old.panes[0].rows, &new.panes[0].rows));
     let second = ax_entry(&app, Action::SetSelected(true));
     apply(&mut app, envelope(2, second)).unwrap();
     assert_eq!(app.panes[0].selected, vec![true, false]);
