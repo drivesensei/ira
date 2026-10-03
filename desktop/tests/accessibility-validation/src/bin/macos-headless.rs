@@ -2,7 +2,7 @@
 #[cfg(target_os = "macos")]
 fn main() {
     use ira_accessibility_validation::accessibility::{
-        ActionSink,
+        ActionSink, Rejection,
         macos::{BridgeError, NativeBridge},
         model::{AccessibilityModel, LayoutSnapshot},
     };
@@ -50,6 +50,20 @@ fn main() {
         !sink.is_closing(),
         "failed pre-attachment must not steal ownership of sink"
     );
+    sink.close();
+    assert!(
+        matches!(
+            NativeBridge::attach_unpublished(&BorrowedView(&view), sink.clone()),
+            Err(BridgeError::Dispatch(Rejection::Closing))
+        ),
+        "closed unpublished sink must reject before inspecting the native view"
+    );
+    assert!(matches!(
+        NativeBridge::attach(&BorrowedView(&view), sink.clone()),
+        Err(BridgeError::Dispatch(Rejection::Closing))
+    ));
+    let closed_after: usize = unsafe { msg_send![&*view, retainCount] };
+    assert_eq!(before, closed_after);
     assert!(view.window().is_none());
     println!(
         "PASS: legacy and unpublished main-thread view-only failed attachment balance retain; no NSWindow created"

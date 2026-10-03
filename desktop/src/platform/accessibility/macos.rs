@@ -75,7 +75,7 @@ define_class!(
         #[unsafe(method(setAccessibilitySelected:))]
         fn ax_set_selected(&self,selected:bool) {self.dispatch(Action::SetSelected(selected));}
         #[unsafe(method(isAccessibilityFocused))]
-        fn ax_focused(&self)->bool {self.ivars().state.upgrade().is_some_and(|s|s.attached.get() && s.tree.borrow().focused==Some(self.ivars().id))}
+        fn ax_focused(&self)->bool {self.ivars().state.upgrade().is_some_and(|s|s.is_attached() && s.tree.borrow().focused==Some(self.ivars().id))}
         #[unsafe(method(setAccessibilityFocused:))]
         fn ax_set_focused(&self,focused:bool) {if focused {self.dispatch(Action::Focus);}}
         #[unsafe(method(isAccessibilityModal))]
@@ -87,7 +87,7 @@ define_class!(
             self.node().and_then(|_|self.ivars().state.upgrade()).and_then(|s|s.frames.borrow().get(&self.ivars().id).copied()).unwrap_or_default()
         }
         #[unsafe(method(isAccessibilityHidden))]
-        fn ax_hidden(&self)->bool {self.ivars().state.upgrade().is_none_or(|s|!s.attached.get() || s.tree.borrow().query_node(self.ivars().id).is_none())}
+        fn ax_hidden(&self)->bool {self.ivars().state.upgrade().is_none_or(|s|!s.is_attached() || s.tree.borrow().query_node(self.ivars().id).is_none())}
         #[unsafe(method_id(accessibilityParent))]
         fn ax_parent(&self)->Option<Retained<AnyObject>> { (|| {
             let state=self.ivars().state.upgrade()?; let node=self.node()?;
@@ -95,13 +95,13 @@ define_class!(
         })() }
         #[unsafe(method_id(accessibilityChildren))]
         fn ax_children(&self)->Option<Retained<NSArray>> { (|| {
-            let state=self.ivars().state.upgrade()?; if !state.attached.get() {return None;} let node=state.tree.borrow().query_node(self.ivars().id)?.clone();
+            let state=self.ivars().state.upgrade()?; if !state.is_attached() {return None;} let node=state.tree.borrow().query_node(self.ivars().id)?.clone();
             let elements:Vec<Retained<AnyObject>>=node.children.iter().filter_map(|id|state.element(*id).map(|e|e.into_super().into_super().into_super())).collect();
             Some(NSArray::from_retained_slice(&elements))
         })() }
         #[unsafe(method_id(accessibilitySelectedChildren))]
         fn ax_selected_children(&self)->Option<Retained<NSArray>> { (|| {
-            let state=self.ivars().state.upgrade()?; if !state.attached.get() {return None;} let node=state.tree.borrow().query_node(self.ivars().id)?.clone();
+            let state=self.ivars().state.upgrade()?; if !state.is_attached() {return None;} let node=state.tree.borrow().query_node(self.ivars().id)?.clone();
             let ids:Vec<_>=node.children.iter().copied().filter(|id|state.tree.borrow().nodes.get(id).is_some_and(|n|n.selected)).collect();
             let elements:Vec<Retained<AnyObject>>=ids.into_iter().filter_map(|id|state.element(id).map(|e|e.into_super().into_super().into_super())).collect();
             Some(NSArray::from_retained_slice(&elements))
@@ -113,7 +113,7 @@ define_class!(
         })() }
         #[unsafe(method_id(accessibilityHitTest:))]
         fn ax_hit_test(&self,point:NSPoint)->Option<Retained<AnyObject>> { (|| {
-            let state=self.ivars().state.upgrade()?; self.node()?; if !state.attached.get() {return None;}
+            let state=self.ivars().state.upgrade()?; self.node()?; if !state.is_attached() {return None;}
             if let Some(frame)=state.prepared.borrow().as_ref() {
                 let frames=state.frames.borrow();
                 let id=frame.geometry.ordered_ids().find(|id|frames.get(id).is_some_and(|r|point.x>=r.origin.x && point.x<r.origin.x+r.size.width && point.y>=r.origin.y && point.y<r.origin.y+r.size.height))?;
@@ -195,7 +195,7 @@ impl AxElement {
     }
     fn node(&self) -> Option<Node> {
         let state = self.ivars().state.upgrade()?;
-        if !state.attached.get() {
+        if !state.is_attached() {
             return None;
         };
 
@@ -209,7 +209,7 @@ impl AxElement {
         let Some(state) = self.ivars().state.upgrade() else {
             return false;
         };
-        if !state.attached.get() {
+        if !state.is_attached() {
             return false;
         }
         let stamp = state.tree.borrow().stamp;
@@ -227,8 +227,11 @@ impl AxElement {
     }
 }
 impl MacState {
+    fn is_attached(&self) -> bool {
+        self.attached.get() && !self.sink.is_closing()
+    }
     fn element(self: &Rc<Self>, id: NodeId) -> Option<Retained<AxElement>> {
-        if !self.attached.get() || self.tree.borrow().query_node(id).is_none() {
+        if !self.is_attached() || self.tree.borrow().query_node(id).is_none() {
             return None;
         }
         if let Some(e) = self.elements.borrow().get(&id) {
@@ -292,6 +295,7 @@ impl NativeBridge {
         publish_initial: bool,
     ) -> Result<Self, BridgeError> {
         let mtm = MainThreadMarker::new().ok_or(BridgeError::WrongThread)?;
+        let tree = sink.attachment_tree().map_err(BridgeError::Dispatch)?;
         let handle =
             HasWindowHandle::window_handle(window).map_err(|_| BridgeError::WrongHandle)?;
         let RawWindowHandle::AppKit(raw) = handle.as_raw() else {
@@ -311,7 +315,6 @@ impl NativeBridge {
             return Err(BridgeError::AlreadyAttached);
         }
         let previous_element = view.isAccessibilityElement();
-        let tree = sink.current().map_err(BridgeError::Dispatch)?;
         let state = Rc::new(MacState {
             tree: RefCell::new(tree.clone()),
             prepared: RefCell::new(None),
@@ -344,6 +347,10 @@ impl NativeBridge {
         };
         if publish_initial {
             bridge.publish(tree)?;
+        }
+        // A close racing native binding invalidates queries immediately and rolls back attachment.
+        if bridge.state.sink.is_closing() {
+            return Err(BridgeError::Dispatch(Rejection::Closing));
         }
         Ok(bridge)
     }

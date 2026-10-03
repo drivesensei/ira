@@ -67,8 +67,11 @@ fn dispatch_error(e: Rejection) -> Error {
     })
 }
 impl State {
+    fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Acquire) || self.sink.is_closing()
+    }
     fn tree(&self) -> Result<Arc<SemanticTree>> {
-        if self.closing.load(Ordering::Acquire) {
+        if self.is_closing() {
             return Err(unavailable());
         };
         self.cache
@@ -78,7 +81,7 @@ impl State {
     }
     fn publication(&self) -> Result<(Arc<SemanticTree>, Option<Arc<PreparedFrame>>)> {
         let cache = self.cache.try_lock().map_err(|_| unavailable())?;
-        if self.closing.load(Ordering::Acquire) {
+        if self.is_closing() {
             return Err(unavailable());
         }
         Ok((cache.tree.clone(), cache.prepared.clone()))
@@ -102,6 +105,9 @@ impl State {
         .map_err(dispatch_error)
     }
     fn simple(self: &Arc<Self>, id: NodeId) -> Result<IRawElementProviderSimple> {
+        if self.is_closing() {
+            return Err(unavailable());
+        }
         self.materialized.record(id).map_err(dispatch_error)?;
         Ok(new_provider(self.clone(), id))
     }
@@ -109,7 +115,7 @@ impl State {
         self.simple(id)?.cast()
     }
     fn send(&self, id: NodeId, action: Action) -> Result<()> {
-        if self.closing.load(Ordering::Acquire) {
+        if self.is_closing() {
             return Err(unavailable());
         }
         let (stamp, key) = {
@@ -131,11 +137,11 @@ impl State {
         .map_err(dispatch_error)
     }
     fn frame(&self, id: NodeId) -> Result<Rect> {
-        if self.closing.load(Ordering::Acquire) {
+        if self.is_closing() {
             return Err(unavailable());
         };
         let cache = self.cache.try_lock().map_err(|_| unavailable())?;
-        if self.closing.load(Ordering::Acquire) || cache.tree.query_node(id).is_none() {
+        if self.is_closing() || cache.tree.query_node(id).is_none() {
             return Err(unavailable());
         }
         cache
@@ -270,7 +276,7 @@ impl IRawElementProviderSimple_Impl for Provider_Impl {
 impl IRawElementProviderFragment_Impl for Provider_Impl {
     fn Navigate(&self, direction: NavigateDirection) -> Result<IRawElementProviderFragment> {
         let cache = self.state.cache.try_lock().map_err(|_| unavailable())?;
-        if self.state.closing.load(Ordering::Acquire) {
+        if self.state.is_closing() {
             return Err(unavailable());
         }
         let direction = match direction {
@@ -333,7 +339,7 @@ impl IRawElementProviderFragment_Impl for Provider_Impl {
 impl IRawElementProviderFragmentRoot_Impl for Provider_Impl {
     fn ElementProviderFromPoint(&self, x: f64, y: f64) -> Result<IRawElementProviderFragment> {
         let cache = self.state.cache.try_lock().map_err(|_| unavailable())?;
-        if self.state.closing.load(Ordering::Acquire) || cache.tree.query_node(self.id).is_none() {
+        if self.state.is_closing() || cache.tree.query_node(self.id).is_none() {
             return Err(unavailable());
         }
         if let Some(frame) = &cache.prepared {
@@ -500,10 +506,7 @@ unsafe extern "system" fn subclass(
         Arc::increment_strong_count(pointer);
         Arc::from_raw(pointer)
     };
-    if message == WM_GETOBJECT
-        && lparam.0 as i32 == UiaRootObjectId
-        && !state.closing.load(Ordering::Acquire)
-    {
+    if message == WM_GETOBJECT && lparam.0 as i32 == UiaRootObjectId && !state.is_closing() {
         if let Ok(t) = state.tree()
             && let Ok(provider) = state.simple(t.root)
         {
@@ -544,6 +547,7 @@ impl NativeBridge {
         sink: ActionSink,
         publish_initial: bool,
     ) -> Result<Self> {
+        let tree = sink.attachment_tree().map_err(dispatch_error)?;
         let handle =
             HasWindowHandle::window_handle(window).map_err(|_| Error::from_hresult(E_HANDLE))?;
         let RawWindowHandle::Win32(raw) = handle.as_raw() else {
@@ -561,7 +565,6 @@ impl NativeBridge {
         {
             return Err(Error::from_hresult(E_FAIL));
         };
-        let tree = sink.current().map_err(dispatch_error)?;
         let state = Arc::new(State {
             cache: Mutex::new(Cached {
                 tree,
@@ -592,13 +595,16 @@ impl NativeBridge {
             let initial = bridge.state.tree()?;
             bridge.publish(initial)?;
         }
+        if bridge.state.is_closing() {
+            return Err(unavailable());
+        }
         Ok(bridge)
     }
     pub fn publish(&mut self, tree: Arc<SemanticTree>) -> Result<()> {
         if unsafe { GetCurrentThreadId() } != self.state.thread {
             return Err(Error::from_hresult(RPC_E_WRONG_THREAD));
         };
-        if self.state.closing.load(Ordering::Acquire) {
+        if self.state.is_closing() {
             return Err(unavailable());
         };
         let hwnd = HWND(self.state.hwnd as *mut _);
@@ -722,7 +728,7 @@ impl NativeBridge {
         if unsafe { GetCurrentThreadId() } != self.state.thread {
             return Err(Error::from_hresult(RPC_E_WRONG_THREAD));
         }
-        if self.state.closing.load(Ordering::Acquire) {
+        if self.state.is_closing() {
             return Err(unavailable());
         }
         if frame.key != expected || !frame.notifications.materialized_only {
