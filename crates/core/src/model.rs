@@ -10,6 +10,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 #[derive(Debug, Clone, Default)]
 pub struct Pane {
+    /// Actor-owned projection version; cursor-only changes do not advance it.
+    pub(crate) projection_generation: u64,
     pub folder: Option<Folder>,
     pub state: ListState,
     pub files: Vec<FEntry>,
