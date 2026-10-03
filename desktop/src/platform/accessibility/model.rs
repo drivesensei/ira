@@ -1,0 +1,674 @@
+//! Pure host semantic projection. No native objects, actor locks or filesystem reads.
+use ira_core::{input::InputContext, observable::Snapshot};
+use std::{collections::BTreeMap, ops::Range, path::PathBuf, sync::Arc};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NodeId {
+    pub window: u64,
+    pub serial: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    Window,
+    Group,
+    List,
+    Row,
+    Button,
+    Status,
+    Dialog,
+    TextField,
+    TextArea,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Target {
+    Window,
+    Pane(usize),
+    Entry {
+        pane: usize,
+        path: PathBuf,
+        listing_generation: u64,
+    },
+    Place {
+        kind: PlaceKind,
+        path: PathBuf,
+    },
+    Job(u64),
+    Modal,
+    Text {
+        document: u64,
+    },
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PlaceKind {
+    Drive,
+    Common,
+    Bookmark,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Action {
+    Focus,
+    Reveal,
+    Activate,
+    SetSelected(bool),
+    SelectOnly,
+    SetValue(String),
+    SetSelection(Range<usize>),
+    Dismiss,
+    Pause,
+    Cancel,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Capability {
+    Focus,
+    Activate,
+    Selection,
+    Value,
+    TextSelection,
+    Dismiss,
+    Pause,
+    Cancel,
+}
+impl Action {
+    pub fn capability(&self) -> Capability {
+        match self {
+            Self::Focus | Self::Reveal => Capability::Focus,
+            Self::Activate => Capability::Activate,
+            Self::SetSelected(_) | Self::SelectOnly => Capability::Selection,
+            Self::SetValue(_) => Capability::Value,
+            Self::SetSelection(_) => Capability::TextSelection,
+            Self::Dismiss => Capability::Dismiss,
+            Self::Pause => Capability::Pause,
+            Self::Cancel => Capability::Cancel,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+impl Rect {
+    pub fn valid(self) -> bool {
+        [self.x, self.y, self.width, self.height]
+            .iter()
+            .all(|x| x.is_finite())
+            && self.width > 0.0
+            && self.height > 0.0
+    }
+    pub fn contains(self, x: f64, y: f64) -> bool {
+        self.valid()
+            && x >= self.x
+            && y >= self.y
+            && x < self.x + self.width
+            && y < self.y + self.height
+    }
+    pub fn intersection(self, other: Self) -> Option<Self> {
+        let x = self.x.max(other.x);
+        let y = self.y.max(other.y);
+        let r = Self {
+            x,
+            y,
+            width: (self.x + self.width).min(other.x + other.width) - x,
+            height: (self.y + self.height).min(other.y + other.height) - y,
+        };
+        r.valid().then_some(r)
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Geometry {
+    pub bounds: Rect,
+    pub visible: Rect,
+}
+#[derive(Clone, Debug, Default)]
+pub struct LayoutSnapshot {
+    pub window_generation: u64,
+    pub semantic_revision: u64,
+    pub revision: u64,
+    pub nodes: BTreeMap<NodeId, Geometry>,
+}
+impl LayoutSnapshot {
+    /// Only record bounds collected from actual GPUI layout/prepaint; clip before native hit testing.
+    pub fn record(&mut self, id: NodeId, bounds: Rect, clip: Rect) -> bool {
+        if !bounds.valid() || !clip.valid() || id.window != self.window_generation {
+            self.nodes.remove(&id);
+            return false;
+        }
+        if let Some(visible) = bounds.intersection(clip) {
+            self.nodes.insert(id, Geometry { bounds, visible });
+            true
+        } else {
+            self.nodes.remove(&id);
+            false
+        }
+    }
+}
+#[derive(Clone, Debug)]
+pub struct NativeTextSnapshot {
+    pub document_generation: u64,
+    pub focus_generation: u64,
+    pub revision: u64,
+    pub text: Arc<str>,
+    pub selection_utf16: Range<usize>,
+    pub marked_utf16: Option<Range<usize>>,
+    pub read_only: bool,
+    pub disabled: bool,
+    pub multiline: bool,
+}
+#[derive(Clone, Debug)]
+pub struct Node {
+    pub id: NodeId,
+    pub parent: Option<NodeId>,
+    pub role: Role,
+    pub name: String,
+    pub value: Option<Arc<str>>,
+    pub help: Option<String>,
+    pub children: Vec<NodeId>,
+    pub enabled: bool,
+    pub focusable: bool,
+    pub selected: bool,
+    pub read_only: bool,
+    pub busy: bool,
+    pub capabilities: Vec<Capability>,
+    pub target: Target,
+    pub geometry: Option<Geometry>,
+    pub text_selection: Option<Range<usize>>,
+    pub marked_text: Option<Range<usize>>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stamp {
+    pub window: u64,
+    pub focus: u64,
+    pub document: u64,
+    pub revision: u64,
+    pub text_revision: u64,
+}
+#[derive(Clone, Debug)]
+pub struct SemanticTree {
+    pub stamp: Stamp,
+    pub layout_revision: u64,
+    pub root: NodeId,
+    pub focused: Option<NodeId>,
+    pub active_modal: Option<NodeId>,
+    pub nodes: BTreeMap<NodeId, Node>,
+}
+impl SemanticTree {
+    pub fn hit_test(&self, x: f64, y: f64) -> Option<NodeId> {
+        fn visit(t: &SemanticTree, id: NodeId, x: f64, y: f64) -> Option<NodeId> {
+            let n = t.nodes.get(&id)?;
+            for child in n.children.iter().rev() {
+                if let Some(found) = visit(t, *child, x, y) {
+                    return Some(found);
+                }
+            }
+            n.geometry.filter(|g| g.visible.contains(x, y)).map(|_| id)
+        }
+        visit(self, self.active_modal.unwrap_or(self.root), x, y)
+    }
+    pub fn in_modal_scope(&self, id: NodeId) -> bool {
+        let Some(modal) = self.active_modal else {
+            return true;
+        };
+        let mut node = Some(id);
+        while let Some(id) = node {
+            if id == modal {
+                return true;
+            };
+            node = self.nodes.get(&id).and_then(|n| n.parent);
+        }
+        false
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Identity {
+    Named(String),
+    Entry(usize, PathBuf, PathBuf),
+    Place(PlaceKind, PathBuf),
+    Job(u64),
+    Text(u64),
+    Modal(u64, String),
+}
+#[derive(Default)]
+pub struct AccessibilityModel {
+    window: Option<u64>,
+    next: u64,
+    registry: BTreeMap<Identity, NodeId>,
+}
+impl AccessibilityModel {
+    fn id(&mut self, key: Identity, window: u64) -> NodeId {
+        if let Some(id) = self.registry.get(&key) {
+            return *id;
+        }
+        self.next += 1;
+        let id = NodeId {
+            window,
+            serial: self.next,
+        };
+        self.registry.insert(key, id);
+        id
+    }
+    fn add(
+        &mut self,
+        t: &mut SemanticTree,
+        key: Identity,
+        parent: Option<NodeId>,
+        role: Role,
+        name: String,
+        target: Target,
+    ) -> NodeId {
+        let id = self.id(key, t.stamp.window);
+        t.nodes.insert(
+            id,
+            Node {
+                id,
+                parent,
+                role,
+                name,
+                value: None,
+                help: None,
+                children: vec![],
+                enabled: true,
+                focusable: false,
+                selected: false,
+                read_only: false,
+                busy: false,
+                capabilities: vec![],
+                target,
+                geometry: None,
+                text_selection: None,
+                marked_text: None,
+            },
+        );
+        if let Some(p) = parent
+            && let Some(n) = t.nodes.get_mut(&p)
+        {
+            n.children.push(id);
+        }
+        id
+    }
+    pub fn project(
+        &mut self,
+        s: &Snapshot,
+        text: Option<&NativeTextSnapshot>,
+        layout: &LayoutSnapshot,
+    ) -> SemanticTree {
+        if self.window != Some(s.window_generation) {
+            self.registry.clear();
+            self.next = 0;
+            self.window = Some(s.window_generation);
+        }
+        let root = self.id(Identity::Named("root".into()), s.window_generation);
+        let mut t = SemanticTree {
+            stamp: Stamp {
+                window: s.window_generation,
+                focus: s.focus_generation,
+                document: s.document_generation,
+                revision: s.revision,
+                text_revision: text
+                    .filter(|x| {
+                        x.document_generation == s.document_generation
+                            && x.focus_generation == s.focus_generation
+                    })
+                    .map(|x| x.revision)
+                    .unwrap_or(0),
+            },
+            layout_revision: layout.revision,
+            root,
+            focused: None,
+            active_modal: None,
+            nodes: BTreeMap::new(),
+        };
+        self.add(
+            &mut t,
+            Identity::Named("root".into()),
+            None,
+            Role::Window,
+            "IRA file manager".into(),
+            Target::Window,
+        );
+        for pane in 0..if s.split { 2 } else { 1 } {
+            let p = &s.panes[pane];
+            let dir = PathBuf::from(p.folder.as_ref().map(|f| f.path.as_str()).unwrap_or(""));
+            let id = self.add(
+                &mut t,
+                Identity::Named(format!("pane-{pane}")),
+                Some(root),
+                Role::List,
+                format!(
+                    "{} files — {}",
+                    if pane == 0 { "Left" } else { "Right" },
+                    dir.display()
+                ),
+                Target::Pane(pane),
+            );
+            let n = t.nodes.get_mut(&id).unwrap();
+            n.busy = !p.listing_settled;
+            n.help = Some(format!(
+                "{} items; {} selected{}",
+                p.rows.len(),
+                p.selected_paths.len(),
+                if p.filter_query.is_some() {
+                    "; filtered"
+                } else {
+                    ""
+                }
+            ));
+            for (i, row) in p.rows.iter().enumerate() {
+                let path = PathBuf::from(&row.entry.path);
+                let row_id = self.add(
+                    &mut t,
+                    Identity::Entry(pane, dir.clone(), path.clone()),
+                    Some(id),
+                    Role::Row,
+                    format!(
+                        "{}{}",
+                        path.file_name()
+                            .unwrap_or(path.as_os_str())
+                            .to_string_lossy(),
+                        if row.entry.is_dir {
+                            " — folder"
+                        } else {
+                            " — file"
+                        }
+                    ),
+                    Target::Entry {
+                        pane,
+                        path,
+                        listing_generation: p.listing_generation,
+                    },
+                );
+                let n = t.nodes.get_mut(&row_id).unwrap();
+                n.selected = row.selected;
+                n.busy = row.deleting;
+                n.focusable = true;
+                n.help = Some(format!(
+                    "{} bytes; modified {}",
+                    row.entry.size,
+                    row.entry
+                        .modified
+                        .map(|m| m.to_string())
+                        .unwrap_or_else(|| "unknown".into())
+                ));
+                n.capabilities = vec![
+                    Capability::Focus,
+                    Capability::Activate,
+                    Capability::Selection,
+                ];
+                if matches!(s.input_context,InputContext::Pane(active) if active==pane)
+                    && p.cursor == Some(i)
+                {
+                    t.focused = Some(row_id);
+                }
+            }
+            if p.rows.is_empty() {
+                t.nodes.get_mut(&id).unwrap().help = Some(
+                    if !p.listing_settled {
+                        "Loading"
+                    } else if p.filter_query.is_some() {
+                        "No matches"
+                    } else {
+                        "Empty folder"
+                    }
+                    .into(),
+                );
+            }
+        }
+        for (kind, name, places) in [
+            (PlaceKind::Drive, "Drives", &s.drives),
+            (PlaceKind::Common, "Common folders", &s.folders),
+            (PlaceKind::Bookmark, "Bookmarks", &s.bookmarks),
+        ] {
+            let group = self.add(
+                &mut t,
+                Identity::Named(name.into()),
+                Some(root),
+                Role::Group,
+                name.into(),
+                Target::Window,
+            );
+            for p in places.iter().flatten() {
+                let path = PathBuf::from(&p.path);
+                let id = self.add(
+                    &mut t,
+                    Identity::Place(kind, path.clone()),
+                    Some(group),
+                    Role::Button,
+                    format!("{} ({})", p.label, p.shortcut),
+                    Target::Place { kind, path },
+                );
+                let n = t.nodes.get_mut(&id).unwrap();
+                n.focusable = true;
+                n.capabilities = vec![Capability::Activate];
+            }
+        }
+        if s.copy_board {
+            let group = self.add(
+                &mut t,
+                Identity::Named("jobs".into()),
+                Some(root),
+                Role::List,
+                "Copy Board".into(),
+                Target::Window,
+            );
+            for (i, job) in s.jobs.iter().enumerate() {
+                let id = self.add(
+                    &mut t,
+                    Identity::Job(job.id),
+                    Some(group),
+                    Role::Row,
+                    format!("{} — {:?}", job.label, job.status),
+                    Target::Job(job.id),
+                );
+                let n = t.nodes.get_mut(&id).unwrap();
+                n.value = Some(
+                    format!(
+                        "{} of {} bytes",
+                        job.copied_bytes,
+                        job.total_bytes
+                            .map(|x| x.to_string())
+                            .unwrap_or("unknown".into())
+                    )
+                    .into(),
+                );
+                let live = matches!(
+                    job.status,
+                    ira_core::services::transfer::JobStatus::Running
+                        | ira_core::services::transfer::JobStatus::Queued
+                        | ira_core::services::transfer::JobStatus::Paused
+                );
+                n.focusable = true;
+                n.busy = live;
+                n.capabilities = if live {
+                    vec![Capability::Focus, Capability::Pause, Capability::Cancel]
+                } else {
+                    vec![Capability::Focus]
+                };
+                if matches!(s.input_context, InputContext::Board) && s.copy_board_cursor == Some(i)
+                {
+                    t.focused = Some(id);
+                }
+                if live {
+                    for (suffix, name, capability) in [
+                        ("pause", "Pause or resume", Capability::Pause),
+                        ("cancel", "Cancel", Capability::Cancel),
+                    ] {
+                        let button = self.add(
+                            &mut t,
+                            Identity::Named(format!("job-{}-{suffix}", job.id)),
+                            Some(id),
+                            Role::Button,
+                            format!("{name} {}", job.label),
+                            Target::Job(job.id),
+                        );
+                        t.nodes.get_mut(&button).unwrap().capabilities = vec![capability];
+                    }
+                }
+            }
+        }
+        if let Some(status) = &s.status {
+            let id = self.add(
+                &mut t,
+                Identity::Named("status".into()),
+                Some(root),
+                Role::Status,
+                status.text.clone(),
+                Target::Window,
+            );
+            t.nodes.get_mut(&id).unwrap().read_only = true;
+        }
+        let modal_name = match s.input_context {
+            InputContext::Rename => Some("Rename"),
+            InputContext::Goto => Some("Go to path"),
+            InputContext::Create => Some("Create new entry"),
+            InputContext::Help => Some("Keybindings"),
+            InputContext::Error => Some("Error"),
+            InputContext::Deletion => Some("Deletion progress"),
+            InputContext::MultiInfo => Some("Selection information"),
+            InputContext::Info => Some("File information"),
+            InputContext::Confirmation => Some("Confirm operation"),
+            _ => None,
+        };
+        let modal = modal_name.map(|name| {
+            let id = self.add(
+                &mut t,
+                Identity::Modal(s.focus_generation, name.into()),
+                Some(root),
+                Role::Dialog,
+                name.into(),
+                Target::Modal,
+            );
+            let n = t.nodes.get_mut(&id).unwrap();
+            n.focusable = true;
+            n.capabilities = vec![Capability::Dismiss];
+            n.value = s
+                .confirming
+                .as_ref()
+                .map(|c| Arc::from(format!("{} — {:?}", c.label, c.policy)))
+                .or_else(|| s.info.as_ref().map(|i| Arc::from(i.lines.join("\n"))))
+                .or_else(|| {
+                    s.status
+                        .as_ref()
+                        .filter(|x| x.is_error)
+                        .map(|x| Arc::from(x.text.as_str()))
+                });
+            t.active_modal = Some(id);
+            t.focused = Some(id);
+            if matches!(s.input_context, InputContext::Confirmation) {
+                let confirm = self.add(
+                    &mut t,
+                    Identity::Modal(s.focus_generation, "Confirm button".into()),
+                    Some(id),
+                    Role::Button,
+                    "Confirm".into(),
+                    Target::Modal,
+                );
+                t.nodes.get_mut(&confirm).unwrap().capabilities = vec![Capability::Activate];
+            }
+            let cancel = self.add(
+                &mut t,
+                Identity::Modal(s.focus_generation, "Dismiss button".into()),
+                Some(id),
+                Role::Button,
+                "Close or cancel".into(),
+                Target::Modal,
+            );
+            t.nodes.get_mut(&cancel).unwrap().capabilities = vec![Capability::Dismiss];
+            id
+        });
+        if let Some(text) = text.filter(|x| {
+            x.document_generation == s.document_generation
+                && x.focus_generation == s.focus_generation
+        }) {
+            let editing = matches!(
+                s.input_context,
+                InputContext::Editor
+                    | InputContext::Rename
+                    | InputContext::Goto
+                    | InputContext::Create
+                    | InputContext::Search
+            );
+            if editing {
+                let id = self.add(
+                    &mut t,
+                    Identity::Text(text.document_generation),
+                    Some(modal.unwrap_or(root)),
+                    if text.multiline {
+                        Role::TextArea
+                    } else {
+                        Role::TextField
+                    },
+                    modal_name
+                        .unwrap_or(if text.multiline {
+                            "File editor"
+                        } else {
+                            "Search"
+                        })
+                        .into(),
+                    Target::Text {
+                        document: text.document_generation,
+                    },
+                );
+                let n = t.nodes.get_mut(&id).unwrap();
+                n.value = Some(text.text.clone());
+                n.read_only = text.read_only;
+                n.enabled = !text.disabled;
+                n.focusable = true;
+                n.capabilities = vec![Capability::Focus, Capability::TextSelection];
+                if !text.read_only && !text.disabled {
+                    n.capabilities.push(Capability::Value);
+                }
+                if valid_text_range(&text.text, &text.selection_utf16) {
+                    n.text_selection = Some(text.selection_utf16.clone());
+                }
+                n.marked_text = text
+                    .marked_utf16
+                    .clone()
+                    .filter(|r| valid_text_range(&text.text, r));
+                t.focused = Some(id);
+            }
+        }
+        let coherent = layout.window_generation == s.window_generation
+            && layout.semantic_revision == s.revision;
+        for n in t.nodes.values_mut() {
+            if coherent {
+                n.geometry = layout.nodes.get(&n.id).copied().filter(|g| {
+                    g.bounds.valid()
+                        && g.visible.valid()
+                        && g.bounds.intersection(g.visible) == Some(g.visible)
+                });
+            }
+        }
+        if let Some(modal) = t.active_modal {
+            t.nodes.get_mut(&root).unwrap().children = vec![modal];
+            let background: Vec<_> = t
+                .nodes
+                .keys()
+                .copied()
+                .filter(|id| !t.in_modal_scope(*id))
+                .collect();
+            for id in background {
+                let n = t.nodes.get_mut(&id).unwrap();
+                n.enabled = false;
+                n.capabilities.clear();
+            }
+        }
+        t
+    }
+}
+
+/// UTF-16 ranges may not bisect a scalar (e.g. the surrogate pair for emoji).
+pub fn valid_text_range(text: &str, range: &Range<usize>) -> bool {
+    if range.start > range.end {
+        return false;
+    }
+    let mut offset = 0;
+    let mut start = range.start == 0;
+    let mut end = range.end == 0;
+    for ch in text.chars() {
+        offset += ch.len_utf16();
+        start |= offset == range.start;
+        end |= offset == range.end;
+    }
+    start && end
+}
