@@ -19,7 +19,7 @@ pub enum Role {
     TextField,
     TextArea,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Target {
     Window,
     Pane(usize),
@@ -31,6 +31,8 @@ pub enum Target {
     Place {
         kind: PlaceKind,
         path: PathBuf,
+        shortcut: char,
+        occurrence: usize,
     },
     Job(u64),
     Modal,
@@ -38,7 +40,7 @@ pub enum Target {
         document: u64,
     },
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PlaceKind {
     Drive,
     Common,
@@ -224,7 +226,7 @@ impl SemanticTree {
 enum Identity {
     Named(String),
     Entry(usize, PathBuf, PathBuf),
-    Place(PlaceKind, PathBuf),
+    Place(PlaceKind, PathBuf, char, usize),
     Job(u64),
     Text(u64),
     Modal(u64, String),
@@ -236,6 +238,28 @@ pub struct AccessibilityModel {
     registry: BTreeMap<Identity, NodeId>,
 }
 impl AccessibilityModel {
+    /// Override semantic cursor focus only with a host-observed actual focused control.
+    /// The host owns native FocusHandles; this never navigates or mutates the actor snapshot.
+    pub fn project_with_host_focus(
+        &mut self,
+        snapshot: &Snapshot,
+        text: Option<&NativeTextSnapshot>,
+        layout: &LayoutSnapshot,
+        host_focused: Option<NodeId>,
+    ) -> SemanticTree {
+        let mut tree = self.project(snapshot, text, layout);
+        if let Some(id) = host_focused
+            && tree
+                .nodes
+                .get(&id)
+                .is_some_and(|node| node.enabled && node.focusable)
+            && tree.in_modal_scope(id)
+        {
+            tree.focused = Some(id);
+        }
+        tree
+    }
+
     fn id(&mut self, key: Identity, window: u64) -> NodeId {
         if let Some(id) = self.registry.get(&key) {
             return *id;
@@ -427,19 +451,28 @@ impl AccessibilityModel {
                 name.into(),
                 Target::Window,
             );
+            let mut occurrences = BTreeMap::<(PathBuf, char), usize>::new();
             for p in places.iter().flatten() {
                 let path = PathBuf::from(&p.path);
+                let next = occurrences.entry((path.clone(), p.shortcut)).or_default();
+                let occurrence = *next;
+                *next += 1;
                 let id = self.add(
                     &mut t,
-                    Identity::Place(kind, path.clone()),
+                    Identity::Place(kind, path.clone(), p.shortcut, occurrence),
                     Some(group),
                     Role::Button,
                     format!("{} ({})", p.label, p.shortcut),
-                    Target::Place { kind, path },
+                    Target::Place {
+                        kind,
+                        path,
+                        shortcut: p.shortcut,
+                        occurrence,
+                    },
                 );
                 let n = t.nodes.get_mut(&id).unwrap();
                 n.focusable = true;
-                n.capabilities = vec![Capability::Activate];
+                n.capabilities = vec![Capability::Focus, Capability::Activate];
             }
         }
         if s.copy_board {

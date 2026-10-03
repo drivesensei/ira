@@ -1,3 +1,5 @@
+// Keep fixtures compatible with both Vec and the agreed Arc<Vec> snapshot contract.
+#![allow(clippy::useless_conversion)]
 use ira_accessibility_validation::accessibility::{model::*, *};
 use ira_core::{
     application::App,
@@ -23,8 +25,8 @@ fn fixture() -> Snapshot {
     s.panes[0].listing_generation = 5;
     s.panes[0].listing_settled = true;
     s.panes[0].cursor = Some(0);
-    s.panes[0].rows = vec![row("a.txt", false), row("日本語.txt", true)];
-    s.panes[0].selected_paths = vec![PathBuf::from("/synthetic-fixture/日本語.txt")];
+    s.panes[0].rows = vec![row("a.txt", false), row("日本語.txt", true)].into();
+    s.panes[0].selected_paths = vec![PathBuf::from("/synthetic-fixture/日本語.txt")].into();
     s
 }
 fn row(name: &str, selected: bool) -> Row {
@@ -64,7 +66,13 @@ fn stable_ids_across_sorting_and_refresh() {
     let mut s = fixture();
     let first = m.project(&s, None, &LayoutSnapshot::default());
     let id = entry(&first, "a.txt");
-    s.panes[0].rows.reverse();
+    s.panes[0].rows = s.panes[0]
+        .rows
+        .iter()
+        .cloned()
+        .rev()
+        .collect::<Vec<_>>()
+        .into();
     s.panes[0].listing_generation += 1;
     s.revision += 1;
     let after = m.project(&s, None, &LayoutSnapshot::default());
