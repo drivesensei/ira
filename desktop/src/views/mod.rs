@@ -1,4 +1,5 @@
 pub mod accessibility;
+pub mod accessibility_worker;
 pub mod preview;
 pub mod rows;
 use crate::platform::accessibility::{

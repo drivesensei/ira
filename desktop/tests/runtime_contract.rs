@@ -799,6 +799,7 @@ fn ax_entry(app: &App, action: ira_desktop::platform::accessibility::model::Acti
             listing_generation: app.panes[0].listing_generation,
         },
         action,
+        prepared_key: None,
     })
 }
 #[test]
