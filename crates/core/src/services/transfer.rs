@@ -399,27 +399,6 @@ pub fn rename_no_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Publishes a privately owned staged entry without replacing a public target.
-/// The caller must own `src`; Windows file publication uses a hard-link reservation.
-pub fn publish_private_no_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
-    #[cfg(windows)]
-    {
-        if fs::symlink_metadata(src)?.is_dir() {
-            let _ = dst;
-            return Err(std::io::Error::new(
-                ErrorKind::Unsupported,
-                "atomic directory publication requires a Windows no-replace provider",
-            ));
-        }
-        fs::hard_link(src, dst)?;
-        fs::remove_file(src)
-    }
-    #[cfg(not(windows))]
-    {
-        rename_no_replace(src, dst)
-    }
-}
-
 static NEXT_STAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 fn create_stage(parent: &Path) -> Result<std::path::PathBuf, JobError> {
     loop {
