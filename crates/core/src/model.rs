@@ -200,6 +200,7 @@ pub struct EditState {
     pub content: String,
     pub document_id: u64,
     pub edit_revision: u64,
+    pub last_saved_revision: Option<u64>,
     /// Any keypress actually modified the buffer.
     pub dirty: bool,
     /// Opened without write access: the buffer renders but never saves.
@@ -258,13 +259,13 @@ pub struct EntryTarget {
     pub listing_generation: u64,
 }
 #[derive(Debug, Clone)]
-pub struct SaveSnapshot {
+pub struct OpenEditorRequest {
     pub document_id: u64,
-    pub base_document: PathBuf,
-    pub mtime: Option<SystemTime>,
-    pub edit_revision: u64,
-    pub content: String,
+    pub target: EntryTarget,
+    pub document_generation: u64,
+    pub focus_generation: u64,
 }
+pub use crate::editor::SaveSnapshot;
 /// Host-only interactions, drained without executing native work in a view.
 #[derive(Debug, Clone)]
 pub enum HostRequest {
@@ -277,10 +278,15 @@ pub enum HostRequest {
     Terminal(PathBuf),
     OpenFile(PathBuf),
     RefreshDrives,
-    EditorKey(crate::input::KeyEvent),
-    EditorPaste(String),
-    SaveEditor {
+    InvalidatePreview(PathBuf),
+    EditorKey {
         document_id: u64,
+        key: crate::input::KeyEvent,
     },
-    OpenEditor(EntryTarget),
+    EditorPaste {
+        document_id: u64,
+        text: String,
+    },
+    SaveEditor(crate::editor::SaveSnapshot),
+    OpenEditor(OpenEditorRequest),
 }

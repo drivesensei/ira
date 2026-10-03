@@ -389,6 +389,7 @@ fn navigation_result(app: &App, folder: &str, ticket: u64, error: Option<&str>) 
     let mut state = before.clone();
     state.panes[0].folder = Some(Folder::new(folder.into(), folder.into(), '#'));
     OperationResult {
+        epoch: app.operation_epoch.load(Ordering::Acquire),
         navigation_ticket: Some(ticket),
         before,
         source,
@@ -458,7 +459,7 @@ fn quit_bypasses_stale_focus_envelope_and_pending_worker() {
     let accepted = app
         .dispatch_envelope(crate::input::CommandEnvelope {
             sequence: 77,
-            window_generation: 100,
+            window_generation: 0,
             document_generation: 100,
             focus_generation: 100,
             command: crate::input::Input::Action(crate::input::Command::Quit),
@@ -485,8 +486,8 @@ fn stale_generation_envelope_acknowledged_without_mutation() {
     let accepted = app
         .dispatch_envelope(crate::input::CommandEnvelope {
             sequence: 8,
-            window_generation: 1,
-            document_generation: 0,
+            window_generation: 0,
+            document_generation: 1,
             focus_generation: 0,
             command: crate::input::Input::Action(crate::input::Command::ToggleSelectAll),
         })
@@ -494,4 +495,311 @@ fn stale_generation_envelope_acknowledged_without_mutation() {
     assert!(!accepted);
     assert_eq!(app.ack_sequence, 8);
     assert_eq!(app.panes[0].selected, vec![false, false, true]);
+}
+
+#[test]
+fn startup_result_restores_legacy_state_before_queued_input() {
+    let tmp = TempFixture::new();
+    let mut app = tmp.app();
+    app.initializing = true;
+    app.dispatch(crate::input::Input::Action(
+        crate::input::Command::ToggleHidden,
+    ))
+    .unwrap();
+    assert_eq!(app.startup_inputs.len(), 1);
+    let state = SessionState {
+        show_hidden: true,
+        split: true,
+        preview: [1, 2],
+        left: app.panes[0].folder.clone(),
+        ..SessionState::default()
+    };
+    app.startup_tx
+        .send((
+            state,
+            vec![("Saved".into(), tmp.0.to_string_lossy().into_owned())],
+        ))
+        .unwrap();
+    app.tick();
+    assert!(!app.is_initializing());
+    assert!(!app.show_hidden);
+    assert!(app.split);
+    assert_eq!(app.panes[0].preview_mode, PreviewMode::Column);
+    assert_eq!(app.bookmarks.as_ref().unwrap().len(), 1);
+    app.persistence_barrier()
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+}
+#[test]
+fn startup_quit_is_immediate_without_waiting_for_codec_read() {
+    let mut app = fixture();
+    app.initializing = true;
+    app.dispatch(crate::input::Input::Action(crate::input::Command::Quit))
+        .unwrap();
+    assert!(!app.running);
+    assert!(app.startup_inputs.is_empty());
+}
+#[test]
+fn stale_transfer_destination_probe_does_not_refresh_new_transfer() {
+    let mut app = fixture();
+    app.transfer_generation = 2;
+    let before = app.panes[0].listing_generation;
+    app.transfer_probe_tx
+        .send((
+            1,
+            TransferDestSync {
+                dest_dir: "/fixture".into(),
+                reveal_path: "/fixture/new".into(),
+                last_refresh: Instant::now(),
+            },
+            true,
+        ))
+        .unwrap();
+    app.refresh_transfer_destinations();
+    assert_eq!(app.panes[0].listing_generation, before);
+    assert!(app.panes[0].pending_select.is_none());
+}
+#[test]
+fn transfer_refresh_respects_user_navigated_suppression() {
+    let mut app = fixture();
+    app.panes[0].folder = Some(Folder::new("fixture".into(), "/fixture".into(), '#'));
+    app.panes[0].user_navigated = true;
+    let before = app.panes[0].listing_generation;
+    app.apply_transfer_destination_refresh(TransferDestSync {
+        dest_dir: "/fixture".into(),
+        reveal_path: "/fixture/new".into(),
+        last_refresh: Instant::now(),
+    });
+    assert_eq!(app.panes[0].listing_generation, before);
+    assert!(app.panes[0].pending_select.is_none());
+}
+#[test]
+fn close_invalidates_old_operation_and_listing_completions() {
+    let mut app = fixture();
+    let result = navigation_result(&app, "/late", 1, None);
+    let generation = app.panes[0].listing_generation;
+    app.navigation_generation[0] = 1;
+    app.pending_operations = 1;
+    app.cancel_pending_work();
+    app.apply_operation_result(result);
+    app.file_list_tx
+        .send((0, vec![entry("old", 0)], true, generation))
+        .unwrap();
+    app.pick_up_pane_listings();
+    assert!(app.panes[0].folder.is_none());
+    assert_eq!(app.panes[0].files[0].label, "alpha.txt");
+    assert_eq!(app.pending_operations(), 0);
+}
+fn editor_fixture(tmp: &TempFixture) -> App {
+    let path = tmp.0.join("edit.txt");
+    std::fs::write(&path, "one\r\ntwo\r\n").unwrap();
+    let mut app = tmp.app();
+    app.panes[0].files = vec![FEntry {
+        path: path.to_string_lossy().into_owned(),
+        ..entry("edit.txt", 10)
+    }];
+    app.panes[0].selected = vec![false];
+    app.panes[0].state.select(Some(0));
+    app.panes[0].preview_mode = PreviewMode::Column;
+    app.panes[0].listing_settled = true;
+    app
+}
+fn open_editor(app: &mut App) {
+    app.switch_pane();
+    let request = app
+        .take_host_requests()
+        .into_iter()
+        .find_map(|r| match r {
+            HostRequest::OpenEditor(request) => Some(request),
+            _ => None,
+        })
+        .unwrap();
+    let document = crate::editor::open_document(request.document_id, &request.target.path).unwrap();
+    assert!(app.apply_open_editor(request, Ok(document)));
+}
+#[test]
+fn editor_focus_keeps_plain_s_and_control_a_out_of_pane_commands() {
+    let tmp = TempFixture::new();
+    let mut app = editor_fixture(&tmp);
+    open_editor(&mut app);
+    handle_key_events(
+        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+        &mut app,
+    )
+    .unwrap();
+    handle_key_events(
+        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        &mut app,
+    )
+    .unwrap();
+    let requests = app.take_host_requests();
+    assert!(matches!(
+        requests[0],
+        HostRequest::EditorKey {
+            key: KeyEvent {
+                code: KeyCode::Char('s'),
+                ..
+            },
+            ..
+        }
+    ));
+    assert!(matches!(
+        requests[1],
+        HostRequest::EditorKey {
+            key: KeyEvent {
+                code: KeyCode::Char('a'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            },
+            ..
+        }
+    ));
+    assert_eq!(app.panes[0].selected, vec![false]);
+}
+#[test]
+fn close_during_open_rejects_late_document_and_tab_discards() {
+    let tmp = TempFixture::new();
+    let mut app = editor_fixture(&tmp);
+    app.switch_pane();
+    let request = app.pending_editor_request().unwrap();
+    let document = crate::editor::open_document(request.document_id, &request.target.path).unwrap();
+    app.switch_pane();
+    assert!(!app.edit_focus);
+    assert!(!app.apply_open_editor(request, Ok(document)));
+    assert!(app.edit.is_none());
+    open_editor(&mut app);
+    let id = app.edit.as_ref().unwrap().document_id;
+    app.update_editor_draft(id, 1, "unsaved".into());
+    app.switch_pane();
+    assert!(app.edit.is_none());
+    assert_eq!(
+        std::fs::read(tmp.0.join("edit.txt")).unwrap(),
+        b"one\r\ntwo\r\n"
+    );
+}
+#[test]
+fn save_snapshot_is_immutable_and_completion_only_clears_matching_revision() {
+    let tmp = TempFixture::new();
+    let mut app = editor_fixture(&tmp);
+    open_editor(&mut app);
+    let id = app.edit.as_ref().unwrap().document_id;
+    app.update_editor_draft(id, 1, "first\n".into());
+    let snapshot = app.editor_save_snapshot().unwrap();
+    app.update_editor_draft(id, 2, "newer\n".into());
+    assert_eq!(snapshot.content, "first\n");
+    let completion = crate::editor::save_document(&snapshot).unwrap();
+    assert!(app.apply_save_result(id, 1, Ok(completion)));
+    assert!(app.edit.as_ref().unwrap().dirty);
+    assert_eq!(app.edit.as_ref().unwrap().content, "newer\n");
+    assert_eq!(std::fs::read(tmp.0.join("edit.txt")).unwrap(), b"first\r\n");
+    let latest = app.editor_save_snapshot().unwrap();
+    let completion = crate::editor::save_document(&latest).unwrap();
+    assert!(app.apply_save_result(id, 2, Ok(completion)));
+    assert!(!app.edit.as_ref().unwrap().dirty);
+    assert_eq!(std::fs::read(tmp.0.join("edit.txt")).unwrap(), b"newer\r\n");
+}
+#[test]
+fn save_completion_cannot_modify_reopened_document() {
+    let tmp = TempFixture::new();
+    let mut app = editor_fixture(&tmp);
+    open_editor(&mut app);
+    let id = app.edit.as_ref().unwrap().document_id;
+    app.update_editor_draft(id, 1, "saved".into());
+    let completion = crate::editor::save_document(&app.editor_save_snapshot().unwrap()).unwrap();
+    app.close_edit();
+    app.edit_focus = false;
+    open_editor(&mut app);
+    let new_id = app.edit.as_ref().unwrap().document_id;
+    assert_ne!(id, new_id);
+    assert!(!app.apply_save_result(id, 1, Ok(completion)));
+    assert_eq!(app.edit.as_ref().unwrap().document_id, new_id);
+}
+#[test]
+fn deterministic_clock_expires_notice_and_ramps_held_navigation() {
+    let mut app = fixture();
+    let start = Instant::now();
+    app.dispatch_at(
+        crate::input::Input::Action(crate::input::Command::CyclePreview),
+        start,
+    )
+    .unwrap();
+    assert!(app.status.is_some());
+    app.dispatch_at(crate::input::Input::Tick, start + STATUS_TTL)
+        .unwrap();
+    assert!(app.status.is_none());
+    app.panes[0].files = (0..20).map(|i| entry(&format!("{i}.txt"), 0)).collect();
+    app.panes[0].selected = vec![false; 20];
+    app.panes[0].state.select(Some(0));
+    for i in 0..7 {
+        app.dispatch_at(
+            crate::input::Input::Action(crate::input::Command::MoveNext),
+            start + Duration::from_millis(i * 20),
+        )
+        .unwrap();
+    }
+    assert_eq!(app.panes[0].state.selected(), Some(8));
+}
+// Independent QA probe G-0030 from evidence/T-016/qa-model-probes.rs.
+#[test]
+fn qa_accepted_older_sequence_never_regresses_acknowledgement() {
+    let tmp = TempFixture::new();
+    let mut app = tmp.app();
+    let envelope = |app: &App, sequence| crate::input::CommandEnvelope {
+        sequence,
+        window_generation: app.window_generation,
+        document_generation: app.document_generation,
+        focus_generation: app.focus_generation,
+        command: crate::input::Input::Action(crate::input::Command::CycleTheme),
+    };
+    app.dispatch_envelope(envelope(&app, 20)).unwrap();
+    app.dispatch_envelope(envelope(&app, 10)).unwrap();
+    assert_eq!(
+        app.ack_sequence, 20,
+        "acknowledgement must remain a monotonic high-water mark"
+    );
+    app.persistence_barrier()
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+}
+
+#[test]
+fn duplicate_mutation_envelope_is_ignored_and_window_sequences_restart() {
+    let tmp = TempFixture::new();
+    let mut app = tmp.app();
+    app.start_new_entry();
+    app.handle_paste("new.txt");
+    let envelope = crate::input::CommandEnvelope {
+        sequence: 5,
+        window_generation: 0,
+        document_generation: 0,
+        focus_generation: 0,
+        command: crate::input::Input::Action(crate::input::Command::ConfirmNewEntry),
+    };
+    assert!(app.dispatch_envelope(envelope.clone()).unwrap());
+    assert!(!app.dispatch_envelope(envelope).unwrap());
+    assert_eq!(app.pending_operations(), 1);
+    until(&mut app, |a| {
+        a.pending_operations() == 0 && a.panes[0].listing_settled
+    });
+    app.attach_window(2);
+    assert_eq!(app.ack_sequence, 0);
+    let stale = crate::input::CommandEnvelope {
+        sequence: 999,
+        window_generation: 0,
+        document_generation: app.document_generation,
+        focus_generation: app.focus_generation,
+        command: crate::input::Input::Action(crate::input::Command::Quit),
+    };
+    assert!(!app.dispatch_envelope(stale).unwrap());
+    assert_eq!(app.ack_sequence, 0);
+    assert!(app.running);
+    let current = crate::input::CommandEnvelope {
+        sequence: 0,
+        window_generation: 2,
+        document_generation: app.document_generation,
+        focus_generation: app.focus_generation,
+        command: crate::input::Input::Action(crate::input::Command::Quit),
+    };
+    assert!(app.dispatch_envelope(current).unwrap());
+    assert!(!app.running);
 }

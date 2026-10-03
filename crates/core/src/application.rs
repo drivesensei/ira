@@ -28,6 +28,7 @@ use crate::{
     },
 };
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     error,
     path::{Path, PathBuf},
@@ -63,11 +64,13 @@ struct OperationState {
     drives: Option<Vec<Folder>>,
 }
 struct OperationRequest {
+    epoch: u64,
     navigation_ticket: Option<u64>,
     operation: BlockingOperation,
     state: OperationState,
 }
 struct OperationResult {
+    epoch: u64,
     navigation_ticket: Option<u64>,
     before: OperationState,
     source: [(Option<String>, u64); 2],
@@ -82,6 +85,19 @@ enum PersistenceRequest {
     Barrier(mpsc::Sender<()>),
 }
 pub struct App {
+    last_sequence: Option<u64>,
+    operation_epoch: Arc<AtomicU64>,
+    pending_editor: Option<OpenEditorRequest>,
+    next_document_id: u64,
+    transfer_probe_tx: mpsc::Sender<(u64, TransferDestSync, bool)>,
+    transfer_probe_rx: mpsc::Receiver<(u64, TransferDestSync, bool)>,
+    transfer_generation: u64,
+    transfer_probe_pending: Option<u64>,
+    transfer_probe_last_attempt: Option<Instant>,
+    startup_tx: mpsc::Sender<(SessionState, Vec<(String, String)>)>,
+    startup_rx: mpsc::Receiver<(SessionState, Vec<(String, String)>)>,
+    initializing: bool,
+    startup_inputs: VecDeque<crate::input::Input>,
     clock_override: Option<Instant>,
     navigation_generation: [u64; 2],
     navigation_inflight: [Option<u64>; 2],
@@ -207,6 +223,8 @@ pub struct App {
 }
 impl Default for App {
     fn default() -> Self {
+        let (transfer_probe_tx, transfer_probe_rx) = mpsc::channel();
+        let (startup_tx, startup_rx) = mpsc::channel();
         let (persistence_tx, persistence_rx) = mpsc::channel();
         thread::spawn(move || {
             while let Ok(request) = persistence_rx.recv() {
@@ -231,6 +249,19 @@ impl Default for App {
         let (file_list_tx, file_list_rx) = mpsc::channel();
         let (info_tx, info_rx) = mpsc::channel();
         Self {
+            last_sequence: None,
+            operation_epoch: Arc::new(AtomicU64::new(0)),
+            pending_editor: None,
+            next_document_id: 1,
+            transfer_probe_tx,
+            transfer_probe_rx,
+            transfer_generation: 0,
+            transfer_probe_pending: None,
+            transfer_probe_last_attempt: None,
+            startup_tx,
+            startup_rx,
+            initializing: false,
+            startup_inputs: VecDeque::new(),
             clock_override: None,
             navigation_generation: [0; 2],
             navigation_inflight: [None; 2],
@@ -365,22 +396,54 @@ fn matching_drive<'a>(drives: &'a [Folder], folder_path: &str) -> Option<&'a Fol
 impl App {
     /// Constructs a new instance of [`App`].
     pub fn new() -> Self {
-        let mut default = Self::default();
-        default.load_bookmarks();
-        default.host_requests.push(HostRequest::RefreshDrives);
-        let persisted_theme = default.restore_state();
-        if let Some(preset) = persisted_theme.and_then(|s| crate::theme::ThemePreset::parse(&s)) {
-            default.theme_preset = preset;
+        Self::new_with_paths(None, None)
+    }
+    pub fn new_with_paths(state_path: Option<PathBuf>, bookmarks_path: Option<PathBuf>) -> Self {
+        let mut app = Self {
+            state_path,
+            bookmarks_path,
+            initializing: true,
+            ..Self::default()
+        };
+        app.host_requests.push(HostRequest::RefreshDrives);
+        let tx = app.startup_tx.clone();
+        let state_path = app.state_path.clone();
+        let bookmarks_path = app.bookmarks_path.clone();
+        thread::spawn(move || {
+            let state = match state_path {
+                Some(path) => load_state_from(&path),
+                None => load_state(),
+            };
+            let bookmarks = match bookmarks_path {
+                Some(path) => read_bookmarks_from(&path),
+                None => read_bookmarks(),
+            };
+            let _ = tx.send((state, bookmarks));
+        });
+        app
+    }
+    pub fn is_initializing(&self) -> bool {
+        self.initializing
+    }
+    fn drain_startup(&mut self) {
+        if let Ok((state, pairs)) = self.startup_rx.try_recv() {
+            self.apply_bookmark_pairs(pairs);
+            let preset = self.apply_session_state(state);
+            if let Some(preset) = preset.and_then(|s| crate::theme::ThemePreset::parse(&s)) {
+                self.theme_preset = preset;
+            }
+            self.initializing = false;
+            self.request_pane_listing(0);
+            self.request_pane_listing(1);
+            while let Some(input) = self.startup_inputs.pop_front() {
+                let _ = self.dispatch(input);
+            }
         }
-        // Startup pane listings run on the async chunked worker so a slow
-        // drive can't block the first frame.
-        default.request_pane_listing(0);
-        default.request_pane_listing(1);
-        default
     }
 
     /// Handles the tick event of the terminal.
     pub fn tick(&mut self) {
+        self.drain_startup();
         self.drain_operation_results();
         self.hint_offset = self.hint_offset.wrapping_add(2);
         self.drain_jobs();
@@ -410,8 +473,12 @@ impl App {
             return;
         }
         if self.edit_focus {
-            self.host_requests
-                .push(HostRequest::EditorPaste(cleaned.to_string()));
+            if let Some(document_id) = self.editor_document_id() {
+                self.host_requests.push(HostRequest::EditorPaste {
+                    document_id,
+                    text: cleaned.to_string(),
+                });
+            }
             return;
         }
         if self.goto_prompt.is_some() {
@@ -1237,11 +1304,14 @@ impl App {
         }
         if !was_editing && !self.board_focused && self.active_pane_offers_edit() {
             self.open_edit();
-            if self.edit.is_some() {
+            if self.edit.is_some() || self.pending_editor.is_some() {
                 self.edit_focus = true;
                 return;
             }
         }
+        self.advance_pane_focus();
+    }
+    fn advance_pane_focus(&mut self) {
         if self.copy_board {
             if self.board_focused {
                 self.board_focused = false;
@@ -2141,6 +2211,9 @@ impl App {
         let job = self.jobs.last().unwrap();
         spawn_job(job, self.job_tx.clone());
 
+        self.transfer_generation = self.transfer_generation.wrapping_add(1);
+        self.transfer_probe_pending = None;
+        self.transfer_probe_last_attempt = None;
         self.transfer_dest = Some(TransferDestSync {
             dest_dir: dest.clone(),
             reveal_path: reveal.to_string_lossy().into_owned(),
@@ -2409,6 +2482,20 @@ impl App {
     /// folder (or are inside it) once per second, so copied items appear
     /// live. Never blocks the UI: listings run on background workers.
     fn refresh_transfer_destinations(&mut self) {
+        while let Ok((generation, sync, exists)) = self.transfer_probe_rx.try_recv() {
+            if generation != self.transfer_generation {
+                continue;
+            }
+            self.transfer_probe_pending = None;
+            let current = self.transfer_dest.as_ref().is_some_and(|current| {
+                current.dest_dir == sync.dest_dir
+                    && current.reveal_path == sync.reveal_path
+                    && current.last_refresh == sync.last_refresh
+            });
+            if exists && current {
+                self.apply_transfer_destination_refresh(sync);
+            }
+        }
         let Some(sync) = self.transfer_dest.clone() else {
             return;
         };
@@ -2420,13 +2507,25 @@ impl App {
             self.transfer_dest = None;
             return;
         }
-        // The destination folder appears once the first item starts copying.
-        if std::fs::metadata(&sync.dest_dir).is_err() {
+        let now = self.now();
+        if self.transfer_probe_pending.is_some()
+            || now.saturating_duration_since(sync.last_refresh) < Duration::from_secs(1)
+            || self
+                .transfer_probe_last_attempt
+                .is_some_and(|last| now.saturating_duration_since(last) < Duration::from_secs(1))
+        {
             return;
         }
-        if self.now().saturating_duration_since(sync.last_refresh) < Duration::from_secs(1) {
-            return;
-        }
+        let generation = self.transfer_generation;
+        self.transfer_probe_pending = Some(generation);
+        self.transfer_probe_last_attempt = Some(now);
+        let tx = self.transfer_probe_tx.clone();
+        thread::spawn(move || {
+            let exists = std::fs::metadata(&sync.dest_dir).is_ok();
+            let _ = tx.send((generation, sync, exists));
+        });
+    }
+    fn apply_transfer_destination_refresh(&mut self, sync: TransferDestSync) {
         for i in 0..self.panes.len() {
             let viewing = self.panes[i].folder.as_ref().is_some_and(|f| {
                 f.path == sync.dest_dir || f.path.starts_with(&format!("{}/", sync.dest_dir))
@@ -2604,11 +2703,7 @@ impl App {
     }
 
     /// Loads persisted bookmarks, assigning shortcuts in keyboard order.
-    fn load_bookmarks(&mut self) {
-        let pairs = match &self.bookmarks_path {
-            Some(path) => read_bookmarks_from(path),
-            None => read_bookmarks(),
-        };
+    fn apply_bookmark_pairs(&mut self, pairs: Vec<(String, String)>) {
         let mut loaded: Vec<Folder> = Vec::new();
         for (label, path) in pairs {
             let Some(shortcut) = next_free_shortcut(&loaded) else {
@@ -2670,6 +2765,9 @@ impl App {
             Some(p) => load_state_from(p),
             None => load_state(),
         };
+        self.apply_session_state(state)
+    }
+    fn apply_session_state(&mut self, state: SessionState) -> Option<String> {
         let prefs = state.theme.clone();
         self.split = state.split;
         self.active_pane = state.active_pane.min(1);
@@ -2799,6 +2897,14 @@ impl App {
             .unwrap_or_else(|| self.drive_cache.lock().unwrap().clone()))
     }
     pub fn apply_drives(&mut self, drives: Vec<Folder>) {
+        if self.panes[0].folder.is_none() && self.navigation_generation[0] == 0 {
+            if let Some(drive) = drives.iter().find(|d| !d.path.is_empty()) {
+                self.panes[0].folder = Some(drive.clone());
+                if !self.initializing {
+                    self.request_pane_listing(0);
+                }
+            }
+        }
         *self.drive_cache.lock().unwrap() = drives;
         *self.drive_generation.lock().unwrap() += 1;
         self.refresh_drives();
@@ -2823,32 +2929,219 @@ impl App {
         self.pane_shows_text_preview(self.active_pane)
     }
     pub fn open_edit(&mut self) {
-        if let Some(e) = self.selected_visible_entry() {
-            self.host_requests
-                .push(HostRequest::OpenEditor(EntryTarget {
-                    pane: self.active_pane,
-                    path: PathBuf::from(&e.path),
-                    listing_generation: self.panes[self.active_pane].listing_generation,
-                }));
-            self.set_status("Editor document adapter is not installed", true);
+        let Some(entry) = self.selected_visible_entry() else {
+            return;
+        };
+        if entry.is_dir || preview_kind(&entry.path) != Some(PreviewKind::Text) {
+            return;
         }
+        let target = EntryTarget {
+            pane: self.active_pane,
+            path: PathBuf::from(&entry.path),
+            listing_generation: self.panes[self.active_pane].listing_generation,
+        };
+        self.document_generation = self.document_generation.wrapping_add(1);
+        let request = OpenEditorRequest {
+            document_id: self.next_document_id,
+            target,
+            document_generation: self.document_generation,
+            focus_generation: self.focus_generation,
+        };
+        self.next_document_id = self.next_document_id.wrapping_add(1);
+        self.pending_editor = Some(request.clone());
+        self.host_requests.push(HostRequest::OpenEditor(request));
     }
     pub fn close_edit(&mut self) {
+        if let Some(document_id) = self.editor_document_id() {
+            self.host_requests.retain(|request|!matches!(request,HostRequest::OpenEditor(request) if request.document_id==document_id) && !matches!(request,HostRequest::EditorKey{document_id:id,..}|HostRequest::EditorPaste{document_id:id,..} if *id==document_id));
+        }
         self.edit = None;
+        self.pending_editor = None;
         self.document_generation = self.document_generation.wrapping_add(1);
     }
+    fn editor_document_id(&self) -> Option<u64> {
+        self.edit
+            .as_ref()
+            .map(|e| e.document_id)
+            .or_else(|| self.pending_editor.as_ref().map(|r| r.document_id))
+    }
     pub fn save_edit(&mut self) {
-        if let Some(edit) = &self.edit {
-            self.host_requests.push(HostRequest::SaveEditor {
-                document_id: edit.document_id,
-            });
+        if let Some(snapshot) = self.editor_save_snapshot() {
+            self.host_requests.push(HostRequest::SaveEditor(snapshot));
         }
     }
     pub fn edit_input(&mut self, key: crate::input::KeyEvent) -> bool {
-        self.host_requests.push(HostRequest::EditorKey(key));
+        if let Some(document_id) = self.editor_document_id() {
+            self.host_requests
+                .push(HostRequest::EditorKey { document_id, key });
+        }
         false
     }
+    pub fn update_editor_draft(
+        &mut self,
+        document_id: u64,
+        edit_revision: u64,
+        content: String,
+    ) -> bool {
+        let Some(edit) = self.edit.as_mut() else {
+            return false;
+        };
+        if edit.document_id != document_id || edit_revision < edit.edit_revision || edit.read_only {
+            return false;
+        }
+        if edit.content != content {
+            edit.dirty = true;
+        }
+        edit.content = content;
+        edit.edit_revision = edit_revision;
+        self.revision = self.revision.wrapping_add(1);
+        true
+    }
+    pub fn editor_save_snapshot(&self) -> Option<crate::editor::SaveSnapshot> {
+        let edit = self.edit.as_ref()?;
+        let document = crate::editor::EditorDocument {
+            id: edit.document_id,
+            listed_path: PathBuf::from(&edit.path),
+            canonical_path: edit.fs_path.clone(),
+            mtime: edit.mtime_at_open,
+            permissions: edit.permissions.clone(),
+            read_only: edit.read_only,
+            crlf: edit.crlf,
+            content: edit.content.clone(),
+        };
+        Some(crate::editor::SaveSnapshot {
+            document_id: edit.document_id,
+            base_document: document,
+            mtime: edit.mtime_at_open,
+            edit_revision: edit.edit_revision,
+            content: edit.content.clone(),
+        })
+    }
+    pub fn apply_open_editor(
+        &mut self,
+        request: OpenEditorRequest,
+        result: Result<crate::editor::EditorDocument, crate::editor::EditorError>,
+    ) -> bool {
+        if self.pending_editor.as_ref().map(|r| r.document_id) != Some(request.document_id)
+            || request.document_generation != self.document_generation
+            || self.resolve_target(&request.target).is_none()
+        {
+            return false;
+        }
+        self.pending_editor = None;
+        match result {
+            Ok(document)
+                if document.id == request.document_id
+                    && document.listed_path == request.target.path =>
+            {
+                self.edit = Some(EditState {
+                    pane_index: request.target.pane,
+                    path: document.listed_path.to_string_lossy().into_owned(),
+                    fs_path: document.canonical_path,
+                    mtime_at_open: document.mtime,
+                    permissions: document.permissions,
+                    content: document.content,
+                    document_id: document.id,
+                    edit_revision: 0,
+                    last_saved_revision: None,
+                    dirty: false,
+                    read_only: document.read_only,
+                    crlf: document.crlf,
+                });
+                self.edit_focus = true;
+            }
+            Ok(_) => return false,
+            Err(error) => {
+                self.edit_focus = false;
+                self.set_status(error.to_string(), true);
+                self.advance_pane_focus();
+            }
+        }
+        self.focus_generation = self.focus_generation.wrapping_add(1);
+        self.revision = self.revision.wrapping_add(1);
+        true
+    }
+    pub fn apply_save_result(
+        &mut self,
+        document_id: u64,
+        edit_revision: u64,
+        result: Result<crate::editor::SaveCompletion, crate::editor::EditorError>,
+    ) -> bool {
+        if self.edit.as_ref().map(|edit| edit.document_id) != Some(document_id) {
+            return false;
+        }
+        match result {
+            Ok(completion) => {
+                if completion.document_id != document_id
+                    || completion.edit_revision != edit_revision
+                {
+                    return false;
+                }
+                let edit = self.edit.as_mut().unwrap();
+                if edit
+                    .last_saved_revision
+                    .is_some_and(|last| completion.edit_revision < last)
+                {
+                    return false;
+                }
+                edit.last_saved_revision = Some(completion.edit_revision);
+                edit.mtime_at_open = completion.document.mtime;
+                if completion.may_clear_dirty(edit.document_id, edit.edit_revision) {
+                    edit.dirty = false;
+                }
+                let pane_index = edit.pane_index;
+                let name = Path::new(&edit.path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if let Some(entry) = self.panes[pane_index]
+                    .files
+                    .iter_mut()
+                    .find(|e| Path::new(&e.path) == completion.invalidate_path)
+                {
+                    entry.size = completion.new_size;
+                    entry.modified = completion
+                        .document
+                        .mtime
+                        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64);
+                }
+                self.host_requests
+                    .push(HostRequest::InvalidatePreview(completion.invalidate_path));
+                self.set_status(format!("Saved {name}"), false);
+            }
+            Err(error) => self.set_status(error.to_string(), true),
+        }
+        self.revision = self.revision.wrapping_add(1);
+        true
+    }
     pub fn dispatch(&mut self, input: crate::input::Input) -> AppResult<()> {
+        if self.initializing && !matches!(input, crate::input::Input::Tick) {
+            let quit = matches!(
+                input,
+                crate::input::Input::Action(crate::input::Command::Quit)
+            ) || matches!(
+                &input,
+                crate::input::Input::Key(crate::input::KeyEvent {
+                    code: crate::input::KeyCode::Char('q'),
+                    phase: crate::input::KeyPhase::Press,
+                    ..
+                })
+            ) || matches!(
+                &input,
+                crate::input::Input::Key(crate::input::KeyEvent {
+                    code: crate::input::KeyCode::Char('c' | 'C'),
+                    modifiers: crate::input::KeyModifiers::CONTROL,
+                    phase: crate::input::KeyPhase::Press
+                })
+            );
+            if quit {
+                self.quit();
+            } else {
+                self.startup_inputs.push_back(input);
+            }
+            return Ok(());
+        }
         let context_before = self.input_context();
         match input {
             crate::input::Input::Key(key) => {
@@ -2870,6 +3163,18 @@ impl App {
         &mut self,
         envelope: crate::input::CommandEnvelope,
     ) -> AppResult<bool> {
+        // Sequence high-water marks are scoped to the attached window.
+        // A stale window must not poison the new window's sequence space.
+        if envelope.window_generation != self.window_generation {
+            return Ok(false);
+        }
+        if self
+            .last_sequence
+            .is_some_and(|last| envelope.sequence <= last)
+        {
+            return Ok(false);
+        }
+        self.last_sequence = Some(envelope.sequence);
         self.ack_sequence = self.ack_sequence.max(envelope.sequence);
         if matches!(
             envelope.command,
@@ -2886,7 +3191,6 @@ impl App {
             return Ok(false);
         }
         self.dispatch(envelope.command)?;
-        self.ack_sequence = envelope.sequence;
         Ok(true)
     }
     pub fn resolve_target(&self, target: &EntryTarget) -> Option<&FEntry> {
@@ -3094,6 +3398,7 @@ impl App {
         if self.operation_tx.is_none() {
             let (tx, rx) = mpsc::channel::<OperationRequest>();
             let result_tx = self.operation_result_tx.clone();
+            let epoch = self.operation_epoch.clone();
             thread::spawn(move || {
                 while let Ok(request) = rx.recv() {
                     let source = std::array::from_fn(|i| {
@@ -3118,16 +3423,21 @@ impl App {
                         defer_listings: true,
                         ..App::default()
                     };
-                    match request.operation {
-                        BlockingOperation::EnterFolder => worker.enter_folder_blocking(),
-                        BlockingOperation::ParentFolder => worker.out_of_folder_blocking(),
-                        BlockingOperation::Create => worker.confirm_new_entry_blocking(),
-                        BlockingOperation::Goto => worker.confirm_goto_blocking(),
-                        BlockingOperation::Rename => worker.commit_rename_blocking(),
-                        BlockingOperation::Drive(i) => worker.set_folder_from_drives_blocking(i),
-                        BlockingOperation::Eject => worker.eject_active_drive_blocking(),
+                    if request.epoch == epoch.load(Ordering::Acquire) {
+                        match request.operation {
+                            BlockingOperation::EnterFolder => worker.enter_folder_blocking(),
+                            BlockingOperation::ParentFolder => worker.out_of_folder_blocking(),
+                            BlockingOperation::Create => worker.confirm_new_entry_blocking(),
+                            BlockingOperation::Goto => worker.confirm_goto_blocking(),
+                            BlockingOperation::Rename => worker.commit_rename_blocking(),
+                            BlockingOperation::Drive(i) => {
+                                worker.set_folder_from_drives_blocking(i)
+                            }
+                            BlockingOperation::Eject => worker.eject_active_drive_blocking(),
+                        }
                     };
                     let result = OperationResult {
+                        epoch: request.epoch,
                         navigation_ticket: request.navigation_ticket,
                         before,
                         source,
@@ -3144,6 +3454,7 @@ impl App {
             self.operation_tx = Some(tx);
         }
         let request = OperationRequest {
+            epoch: self.operation_epoch.load(Ordering::Acquire),
             navigation_ticket,
             operation,
             state: self.operation_state(),
@@ -3166,6 +3477,9 @@ impl App {
     }
     fn apply_operation_result(&mut self, result: OperationResult) {
         self.pending_operations = self.pending_operations.saturating_sub(1);
+        if result.epoch != self.operation_epoch.load(Ordering::Acquire) {
+            return;
+        }
         let active = result.state.active_pane;
         if let Some(ticket) = result.navigation_ticket {
             if self.navigation_generation[active] != ticket {
@@ -3356,5 +3670,55 @@ impl App {
         let result = self.dispatch(input);
         self.clock_override = None;
         result
+    }
+}
+
+impl App {
+    /// Nonblocking close/cancel boundary. An in-flight OS syscall cannot be preempted,
+    /// but queued mutations and all stale view completions are invalidated immediately.
+    pub fn cancel_pending_work(&mut self) {
+        self.operation_epoch.fetch_add(1, Ordering::AcqRel);
+        self.pending_operations = 0;
+        self.relative_navigation.clear();
+        self.navigation_inflight = [None; 2];
+        self.navigation_waiting_listing = [false; 2];
+        self.startup_inputs.clear();
+        for pane in &mut self.panes {
+            pane.listing_generation = pane.listing_generation.wrapping_add(1);
+        }
+        for generation in &mut self.navigation_generation {
+            *generation = generation.wrapping_add(1);
+        }
+        for slot in self.size_walks.values() {
+            slot.handle.cancel();
+        }
+        self.size_walks.clear();
+        for job in &self.jobs {
+            job.control.request_cancel();
+        }
+        if let Some(deletion) = &self.deletion {
+            deletion.control.request_cancel();
+        }
+        self.close_edit();
+        self.edit_focus = false;
+        self.focus_generation = self.focus_generation.wrapping_add(1);
+        self.transfer_generation = self.transfer_generation.wrapping_add(1);
+        self.transfer_probe_pending = None;
+        self.transfer_dest = None;
+    }
+    pub fn attach_window(&mut self, window_generation: u64) {
+        if window_generation != self.window_generation {
+            self.cancel_pending_work();
+            self.window_generation = window_generation;
+            self.last_sequence = None;
+            self.ack_sequence = 0;
+            self.revision = self.revision.wrapping_add(1);
+        }
+    }
+}
+
+impl App {
+    pub fn pending_editor_request(&self) -> Option<OpenEditorRequest> {
+        self.pending_editor.clone()
     }
 }
