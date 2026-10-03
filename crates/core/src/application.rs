@@ -18,8 +18,8 @@ use crate::{
         list_files::{list_files_bounded, list_files_chunked, FEntry, LISTING_CHUNK},
         state::{load_state, load_state_from, save_state, save_state_to, SessionState, SizeEntry},
         transfer::{
-            spawn_delete_job, spawn_job, Job, JobControl, JobEvent, JobKind, JobStatus,
-            OverwritePolicy,
+            spawn_delete_job, spawn_job, spawn_job_with_provider, Job, JobControl, JobEvent,
+            JobKind, JobStatus, NoReplaceProvider, OverwritePolicy,
         },
     },
     utils::{
@@ -184,6 +184,7 @@ pub struct App {
     scroll_repeat: u32,
     last_scroll: Option<Instant>,
 
+    transfer_provider: Option<Arc<NoReplaceProvider>>,
     job_tx: mpsc::Sender<JobEvent>,
     job_rx: mpsc::Receiver<JobEvent>,
     info_tx: mpsc::Sender<InfoEvent>,
@@ -308,6 +309,7 @@ impl Default for App {
             scroll_dir: 0,
             scroll_repeat: 0,
             last_scroll: None,
+            transfer_provider: None,
             job_tx,
             job_rx,
             size_cache: HashMap::new(),
@@ -394,6 +396,12 @@ fn matching_drive<'a>(drives: &'a [Folder], folder_path: &str) -> Option<&'a Fol
 }
 
 impl App {
+    /// Install the host atomic no-replace primitive for future transfer workers.
+    /// Already-running workers retain their provider; default core behavior stays fail-closed.
+    pub fn set_transfer_provider(&mut self, provider: Arc<NoReplaceProvider>) {
+        self.transfer_provider = Some(provider);
+    }
+
     /// Constructs a new instance of [`App`].
     pub fn new() -> Self {
         Self::new_with_paths(None, None)
@@ -2210,7 +2218,11 @@ impl App {
             control: JobControl::new(),
         });
         let job = self.jobs.last().unwrap();
-        spawn_job(job, self.job_tx.clone());
+        if let Some(provider) = &self.transfer_provider {
+            spawn_job_with_provider(job, self.job_tx.clone(), Arc::clone(provider));
+        } else {
+            spawn_job(job, self.job_tx.clone());
+        }
 
         self.transfer_generation = self.transfer_generation.wrapping_add(1);
         self.transfer_probe_pending = None;
