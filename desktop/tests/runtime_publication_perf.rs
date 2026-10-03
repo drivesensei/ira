@@ -119,7 +119,8 @@ fn measure_actual_actor_100k_cursor_publications_and_retained_rows() {
         assert!(Instant::now() < deadline);
         std::thread::yield_now();
     }
-    std::fs::remove_dir_all(fixture).unwrap();
+    // Retain the task fixture until checked write receipts and worker retirement
+    // prove cleanup safe; the legacy processing barrier is insufficient.
     drop(retained);
     drop(runtime);
     // Arc itself is the native foreground snapshot contract; no window or native provider was attached.

@@ -204,6 +204,7 @@ mod quit_tests {
             "platform observer must await legacy persistence drain when it finishes within GPUI's budget"
         );
         assert!(fixture.join("state").is_file());
-        std::fs::remove_dir_all(fixture).unwrap();
+        // Retain the task fixture until checked write receipts and worker retirement
+        // prove cleanup safe; the legacy processing barrier is insufficient.
     }
 }

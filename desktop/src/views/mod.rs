@@ -1757,7 +1757,8 @@ mod crossing_tests {
                 .len(),
             16384
         );
-        std::fs::remove_dir_all(fixture).unwrap();
+        // Retain the task fixture until checked write receipts and worker retirement
+        // prove cleanup safe; the legacy processing barrier is insufficient.
     }
     #[gpui::test]
     fn grid_viewport_mouse_and_mode_changes_keep_path_targets(cx: &mut TestAppContext) {
@@ -1997,7 +1998,8 @@ mod crossing_tests {
             assert_eq!(view.accessibility_actions.len(),1);
             view.runtime.stop(&view.controls);view.close();
         });
-        std::fs::remove_dir_all(fixture).unwrap();
+        // Retain the task fixture until checked write receipts and worker retirement
+        // prove cleanup safe; the legacy processing barrier is insufficient.
     }
     #[gpui::test]
     fn measured_help_modal_preserves_absolute_overlay_and_visible_ax_geometry(
@@ -2305,7 +2307,7 @@ mod crossing_tests {
         while !shutdown.shutdown_complete() {
             assert!(
                 std::time::Instant::now() < deadline,
-                "fixture persistence must acknowledge before deletion"
+                "fixture persistence processing drain must complete before the fixture scope exits"
             );
             std::thread::yield_now();
         }
@@ -2313,7 +2315,8 @@ mod crossing_tests {
             std::fs::read(fixture.join("fixture.txt")).unwrap(),
             "文😀e\u{301}\nfixture".as_bytes()
         );
-        std::fs::remove_dir_all(fixture).unwrap();
+        // Retain the task fixture until checked write receipts and worker retirement
+        // prove cleanup safe; the legacy processing barrier is insufficient.
     }
 
     #[gpui::test]
@@ -2425,7 +2428,8 @@ mod crossing_tests {
             view.close();
         });
         assert_eq!(std::fs::read(fixture.join("é-ax.txt")).unwrap(), b"fixture");
-        std::fs::remove_dir_all(fixture).unwrap();
+        // Retain the task fixture until checked write receipts and worker retirement
+        // prove cleanup safe; the legacy processing barrier is insufficient.
     }
     #[gpui::test]
     fn actual_prepared_host_footer_expiry_and_feedback_match_painted_status(
