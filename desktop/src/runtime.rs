@@ -20,6 +20,86 @@ use std::{
     time::{Duration, Instant},
 };
 
+// One finite unit is admitted by an RMW on the same irreversible stop latch.
+// This does not authenticate settlement of asynchronous work started by that unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActorUnit {
+    Attachment,
+    Completion,
+    Command,
+    Tick,
+    ChooserDrain,
+    Host,
+    Publication,
+}
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActorPhase {
+    BeforeAdmission,
+    Admitted,
+    Returned,
+    Canceled,
+}
+#[cfg(test)]
+type ActorHook = Arc<dyn Fn(ActorUnit, ActorPhase, &App) + Send + Sync>;
+#[cfg(test)]
+thread_local! { static ACTOR_HOOK: std::cell::RefCell<Option<ActorHook>> = const { std::cell::RefCell::new(None) }; }
+struct ActorAdmission {
+    stop: Arc<AtomicBool>,
+    #[cfg(test)]
+    hook: Option<ActorHook>,
+}
+impl ActorAdmission {
+    fn admit(&self, app: &mut App, unit: ActorUnit) -> bool {
+        #[cfg(not(test))]
+        let _ = unit;
+        #[cfg(test)]
+        if let Some(hook) = &self.hook {
+            hook(unit, ActorPhase::BeforeAdmission, app);
+        }
+        if !app.running {
+            self.stop.store(true, Ordering::Release);
+        }
+        // Strong no-op CAS cannot reset true and establishes one-unit admission.
+        let admitted = self
+            .stop
+            .compare_exchange(false, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        #[cfg(test)]
+        if admitted {
+            if let Some(hook) = &self.hook {
+                hook(unit, ActorPhase::Admitted, app);
+            }
+        }
+        if !admitted {
+            self.finish(app, unit);
+        }
+        admitted
+    }
+    fn finish(&self, app: &mut App, unit: ActorUnit) -> bool {
+        #[cfg(not(test))]
+        let _ = unit;
+        #[cfg(test)]
+        if let Some(hook) = &self.hook {
+            hook(unit, ActorPhase::Returned, app);
+        }
+        if !app.running {
+            self.stop.store(true, Ordering::Release);
+        }
+        if self.stop.load(Ordering::Acquire) {
+            app.cancel_pending_work();
+            cancel_all(app); // Includes controls created by this unit, never published.
+            #[cfg(test)]
+            if let Some(hook) = &self.hook {
+                hook(unit, ActorPhase::Canceled, app);
+            }
+            false
+        } else {
+            true
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Command {
     Browse(crate::platform::chooser::ChooserKind),
@@ -257,7 +337,14 @@ impl Runtime {
         let stop = stopping.clone();
         let attached_window = Arc::new(AtomicU64::new(window_generation));
         let attached = attached_window.clone();
+        #[cfg(test)]
+        let hook = ACTOR_HOOK.with(|slot| slot.borrow().clone());
         thread::spawn(move || {
+            let admission = ActorAdmission {
+                stop: stop.clone(),
+                #[cfg(test)]
+                hook,
+            };
             let (mut app, loader, font_family) = factory();
             #[cfg(test)]
             if let Some(fixture) = fixture {
@@ -268,7 +355,10 @@ impl Runtime {
                     app.bookmarks_path = Some(fixture.directory.join("bookmarks"));
                 }
             }
-            app.attach_window(window_generation);
+            if admission.admit(&mut app, ActorUnit::Attachment) {
+                app.attach_window(window_generation);
+                admission.finish(&mut app, ActorUnit::Attachment);
+            }
             let (editor_tx, editor_rx) = mpsc::channel::<(u64, HostRequest)>();
             let (editor_done, editor_results) = mpsc::channel();
             let (drive_tx, drive_rx) = mpsc::channel::<u64>();
@@ -348,28 +438,58 @@ impl Runtime {
             let mut chooser = chooser_runtime::ActorChooser::default();
             let (chooser_pending_tx, chooser_pending_rx) = mpsc::channel();
             let mut last_tick = Instant::now();
-            *actor_chooser_permit.lock().unwrap() = chooser.permit(&app);
-            *actor_chooser_focus.lock().unwrap() = app.existing_path_focus_stamp();
-            for event in chooser_pending_rx.try_iter() {
-                let _ = chooser_tx.send(event);
+            if admission.admit(&mut app, ActorUnit::Publication) {
+                *actor_chooser_permit.lock().unwrap() = chooser.permit(&app);
+                *actor_chooser_focus.lock().unwrap() = app.existing_path_focus_stamp();
+                for event in chooser_pending_rx.try_iter() {
+                    if !admission.finish(&mut app, ActorUnit::Publication) {
+                        break;
+                    }
+                    let _ = chooser_tx.send(event);
+                }
+                if admission.finish(&mut app, ActorUnit::Publication) {
+                    publish(&app, &publication, &loader, &font_family);
+                }
+                admission.finish(&mut app, ActorUnit::Publication);
             }
-            publish(&app, &publication, &loader, &font_family);
-            while !stop.load(Ordering::Acquire) && app.running {
-                if synchronize_attachment(
+            'actor: while !stop.load(Ordering::Acquire) && app.running {
+                if !admission.admit(&mut app, ActorUnit::Attachment) {
+                    break;
+                }
+                let changed = synchronize_attachment(
                     &mut app,
                     attached.load(Ordering::Acquire),
                     &editor_tx,
                     &drive_tx,
                     &completed,
-                ) {
+                    &admission,
+                );
+                if !admission.finish(&mut app, ActorUnit::Attachment) {
+                    break;
+                }
+                if changed {
+                    if !admission.admit(&mut app, ActorUnit::Publication) {
+                        break;
+                    }
                     *actor_chooser_permit.lock().unwrap() = chooser.permit(&app);
                     *actor_chooser_focus.lock().unwrap() = app.existing_path_focus_stamp();
                     for event in chooser_pending_rx.try_iter() {
+                        if !admission.finish(&mut app, ActorUnit::Publication) {
+                            break;
+                        }
                         let _ = chooser_tx.send(event);
                     }
-                    publish(&app, &publication, &loader, &font_family);
+                    if admission.finish(&mut app, ActorUnit::Publication) {
+                        publish(&app, &publication, &loader, &font_family);
+                    }
+                    if !admission.finish(&mut app, ActorUnit::Publication) {
+                        break;
+                    }
                 }
                 for result in editor_results.try_iter() {
+                    if !admission.admit(&mut app, ActorUnit::Completion) {
+                        break 'actor;
+                    }
                     match result {
                         EditorResult::Drives(epoch, generation, result)
                             if epoch == app.window_generation
@@ -398,24 +518,59 @@ impl Runtime {
                         }
                         _ => {}
                     }
+                    if !admission.finish(&mut app, ActorUnit::Completion) {
+                        break 'actor;
+                    }
+                    if !admission.admit(&mut app, ActorUnit::Publication) {
+                        break 'actor;
+                    }
                     *actor_chooser_permit.lock().unwrap() = chooser.permit(&app);
                     *actor_chooser_focus.lock().unwrap() = app.existing_path_focus_stamp();
                     for event in chooser_pending_rx.try_iter() {
+                        if !admission.finish(&mut app, ActorUnit::Publication) {
+                            break;
+                        }
                         let _ = chooser_tx.send(event);
                     }
-                    publish(&app, &publication, &loader, &font_family);
+                    if admission.finish(&mut app, ActorUnit::Publication) {
+                        publish(&app, &publication, &loader, &font_family);
+                    }
+                    if !admission.finish(&mut app, ActorUnit::Publication) {
+                        break 'actor;
+                    }
                 }
                 match commands.recv_timeout(Duration::from_millis(20)) {
                     Ok(envelope) => {
+                        // Dequeue is not admission. Attachment and dispatch each cross the latch.
+                        let sequence = envelope.sequence;
+                        let window_generation = envelope.window_generation;
+                        if !admission.admit(&mut app, ActorUnit::Attachment) {
+                            let _ = completed.send(Completion::Rejected {
+                                sequence,
+                                window_generation,
+                                reason: "Actor is stopping".into(),
+                            });
+                            break;
+                        }
                         synchronize_attachment(
                             &mut app,
                             attached.load(Ordering::Acquire),
                             &editor_tx,
                             &drive_tx,
                             &completed,
+                            &admission,
                         );
-                        let sequence = envelope.sequence;
-                        let window_generation = envelope.window_generation;
+                        if !admission.finish(&mut app, ActorUnit::Attachment) {
+                            break;
+                        }
+                        if !admission.admit(&mut app, ActorUnit::Command) {
+                            let _ = completed.send(Completion::Rejected {
+                                sequence,
+                                window_generation,
+                                reason: "Actor is stopping".into(),
+                            });
+                            break;
+                        }
                         if let Err(reason) = chooser.apply(&mut app, envelope, &chooser_pending_tx)
                         {
                             let _ = completed.send(Completion::Rejected {
@@ -424,28 +579,63 @@ impl Runtime {
                                 reason,
                             });
                         }
+                        if !admission.finish(&mut app, ActorUnit::Command) {
+                            break;
+                        }
                         for request in app.take_host_requests() {
+                            if !admission.admit(&mut app, ActorUnit::Host) {
+                                break 'actor;
+                            }
                             route_host(&app, request, sequence, &editor_tx, &drive_tx, &completed);
+                            if !admission.finish(&mut app, ActorUnit::Host) {
+                                break 'actor;
+                            }
+                        }
+                        if !admission.admit(&mut app, ActorUnit::Publication) {
+                            break;
                         }
                         *actor_chooser_permit.lock().unwrap() = chooser.permit(&app);
                         *actor_chooser_focus.lock().unwrap() = app.existing_path_focus_stamp();
                         for event in chooser_pending_rx.try_iter() {
+                            if !admission.finish(&mut app, ActorUnit::Publication) {
+                                break;
+                            }
                             let _ = chooser_tx.send(event);
                         }
-                        publish(&app, &publication, &loader, &font_family);
+                        if admission.finish(&mut app, ActorUnit::Publication) {
+                            publish(&app, &publication, &loader, &font_family);
+                        }
+                        if !admission.finish(&mut app, ActorUnit::Publication) {
+                            break;
+                        }
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
                 if last_tick.elapsed() >= Duration::from_millis(500) {
+                    if !admission.admit(&mut app, ActorUnit::Tick) {
+                        break;
+                    }
                     let context = app.input_context();
                     let focus = app.focus_generation;
                     app.tick();
                     if context != app.input_context() && focus == app.focus_generation {
                         app.focus_generation = app.focus_generation.wrapping_add(1);
                     }
+                    if !admission.finish(&mut app, ActorUnit::Tick) {
+                        break;
+                    }
+                    if !admission.admit(&mut app, ActorUnit::ChooserDrain) {
+                        break;
+                    }
                     chooser.drain(&mut app, &chooser_pending_tx);
+                    if !admission.finish(&mut app, ActorUnit::ChooserDrain) {
+                        break;
+                    }
                     for request in app.take_host_requests() {
+                        if !admission.admit(&mut app, ActorUnit::Host) {
+                            break 'actor;
+                        }
                         route_host(
                             &app,
                             request,
@@ -454,13 +644,27 @@ impl Runtime {
                             &drive_tx,
                             &completed,
                         );
+                        if !admission.finish(&mut app, ActorUnit::Host) {
+                            break 'actor;
+                        }
+                    }
+                    if !admission.admit(&mut app, ActorUnit::Publication) {
+                        break;
                     }
                     *actor_chooser_permit.lock().unwrap() = chooser.permit(&app);
                     *actor_chooser_focus.lock().unwrap() = app.existing_path_focus_stamp();
                     for event in chooser_pending_rx.try_iter() {
+                        if !admission.finish(&mut app, ActorUnit::Publication) {
+                            break;
+                        }
                         let _ = chooser_tx.send(event);
                     }
-                    publish(&app, &publication, &loader, &font_family);
+                    if admission.finish(&mut app, ActorUnit::Publication) {
+                        publish(&app, &publication, &loader, &font_family);
+                    }
+                    if !admission.finish(&mut app, ActorUnit::Publication) {
+                        break;
+                    }
                     last_tick = Instant::now();
                 }
             }
@@ -995,6 +1199,7 @@ fn synchronize_attachment(
     editor: &mpsc::Sender<(u64, HostRequest)>,
     drives: &mpsc::Sender<u64>,
     completed: &mpsc::Sender<Completion>,
+    admission: &ActorAdmission,
 ) -> bool {
     if app.window_generation == epoch {
         return false;
@@ -1004,7 +1209,13 @@ fn synchronize_attachment(
     app.attach_window(epoch);
     for request in abandoned {
         if matches!(request, HostRequest::RefreshDrives) {
+            if !admission.admit(app, ActorUnit::Host) {
+                return true;
+            }
             route_host(app, request, app.ack_sequence, editor, drives, completed);
+            if !admission.finish(app, ActorUnit::Host) {
+                return true;
+            }
         } else {
             let _ = completed.send(Completion::Rejected {
                 sequence: app.ack_sequence,
@@ -1044,3 +1255,7 @@ impl Runtime {
         self.chooser_events.try_lock().ok()?.try_recv().ok()
     }
 }
+
+#[cfg(test)]
+#[path = "runtime_stop_admission_tests.rs"]
+mod stop_admission_tests;
