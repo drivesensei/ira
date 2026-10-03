@@ -72,6 +72,17 @@ pub(crate) fn publish(path: &Path, bytes: &[u8]) -> Result<(), PersistenceError>
     // Refuse read-only targets rather than replacing them through directory rights.
     let permissions = match fs::metadata(&destination) {
         Ok(m) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if m.is_file() && m.nlink() > 1 {
+                    return Err(PersistenceError::io(
+                        path,
+                        "identity",
+                        "atomic publication of a hard-linked destination is unsupported",
+                    ));
+                }
+            }
             if m.permissions().readonly() {
                 return Err(PersistenceError::io(
                     path,

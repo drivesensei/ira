@@ -98,3 +98,31 @@ fn atomic_publication_preserves_existing_symlink_and_target_permissions() {
         0o640
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn relative_symlink_chain_and_dangling_target_keep_legacy_write_destination() {
+    use std::os::unix::fs::symlink;
+    let f = Fixture::new();
+    let target = f.0.join("target");
+    let middle = f.0.join("middle");
+    let link = f.0.join("link");
+    symlink("target", &middle).unwrap();
+    symlink("middle", &link).unwrap();
+    publish(&link, b"created through aliases").unwrap();
+    assert!(link.is_symlink());
+    assert!(middle.is_symlink());
+    assert_eq!(fs::read(target).unwrap(), b"created through aliases");
+}
+#[cfg(unix)]
+#[test]
+fn hard_link_destination_is_rejected_without_modifying_either_alias() {
+    let f = Fixture::new();
+    let target = f.0.join("target");
+    let alias = f.0.join("alias");
+    fs::write(&target, b"old").unwrap();
+    fs::hard_link(&target, &alias).unwrap();
+    assert_eq!(publish(&target, b"new").unwrap_err().stage, "identity");
+    assert_eq!(fs::read(target).unwrap(), b"old");
+    assert_eq!(fs::read(alias).unwrap(), b"old");
+}
