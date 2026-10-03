@@ -72,7 +72,7 @@ fn accessibility_selection_rejects_invalid_unicode_without_mutation(cx: &mut Tes
         cx.add_window_view(|_, cx| TextInput::new("a😀e\u{301}z", InputOptions::default(), cx));
     input.update_in(cx, |i, w, cx| {
         let before = i.snapshot();
-        for range in [3..2, 0..99] {
+        for range in [std::ops::Range { start: 3, end: 2 }, 0..99] {
             assert_eq!(
                 i.set_selection_utf16(range, false, w, cx),
                 Err(InputEditError::InvalidRange)

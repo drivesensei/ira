@@ -136,7 +136,7 @@ fn strict_utf16_selection_rejects_surrogates_combining_and_emoji_cluster_splits(
         Err(SelectionError::InvalidBoundary)
     );
     assert_eq!(
-        b.checked_utf16_selection(4..3),
+        b.checked_utf16_selection(std::ops::Range { start: 4, end: 3 }),
         Err(SelectionError::InvalidRange)
     );
     assert_eq!(
