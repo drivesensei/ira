@@ -93,8 +93,16 @@ fn main() -> AppResult<()> {
 /// The normal terminal-exit path. Cleanup is injected so regression tests use
 /// owned synthetic state and never initialize a terminal or call App::new.
 fn finish_exit(app: &mut App, cleanup: impl FnOnce(&mut App) -> AppResult<()>) -> AppResult<()> {
-    app.persist_state();
-    cleanup(app)
+    let saved = app.try_persist_state();
+    let cleaned = cleanup(app);
+    match (saved, cleaned) {
+        (Err(save_error), Err(cleanup_error)) => {
+            eprintln!("Terminal cleanup failed: {cleanup_error}");
+            Err(save_error.into())
+        }
+        (Err(save_error), Ok(())) => Err(save_error.into()),
+        (Ok(()), cleaned) => cleaned,
+    }
 }
 
 /// Prints detected terminal capabilities and exits. Useful when icons

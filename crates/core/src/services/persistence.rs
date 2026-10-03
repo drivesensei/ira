@@ -90,6 +90,15 @@ fn same_version(before: &fs::Metadata, after: &fs::Metadata) -> bool {
 fn same_version(before: &fs::Metadata, after: &fs::Metadata) -> bool {
     before.len() == after.len() && before.modified().ok() == after.modified().ok()
 }
+/// Publishes complete caller-encoded bytes using the reviewed same-directory
+/// writer. Errors preserve the previous destination before publication.
+/// Success includes file sync and rename, not directory/power-loss durability.
+/// Existing aliases, permissions and supported Apple metadata follow the same
+/// policy as session/bookmark persistence; unsupported identities are errors.
+pub fn try_publish_bytes(path: &Path, bytes: &[u8]) -> Result<(), PersistenceError> {
+    publish(path, bytes)
+}
+
 pub(crate) fn publish(path: &Path, bytes: &[u8]) -> Result<(), PersistenceError> {
     publish_with(path, bytes, || {})
 }
