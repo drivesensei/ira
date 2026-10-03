@@ -40,6 +40,10 @@ use crate::{
         is_dir::{get_directory, get_parent_directory},
     },
 };
+type TransferProbeResult = (u64, TransferDestSync, [u64; 2], bool);
+#[cfg(test)]
+type TransferProbeTest = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 /// Application result type.
 pub type AppResult<T> = std::result::Result<T, Box<dyn error::Error>>;
 
@@ -349,6 +353,13 @@ pub struct App {
     pub goto_prompt: Option<String>,
     /// Live destination sync while a transfer writes into a folder.
     pub transfer_dest: Option<TransferDestSync>,
+    transfer_probe_tx: mpsc::Sender<TransferProbeResult>,
+    transfer_probe_rx: mpsc::Receiver<TransferProbeResult>,
+    transfer_generation: u64,
+    transfer_probe_pending: Option<u64>,
+    transfer_probe_last_attempt: Option<Instant>,
+    #[cfg(test)]
+    transfer_probe_test: Option<TransferProbeTest>,
     /// Keybindings help dialog (`*`); closed by any key.
     pub keybindings_visible: bool,
     /// Marquee scroll offset (chars) for the contextual hint bar; advanced
@@ -615,6 +626,7 @@ impl Default for App {
     fn default() -> Self {
         let (job_tx, job_rx) = mpsc::channel();
         let (file_list_tx, file_list_rx) = mpsc::channel();
+        let (transfer_probe_tx, transfer_probe_rx) = mpsc::channel();
         let (info_tx, info_rx) = mpsc::channel();
         let (thumb_tx, thumb_rx) = mpsc::channel();
         let (thumb_jobs_hi, thumb_jobs_hi_rx) = mpsc::sync_channel(JOB_QUEUE_HI_CAP);
@@ -640,6 +652,13 @@ impl Default for App {
             new_entry: None,
             goto_prompt: None,
             transfer_dest: None,
+            transfer_probe_tx,
+            transfer_probe_rx,
+            transfer_generation: 0,
+            transfer_probe_pending: None,
+            transfer_probe_last_attempt: None,
+            #[cfg(test)]
+            transfer_probe_test: None,
             info: None,
             multi_info: None,
             status: None,
@@ -3418,6 +3437,7 @@ impl App {
         let job = self.jobs.last().unwrap();
         spawn_job(job, self.job_tx.clone());
 
+        self.invalidate_transfer_probe();
         self.transfer_dest = Some(TransferDestSync {
             dest_dir: dest.clone(),
             reveal_path: reveal.to_string_lossy().into_owned(),
@@ -3594,6 +3614,7 @@ impl App {
                     }
                 }
                 JobEvent::Done { id } => {
+                    self.invalidate_transfer_probe();
                     if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id) {
                         j.status = JobStatus::Done;
                         self.transfer_dest = None;
@@ -3627,12 +3648,14 @@ impl App {
                     self.refresh_after_job();
                 }
                 JobEvent::Cancelled { id } => {
+                    self.invalidate_transfer_probe();
                     if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id) {
                         j.status = JobStatus::Cancelled;
                     }
                     self.refresh_after_job();
                 }
                 JobEvent::Failed { id, error } => {
+                    self.invalidate_transfer_probe();
                     if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id) {
                         j.status = JobStatus::Failed(error);
                     }
@@ -3680,29 +3703,86 @@ impl App {
         self.list_files_for_pane(1);
     }
 
-    /// While a transfer writes into a folder, re-lists panes that show that
-    /// folder (or are inside it) once per second, so copied items appear
-    /// live. Never blocks the UI: listings run on background workers.
+    fn invalidate_transfer_probe(&mut self) {
+        self.transfer_generation = self.transfer_generation.wrapping_add(1);
+        self.transfer_probe_pending = None;
+        self.transfer_probe_last_attempt = None;
+    }
+
+    /// Probe transfer destination existence on a worker, at most once per second.
+    /// Current results retain the source reveal and navigation-preservation rules.
     fn refresh_transfer_destinations(&mut self) {
-        let Some(sync) = self.transfer_dest.clone() else {
-            return;
-        };
+        // Terminal events are drained first by tick. Also reject results when
+        // no transfer is live, even if a caller changed job state directly.
         if !self
             .jobs
             .iter()
             .any(|j| matches!(j.status, JobStatus::Running | JobStatus::Paused))
         {
-            self.transfer_dest = None;
+            if self.transfer_dest.take().is_some() || self.transfer_probe_pending.is_some() {
+                self.invalidate_transfer_probe();
+            }
+            while self.transfer_probe_rx.try_recv().is_ok() {}
             return;
         }
-        // The destination folder appears once the first item starts copying.
-        if std::fs::metadata(&sync.dest_dir).is_err() {
+        while let Ok((generation, sync, listing_generations, exists)) =
+            self.transfer_probe_rx.try_recv()
+        {
+            if generation != self.transfer_generation {
+                continue;
+            }
+            self.transfer_probe_pending = None;
+            let current = self.transfer_dest.as_ref().is_some_and(|current| {
+                current.dest_dir == sync.dest_dir
+                    && current.reveal_path == sync.reveal_path
+                    && current.last_refresh == sync.last_refresh
+            });
+            if exists && current {
+                self.apply_transfer_destination_refresh(sync, listing_generations);
+            }
+        }
+        let Some(sync) = self.transfer_dest.clone() else {
+            return;
+        };
+        let now = Instant::now();
+        if self.transfer_probe_pending.is_some()
+            || now.saturating_duration_since(sync.last_refresh) < Duration::from_secs(1)
+            || self
+                .transfer_probe_last_attempt
+                .is_some_and(|last| now.saturating_duration_since(last) < Duration::from_secs(1))
+        {
             return;
         }
-        if sync.last_refresh.elapsed() < Duration::from_secs(1) {
-            return;
-        }
-        for i in 0..self.panes.len() {
+        let generation = self.transfer_generation;
+        let listing_generations = self.panes.each_ref().map(|pane| pane.listing_generation);
+        self.transfer_probe_pending = Some(generation);
+        self.transfer_probe_last_attempt = Some(now);
+        let tx = self.transfer_probe_tx.clone();
+        #[cfg(test)]
+        let probe = self.transfer_probe_test.clone();
+        thread::spawn(move || {
+            #[cfg(test)]
+            let exists = probe.as_ref().map_or_else(
+                || std::fs::metadata(&sync.dest_dir).is_ok(),
+                |probe| probe(&sync.dest_dir),
+            );
+            #[cfg(not(test))]
+            let exists = std::fs::metadata(&sync.dest_dir).is_ok();
+            let _ = tx.send((generation, sync, listing_generations, exists));
+        });
+    }
+
+    fn apply_transfer_destination_refresh(
+        &mut self,
+        sync: TransferDestSync,
+        listing_generations: [u64; 2],
+    ) {
+        for (i, listing_generation) in listing_generations.iter().enumerate() {
+            // An asynchronous existence result must not refresh a newer listing
+            // requested while the probe was in flight (including away-and-back).
+            if self.panes[i].listing_generation != *listing_generation {
+                continue;
+            }
             let viewing = self.panes[i].folder.as_ref().is_some_and(|f| {
                 f.path == sync.dest_dir || f.path.starts_with(&format!("{}/", sync.dest_dir))
             });
@@ -6274,3 +6354,7 @@ mod editor_safety_tests;
 
 #[path = "services/editor.rs"]
 mod editor_staging;
+
+#[cfg(test)]
+#[path = "app_transfer_probe_tests.rs"]
+mod transfer_probe_tests;
