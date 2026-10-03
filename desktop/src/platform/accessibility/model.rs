@@ -220,6 +220,14 @@ pub struct SemanticTree {
     pub nodes: BTreeMap<NodeId, Node>,
 }
 impl SemanticTree {
+    /// Background identities remain logical but retained native queries are unavailable
+    /// during a modal. The root remains the native fragment/parent boundary.
+    pub fn query_node(&self, id: NodeId) -> Option<&Node> {
+        if id != self.root && !self.in_modal_scope(id) {
+            return None;
+        }
+        self.nodes.get(&id)
+    }
     pub fn hit_test(&self, x: f64, y: f64) -> Option<NodeId> {
         fn visit(t: &SemanticTree, id: NodeId, x: f64, y: f64) -> Option<NodeId> {
             let n = t.nodes.get(&id)?;
@@ -1244,4 +1252,64 @@ impl MaterializedNodes {
             Some(self.revision.load(std::sync::atomic::Ordering::Acquire));
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NavigationDirection {
+    Parent,
+    FirstChild,
+    LastChild,
+    NextSibling,
+    PreviousSibling,
+}
+/// Resolve both source and destination in one immutable cached publication.
+/// Prepared sibling lookup is O(log N); legacy fallback remains compatible.
+pub fn navigation_destination(
+    tree: &Arc<SemanticTree>,
+    prepared: Option<&PreparedSemantic>,
+    source: NodeId,
+    direction: NavigationDirection,
+) -> Result<NodeId, super::Rejection> {
+    if prepared.is_some_and(|p| !Arc::ptr_eq(tree, &p.tree)) {
+        return Err(super::Rejection::Stale);
+    }
+    let node = tree.query_node(source).ok_or(super::Rejection::Stale)?;
+    let destination = match direction {
+        NavigationDirection::Parent => node.parent,
+        NavigationDirection::FirstChild => node.children.first().copied(),
+        NavigationDirection::LastChild => node.children.last().copied(),
+        NavigationDirection::NextSibling | NavigationDirection::PreviousSibling => {
+            if let Some(prepared) = prepared {
+                prepared.siblings.get(&source).and_then(|(previous, next)| {
+                    if direction == NavigationDirection::NextSibling {
+                        *next
+                    } else {
+                        *previous
+                    }
+                })
+            } else {
+                node.parent
+                    .and_then(|parent| tree.query_node(parent))
+                    .and_then(|parent| {
+                        parent
+                            .children
+                            .iter()
+                            .position(|id| *id == source)
+                            .and_then(|index| {
+                                if direction == NavigationDirection::NextSibling {
+                                    parent.children.get(index + 1).copied()
+                                } else {
+                                    index
+                                        .checked_sub(1)
+                                        .and_then(|index| parent.children.get(index).copied())
+                                }
+                            })
+                    })
+            }
+        }
+    }
+    .ok_or(super::Rejection::Unsupported)?;
+    tree.query_node(destination)
+        .ok_or(super::Rejection::Stale)?;
+    Ok(destination)
 }
