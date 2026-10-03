@@ -101,6 +101,10 @@ impl JobControl {
     }
 
     pub fn request_cancel(&self) {
+        // Synchronize with the pause wait to avoid a lost wakeup between its
+        // cancellation check and Condvar::wait. Preserve the original gate
+        // algorithm; cancellation wakes the paused worker to return Cancelled.
+        let _paused = self.pause.lock();
         self.cancel.store(true, Ordering::Relaxed);
         self.resume.notify_all();
     }
@@ -173,6 +177,53 @@ const MAX_ENTRIES: u64 = 200_000; // pre-scan cap; above this show indeterminate
 /// It must support files and directories without copying across volumes.
 pub type NoReplaceProvider = dyn Fn(&Path, &Path) -> std::io::Result<()> + Send + Sync;
 
+/// A dedicated one-shot terminal capability. Only the worker sends it after
+/// its last business I/O; dropping it never authenticates completion.
+pub(crate) struct TerminalReceipt {
+    identity: u64,
+    sender: mpsc::Sender<u64>,
+}
+impl TerminalReceipt {
+    pub(crate) fn acknowledge(self) {
+        let _ = self.sender.send(self.identity);
+    }
+}
+pub(crate) fn terminal_receipt(identity: u64) -> (TerminalReceipt, mpsc::Receiver<u64>) {
+    let (sender, receiver) = mpsc::channel();
+    (TerminalReceipt { identity, sender }, receiver)
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct WorkerTestHooks {
+    pub provider: Option<Arc<NoReplaceProvider>>,
+    /// Observe/block after the real owned remove attempt, before its return
+    /// is processed. This is not a physically blocked OS syscall witness.
+    pub after_remove: Option<Arc<dyn Fn(&Path) + Send + Sync>>,
+    pub lose_receipt: bool,
+}
+
+#[cfg(test)]
+pub(crate) fn test_real_no_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
+    rename_no_replace(src, dst)
+}
+
+pub(crate) fn spawn_job_tracked(
+    job: &Job,
+    tx: mpsc::Sender<JobEvent>,
+    receipt: TerminalReceipt,
+    #[cfg(test)] hooks: Option<WorkerTestHooks>,
+) {
+    spawn_job_internal(
+        job,
+        tx,
+        Arc::new(rename_no_replace),
+        Some(receipt),
+        #[cfg(test)]
+        hooks,
+    );
+}
+
 pub fn spawn_job(job: &Job, tx: mpsc::Sender<JobEvent>) {
     spawn_job_with_provider(job, tx, Arc::new(rename_no_replace));
 }
@@ -183,6 +234,28 @@ pub fn spawn_job_with_provider(
     tx: mpsc::Sender<JobEvent>,
     provider: Arc<NoReplaceProvider>,
 ) {
+    spawn_job_internal(
+        job,
+        tx,
+        provider,
+        None,
+        #[cfg(test)]
+        None,
+    );
+}
+
+fn spawn_job_internal(
+    job: &Job,
+    tx: mpsc::Sender<JobEvent>,
+    provider: Arc<NoReplaceProvider>,
+    receipt: Option<TerminalReceipt>,
+    #[cfg(test)] hooks: Option<WorkerTestHooks>,
+) {
+    #[cfg(test)]
+    let provider = hooks
+        .as_ref()
+        .and_then(|h| h.provider.clone())
+        .unwrap_or(provider);
     let id = job.id;
     let kind = job.kind;
     let control = job.control.clone();
@@ -209,6 +282,13 @@ pub fn spawn_job_with_provider(
             }
         };
         let _ = tx.send(event);
+        #[cfg(test)]
+        if hooks.as_ref().is_some_and(|h| h.lose_receipt) {
+            return;
+        }
+        if let Some(receipt) = receipt {
+            receipt.acknowledge();
+        }
     });
 }
 
@@ -1089,7 +1169,41 @@ fn remove_tree(path: &Path) -> Result<(), JobError> {
 /// granularity is per path).
 pub fn spawn_delete_job(paths: Vec<String>, tx: mpsc::Sender<JobEvent>) -> Arc<JobControl> {
     let control = JobControl::new();
-    let c = control.clone();
+    spawn_delete_internal(
+        paths,
+        tx,
+        control.clone(),
+        None,
+        #[cfg(test)]
+        None,
+    );
+    control
+}
+
+pub(crate) fn spawn_delete_tracked(
+    paths: Vec<String>,
+    tx: mpsc::Sender<JobEvent>,
+    control: Arc<JobControl>,
+    receipt: TerminalReceipt,
+    #[cfg(test)] hooks: Option<WorkerTestHooks>,
+) {
+    spawn_delete_internal(
+        paths,
+        tx,
+        control,
+        Some(receipt),
+        #[cfg(test)]
+        hooks,
+    );
+}
+
+fn spawn_delete_internal(
+    paths: Vec<String>,
+    tx: mpsc::Sender<JobEvent>,
+    c: Arc<JobControl>,
+    receipt: Option<TerminalReceipt>,
+    #[cfg(test)] hooks: Option<WorkerTestHooks>,
+) {
     thread::spawn(move || {
         let total = paths.len();
         let mut failed: Vec<(String, String)> = Vec::new();
@@ -1099,6 +1213,13 @@ pub fn spawn_delete_job(paths: Vec<String>, tx: mpsc::Sender<JobEvent>) -> Arc<J
                     cancelled: true,
                     failed,
                 });
+                #[cfg(test)]
+                if hooks.as_ref().is_some_and(|h| h.lose_receipt) {
+                    return;
+                }
+                if let Some(receipt) = receipt {
+                    receipt.acknowledge();
+                }
                 return;
             }
             let result = std::fs::symlink_metadata(path).ok().map(|meta| {
@@ -1108,6 +1229,10 @@ pub fn spawn_delete_job(paths: Vec<String>, tx: mpsc::Sender<JobEvent>) -> Arc<J
                     std::fs::remove_file(path)
                 }
             });
+            #[cfg(test)]
+            if let Some(hook) = hooks.as_ref().and_then(|h| h.after_remove.as_ref()) {
+                hook(Path::new(path));
+            }
             if let Some(Err(e)) = result {
                 failed.push((path.clone(), e.to_string()));
             }
@@ -1121,8 +1246,14 @@ pub fn spawn_delete_job(paths: Vec<String>, tx: mpsc::Sender<JobEvent>) -> Arc<J
             cancelled: false,
             failed,
         });
+        #[cfg(test)]
+        if hooks.as_ref().is_some_and(|h| h.lose_receipt) {
+            return;
+        }
+        if let Some(receipt) = receipt {
+            receipt.acknowledge();
+        }
     });
-    control
 }
 
 #[cfg(test)]
@@ -1530,3 +1661,7 @@ mod batch_tests {
 #[cfg(test)]
 #[path = "transfer_safety_tests.rs"]
 mod safety_tests;
+
+#[cfg(test)]
+#[path = "transfer_settlement_tests.rs"]
+mod settlement_tests;

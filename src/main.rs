@@ -90,10 +90,52 @@ fn main() -> AppResult<()> {
     })
 }
 
-/// The normal terminal-exit path. Cleanup is injected so regression tests use
-/// owned synthetic state and never initialize a terminal or call App::new.
-fn finish_exit(app: &mut App, cleanup: impl FnOnce(&mut App) -> AppResult<()>) -> AppResult<()> {
-    let saved = app.try_persist_state();
+// Private source harness boundary; production delegates to the real root App.
+trait ExitApp {
+    type Seal;
+    type SaveError: std::error::Error + 'static;
+    fn begin_exit_work(&mut self) -> Self::Seal;
+    fn poll_exit_work(&mut self, seal: &Self::Seal, budget: usize) -> AppResult<bool>;
+    fn save_exit_state(&self) -> Result<(), Self::SaveError>;
+}
+impl ExitApp for App {
+    type Seal = ira::app::ExitWorkSeal;
+    type SaveError = ira::services::persistence::PersistenceError;
+    fn begin_exit_work(&mut self) -> Self::Seal {
+        self.begin_exit_settlement()
+    }
+    fn poll_exit_work(&mut self, seal: &Self::Seal, budget: usize) -> AppResult<bool> {
+        match self.poll_exit_settlement(seal, budget) {
+            ira::app::ExitWorkPoll::Pending => Ok(false),
+            ira::app::ExitWorkPoll::Settled => Ok(true),
+            ira::app::ExitWorkPoll::Error(error) => Err(error.into()),
+        }
+    }
+    fn save_exit_state(&self) -> Result<(), ira::services::persistence::PersistenceError> {
+        self.try_persist_state()
+    }
+}
+
+/// Normal terminal exit: receipts first, checked save next, cleanup exactly once.
+/// Tests inject cleanup using owned state and never initialize a terminal.
+fn finish_exit<A: ExitApp>(
+    app: &mut A,
+    cleanup: impl FnOnce(&mut A) -> AppResult<()>,
+) -> AppResult<()> {
+    let seal = app.begin_exit_work();
+    loop {
+        match app.poll_exit_work(&seal, 64) {
+            Ok(false) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Ok(true) => break,
+            Err(settlement_error) => {
+                if let Err(cleanup_error) = cleanup(app) {
+                    eprintln!("Terminal cleanup failed: {cleanup_error}");
+                }
+                return Err(settlement_error);
+            }
+        }
+    }
+    let saved = app.save_exit_state();
     let cleaned = cleanup(app);
     match (saved, cleaned) {
         (Err(save_error), Err(cleanup_error)) => {
@@ -194,3 +236,33 @@ fn print_terminal_check() {
 #[cfg(test)]
 #[path = "main_exit_tests.rs"]
 mod main_exit_tests;
+
+// Bin unit tests compile source-identical root App/workers with private hooks;
+// the production imports/main and original four tests retain ira::app::App.
+#[cfg(test)]
+pub use ira::{components, domain, theme, utils};
+#[cfg(test)]
+#[path = "app.rs"]
+mod app;
+#[cfg(test)]
+#[path = "handler.rs"]
+mod handler;
+#[cfg(test)]
+mod services {
+    pub use ira::services::{
+        blocks, clipboard, drives, file_info, folders, list_files, overlay, picker_probe,
+        thumbnails,
+    };
+    // Preserve cfg(test) owned default paths even for inherited source tests.
+    #[path = "bookmarks.rs"]
+    pub mod bookmarks;
+    #[path = "persistence.rs"]
+    pub mod persistence;
+    #[path = "state.rs"]
+    pub mod state;
+    #[path = "transfer.rs"]
+    pub mod transfer;
+}
+#[cfg(test)]
+#[path = "main_exit_settlement_tests.rs"]
+mod main_exit_settlement_tests;

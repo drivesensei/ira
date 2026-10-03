@@ -33,8 +33,8 @@ use crate::{
             ThumbEvent, ThumbRequest, WorkerQueues, JOB_QUEUE_HI_CAP, JOB_QUEUE_LO_CAP,
         },
         transfer::{
-            spawn_delete_job, spawn_job, Job, JobControl, JobEvent, JobKind, JobStatus,
-            OverwritePolicy,
+            spawn_delete_tracked, spawn_job_tracked, terminal_receipt, Job, JobControl, JobEvent,
+            JobKind, JobStatus, OverwritePolicy, TerminalReceipt,
         },
     },
     utils::{
@@ -320,6 +320,35 @@ struct WalkSlot {
     started: Instant,
 }
 
+/// Opaque, instance-bound authority for the finite set of accepted root workers.
+pub struct ExitWorkSeal(Arc<()>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkSettlementError {
+    ForeignSeal,
+    Sealed,
+    IdentityExhausted,
+    ReceiptLost { identity: u64 },
+    InvalidReceipt { identity: u64 },
+}
+impl std::fmt::Display for WorkSettlementError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Terminal work settlement failed: {self:?}")
+    }
+}
+impl error::Error for WorkSettlementError {}
+
+pub enum ExitWorkPoll {
+    Pending,
+    Settled,
+    Error(WorkSettlementError),
+}
+struct ExitWork {
+    identity: u64,
+    control: Arc<JobControl>,
+    receiver: mpsc::Receiver<u64>,
+}
+
 /// Application.
 pub struct App {
     /// Is the application running?
@@ -413,6 +442,13 @@ pub struct App {
     /// Active background walks keyed by path (one per folder, cancellable).
     size_walks: HashMap<String, WalkSlot>,
     next_job_id: u64,
+    exit_work_identity: Arc<()>,
+    exit_work_sealed: bool,
+    next_exit_work_id: u64,
+    exit_work: VecDeque<ExitWork>,
+    exit_work_error: Option<WorkSettlementError>,
+    #[cfg(test)]
+    pub(crate) exit_worker_test: Option<crate::services::transfer::WorkerTestHooks>,
 
     /// Latest drive list produced by the background poller.
     drive_cache: Arc<Mutex<Vec<Folder>>>,
@@ -697,6 +733,13 @@ impl Default for App {
             size_cache: HashMap::new(),
             size_walks: HashMap::new(),
             next_job_id: 0,
+            exit_work_identity: Arc::new(()),
+            exit_work_sealed: false,
+            next_exit_work_id: 0,
+            exit_work: VecDeque::new(),
+            exit_work_error: None,
+            #[cfg(test)]
+            exit_worker_test: None,
             drive_cache: Arc::new(Mutex::new(Vec::new())),
             drive_generation: Arc::new(Mutex::new(0)),
             seen_drive_generation: 0,
@@ -823,8 +866,85 @@ impl App {
         default
     }
 
+    #[cfg(test)]
+    pub(crate) fn exit_test_event(&mut self) -> Option<JobEvent> {
+        self.job_rx.try_recv().ok()
+    }
+
+    /// Permanently closes transfer/delete admission and wakes paused workers.
+    /// The terminal dispatcher is serial; this introduces no global stop domain.
+    pub fn begin_exit_settlement(&mut self) -> ExitWorkSeal {
+        self.exit_work_sealed = true;
+        for work in &self.exit_work {
+            work.control.request_cancel();
+        }
+        ExitWorkSeal(self.exit_work_identity.clone())
+    }
+
+    /// Fair, bounded receipt-only bookkeeping. Never drains JobEvents or ticks.
+    pub fn poll_exit_settlement(&mut self, seal: &ExitWorkSeal, budget: usize) -> ExitWorkPoll {
+        if !self.exit_work_sealed || !Arc::ptr_eq(&seal.0, &self.exit_work_identity) {
+            return ExitWorkPoll::Error(WorkSettlementError::ForeignSeal);
+        }
+        self.poll_exit_receipts(budget);
+        if !self.exit_work.is_empty() {
+            return ExitWorkPoll::Pending;
+        }
+        match &self.exit_work_error {
+            Some(error) => ExitWorkPoll::Error(error.clone()),
+            None => ExitWorkPoll::Settled,
+        }
+    }
+
+    fn poll_exit_receipts(&mut self, budget: usize) {
+        for _ in 0..budget.min(self.exit_work.len()) {
+            let Some(work) = self.exit_work.pop_front() else {
+                break;
+            };
+            let error = match work.receiver.try_recv() {
+                Ok(identity) if identity == work.identity => None,
+                Ok(_) => Some(WorkSettlementError::InvalidReceipt {
+                    identity: work.identity,
+                }),
+                Err(mpsc::TryRecvError::Disconnected) => Some(WorkSettlementError::ReceiptLost {
+                    identity: work.identity,
+                }),
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.exit_work.push_back(work);
+                    continue;
+                }
+            };
+            if self.exit_work_error.is_none() {
+                self.exit_work_error = error;
+            }
+        }
+    }
+
+    fn register_exit_work(
+        &mut self,
+        control: Arc<JobControl>,
+    ) -> Result<TerminalReceipt, WorkSettlementError> {
+        if self.exit_work_sealed {
+            return Err(WorkSettlementError::Sealed);
+        }
+        let next = self
+            .next_exit_work_id
+            .checked_add(1)
+            .ok_or(WorkSettlementError::IdentityExhausted)?;
+        let identity = self.next_exit_work_id;
+        let (receipt, receiver) = terminal_receipt(identity);
+        self.next_exit_work_id = next;
+        self.exit_work.push_back(ExitWork {
+            identity,
+            control,
+            receiver,
+        });
+        Ok(receipt)
+    }
+
     /// Handles the tick event of the terminal.
     pub fn tick(&mut self) {
+        self.poll_exit_receipts(64);
         self.hint_offset = self.hint_offset.wrapping_add(2);
         self.drain_jobs();
         self.drain_info_results();
@@ -3435,8 +3555,20 @@ impl App {
             format!("{} items", paths.len())
         };
 
+        let Some(next_job_id) = self.next_job_id.checked_add(1) else {
+            self.set_status(WorkSettlementError::IdentityExhausted.to_string(), true);
+            return;
+        };
+        let control = JobControl::new();
+        let receipt = match self.register_exit_work(control.clone()) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.set_status(error.to_string(), true);
+                return;
+            }
+        };
         let id = self.next_job_id;
-        self.next_job_id += 1;
+        self.next_job_id = next_job_id;
         let reveal = std::path::Path::new(&dest).join(
             std::path::Path::new(&paths[0])
                 .file_name()
@@ -3454,10 +3586,16 @@ impl App {
             current: String::new(),
             status: JobStatus::Running,
             started_at: Instant::now(),
-            control: JobControl::new(),
+            control,
         });
         let job = self.jobs.last().unwrap();
-        spawn_job(job, self.job_tx.clone());
+        spawn_job_tracked(
+            job,
+            self.job_tx.clone(),
+            receipt,
+            #[cfg(test)]
+            self.exit_worker_test.clone(),
+        );
 
         self.invalidate_transfer_probe();
         self.transfer_dest = Some(TransferDestSync {
@@ -3586,9 +3724,24 @@ impl App {
         if confirm.paths.is_empty() {
             return;
         }
+        let control = JobControl::new();
+        let receipt = match self.register_exit_work(control.clone()) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.set_status(error.to_string(), true);
+                return;
+            }
+        };
         self.deleting_paths = confirm.paths.iter().cloned().collect();
         let tx = self.job_tx.clone();
-        let control = spawn_delete_job(confirm.paths.clone(), tx);
+        spawn_delete_tracked(
+            confirm.paths.clone(),
+            tx,
+            control.clone(),
+            receipt,
+            #[cfg(test)]
+            self.exit_worker_test.clone(),
+        );
         self.deletion = Some(DeletionState {
             total: confirm.paths.len(),
             done: 0,
@@ -6439,3 +6592,7 @@ mod persistence_tests;
 #[cfg(test)]
 #[path = "app_transfer_probe_tests.rs"]
 mod transfer_probe_tests;
+
+#[cfg(test)]
+#[path = "app_exit_settlement_tests.rs"]
+mod exit_settlement_tests;
