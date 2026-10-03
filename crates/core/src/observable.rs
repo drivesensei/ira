@@ -104,6 +104,8 @@ pub struct StatusSnapshot {
 }
 #[derive(Debug, Clone)]
 pub struct Snapshot {
+    pub initializing: bool,
+    pub pending_editor: Option<crate::model::OpenEditorRequest>,
     pub input_context: crate::input::InputContext,
     pub transfer_dest: Option<crate::model::TransferDestSync>,
     pub revision: u64,
@@ -173,6 +175,8 @@ impl App {
             }
         });
         Snapshot {
+            initializing: self.is_initializing(),
+            pending_editor: self.pending_editor_request(),
             input_context: self.input_context(),
             transfer_dest: self.transfer_dest.clone(),
             revision: self.revision,
