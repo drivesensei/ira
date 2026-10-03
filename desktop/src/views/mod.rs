@@ -2666,10 +2666,12 @@ mod crossing_tests {
             );
             assert_eq!(proof.2, count);
             eprintln!(
-                "actual_source_row_last_drop rows={} strong_count={} off_ui={}",
+                "actual_source_row_last_drop rows={} strong_count={} off_ui={} destructor_thread={:?} foreground_thread={:?}",
                 proof.2,
                 proof.1,
-                proof.0 != std::thread::current().id()
+                proof.0 != std::thread::current().id(),
+                proof.0,
+                std::thread::current().id()
             );
             view.update_in(cx, |view, _, _| {
                 let frame = view.accessibility.prepared_frame_for_test().unwrap();
