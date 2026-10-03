@@ -1,5 +1,5 @@
 //! Native GPUI text input. Register bindings once; retain event subscriptions in host.
-use super::text_buffer::{BufferSnapshot, TextBuffer};
+use super::text_buffer::{BufferSnapshot, SelectionError, TextBuffer};
 use gpui::{prelude::*, *};
 use std::ops::Range;
 actions!(
@@ -48,6 +48,25 @@ pub enum InputAccess {
     ReadOnly,
     Disabled,
 }
+/// External edit refusal; no state/event mutation occurs on error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputEditError {
+    ReadOnly,
+    Disabled,
+    InvalidRange,
+    InvalidBoundary,
+}
+impl std::fmt::Display for InputEditError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ReadOnly => "input is read-only",
+            Self::Disabled => "input is disabled",
+            Self::InvalidRange => "selection range is unordered or outside the text",
+            Self::InvalidBoundary => "selection splits a Unicode scalar or grapheme",
+        })
+    }
+}
+impl std::error::Error for InputEditError {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InputStamp {
     pub document_generation: u64,
@@ -172,6 +191,62 @@ impl TextInput {
     pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
         self.sync_text(text, cx);
         self.changed(cx);
+    }
+    /// Accessibility/user edit of the entire value through the authoritative buffer.
+    /// The caller validates its expected document/focus/value stamp before updating.
+    /// Pending composition commits first; this edit is its own undo step. Exactly
+    /// one Changed is emitted on success, with revision advanced only for new text.
+    pub fn edit_value(
+        &mut self,
+        text: &str,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), InputEditError> {
+        match self.options.access {
+            InputAccess::Disabled => return Err(InputEditError::Disabled),
+            InputAccess::ReadOnly => return Err(InputEditError::ReadOnly),
+            InputAccess::Editable => {}
+        }
+        let text = self.normalize(text);
+        self.buffer.unmark();
+        self.buffer.break_group();
+        if text != self.buffer.text() {
+            let end = self.buffer.text().encode_utf16().count();
+            self.buffer.replace(Some(0..end), &text, false);
+        }
+        self.changed(cx);
+        Ok(())
+    }
+    /// Select an ordered UTF16 range; reversed chooses its start as the caret.
+    /// ReadOnly allows selection, Disabled refuses it. Invalid scalar/grapheme
+    /// boundaries return errors without committing composition or emitting events.
+    /// Success commits composition and emits Changed with unchanged value_revision;
+    /// selection alone must not dirty a document or invalidate a save completion.
+    pub fn set_selection_utf16(
+        &mut self,
+        range: Range<usize>,
+        reversed: bool,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), InputEditError> {
+        if self.options.access == InputAccess::Disabled {
+            return Err(InputEditError::Disabled);
+        }
+        let range = self
+            .buffer
+            .checked_utf16_selection(range)
+            .map_err(|e| match e {
+                SelectionError::InvalidRange => InputEditError::InvalidRange,
+                SelectionError::InvalidBoundary => InputEditError::InvalidBoundary,
+            })?;
+        let (anchor, caret) = if reversed {
+            (range.end, range.start)
+        } else {
+            (range.start, range.end)
+        };
+        self.buffer.select(anchor, caret);
+        self.changed(cx);
+        Ok(())
     }
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle);
