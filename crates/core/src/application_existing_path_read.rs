@@ -30,17 +30,7 @@ pub(super) fn load(
     let entries =
         std::fs::read_dir(&folder).map_err(|e| format!("Directory listing failed: {e}"))?;
     let mut files = read_entries(entries, hidden)?;
-    files.sort_by(|x, y| match sort {
-        1 => match (x.is_dir, y.is_dir) {
-            (true, true) => x.label.cmp(&y.label),
-            (true, false) => std::cmp::Ordering::Greater,
-            (false, true) => std::cmp::Ordering::Less,
-            (false, false) => y.size.cmp(&x.size).then(x.label.cmp(&y.label)),
-        },
-        2 => y.modified.cmp(&x.modified).then(x.label.cmp(&y.label)),
-        3 => y.is_dir.cmp(&x.is_dir).then(x.label.cmp(&y.label)),
-        _ => x.label.cmp(&y.label),
-    });
+    sort_entries(&mut files, sort);
     if target
         .as_ref()
         .is_some_and(|target| !files.iter().any(|f| Path::new(&f.path) == target))
@@ -63,16 +53,18 @@ pub(super) fn read_entries(
     let mut files = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|e| format!("Partial directory listing failed: {e}"))?;
-        let path = entry.path();
-        let Some(identity) = path.to_str() else {
-            continue;
-        };
-        let Some(label) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        if !hidden && label.starts_with('.') {
+        let name = entry.file_name();
+        if !hidden && raw_dot_prefix(&name) {
             continue;
         }
+        let path = entry.path();
+        let identity = path
+            .to_str()
+            .ok_or("Directory listing unsupported: non-UTF8 identity")?;
+        let label = name
+            .to_str()
+            .ok_or("Directory listing unsupported: non-UTF8 label")?
+            .to_owned();
         let metadata =
             std::fs::metadata(&path).map_err(|e| format!("Directory entry unavailable: {e}"))?;
         files.push(FEntry {
@@ -88,4 +80,35 @@ pub(super) fn read_entries(
         });
     }
     Ok(files)
+}
+
+fn raw_dot_prefix(name: &std::ffi::OsStr) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        name.as_bytes().first() == Some(&b'.')
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        name.encode_wide().next() == Some(u16::from(b'.'))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        name.as_encoded_bytes().first() == Some(&b'.')
+    }
+}
+
+pub(super) fn sort_entries(files: &mut [FEntry], sort: usize) {
+    files.sort_by(|x, y| match sort {
+        1 => match (x.is_dir, y.is_dir) {
+            (true, true) => x.label.cmp(&y.label),
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            (false, false) => y.size.cmp(&x.size).then(x.label.cmp(&y.label)),
+        },
+        2 => y.modified.cmp(&x.modified).then(x.label.cmp(&y.label)),
+        3 => y.is_dir.cmp(&x.is_dir).then(x.label.cmp(&y.label)),
+        _ => x.label.cmp(&y.label),
+    });
 }

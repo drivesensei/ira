@@ -349,7 +349,7 @@ impl Runtime {
             let (chooser_pending_tx, chooser_pending_rx) = mpsc::channel();
             let mut last_tick = Instant::now();
             *actor_chooser_permit.lock().unwrap() = chooser.permit(&app);
-            *actor_chooser_focus.lock().unwrap() = Some(ChooserFocusPermit::capture(&app));
+            *actor_chooser_focus.lock().unwrap() = app.existing_path_focus_stamp();
             for event in chooser_pending_rx.try_iter() {
                 let _ = chooser_tx.send(event);
             }
@@ -363,7 +363,7 @@ impl Runtime {
                     &completed,
                 ) {
                     *actor_chooser_permit.lock().unwrap() = chooser.permit(&app);
-                    *actor_chooser_focus.lock().unwrap() = Some(ChooserFocusPermit::capture(&app));
+                    *actor_chooser_focus.lock().unwrap() = app.existing_path_focus_stamp();
                     for event in chooser_pending_rx.try_iter() {
                         let _ = chooser_tx.send(event);
                     }
@@ -399,7 +399,7 @@ impl Runtime {
                         _ => {}
                     }
                     *actor_chooser_permit.lock().unwrap() = chooser.permit(&app);
-                    *actor_chooser_focus.lock().unwrap() = Some(ChooserFocusPermit::capture(&app));
+                    *actor_chooser_focus.lock().unwrap() = app.existing_path_focus_stamp();
                     for event in chooser_pending_rx.try_iter() {
                         let _ = chooser_tx.send(event);
                     }
@@ -428,8 +428,7 @@ impl Runtime {
                             route_host(&app, request, sequence, &editor_tx, &drive_tx, &completed);
                         }
                         *actor_chooser_permit.lock().unwrap() = chooser.permit(&app);
-                        *actor_chooser_focus.lock().unwrap() =
-                            Some(ChooserFocusPermit::capture(&app));
+                        *actor_chooser_focus.lock().unwrap() = app.existing_path_focus_stamp();
                         for event in chooser_pending_rx.try_iter() {
                             let _ = chooser_tx.send(event);
                         }
@@ -457,7 +456,7 @@ impl Runtime {
                         );
                     }
                     *actor_chooser_permit.lock().unwrap() = chooser.permit(&app);
-                    *actor_chooser_focus.lock().unwrap() = Some(ChooserFocusPermit::capture(&app));
+                    *actor_chooser_focus.lock().unwrap() = app.existing_path_focus_stamp();
                     for event in chooser_pending_rx.try_iter() {
                         let _ = chooser_tx.send(event);
                     }

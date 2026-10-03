@@ -579,6 +579,7 @@ impl App {
 
     /// Raises a transient bottom-bar message (replaces any current one).
     pub fn set_status(&mut self, text: impl Into<String>, is_error: bool) {
+        self.observe_existing_path_status(is_error);
         let status = Status {
             text: text.into(),
             is_error,
@@ -628,6 +629,7 @@ impl App {
 
     /// Dismisses the error dialog immediately (any key while it is open).
     pub fn clear_status(&mut self) {
+        self.observe_existing_path_status(false);
         if self.status.take().is_some() {
             self.semantic_changed();
         }
@@ -3860,6 +3862,7 @@ impl App {
                 self.new_entry = result.state.new_entry;
             }
             if let Some(status) = result.status {
+                self.observe_existing_path_status(status.is_error);
                 self.status = Some(status);
             }
             if self.drives != result.state.drives {
@@ -4102,4 +4105,6 @@ mod transfer_probe_tests;
 
 #[path = "application_existing_path.rs"]
 mod existing_path;
-pub use existing_path::{ExistingPathKind, ExistingPathScope, ExistingPathReceipt};
+pub use existing_path::{
+    ExistingPathFocusStamp, ExistingPathKind, ExistingPathReceipt, ExistingPathScope,
+};

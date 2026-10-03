@@ -1,5 +1,5 @@
 use super::*;
-fn fixture() -> PathBuf {
+pub(super) fn fixture() -> PathBuf {
     let path = std::env::temp_dir().join(format!(
         "ira-existing-path-{}-{}",
         std::process::id(),
@@ -56,11 +56,9 @@ fn partial_directory_error_is_a_failed_result_not_a_successful_prefix() {
         ],
         true,
     );
-    assert!(
-        result
-            .unwrap_err()
-            .contains("Partial directory listing failed")
-    );
+    assert!(result
+        .unwrap_err()
+        .contains("Partial directory listing failed"));
 }
 #[cfg(unix)]
 #[test]
@@ -82,11 +80,9 @@ fn directory_symlink_is_folder_and_non_utf8_is_rejected() {
     assert!(load(dangling, ExistingPathKind::Folder, true, 0).is_err());
     let raw = root.join(std::ffi::OsString::from_vec(vec![255]));
     std::fs::write(&raw, b"v").unwrap();
-    assert!(
-        load(raw, ExistingPathKind::File, true, 0)
-            .unwrap_err()
-            .contains("non-UTF8")
-    );
+    assert!(load(raw, ExistingPathKind::File, true, 0)
+        .unwrap_err()
+        .contains("non-UTF8"));
 }
 #[test]
 fn scoped_receipt_selects_exact_file_and_stale_scope_cannot_mutate() {
@@ -142,7 +138,7 @@ fn scoped_receipt_selects_exact_file_and_stale_scope_cannot_mutate() {
     assert_eq!(app.panes[0].state.selected(), original_cursor);
     assert_eq!(app.panes[0].files.len(), original_rows);
     assert!(app.status.as_ref().unwrap().is_error);
-    app.status = None;
+    app.clear_status();
     app.focus_generation = app.focus_generation.wrapping_add(1);
     let before = app.panes[0].folder.clone();
     let current = app.existing_path_scope(0).unwrap();
@@ -198,11 +194,10 @@ fn physical_worker_admission_survives_invalidated_and_dropped_app_until_real_rep
     next.window_generation = 8;
     next.panes[0].listing_settled = true;
     let scope = next.existing_path_scope(0).unwrap();
-    assert!(
-        next.request_existing_path(0, root.clone(), ExistingPathKind::Folder, scope.clone(), 2)
-            .unwrap_err()
-            .contains("physical worker")
-    );
+    assert!(next
+        .request_existing_path(0, root.clone(), ExistingPathKind::Folder, scope.clone(), 2)
+        .unwrap_err()
+        .contains("physical worker"));
     {
         let (lock, ready) = &*release;
         *lock.lock().unwrap() = true;
@@ -222,11 +217,10 @@ fn physical_worker_admission_survives_invalidated_and_dropped_app_until_real_rep
         assert!(Instant::now() < deadline);
         thread::yield_now();
     }
-    assert!(
-        next.take_existing_path_receipts()
-            .pop()
-            .unwrap()
-            .result
-            .is_ok()
-    );
+    assert!(next
+        .take_existing_path_receipts()
+        .pop()
+        .unwrap()
+        .result
+        .is_ok());
 }

@@ -6,32 +6,7 @@ pub struct AdmittedChooser {
     pub ticket: ChooserTicket,
     pub context: ExistingPathScope,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ChooserFocusPermit {
-    pub window: u64,
-    pub document: u64,
-    pub focus: u64,
-    pub pane: usize,
-    pub context: ira_core::input::InputContext,
-    pub listing: u64,
-    pub folder: Option<String>,
-}
-impl ChooserFocusPermit {
-    pub(super) fn capture(app: &App) -> Self {
-        Self {
-            window: app.window_generation,
-            document: app.document_generation,
-            focus: app.focus_generation,
-            pane: app.active_pane,
-            context: app.input_context(),
-            listing: app.panes[app.active_pane].listing_generation,
-            folder: app.panes[app.active_pane]
-                .folder
-                .as_ref()
-                .map(|f| f.path.clone()),
-        }
-    }
-}
+pub type ChooserFocusPermit = ira_core::application::ExistingPathFocusStamp;
 pub enum ChooserEvent {
     Prompt(AdmittedChooser),
     RestoreFocus(ChooserFocusPermit),
@@ -175,7 +150,7 @@ impl ActorChooser {
     }
     pub fn drain(&mut self, app: &mut App, events: &mpsc::Sender<ChooserEvent>) {
         for receipt in app.take_existing_path_receipts() {
-            let Some(admitted) = self
+            let Some(_admitted) = self
                 .pending
                 .as_ref()
                 .filter(|a| a.ticket.request_id == receipt.request_id && a.context == receipt.scope)
@@ -186,7 +161,12 @@ impl ActorChooser {
             self.pending = None;
             self.loading = false;
             if !self.invalid {
-                restore(app, &admitted, events);
+                if let Some(stamp) = receipt
+                    .focus_stamp
+                    .filter(|s| app.existing_path_focus_is_current(s))
+                {
+                    let _ = events.send(ChooserEvent::RestoreFocus(stamp));
+                }
             }
         }
         if self.loading
@@ -203,7 +183,9 @@ impl ActorChooser {
     }
 }
 fn restore(app: &App, _admitted: &AdmittedChooser, events: &mpsc::Sender<ChooserEvent>) {
-    let _ = events.send(ChooserEvent::RestoreFocus(ChooserFocusPermit::capture(app)));
+    if let Some(stamp) = app.existing_path_focus_stamp() {
+        let _ = events.send(ChooserEvent::RestoreFocus(stamp));
+    }
 }
 #[cfg(test)]
 #[path = "runtime_chooser_tests.rs"]

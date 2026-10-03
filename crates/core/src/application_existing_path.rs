@@ -23,6 +23,30 @@ impl PartialEq for ScopeOwner {
     }
 }
 impl Eq for ScopeOwner {}
+#[derive(Debug)]
+struct ErrorOwner;
+impl PartialEq for ErrorOwner {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+impl Eq for ErrorOwner {}
+/// Receipt-owned post-settlement authority; unrelated semantic revisions are excluded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExistingPathFocusStamp {
+    pub window: u64,
+    pub pane: usize,
+    document: u64,
+    focus: u64,
+    folder: Option<String>,
+    listing: u64,
+    navigation: u64,
+    epoch: u64,
+    owner: Arc<ScopeOwner>,
+    context_generation: u64,
+    context: crate::input::InputContext,
+    error_owner: Option<Arc<ErrorOwner>>,
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExistingPathScope {
     pub window: u64,
@@ -46,6 +70,7 @@ pub struct ExistingPathReceipt {
     pub listing_generation: u64,
     pub exact_target: Option<PathBuf>,
     pub result: Result<(), String>,
+    pub focus_stamp: Option<ExistingPathFocusStamp>,
 }
 #[derive(Debug)]
 struct Loaded {
@@ -62,6 +87,7 @@ struct Reply {
 }
 pub(super) struct State {
     owner: Arc<ScopeOwner>,
+    error_owner: Option<Arc<ErrorOwner>>,
     tx: mpsc::Sender<Reply>,
     rx: mpsc::Receiver<Reply>,
     #[cfg(test)]
@@ -75,6 +101,7 @@ impl Default for State {
         let (tx, rx) = mpsc::channel();
         Self {
             owner: Arc::new(ScopeOwner),
+            error_owner: None,
             tx,
             rx,
             #[cfg(test)]
@@ -91,6 +118,45 @@ use reader::load;
 #[cfg(test)]
 use reader::read_entries;
 impl App {
+    // Every installation owns a distinct error identity, even equal Status values.
+    pub(super) fn observe_existing_path_status(&mut self, is_error: bool) {
+        self.existing_paths.error_owner = is_error.then(|| Arc::new(ErrorOwner));
+    }
+    /// Comparison only: events must retain the stamp captured by their settlement.
+    pub fn existing_path_focus_stamp(&self) -> Option<ExistingPathFocusStamp> {
+        let pane = self.active_pane;
+        if self.window_generation == 0
+            || pane >= 2
+            || (pane == 1 && !self.split)
+            || self.initializing
+            || !self.panes[pane].listing_settled
+        {
+            return None;
+        }
+        let context = self.input_context();
+        let error_owner = match context {
+            crate::input::InputContext::Pane(p) if p == pane => None,
+            crate::input::InputContext::Error => Some(self.existing_paths.error_owner.clone()?),
+            _ => return None,
+        };
+        Some(ExistingPathFocusStamp {
+            window: self.window_generation,
+            pane,
+            document: self.document_generation,
+            focus: self.focus_generation,
+            folder: self.panes[pane].folder.as_ref().map(|f| f.path.clone()),
+            listing: self.panes[pane].listing_generation,
+            navigation: self.navigation_generation[pane],
+            epoch: self.operation_epoch.load(Ordering::Acquire),
+            owner: self.existing_paths.owner.clone(),
+            context_generation: self.existing_paths.generation,
+            context,
+            error_owner,
+        })
+    }
+    pub fn existing_path_focus_is_current(&self, stamp: &ExistingPathFocusStamp) -> bool {
+        self.existing_path_focus_stamp().as_ref() == Some(stamp)
+    }
     pub fn existing_path_scope(&self, pane: usize) -> Option<ExistingPathScope> {
         if self.window_generation == 0
             || pane >= 2
@@ -189,6 +255,8 @@ impl App {
                 continue;
             }
             let pane_index = reply.scope.pane;
+            let before_context = self.input_context();
+            let before_focus = self.focus_generation;
             let (target, result) = match reply.result {
                 Err(error) => {
                     self.set_status(error.clone(), true);
@@ -236,12 +304,18 @@ impl App {
                     (loaded.target, Ok(()))
                 }
             };
+            // Observe the chooser-owned transition now, before tick's peer drains.
+            if self.input_context() != before_context && self.focus_generation == before_focus {
+                self.focus_generation = self.focus_generation.wrapping_add(1);
+            }
+            let focus_stamp = self.existing_path_focus_stamp();
             self.existing_paths.receipts.push_back(ExistingPathReceipt {
                 request_id: reply.id,
                 scope: reply.scope,
                 listing_generation: self.panes[pane_index].listing_generation,
                 exact_target: target,
                 result,
+                focus_stamp,
             });
         }
     }
@@ -255,3 +329,13 @@ impl App {
 #[cfg(test)]
 #[path = "application_existing_path_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "application_existing_path_neighbor_tests.rs"]
+mod neighbor_tests;
+#[cfg(test)]
+#[path = "application_existing_path_settlement_tests.rs"]
+mod settlement_tests;
+#[cfg(test)]
+#[path = "application_existing_path_sort_tests.rs"]
+mod sort_tests;
