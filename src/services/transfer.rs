@@ -32,7 +32,7 @@ pub enum OverwritePolicy {
     AutoRename,
     /// Never overwrite: colliding destinations are skipped and reported.
     SkipExisting,
-    /// Replace existing destination files; existing directories are refused.
+    /// Replace files; on Unix a directory Move may replace an empty directory.
     Overwrite,
 }
 
@@ -562,6 +562,21 @@ fn transfer_staged(
         ))
     })
 }
+/// Unix rename atomically replaces an empty real directory and refuses a
+/// nonempty one. Failure leaves both public entries in place; no cleanup or
+/// cross-volume copying is authorized for this legacy directory move case.
+#[cfg(unix)]
+fn move_directory_over_directory(
+    src: &Path,
+    dst: &Path,
+    context: &TransferContext<'_>,
+    before_rename: impl FnOnce(),
+) -> Result<(), JobError> {
+    context.control.gate()?;
+    before_rename();
+    fs::rename(src, dst).map_err(Into::into)
+}
+
 fn transfer_entry(
     src: &Path,
     dst: &Path,
@@ -577,6 +592,12 @@ fn transfer_entry(
     if policy == OverwritePolicy::Overwrite
         && destination.as_ref().is_some_and(fs::Metadata::is_dir)
     {
+        #[cfg(unix)]
+        if kind == JobKind::Move && fs::symlink_metadata(src)?.is_dir() {
+            // symlink_metadata excludes source/target links. The OS validates
+            // entry types and destination emptiness at the atomic rename.
+            return move_directory_over_directory(src, dst, context, || {});
+        }
         return Err(std::io::Error::new(
             ErrorKind::AlreadyExists,
             "destination directory already exists",
