@@ -23,7 +23,10 @@ fn exact_file_and_folder_gpui_options() {
         assert_eq!(actual.files, kind == ChooserKind::File);
         assert_eq!(actual.directories, kind == ChooserKind::Folder);
         assert!(!actual.multiple);
-        assert_eq!(actual.prompt.as_deref(), Some("Select"));
+        assert_eq!(
+            actual.prompt.as_ref().map(gpui::SharedString::as_str),
+            Some("Select")
+        );
     }
 }
 
