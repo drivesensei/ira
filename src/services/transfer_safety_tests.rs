@@ -6,7 +6,10 @@ static NEXT: AtomicU64 = AtomicU64::new(1);
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!(
+        Self::new_in(&std::env::temp_dir())
+    }
+    fn new_in(parent: &Path) -> Self {
+        let root = parent.join(format!(
             "ira-overwrite-safety-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
@@ -183,7 +186,16 @@ fn directory_partial_copy_failure_cleans_only_private_stage() {
     let f = Fixture::new();
     fs::create_dir(f.path("src/tree")).unwrap();
     fs::write(f.path("src/tree/good.txt"), b"SOURCE").unwrap();
-    let _listener = std::os::unix::net::UnixListener::bind(f.path("src/tree/socket")).unwrap();
+    // SUN_LEN limits only the bind address, not the destination pathname.
+    // Keep the main synthetic TMPDIR/native-length source tree unchanged.
+    let short_socket = Fixture::new_in(Path::new("/tmp"));
+    let _listener = std::os::unix::net::UnixListener::bind(short_socket.path("socket")).unwrap();
+    fs::rename(short_socket.path("socket"), f.path("src/tree/socket")).unwrap();
+    use std::os::unix::fs::FileTypeExt;
+    assert!(fs::symlink_metadata(f.path("src/tree/socket"))
+        .unwrap()
+        .file_type()
+        .is_socket());
     assert!(transfer(&f, JobKind::Copy, "tree", OverwritePolicy::AutoRename).is_err());
     assert_eq!(fs::read(f.path("src/tree/good.txt")).unwrap(), b"SOURCE");
     assert!(!f.path("dst/tree").exists());
