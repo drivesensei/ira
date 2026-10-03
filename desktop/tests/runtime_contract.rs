@@ -827,3 +827,50 @@ fn accessibility_selected_is_idempotent_exclusive_and_generation_checked() {
     assert!(apply(&mut app, envelope(4, stale)).is_err());
     assert!(app.panes[0].selected[0]);
 }
+
+#[test]
+fn background_semantic_publications_advance_revision_without_input() {
+    let fixture = Fixture::new();
+    let app = fixture.app();
+    let path = fixture.0.to_string_lossy().into_owned();
+    let mut generation = 0;
+    let runtime = Runtime::with_drive_probe(
+        7,
+        move || app,
+        move || {
+            generation += 1;
+            Ok(vec![Folder::new(
+                format!("drive-{generation}"),
+                path.clone(),
+                '1',
+            )])
+        },
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut first = None;
+    loop {
+        if let Some(publication) = runtime.try_snapshot()
+            && let Some(drives) = &publication.snapshot.drives
+            && let Some(drive) = drives.first()
+        {
+            if let Some((label, revision)) = &first {
+                if label != &drive.label {
+                    runtime.stop(&[]);
+                    assert!(
+                        publication.snapshot.revision > *revision,
+                        "background drive semantics changed without a fresh publication revision"
+                    );
+                    assert_eq!(
+                        publication.snapshot.ack_sequence, 0,
+                        "no input command was needed"
+                    );
+                    break;
+                }
+            } else {
+                first = Some((drive.label.clone(), publication.snapshot.revision));
+            }
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
