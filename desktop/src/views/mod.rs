@@ -109,6 +109,7 @@ impl Desktop {
         cx.notify();
     }
     pub fn close(&mut self) {
+        crate::lifecycle_trace("Desktop close/detach");
         self.preview.close();
         self.accessibility.close();
         self.accessibility_actions.clear();
@@ -181,6 +182,7 @@ impl Desktop {
                     self.host(request, self.runtime.effect_guard(window_generation), cx)
                 }
                 Completion::Closed => {
+                    crate::lifecycle_trace("actor Closed received; application quit scheduled");
                     let barrier = self.geometry.barrier();
                     cx.spawn(async move |_, cx| {
                         cx.background_executor()
@@ -342,6 +344,7 @@ impl Desktop {
             }
         }
         if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+            crate::lifecycle_trace("pane control-c quit");
             self.runtime.stop(&self.controls);
             cx.stop_propagation();
             return;
@@ -454,6 +457,7 @@ impl Desktop {
             }
             InputEventKind::Cancel => Command::Input(actions::input(KeyCode::Esc)),
             InputEventKind::Quit => {
+                crate::lifecycle_trace("native text input Quit event");
                 self.runtime.stop(&self.controls);
                 cx.notify();
                 return;
@@ -519,6 +523,14 @@ impl Desktop {
                 snapshot.revision,
                 text.as_ref().map_or(0, |t| t.revision),
             ) {
+                crate::lifecycle_trace(&format!(
+                    "AX action rejected: window={} document={} focus={} semantic={} native_text={}",
+                    action.stamp.window != snapshot.window_generation,
+                    action.stamp.document != snapshot.document_generation,
+                    action.stamp.focus != snapshot.focus_generation,
+                    action.stamp.revision != snapshot.revision,
+                    action.stamp.text_revision != text.as_ref().map_or(0, |t| t.revision),
+                ));
                 self.feedback = Some("Accessibility request belongs to an older frame".into());
                 continue;
             }
@@ -1279,6 +1291,7 @@ impl Render for Desktop {
                 .text_color(native_color(self.theme.text))
                 .on_key_down(cx.listener(Self::key))
                 .on_action(cx.listener(|this, _: &actions::Quit, _, _cx| {
+                    crate::lifecycle_trace("menu/keybinding Quit action");
                     this.runtime.stop(&this.controls);
                 }))
                 .on_action(
@@ -1408,6 +1421,7 @@ impl Render for Desktop {
 }
 impl Drop for Desktop {
     fn drop(&mut self) {
+        crate::lifecycle_trace("Desktop entity dropped");
         self.close();
     }
 }

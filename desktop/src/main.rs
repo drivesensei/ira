@@ -34,6 +34,7 @@ fn open_main_window(cx: &mut App) {
     .detach();
 }
 fn open_loaded_window(geometry: Option<Geometry>, cx: &mut App) {
+    ira_desktop::lifecycle_trace("native window opening");
     cx.update_global::<Session, _>(|session, _| session.opening = false);
     let runtime = cx.update_global::<Session, _>(|session, _| {
         let generation = session.next_window;
@@ -61,13 +62,17 @@ fn open_loaded_window(geometry: Option<Geometry>, cx: &mut App) {
             entity.update(cx, |this, cx| this.focus_main(window, cx));
             let weak = entity.downgrade();
             window.on_window_should_close(cx, move |_, cx| {
+                ira_desktop::lifecycle_trace("OS window should-close callback");
                 let _ = weak.update(cx, |this, _| this.close());
                 true
             });
             entity
         },
     ) {
-        Ok(_) => cx.activate(true),
+        Ok(_) => {
+            ira_desktop::lifecycle_trace("native window opened");
+            cx.activate(true);
+        }
         Err(error) => eprintln!("Failed to open IRA desktop window: {error}"),
     }
 }

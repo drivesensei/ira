@@ -1081,3 +1081,32 @@ fn no_input_relisting_rejects_queued_full_stamp_on_same_entry_node() {
     }
     runtime.stop(&[]);
 }
+
+#[test]
+fn unicode_search_draft_and_escape_preserve_running_window() {
+    let fixture = Fixture::new();
+    let mut app = fixture.app();
+    for (sequence, command) in [
+        key(KeyCode::Down),
+        key(KeyCode::Char(' ')),
+        key(KeyCode::Char('/')),
+        Command::Draft {
+            text: "文😀e\u{301}".into(),
+            cursor: 4,
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        apply(&mut app, envelope(sequence as u64 + 1, command)).unwrap();
+        app.tick();
+        assert!(app.running, "search path cannot request shutdown");
+        assert_eq!(app.window_generation, 7);
+    }
+    assert_eq!(app.search_query.as_deref(), Some("文😀e\u{301}"));
+    apply(&mut app, envelope(5, key(KeyCode::Esc))).unwrap();
+    app.tick();
+    assert!(app.running);
+    assert_eq!(app.window_generation, 7);
+    assert!(app.search_query.is_none());
+}

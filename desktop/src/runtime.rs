@@ -388,6 +388,11 @@ impl Runtime {
                     last_tick = Instant::now();
                 }
             }
+            crate::lifecycle_trace(if app.running {
+                "actor terminating: stop flag or command channel disconnected"
+            } else {
+                "actor terminating: core running false"
+            });
             stop.store(true, Ordering::Release);
             app.cancel_pending_work();
             cancel_all(&app);
