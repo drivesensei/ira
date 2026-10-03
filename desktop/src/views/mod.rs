@@ -112,6 +112,12 @@ impl Desktop {
             host_rx,
         }
     }
+    pub fn restore_chooser_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.runtime.is_stopping() {
+            window.focus(&self.focus);
+            cx.notify();
+        }
+    }
     pub fn focus_main(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus);
         self.geometry_subscription = Some(cx.observe_window_bounds(window, |this, window, _| {
@@ -1415,113 +1421,120 @@ impl Render for Desktop {
             content = content.child(board);
         }
         let status = self.rendered_footer();
-        let mut root =
-            div()
-                .id("ira-root")
-                .key_context("IraDesktop")
-                .track_focus(&self.focus)
-                .relative()
-                .size_full()
-                .flex()
-                .flex_col()
-                .bg(native_color(self.theme.bg))
-                .text_color(native_color(self.theme.text))
-                .on_key_down(cx.listener(Self::key))
-                .on_action(cx.listener(|_, _: &actions::Quit, _, cx| {
-                    crate::lifecycle_trace("menu/keybinding Quit action");
-                    cx.propagate();
-                }))
-                .on_action(
-                    cx.listener(|this, _: &actions::Rename, _, cx| {
-                        this.dispatch(KeyCode::Enter, cx)
-                    }),
-                )
-                .on_action(
-                    cx.listener(|this, _: &actions::Open, _, cx| this.dispatch(KeyCode::Right, cx)),
-                )
-                .on_action(
-                    cx.listener(|this, _: &actions::Parent, _, cx| {
-                        this.dispatch(KeyCode::Left, cx)
-                    }),
-                )
-                .on_action(cx.listener(|this, _: &actions::Search, _, cx| {
+        let mut root = div()
+            .id("ira-root")
+            .key_context("IraDesktop")
+            .track_focus(&self.focus)
+            .relative()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(native_color(self.theme.bg))
+            .text_color(native_color(self.theme.text))
+            .on_key_down(cx.listener(Self::key))
+            .on_action(cx.listener(|_, _: &actions::Quit, _, cx| {
+                crate::lifecycle_trace("menu/keybinding Quit action");
+                cx.propagate();
+            }))
+            .on_action(
+                cx.listener(|this, _: &actions::Rename, _, cx| this.dispatch(KeyCode::Enter, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &actions::Open, _, cx| this.dispatch(KeyCode::Right, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &actions::Parent, _, cx| this.dispatch(KeyCode::Left, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &actions::Search, _, cx| {
                     this.dispatch(KeyCode::Char('/'), cx)
-                }))
-                .on_action(cx.listener(|this, _: &actions::NewEntry, _, cx| {
-                    this.dispatch(KeyCode::Char('n'), cx)
-                }))
-                .on_action(cx.listener(|this, _: &actions::Copy, _, cx| {
-                    this.dispatch(KeyCode::Char('c'), cx)
-                }))
-                .on_action(cx.listener(|this, _: &actions::Move, _, cx| {
-                    this.dispatch(KeyCode::Char('m'), cx)
-                }))
-                .on_action(cx.listener(|this, _: &actions::Delete, _, cx| {
-                    this.dispatch(KeyCode::Delete, cx)
-                }))
-                .on_action(cx.listener(|this, _: &actions::ToggleSplit, _, cx| {
-                    this.dispatch(KeyCode::Char('+'), cx)
-                }))
-                .on_action(cx.listener(|this, _: &actions::ToggleBoard, _, cx| {
-                    this.dispatch(KeyCode::Char('`'), cx)
-                }))
-                .on_action(cx.listener(|this, _: &actions::Sort, _, cx| {
-                    this.dispatch(KeyCode::Char(','), cx)
-                }))
-                .on_action(cx.listener(|this, _: &actions::Hidden, _, cx| {
+                }),
+            )
+            .on_action(cx.listener(|this, _: &actions::NewEntry, _, cx| {
+                this.dispatch(KeyCode::Char('n'), cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &actions::Copy, _, cx| this.dispatch(KeyCode::Char('c'), cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &actions::Move, _, cx| this.dispatch(KeyCode::Char('m'), cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &actions::Delete, _, cx| this.dispatch(KeyCode::Delete, cx)),
+            )
+            .on_action(cx.listener(|this, _: &actions::ToggleSplit, _, cx| {
+                this.dispatch(KeyCode::Char('+'), cx)
+            }))
+            .on_action(cx.listener(|this, _: &actions::ToggleBoard, _, cx| {
+                this.dispatch(KeyCode::Char('`'), cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &actions::Sort, _, cx| this.dispatch(KeyCode::Char(','), cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &actions::Hidden, _, cx| {
                     this.dispatch(KeyCode::Char('.'), cx)
-                }))
-                .on_action(cx.listener(|this, _: &actions::Bookmark, _, cx| {
-                    this.dispatch(KeyCode::Char('b'), cx)
-                }))
-                .on_action(cx.listener(|this, _: &actions::Info, _, cx| {
-                    this.dispatch(KeyCode::Char('?'), cx)
-                }))
-                .on_action(cx.listener(|this, _: &actions::Theme, _, cx| {
+                }),
+            )
+            .on_action(cx.listener(|this, _: &actions::Bookmark, _, cx| {
+                this.dispatch(KeyCode::Char('b'), cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &actions::Info, _, cx| this.dispatch(KeyCode::Char('?'), cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &actions::Theme, _, cx| {
                     this.dispatch(KeyCode::Char('\\'), cx)
-                }))
-                .on_action(cx.listener(|this, _: &actions::FocusNext, _, cx| {
-                    this.dispatch(KeyCode::Tab, cx)
-                }))
-                .child(
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &actions::FocusNext, _, cx| this.dispatch(KeyCode::Tab, cx)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .p_2()
+                    .flex_wrap()
+                    .child(div().id("browse-file").child("Browse file…").on_click(
+                        |_, window, cx| window.dispatch_action(Box::new(actions::BrowseFile), cx),
+                    ))
+                    .child(div().id("browse-folder").child("Browse folder…").on_click(
+                        |_, window, cx| window.dispatch_action(Box::new(actions::BrowseFolder), cx),
+                    ))
+                    .child(self.button("Parent", KeyCode::Left, cx))
+                    .child(self.button("Rename", KeyCode::Enter, cx))
+                    .child(self.button("New", KeyCode::Char('n'), cx))
+                    .child(self.button("Search", KeyCode::Char('/'), cx))
+                    .child(self.button("Copy", KeyCode::Char('c'), cx))
+                    .child(self.button("Move", KeyCode::Char('m'), cx))
+                    .child(self.button("Delete", KeyCode::Delete, cx))
+                    .child(self.button("Split", KeyCode::Char('+'), cx))
+                    .child(self.button("Sort", KeyCode::Char(','), cx))
+                    .child(self.button("Hidden", KeyCode::Char('.'), cx))
+                    .child(self.button("Jobs", KeyCode::Char('`'), cx)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.places(cx))
+                    .child(content),
+            )
+            .child(
+                self.accessibility.measured(
                     div()
-                        .flex()
-                        .gap_2()
+                        .debug_selector(|| "ira-status-footer".into())
                         .p_2()
-                        .flex_wrap()
-                        .child(self.button("Parent", KeyCode::Left, cx))
-                        .child(self.button("Rename", KeyCode::Enter, cx))
-                        .child(self.button("New", KeyCode::Char('n'), cx))
-                        .child(self.button("Search", KeyCode::Char('/'), cx))
-                        .child(self.button("Copy", KeyCode::Char('c'), cx))
-                        .child(self.button("Move", KeyCode::Char('m'), cx))
-                        .child(self.button("Delete", KeyCode::Delete, cx))
-                        .child(self.button("Split", KeyCode::Char('+'), cx))
-                        .child(self.button("Sort", KeyCode::Char(','), cx))
-                        .child(self.button("Hidden", KeyCode::Char('.'), cx))
-                        .child(self.button("Jobs", KeyCode::Char('`'), cx)),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_1()
-                        .min_h_0()
-                        .child(self.places(cx))
-                        .child(content),
-                )
-                .child(
-                    self.accessibility.measured(
-                        div()
-                            .debug_selector(|| "ira-status-footer".into())
-                            .p_2()
-                            .text_sm()
-                            .bg(native_color(self.theme.surface_alt))
-                            .child(status.to_string()),
-                        AxTarget::Window,
-                        Some(AxRole::Status),
-                        None,
-                    ),
-                );
+                        .text_sm()
+                        .bg(native_color(self.theme.surface_alt))
+                        .child(status.to_string()),
+                    AxTarget::Window,
+                    Some(AxRole::Status),
+                    None,
+                ),
+            );
         if let Some(family) = &self.font_family {
             root = root.font_family(family.clone());
         }

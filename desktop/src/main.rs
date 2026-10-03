@@ -14,6 +14,9 @@ use ira_desktop::{
 use std::{cell::RefCell, rc::Rc};
 struct Session {
     runtime: Runtime,
+    chooser: ira_desktop::platform::chooser::SingleFlight,
+    chooser_prompt: ChooserPrompt,
+    chooser_deferred: Option<ira_desktop::runtime::ChooserEvent>,
     next_window: u64,
     geometry: Writer,
     opening: bool,
@@ -264,7 +267,159 @@ fn tick_shutdown(cx: &mut App) {
         }
     }
 }
+type ChooserPrompt = fn(
+    ira_desktop::platform::chooser::ChooserKind,
+    &mut App,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = ira_desktop::platform::chooser::ChooserOutcome>>,
+>;
+fn native_chooser_prompt(
+    kind: ira_desktop::platform::chooser::ChooserKind,
+    cx: &mut App,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = ira_desktop::platform::chooser::ChooserOutcome>>,
+> {
+    let received = cx.prompt_for_paths(ira_desktop::platform::chooser::options(kind));
+    Box::pin(async move {
+        ira_desktop::platform::chooser::normalize_received(
+            received
+                .await
+                .map_err(|e| e.to_string())
+                .map(|r| r.map_err(|e| e.to_string())),
+        )
+    })
+}
+fn request_browse(kind: ira_desktop::platform::chooser::ChooserKind, cx: &mut App) {
+    if cx.global::<Retirement>().quit_committed() {
+        return;
+    }
+    cx.update_global::<Session, _>(|session, _| {
+        if session.shutdown.is_some() || session.chooser.active().is_some() {
+            return;
+        }
+        let epoch = session.runtime.attached_epoch();
+        if epoch == 0 {
+            return;
+        }
+        session
+            .runtime
+            .enqueue_current(ira_desktop::runtime::Command::Browse(kind));
+    });
+}
+fn tick_chooser(cx: &mut App) {
+    use ira_desktop::{
+        platform::chooser,
+        runtime::{ChooserEvent, Command},
+    };
+    cx.update_global::<Session, _>(|session, _| session.runtime.flush());
+    for _ in 0..8 {
+        let Some(event) = cx.update_global::<Session, _>(|s, _| {
+            s.chooser_deferred
+                .take()
+                .or_else(|| s.runtime.try_chooser_event())
+        }) else {
+            break;
+        };
+        match event {
+            ChooserEvent::Prompt(request) => {
+                let admission = cx.global::<Session>().runtime.chooser_is_current(&request);
+                if admission.is_none() {
+                    cx.update_global::<Session, _>(|s, _| {
+                        s.chooser_deferred = Some(ChooserEvent::Prompt(request))
+                    });
+                    break;
+                }
+                let acquired = cx.update_global::<Session, _>(|s, _| {
+                    s.chooser.try_acquire(request.ticket).is_ok()
+                });
+                let current = acquired
+                    && !cx.global::<Retirement>().quit_committed()
+                    && admission == Some(true);
+                // The actor admitted the currently attached originating window.
+                let origin = cx.windows().first().copied();
+                if !current || origin.is_none() {
+                    cx.update_global::<Session, _>(|s, _| {
+                        if acquired {
+                            s.chooser.release(request.ticket);
+                        }
+                        s.runtime.enqueue_current(Command::ChooserResult {
+                            ticket: request.ticket,
+                            outcome: std::sync::Arc::new(chooser::ChooserOutcome::Canceled),
+                        });
+                    });
+                    continue;
+                }
+                let activated = origin
+                    .unwrap()
+                    .update(cx, |_, window, _| window.activate_window())
+                    .is_ok();
+                let admission = cx.global::<Session>().runtime.chooser_is_current(&request);
+                if activated && admission.is_none() {
+                    cx.update_global::<Session, _>(|s, _| {
+                        s.chooser.release(request.ticket);
+                        s.chooser_deferred = Some(ChooserEvent::Prompt(request));
+                    });
+                    break;
+                }
+                if !activated || admission != Some(true) {
+                    cx.update_global::<Session, _>(|s, _| {
+                        s.chooser.release(request.ticket);
+                        s.runtime.enqueue_current(Command::ChooserResult {
+                            ticket: request.ticket,
+                            outcome: std::sync::Arc::new(chooser::ChooserOutcome::Canceled),
+                        });
+                    });
+                    continue;
+                }
+                let prompt = cx.global::<Session>().chooser_prompt;
+                let received = prompt(request.ticket.kind, cx);
+                cx.spawn(async move |cx| {
+                    let outcome = received.await;
+                    let _ = cx.update(|cx| {
+                        cx.update_global::<Session, _>(|s, _| {
+                            // Receiver ownership survives a vanished Desktop/window. Only exact release.
+                            if s.chooser.release(request.ticket) {
+                                s.runtime.enqueue_current(Command::ChooserResult {
+                                    ticket: request.ticket,
+                                    outcome: std::sync::Arc::new(outcome),
+                                });
+                            }
+                        })
+                    });
+                })
+                .detach();
+            }
+            ChooserEvent::RestoreFocus(permit) => {
+                let current = cx
+                    .global::<Session>()
+                    .runtime
+                    .chooser_focus_is_current(&permit);
+                if current.is_none() {
+                    cx.update_global::<Session, _>(|s, _| {
+                        s.chooser_deferred = Some(ChooserEvent::RestoreFocus(permit))
+                    });
+                    break;
+                }
+                if !cx.global::<Retirement>().quit_committed()
+                    && current == Some(true)
+                    && let Some(desktop) = cx.global::<Session>().desktop.clone()
+                    && let Some(window) = cx.windows().first().copied()
+                {
+                    let _ = window.update(cx, |_, window, cx| {
+                        desktop.update(cx, |this, cx| this.restore_chooser_focus(window, cx))
+                    });
+                }
+            }
+        }
+    }
+}
 fn register_platform_quit(cx: &mut App) {
+    cx.on_action(|_: &actions::BrowseFile, cx| {
+        request_browse(ira_desktop::platform::chooser::ChooserKind::File, cx)
+    });
+    cx.on_action(|_: &actions::BrowseFolder, cx| {
+        request_browse(ira_desktop::platform::chooser::ChooserKind::Folder, cx)
+    });
     // Global registration is required when the ordinary last window is closed.
     cx.on_action(|_: &actions::Quit, cx| start_checked_shutdown(cx));
     // Late GPUI observer is cancellation/retention fallback only. It never
@@ -319,6 +474,7 @@ fn main() {
                     .update(|cx| {
                         pump.pump(64);
                         tick_shutdown(cx);
+                        tick_chooser(cx);
                     })
                     .is_err()
                 {
@@ -337,6 +493,9 @@ fn main() {
         });
         text_input::register(cx);
         cx.set_global(Session {
+            chooser: Default::default(),
+            chooser_prompt: native_chooser_prompt,
+            chooser_deferred: None,
             runtime: Runtime::start_with_fonts(0, cx.text_system().clone()),
             next_window: 1,
             geometry: Writer::new(geometry::path()),
@@ -362,3 +521,7 @@ fn main() {
 #[cfg(test)]
 #[path = "main_quit_tests.rs"]
 mod quit_tests;
+
+#[cfg(test)]
+#[path = "main_chooser_tests.rs"]
+mod chooser_tests;

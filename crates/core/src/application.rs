@@ -162,6 +162,7 @@ pub struct App {
     initializing: bool,
     startup_inputs: VecDeque<crate::input::Input>,
     clock_override: Option<Instant>,
+    existing_paths: existing_path::State,
     navigation_generation: [u64; 2],
     navigation_inflight: [Option<u64>; 2],
     navigation_waiting_listing: [bool; 2],
@@ -319,6 +320,7 @@ impl Default for App {
             initializing: false,
             startup_inputs: VecDeque::new(),
             clock_override: None,
+            existing_paths: existing_path::State::default(),
             navigation_generation: [0; 2],
             navigation_inflight: [None; 2],
             navigation_waiting_listing: [false; 2],
@@ -556,6 +558,7 @@ impl App {
         let focus = self.focus_generation;
         self.drain_startup();
         self.drain_operation_results();
+        self.drain_existing_paths();
         self.hint_offset = self.hint_offset.wrapping_add(2);
         self.drain_jobs();
         self.drain_info_results();
@@ -4096,3 +4099,7 @@ mod persistence_tests;
 #[cfg(test)]
 #[path = "application_transfer_probe_tests.rs"]
 mod transfer_probe_tests;
+
+#[path = "application_existing_path.rs"]
+mod existing_path;
+pub use existing_path::{ExistingPathKind, ExistingPathScope, ExistingPathReceipt};

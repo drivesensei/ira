@@ -23,6 +23,9 @@ fn pinned_platform_quit_stops_actor_and_acknowledges_temporary_persistence_drain
         cx.set_global(retirement.clone());
         cx.set_global(Session {
             runtime,
+            chooser: Default::default(),
+            chooser_prompt: native_chooser_prompt,
+            chooser_deferred: None,
             next_window: 8,
             geometry: Writer::new(None),
             opening: true,
@@ -72,6 +75,9 @@ fn global_quit_without_active_window_prepares_visible_checked_shutdown(
         cx.set_global(retirement.clone());
         cx.set_global(Session {
             runtime,
+            chooser: Default::default(),
+            chooser_prompt: native_chooser_prompt,
+            chooser_deferred: None,
             next_window: 8,
             geometry: Writer::new(None),
             opening: true,

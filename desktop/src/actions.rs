@@ -4,6 +4,8 @@ actions!(
     ira,
     [
         Quit,
+        BrowseFile,
+        BrowseFolder,
         RetryShutdown,
         Rename,
         Open,
@@ -52,6 +54,8 @@ pub fn register(cx: &mut App) {
         Menu {
             name: "Navigate".into(),
             items: vec![
+                MenuItem::action("Browse file…", BrowseFile),
+                MenuItem::action("Browse folder…", BrowseFolder),
                 MenuItem::action("Parent folder", Parent),
                 MenuItem::action("Search", Search),
                 MenuItem::action("Bookmark folder", Bookmark),

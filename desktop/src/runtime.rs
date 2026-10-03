@@ -22,6 +22,11 @@ use std::{
 
 #[derive(Clone, Debug)]
 pub enum Command {
+    Browse(crate::platform::chooser::ChooserKind),
+    ChooserResult {
+        ticket: crate::platform::chooser::ChooserTicket,
+        outcome: Arc<crate::platform::chooser::ChooserOutcome>,
+    },
     Input(Input),
     Accessibility(crate::platform::accessibility::ResolvedAction),
     FocusPane(usize),
@@ -148,6 +153,9 @@ pub struct Runtime {
     shutdown_complete: Arc<AtomicBool>,
     shutdown: Arc<Mutex<ShutdownState>>,
     retry_shutdown: SyncSender<()>,
+    chooser_events: Arc<Mutex<Receiver<chooser_runtime::ChooserEvent>>>,
+    chooser_permit: Arc<Mutex<Option<AdmittedChooser>>>,
+    chooser_focus: Arc<Mutex<Option<ChooserFocusPermit>>>,
     pub window_generation: u64,
     next_sequence: Arc<AtomicU64>,
     pending: VecDeque<Envelope>,
@@ -225,6 +233,11 @@ impl Runtime {
     ) -> Self {
         let (sender, commands) = mpsc::sync_channel::<Envelope>(256);
         let (completed, completions) = mpsc::channel();
+        let (chooser_tx, chooser_rx) = mpsc::channel();
+        let chooser_permit = Arc::new(Mutex::new(None));
+        let actor_chooser_permit = chooser_permit.clone();
+        let chooser_focus = Arc::new(Mutex::new(None));
+        let actor_chooser_focus = chooser_focus.clone();
         let latest = Arc::new(Latest::default());
         let stopping = Arc::new(AtomicBool::new(false));
         let shutdown_complete = Arc::new(AtomicBool::new(false));
@@ -332,7 +345,14 @@ impl Runtime {
                     }
                 }
             });
+            let mut chooser = chooser_runtime::ActorChooser::default();
+            let (chooser_pending_tx, chooser_pending_rx) = mpsc::channel();
             let mut last_tick = Instant::now();
+            *actor_chooser_permit.lock().unwrap() = chooser.permit(&app);
+            *actor_chooser_focus.lock().unwrap() = Some(ChooserFocusPermit::capture(&app));
+            for event in chooser_pending_rx.try_iter() {
+                let _ = chooser_tx.send(event);
+            }
             publish(&app, &publication, &loader, &font_family);
             while !stop.load(Ordering::Acquire) && app.running {
                 if synchronize_attachment(
@@ -342,6 +362,11 @@ impl Runtime {
                     &drive_tx,
                     &completed,
                 ) {
+                    *actor_chooser_permit.lock().unwrap() = chooser.permit(&app);
+                    *actor_chooser_focus.lock().unwrap() = Some(ChooserFocusPermit::capture(&app));
+                    for event in chooser_pending_rx.try_iter() {
+                        let _ = chooser_tx.send(event);
+                    }
                     publish(&app, &publication, &loader, &font_family);
                 }
                 for result in editor_results.try_iter() {
@@ -373,6 +398,11 @@ impl Runtime {
                         }
                         _ => {}
                     }
+                    *actor_chooser_permit.lock().unwrap() = chooser.permit(&app);
+                    *actor_chooser_focus.lock().unwrap() = Some(ChooserFocusPermit::capture(&app));
+                    for event in chooser_pending_rx.try_iter() {
+                        let _ = chooser_tx.send(event);
+                    }
                     publish(&app, &publication, &loader, &font_family);
                 }
                 match commands.recv_timeout(Duration::from_millis(20)) {
@@ -386,7 +416,8 @@ impl Runtime {
                         );
                         let sequence = envelope.sequence;
                         let window_generation = envelope.window_generation;
-                        if let Err(reason) = apply(&mut app, envelope) {
+                        if let Err(reason) = chooser.apply(&mut app, envelope, &chooser_pending_tx)
+                        {
                             let _ = completed.send(Completion::Rejected {
                                 sequence,
                                 window_generation,
@@ -395,6 +426,12 @@ impl Runtime {
                         }
                         for request in app.take_host_requests() {
                             route_host(&app, request, sequence, &editor_tx, &drive_tx, &completed);
+                        }
+                        *actor_chooser_permit.lock().unwrap() = chooser.permit(&app);
+                        *actor_chooser_focus.lock().unwrap() =
+                            Some(ChooserFocusPermit::capture(&app));
+                        for event in chooser_pending_rx.try_iter() {
+                            let _ = chooser_tx.send(event);
                         }
                         publish(&app, &publication, &loader, &font_family);
                     }
@@ -408,6 +445,7 @@ impl Runtime {
                     if context != app.input_context() && focus == app.focus_generation {
                         app.focus_generation = app.focus_generation.wrapping_add(1);
                     }
+                    chooser.drain(&mut app, &chooser_pending_tx);
                     for request in app.take_host_requests() {
                         route_host(
                             &app,
@@ -417,6 +455,11 @@ impl Runtime {
                             &drive_tx,
                             &completed,
                         );
+                    }
+                    *actor_chooser_permit.lock().unwrap() = chooser.permit(&app);
+                    *actor_chooser_focus.lock().unwrap() = Some(ChooserFocusPermit::capture(&app));
+                    for event in chooser_pending_rx.try_iter() {
+                        let _ = chooser_tx.send(event);
                     }
                     publish(&app, &publication, &loader, &font_family);
                     last_tick = Instant::now();
@@ -485,6 +528,9 @@ impl Runtime {
             shutdown_complete,
             shutdown,
             retry_shutdown,
+            chooser_events: Arc::new(Mutex::new(chooser_rx)),
+            chooser_permit,
+            chooser_focus,
             window_generation,
             next_sequence: Arc::new(AtomicU64::new(1)),
             pending: VecDeque::new(),
@@ -536,6 +582,9 @@ impl Runtime {
             shutdown_complete: self.shutdown_complete.clone(),
             shutdown: self.shutdown.clone(),
             retry_shutdown: self.retry_shutdown.clone(),
+            chooser_events: self.chooser_events.clone(),
+            chooser_permit: self.chooser_permit.clone(),
+            chooser_focus: self.chooser_focus.clone(),
             window_generation,
             next_sequence: self.next_sequence.clone(),
             pending: VecDeque::new(),
@@ -671,6 +720,9 @@ pub fn apply(app: &mut App, envelope: Envelope) -> Result<(), String> {
         command => command,
     };
     match command {
+        Command::Browse(_) | Command::ChooserResult { .. } => {
+            return Err("Chooser command requires actor admission".into());
+        }
         Command::Accessibility(_) => unreachable!("resolved above"),
         Command::FocusPane(pane) => {
             if pane >= 2
@@ -963,4 +1015,33 @@ fn synchronize_attachment(
         }
     }
     true
+}
+
+#[path = "runtime_chooser.rs"]
+mod chooser_runtime;
+pub use chooser_runtime::{AdmittedChooser, ChooserEvent, ChooserFocusPermit};
+impl Runtime {
+    /// None means transient lock pressure; a host must defer rather than cancel.
+    pub fn chooser_is_current(&self, request: &AdmittedChooser) -> Option<bool> {
+        if !self.effect_guard(request.context.window).is_current() {
+            return Some(false);
+        }
+        Some(self.chooser_permit.try_lock().ok()?.as_ref() == Some(request))
+    }
+    pub fn chooser_focus_is_current(&self, permit: &ChooserFocusPermit) -> Option<bool> {
+        if !self.effect_guard(permit.window).is_current() {
+            return Some(false);
+        }
+        Some(self.chooser_focus.try_lock().ok()?.as_ref() == Some(permit))
+    }
+    pub fn enqueue_current(&mut self, command: Command) -> u64 {
+        self.window_generation = self.attached_epoch();
+        self.enqueue(command, None)
+    }
+    pub fn attached_epoch(&self) -> u64 {
+        self.attached_window.load(Ordering::Acquire)
+    }
+    pub fn try_chooser_event(&self) -> Option<ChooserEvent> {
+        self.chooser_events.try_lock().ok()?.try_recv().ok()
+    }
 }

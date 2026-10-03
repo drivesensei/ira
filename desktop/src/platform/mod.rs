@@ -1,3 +1,4 @@
+pub mod chooser;
 pub mod accessibility;
 pub mod application_quit;
 pub mod geometry;
