@@ -117,3 +117,36 @@ fn inserted_base_character_keeps_caret_on_combining_grapheme_boundary() {
     b.delete(false);
     assert_eq!(b.text(), "x");
 }
+
+#[test]
+fn strict_utf16_selection_rejects_surrogates_combining_and_emoji_cluster_splits() {
+    use ira_native_input_validation::text_buffer::SelectionError;
+    let b = TextBuffer::new("a😀e\u{301}👩‍👩‍👧‍👦z");
+    assert_eq!(b.checked_utf16_selection(1..5), Ok(1..8));
+    assert_eq!(
+        b.checked_utf16_selection(2..3),
+        Err(SelectionError::InvalidBoundary)
+    );
+    assert_eq!(
+        b.checked_utf16_selection(3..4),
+        Err(SelectionError::InvalidBoundary)
+    );
+    assert_eq!(
+        b.checked_utf16_selection(5..7),
+        Err(SelectionError::InvalidBoundary)
+    );
+    assert_eq!(
+        b.checked_utf16_selection(4..3),
+        Err(SelectionError::InvalidRange)
+    );
+    assert_eq!(
+        b.checked_utf16_selection(0..usize::MAX),
+        Err(SelectionError::InvalidRange)
+    );
+    let empty = TextBuffer::new("");
+    assert_eq!(empty.checked_utf16_selection(0..0), Ok(0..0));
+    assert_eq!(
+        empty.checked_utf16_selection(0..1),
+        Err(SelectionError::InvalidRange)
+    );
+}

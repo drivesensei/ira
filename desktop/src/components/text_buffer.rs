@@ -8,6 +8,11 @@ pub struct BufferSnapshot {
     pub reversed: bool,
     pub marked: Option<Range<usize>>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectionError {
+    InvalidRange,
+    InvalidBoundary,
+}
 #[derive(Clone, Debug)]
 pub struct TextBuffer {
     state: BufferSnapshot,
@@ -81,6 +86,23 @@ impl TextBuffer {
         let a = self.byte(r.start);
         let b = self.byte(r.end);
         a.min(b)..a.max(b)
+    }
+    /// Strict external selection conversion: do not clamp or split a scalar/grapheme.
+    pub fn checked_utf16_selection(
+        &self,
+        range: Range<usize>,
+    ) -> Result<Range<usize>, SelectionError> {
+        if range.start > range.end || range.end > self.text().encode_utf16().count() {
+            return Err(SelectionError::InvalidRange);
+        }
+        let bytes = self.from_utf16(range.clone());
+        if self.to_utf16(bytes.clone()) != range
+            || self.boundary(bytes.start) != bytes.start
+            || self.boundary(bytes.end) != bytes.end
+        {
+            return Err(SelectionError::InvalidBoundary);
+        }
+        Ok(bytes)
     }
     pub fn to_utf16(&self, r: Range<usize>) -> Range<usize> {
         self.utf16(r.start)..self.utf16(r.end)
