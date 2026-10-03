@@ -2,7 +2,7 @@ use gpui::{EntityInputHandler, TestAppContext};
 use ira_native_input_validation::text_input::{self, InputAccess, InputOptions, TextInput};
 #[gpui::test]
 fn native_entity_input_composition_and_readonly(cx: &mut TestAppContext) {
-    cx.update(|cx| text_input::register(cx));
+    cx.update(text_input::register);
     let (input, cx) =
         cx.add_window_view(|_, cx| TextInput::new("prefix suffix", InputOptions::default(), cx));
     input.update(cx, |_, cx| cx.notify());
@@ -21,7 +21,7 @@ fn native_entity_input_composition_and_readonly(cx: &mut TestAppContext) {
 }
 #[gpui::test]
 fn simulated_editor_ctrl_a_plain_s_and_native_undo(cx: &mut TestAppContext) {
-    cx.update(|cx| text_input::register(cx));
+    cx.update(text_input::register);
     let (input, cx) = cx.add_window_view(|_, cx| {
         TextInput::new(
             "first\nsecond",
@@ -53,7 +53,7 @@ fn simulated_editor_ctrl_a_plain_s_and_native_undo(cx: &mut TestAppContext) {
 fn native_clipboard_submit_cancel_quit_events_are_generation_stamped(cx: &mut TestAppContext) {
     use ira_native_input_validation::text_input::{InputEvent, InputEventKind};
     use std::{cell::RefCell, rc::Rc};
-    cx.update(|cx| text_input::register(cx));
+    cx.update(text_input::register);
     let (input, cx) = cx.add_window_view(|_, cx| {
         TextInput::new(
             "😀 hello",
@@ -95,7 +95,7 @@ fn native_clipboard_submit_cancel_quit_events_are_generation_stamped(cx: &mut Te
 fn multiline_enter_save_and_disabled_input(cx: &mut TestAppContext) {
     use ira_native_input_validation::text_input::{InputEvent, InputEventKind};
     use std::{cell::RefCell, rc::Rc};
-    cx.update(|cx| text_input::register(cx));
+    cx.update(text_input::register);
     let (input, cx) = cx.add_window_view(|_, cx| {
         TextInput::new(
             "a",
@@ -134,4 +134,41 @@ fn multiline_enter_save_and_disabled_input(cx: &mut TestAppContext) {
         input.read_with(cx, |input, _| input.snapshot().text),
         "a\ns"
     );
+}
+#[gpui::test]
+fn search_arrow_keys_emit_oracle_navigation_without_changing_query(cx: &mut TestAppContext) {
+    use ira_native_input_validation::text_input::{InputEvent, InputEventKind, SearchNavigation};
+    use std::{cell::RefCell, rc::Rc};
+    cx.update(text_input::register);
+    let (input, cx) = cx.add_window_view(|_, cx| {
+        TextInput::new(
+            "query",
+            InputOptions {
+                search: true,
+                ..Default::default()
+            },
+            cx,
+        )
+    });
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let output = events.clone();
+    let _subscription = cx.update(|_, cx| {
+        cx.subscribe(&input, move |_, e: &InputEvent, _| {
+            output.borrow_mut().push(e.kind.clone())
+        })
+    });
+    input.update_in(cx, |input, w, cx| input.focus(w, cx));
+    cx.simulate_keystrokes("right up down alt-up alt-down");
+    assert_eq!(
+        *events.borrow(),
+        [
+            SearchNavigation::Open,
+            SearchNavigation::Previous,
+            SearchNavigation::Next,
+            SearchNavigation::Top,
+            SearchNavigation::Bottom
+        ]
+        .map(InputEventKind::SearchNavigate)
+    );
+    assert_eq!(input.read_with(cx, |i, _| i.snapshot().text), "query");
 }

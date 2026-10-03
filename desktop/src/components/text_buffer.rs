@@ -89,8 +89,7 @@ impl TextBuffer {
         self.text()
             .grapheme_indices(true)
             .map(|(i, _)| i)
-            .filter(|i| *i < b)
-            .next_back()
+            .rfind(|i| *i < b)
             .unwrap_or(0)
     }
     pub fn next(&self, b: usize) -> usize {
