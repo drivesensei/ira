@@ -29,3 +29,9 @@ ui:macos-terminal-window-geometry-overlay
 ui:windows-terminal-window-geometry-overlay
 ui:macos-appkit-preview-panel
 ui:windows-layered-preview-popup
+
+ui:drive-hotplug-refresh
+runtime:drive-rescan-2s
+state:drive-refresh-error-retention
+state:drive-refresh-unchanged-suppression
+state:drive-refresh-window-generation

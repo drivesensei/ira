@@ -1,0 +1,43 @@
+{
+  "snapshot": "d3e46e5891f609cdb8f9c3b450d5788f5560f217",
+  "oracle": "1cad4ce43cc72d52d4cc4eef920e0da22cb69568",
+  "approval": "Explicit human both-host data-loss fix authorization; T030 exact-stage allowance approved by coordinator. Structural provenance is not safety verification.",
+  "files": {
+    "src/services/transfer.rs": {
+      "commit": "4290fde018d60d48cc38742c5d4a2dc198392e8c",
+      "blob": "80d4438a2a391442bf084fdf2a692bd5881ffb06",
+      "sha256": "e0ab9e580b77264bcf719d79028c25a3eba77621461b703892944f7e1288964f",
+      "regressions": [
+        "src/services/transfer_safety_tests.rs",
+        ".devteam/reports/T-022-reviewer-safety.md",
+        ".devteam/reports/T-023-reviewer-safety-policy.md",
+        ".devteam/evidence/T-030/INDEX.md (exact stage S5:11 safety assertions pass, socket fixture fails SUN_LEN)"
+      ],
+      "limits": "G0039/G0046 target/source race findings remain open; this snapshot allowance does not approve safety semantics.",
+      "regression_scope": "Later reviewed safety evidence demonstrates the authorized fix family only; current stage blobs are exact d3e46e5 and are not claimed safety-verified by these later logs.",
+      "historical_family_evidence": [
+        ".devteam/evidence/T-015/red-core-531f525.txt",
+        ".devteam/evidence/T-015/red-terminal-531f525.txt",
+        ".devteam/evidence/T-015/green-970878f.txt"
+      ]
+    },
+    "src/services/transfer_safety_tests.rs": {
+      "commit": "4290fde018d60d48cc38742c5d4a2dc198392e8c",
+      "blob": "c8e76e937bb0765728eb515fada328dc5d80553b",
+      "sha256": "3e51921688fb0718378dcadf6534cd8d8536289821882c9f7eb7d8afe2016d31",
+      "regressions": [
+        "src/services/transfer_safety_tests.rs",
+        ".devteam/reports/T-022-reviewer-safety.md",
+        ".devteam/reports/T-023-reviewer-safety-policy.md",
+        ".devteam/evidence/T-030/INDEX.md (exact stage S5:11 safety assertions pass, socket fixture fails SUN_LEN)"
+      ],
+      "limits": "G0039/G0046 target/source race findings remain open; this snapshot allowance does not approve safety semantics.",
+      "regression_scope": "Later reviewed safety evidence demonstrates the authorized fix family only; current stage blobs are exact d3e46e5 and are not claimed safety-verified by these later logs.",
+      "historical_family_evidence": [
+        ".devteam/evidence/T-015/red-core-531f525.txt",
+        ".devteam/evidence/T-015/red-terminal-531f525.txt",
+        ".devteam/evidence/T-015/green-970878f.txt"
+      ]
+    }
+  }
+}

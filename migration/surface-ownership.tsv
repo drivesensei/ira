@@ -156,10 +156,8 @@ key:normal:down	F-033	INV-INPUT-002
 key:normal:drive-digit-1-9	F-140	INV-INPUT-002
 key:normal:e	F-141	INV-INPUT-002
 key:normal:enter	F-036	INV-INPUT-005
-key:normal:enter:open-default	F-083	INV-PE-010
 key:normal:escape	F-139	INV-INPUT-003
 key:normal:i	F-141	INV-INPUT-002
-key:normal:l:open-default-or-directory	F-083	INV-PE-010
 key:normal:left	F-033	INV-INPUT-002
 key:normal:left-bracket	F-037	INV-INPUT-006
 key:normal:m	F-145	INV-INPUT-004
@@ -310,6 +308,10 @@ msg:select a file	F-039	INV-INPUT-008
 msg:select-a-file	F-039	INV-INPUT-008
 msg:truncated	F-075	INV-PE-002
 msg:… truncated	F-075	INV-PE-002
+runtime:drive-rescan-2s	F-152	T030-frozen-app-drive-poller
+state:drive-refresh-error-retention	F-152	T030-frozen-app-drive-poller
+state:drive-refresh-unchanged-suppression	F-152	T030-frozen-app-drive-poller
+state:drive-refresh-window-generation	F-152	T030-frozen-app-drive-poller
 ui:actions-row	F-094	INV-RENDER-002
 ui:binary-preview-placeholder	F-075	INV-PE-002
 ui:bookmark-row	F-018	INV-CONFIG-004
@@ -329,6 +331,7 @@ ui:deletion-progress-dialog	F-131	INV-INPUT-011
 ui:details-listing	F-147	INV-RENDER-003/INV-files-ops-004
 ui:details-relative-time	F-147	INV-RENDER-003/INV-files-ops-004
 ui:dialog-glass-chrome	F-098	INV-RENDER-006
+ui:drive-hotplug-refresh	F-152	T030-frozen-app-drive-poller
 ui:drive-row	F-094	INV-RENDER-002
 ui:empty-common-folders	F-067	INV-PLAT-003
 ui:empty-file-preview	F-075	INV-PE-002
