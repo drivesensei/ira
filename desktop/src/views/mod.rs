@@ -24,6 +24,7 @@ use ira_core::{
     services::transfer::JobControl,
 };
 use std::{
+    collections::BTreeMap,
     path::PathBuf,
     sync::{Arc, mpsc},
     time::Duration,
@@ -36,6 +37,7 @@ pub struct Desktop {
     snapshot: Option<Arc<Snapshot>>,
     controls: Vec<Arc<JobControl>>,
     focus: FocusHandle,
+    place_focus: BTreeMap<AxTarget, FocusHandle>,
     scroll: [UniformListScrollHandle; 2],
     input: Option<Entity<TextInput>>,
     input_mode: Option<InputMode>,
@@ -74,6 +76,7 @@ impl Desktop {
             snapshot: None,
             controls: Vec::new(),
             focus: cx.focus_handle(),
+            place_focus: BTreeMap::new(),
             scroll: std::array::from_fn(|_| UniformListScrollHandle::new()),
             input: None,
             input_mode: None,
@@ -250,7 +253,7 @@ impl Desktop {
             .enqueue(Command::Input(actions::input(code)), None);
         cx.notify();
     }
-    fn key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.input.is_some() {
             // Input widgets own composition/caret keys. Ctrl+A in search remains a file action.
             if self.input_mode == Some(InputMode::Search)
@@ -269,6 +272,56 @@ impl Desktop {
             return;
         }
         let key = keymap::decode(&event.keystroke);
+        if key.modifiers.is_empty()
+            && let Some((target, _)) = self
+                .place_focus
+                .iter()
+                .find(|(_, handle)| handle.is_focused(window))
+        {
+            match key.code {
+                KeyCode::Enter | KeyCode::Right => {
+                    if let AxTarget::Place {
+                        kind,
+                        path,
+                        shortcut,
+                        occurrence,
+                    } = target
+                    {
+                        let kind = match kind {
+                            crate::platform::accessibility::model::PlaceKind::Drive => {
+                                PlaceKind::Drive
+                            }
+                            crate::platform::accessibility::model::PlaceKind::Common => {
+                                PlaceKind::Common
+                            }
+                            crate::platform::accessibility::model::PlaceKind::Bookmark => {
+                                PlaceKind::Bookmark
+                            }
+                        };
+                        self.runtime.enqueue(
+                            Command::PlaceExact {
+                                kind,
+                                path: path.to_string_lossy().into_owned(),
+                                shortcut: *shortcut,
+                                occurrence: *occurrence,
+                            },
+                            None,
+                        );
+                    }
+                    window.focus(&self.focus);
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                KeyCode::Esc | KeyCode::Tab => {
+                    window.focus(&self.focus);
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                _ => {}
+            }
+        }
         if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
             self.runtime.stop(&self.controls);
             cx.stop_propagation();
@@ -451,6 +504,12 @@ impl Desktop {
                 continue;
             }
             match (&action.target, &action.action) {
+                (target @ AxTarget::Place { .. }, AxAction::Focus) => {
+                    if let Some(handle) = self.place_focus.get(target) {
+                        window.focus(handle);
+                        cx.notify();
+                    }
+                }
                 (AxTarget::Text { document }, AxAction::Focus)
                     if *document == snapshot.document_generation =>
                 {
@@ -627,7 +686,7 @@ impl Desktop {
         self.accessibility
             .measured(body, AxTarget::Pane(index), Some(AxRole::List), None)
     }
-    fn places(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn places(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let mut list = div()
             .w(px(190.))
             .flex_shrink_0()
@@ -649,6 +708,7 @@ impl Desktop {
                         .child(heading),
                 );
                 if let Some(folders) = folders {
+                    let mut occurrences = BTreeMap::new();
                     for (i, folder) in folders.iter().enumerate() {
                         let key = if heading == "Drives" {
                             char::from_digit((i + 1) as u32, 10).unwrap_or(' ')
@@ -673,14 +733,28 @@ impl Desktop {
                                 crate::platform::accessibility::model::PlaceKind::Bookmark
                             }
                         };
+                        let count = occurrences
+                            .entry((folder.path.clone(), folder.shortcut))
+                            .or_insert(0usize);
+                        let occurrence = *count;
+                        *count += 1;
                         let ax_target = AxTarget::Place {
                             kind: ax_kind,
                             path: PathBuf::from(&path),
+                            shortcut: folder.shortcut,
+                            occurrence,
                         };
+                        let handle = self
+                            .place_focus
+                            .entry(ax_target.clone())
+                            .or_insert_with(|| cx.focus_handle())
+                            .clone();
+                        let shortcut = folder.shortcut;
                         list = list.child(
                             self.accessibility.measured(
                                 div()
                                     .id((heading, i))
+                                    .track_focus(&handle)
                                     .px_2()
                                     .py_1()
                                     .rounded_sm()
@@ -688,9 +762,11 @@ impl Desktop {
                                     .child(label)
                                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                         this.runtime.enqueue(
-                                            Command::Place {
+                                            Command::PlaceExact {
                                                 kind,
                                                 path: path.clone(),
+                                                shortcut,
+                                                occurrence,
                                             },
                                             None,
                                         );
@@ -705,6 +781,11 @@ impl Desktop {
                 }
             }
         }
+        self.place_focus.retain(|target, _| {
+            self.accessibility
+                .id(target, Some(AxRole::Button), Some(AxCapability::Focus))
+                .is_some()
+        });
         list.into_any_element()
     }
     fn modal(&self, height: gpui::Pixels, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
@@ -804,6 +885,11 @@ impl Render for Desktop {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_input(window, cx);
         self.accessibility_actions(window, cx);
+        self.accessibility.focused_target = self
+            .place_focus
+            .iter()
+            .find(|(_, handle)| handle.is_focused(window))
+            .map(|(target, _)| target.clone());
         if let Some(snapshot) = &self.snapshot {
             let text = self.native_text(cx);
             self.accessibility.begin(snapshot, text.as_ref());
@@ -1078,6 +1164,83 @@ mod crossing_tests {
     };
     use gpui::TestAppContext;
     use ira_core::{application::App, domain::data::Folder, services::list_files::list_files};
+    #[gpui::test]
+    fn duplicate_place_focus_uses_real_handle_without_navigation(cx: &mut TestAppContext) {
+        let mut app = App::default();
+        app.window_generation = 7;
+        app.bookmarks = Some(vec![
+            Folder::new("First".into(), "/tmp".into(), 'b'),
+            Folder::new("Duplicate".into(), "/tmp".into(), 'b'),
+        ]);
+        let runtime = Runtime::with_factory(7, move || app);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let publication = loop {
+            if let Some(p) = runtime.try_snapshot() {
+                break p;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            let mut view = Desktop::new(runtime, crate::platform::geometry::Writer::new(None), cx);
+            view.accessibility = accessibility::Host::headless();
+            view.snapshot = Some(publication.snapshot);
+            view
+        });
+        view.update_in(cx, |view, window, cx| {
+            let tree = view.accessibility.tree.as_ref().unwrap();
+            let nodes: Vec<_> = tree
+                .nodes
+                .values()
+                .filter(|n| {
+                    matches!(
+                        &n.target,
+                        Target::Place {
+                            kind: crate::platform::accessibility::model::PlaceKind::Bookmark,
+                            ..
+                        }
+                    )
+                })
+                .collect();
+            assert_eq!(nodes.len(), 2);
+            assert_ne!(nodes[0].id, nodes[1].id);
+            assert!(nodes.iter().all(|n| n.geometry.is_some()));
+            let node = nodes
+                .iter()
+                .find(|n| matches!(n.target, Target::Place { occurrence: 1, .. }))
+                .unwrap();
+            let target = node.target.clone();
+            let id = node.id;
+            let revision = view.snapshot.as_ref().unwrap().revision;
+            view.accessibility
+                .sink_for_test()
+                .try_dispatch(AccessibilityIntent {
+                    node: id,
+                    stamp: tree.stamp,
+                    action: Action::Focus,
+                })
+                .unwrap();
+            view.poll(cx);
+            view.accessibility_actions(window, cx);
+            assert!(view.place_focus.get(&target).unwrap().is_focused(window));
+            assert!(!view.focus.is_focused(window));
+            assert_eq!(
+                view.snapshot.as_ref().unwrap().revision,
+                revision,
+                "focus must not navigate or mutate actor state"
+            );
+            view.accessibility.focused_target = Some(target);
+            let snapshot = view.snapshot.as_ref().unwrap();
+            view.accessibility.begin(snapshot, None);
+            assert_eq!(view.accessibility.tree.as_ref().unwrap().focused, Some(id));
+            window.focus(&view.focus);
+            view.accessibility.focused_target = None;
+            view.accessibility.begin(snapshot, None);
+            assert_ne!(view.accessibility.tree.as_ref().unwrap().focused, Some(id));
+            view.runtime.stop(&view.controls);
+            view.close();
+        });
+    }
     #[gpui::test]
     fn real_virtualized_desktop_frame_records_clipped_path_geometry(cx: &mut TestAppContext) {
         let fixture = std::env::temp_dir().join(format!("ira-ax-frame-{}", std::process::id()));

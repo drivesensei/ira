@@ -24,6 +24,7 @@ pub struct Host {
     bridge: Option<crate::platform::accessibility::NativeBridge>,
     frame_revision: u64,
     native: bool,
+    pub focused_target: Option<Target>,
 }
 impl Default for Host {
     fn default() -> Self {
@@ -37,6 +38,7 @@ impl Default for Host {
             bridge: None,
             frame_revision: 0,
             native: true,
+            focused_target: None,
         }
     }
 }
@@ -55,7 +57,16 @@ impl Host {
             revision: self.frame_revision,
             nodes: Default::default(),
         }));
-        self.tree = Some(Arc::new(self.model.project(s, text, &self.frame.borrow())));
+        self.tree = Some(Arc::new(
+            self.model.project_with_host_focus(
+                s,
+                text,
+                &self.frame.borrow(),
+                self.focused_target
+                    .as_ref()
+                    .and_then(|target| self.id(target, None, None)),
+            ),
+        ));
     }
     pub fn id(
         &self,
@@ -114,7 +125,16 @@ impl Host {
         {
             return Ok(());
         }
-        let tree = Arc::new(self.model.project(s, text, &self.frame.borrow()));
+        let tree = Arc::new(
+            self.model.project_with_host_focus(
+                s,
+                text,
+                &self.frame.borrow(),
+                self.focused_target
+                    .as_ref()
+                    .and_then(|target| self.id(target, None, None)),
+            ),
+        );
         if self.sink.is_none() {
             let (sink, receiver) = ActionSink::channel(tree.clone(), 128);
             #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -227,13 +247,23 @@ pub fn actor_command(action: ResolvedAction) -> Result<Command, String> {
                 _ => return Err("Unsupported entry accessibility action".into()),
             },
         },
-        (Target::Place { kind, path }, Action::Activate) => Command::Place {
+        (
+            Target::Place {
+                kind,
+                path,
+                shortcut,
+                occurrence,
+            },
+            Action::Activate,
+        ) => Command::PlaceExact {
             kind: match kind {
                 crate::platform::accessibility::model::PlaceKind::Drive => PlaceKind::Drive,
                 crate::platform::accessibility::model::PlaceKind::Common => PlaceKind::Common,
                 crate::platform::accessibility::model::PlaceKind::Bookmark => PlaceKind::Bookmark,
             },
             path: path.to_string_lossy().into_owned(),
+            shortcut,
+            occurrence,
         },
         (Target::Job(id), action) => Command::Job {
             id,

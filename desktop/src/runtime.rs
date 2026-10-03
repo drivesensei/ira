@@ -38,6 +38,12 @@ pub enum Command {
         kind: PlaceKind,
         path: String,
     },
+    PlaceExact {
+        kind: PlaceKind,
+        path: String,
+        shortcut: char,
+        occurrence: usize,
+    },
     Target {
         target: EntryTarget,
         verb: TargetVerb,
@@ -616,6 +622,40 @@ pub fn apply(app: &mut App, envelope: Envelope) -> Result<(), String> {
                 JobVerb::Pause => app.toggle_selected_job_pause(),
                 JobVerb::Cancel => app.cancel_selected_job(),
             }
+        }
+        Command::PlaceExact {
+            kind,
+            path,
+            shortcut,
+            occurrence,
+        } => {
+            if !matches!(
+                app.input_context(),
+                ira_core::input::InputContext::Pane(_) | ira_core::input::InputContext::Search
+            ) {
+                return Err("An input or dialog owns focus".into());
+            }
+            let folders = match kind {
+                PlaceKind::Drive => &app.drives,
+                PlaceKind::Common => &app.folders,
+                PlaceKind::Bookmark => &app.bookmarks,
+            };
+            let index = folders
+                .as_ref()
+                .and_then(|folders| {
+                    folders
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, folder)| folder.path == path && folder.shortcut == shortcut)
+                        .nth(occurrence)
+                        .map(|(index, _)| index)
+                })
+                .ok_or_else(|| "Place is no longer available".to_string())?;
+            app.apply_command(match kind {
+                PlaceKind::Drive => ira_core::input::Command::Drive(index),
+                PlaceKind::Common => ira_core::input::Command::CommonFolder(index),
+                PlaceKind::Bookmark => ira_core::input::Command::Bookmark(index),
+            });
         }
         Command::Place { kind, path } => {
             if !matches!(
