@@ -125,7 +125,7 @@ impl Directory {
     }
     #[cfg(windows)]
     fn pin_windows(path: &Path) -> Result<File, String> {
-        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
         let f = std::fs::OpenOptions::new()
             .read(true)
             .share_mode(3)
@@ -133,7 +133,7 @@ impl Directory {
             .open(path)
             .map_err(|e| e.to_string())?;
         let meta = f.metadata().map_err(|e| e.to_string())?;
-        if !meta.is_dir() || meta.file_type().is_symlink() {
+        if !meta.is_dir() || meta.file_attributes() & 0x400 != 0 {
             return Err("staging directory is a reparse point or not a directory".into());
         }
         Ok(f)

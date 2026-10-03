@@ -405,7 +405,12 @@ impl PtySession {
         self.master.take();
     }
 
-    fn terminate_and_reap_child(&mut self, deadline: Instant, cleanup: &mut Vec<String>) -> bool {
+    fn terminate_and_reap_child(
+        &mut self,
+        deadline: Instant,
+        cleanup: &mut Vec<String>,
+        hard_abort: bool,
+    ) -> bool {
         let Some(child) = self.child.as_mut() else {
             return true;
         };
@@ -426,11 +431,29 @@ impl PtySession {
             }
         }
 
-        // A scenario shutdown is a hard abort, not interactive graceful close.
-        // Send a nonblocking hard signal immediately; leave the entire absolute
-        // budget for OS scheduling/reaping (portable-pty Unix kill has a 200ms grace).
-        if let Err(error) = hard_terminate(child.as_mut()) {
-            cleanup.push(error);
+        // Normal shutdown preserves the input-close/HUP handler contract when
+        // spare budget exists. Always reserve 20ms for escalation/reaping; short
+        // deadlines and primary-error aborts get an immediate hard signal.
+        // Both signal paths are nonblocking and share the original absolute deadline.
+        let grace = if hard_abort {
+            Duration::ZERO
+        } else {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .saturating_sub(Duration::from_millis(20))
+                .min(Duration::from_millis(100))
+        };
+        let force_at = Instant::now() + grace;
+        let mut force_sent = grace.is_zero();
+        if force_sent {
+            if let Err(error) = hard_terminate(child.as_mut()) {
+                cleanup.push(error);
+            }
+        } else {
+            let mut signaler = child.clone_killer();
+            if let Err(error) = signaler.kill() {
+                cleanup.push(format!("child termination signal failed: {error}"));
+            }
         }
 
         loop {
@@ -456,6 +479,14 @@ impl PtySession {
                 None => return true,
             }
 
+            if !force_sent && Instant::now() >= force_at {
+                if let Some(child) = self.child.as_mut() {
+                    if let Err(error) = hard_terminate(child.as_mut()) {
+                        cleanup.push(error);
+                    }
+                }
+                force_sent = true;
+            }
             if Instant::now() >= deadline {
                 cleanup.push("child cleanup deadline exceeded".into());
                 return false;
@@ -492,7 +523,8 @@ impl PtySession {
         self.writer.take();
         self.slave.take();
         events.push(CleanupEvent::InputClosed);
-        let child_reaped = self.terminate_and_reap_child(child_deadline, &mut cleanup);
+        let child_reaped =
+            self.terminate_and_reap_child(child_deadline, &mut cleanup, primary.is_some());
         if child_reaped {
             events.push(CleanupEvent::ChildReaped);
         }
