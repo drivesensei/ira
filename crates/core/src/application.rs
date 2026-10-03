@@ -84,6 +84,39 @@ enum PersistenceRequest {
     Bookmarks(Option<PathBuf>, Vec<Folder>),
     Barrier(mpsc::Sender<()>),
 }
+#[derive(PartialEq, Eq)]
+struct PaneTickSemantics {
+    projection: u64,
+    listing: u64,
+    settled: bool,
+    folder: Option<Folder>,
+    cursor: Option<usize>,
+    pending_select: Option<String>,
+    user_navigated: bool,
+}
+#[derive(PartialEq, Eq)]
+struct TickSemantics {
+    panes: [PaneTickSemantics; 2],
+    initializing: bool,
+    running: bool,
+    context: crate::input::InputContext,
+    renaming: Option<RenamePrompt>,
+    new_entry: Option<NewEntryPrompt>,
+    goto_prompt: Option<String>,
+    search_query: Option<String>,
+    status: Option<Status>,
+    transfer_dest: Option<TransferDestSync>,
+}
+fn same_entries(left: &[FEntry], right: &[FEntry]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(a, b)| {
+            a.path == b.path
+                && a.label == b.label
+                && a.is_dir == b.is_dir
+                && a.size == b.size
+                && a.modified == b.modified
+        })
+}
 struct SearchProjection {
     pane: usize,
     generation: u64,
@@ -416,6 +449,7 @@ impl App {
     pub fn invalidate_pane_projection(&mut self, pane_index: usize) {
         if let Some(pane) = self.panes.get_mut(pane_index) {
             pane.projection_generation = pane.projection_generation.wrapping_add(1);
+            self.semantic_changed();
         }
     }
 
@@ -476,8 +510,42 @@ impl App {
         }
     }
 
+    fn semantic_changed(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
+    // Constant in row count. Row mutations carry the existing projection version;
+    // jobs/info/drives notify at accepted event application, not publication cadence.
+    fn tick_semantics(&self) -> TickSemantics {
+        TickSemantics {
+            panes: std::array::from_fn(|i| {
+                let pane = &self.panes[i];
+                PaneTickSemantics {
+                    projection: pane.projection_generation,
+                    listing: pane.listing_generation,
+                    settled: pane.listing_settled,
+                    folder: pane.folder.clone(),
+                    cursor: pane.state.selected(),
+                    pending_select: pane.pending_select.clone(),
+                    user_navigated: pane.user_navigated,
+                }
+            }),
+            initializing: self.initializing,
+            running: self.running,
+            context: self.input_context(),
+            renaming: self.renaming.clone(),
+            new_entry: self.new_entry.clone(),
+            goto_prompt: self.goto_prompt.clone(),
+            search_query: self.search_query.clone(),
+            status: self.status.clone(),
+            transfer_dest: self.transfer_dest.clone(),
+        }
+    }
+
     /// Handles the tick event of the terminal.
     pub fn tick(&mut self) {
+        let before = self.tick_semantics();
+        let revision = self.revision;
+        let focus = self.focus_generation;
         self.drain_startup();
         self.drain_operation_results();
         self.hint_offset = self.hint_offset.wrapping_add(2);
@@ -489,15 +557,26 @@ impl App {
         self.refresh_transfer_destinations();
         self.expire_status();
         self.start_pending_relative_navigation();
+        let after = self.tick_semantics();
+        if before.context != after.context && self.focus_generation == focus {
+            self.focus_generation = self.focus_generation.wrapping_add(1);
+        }
+        if before != after && self.revision == revision {
+            self.semantic_changed();
+        }
     }
 
     /// Raises a transient bottom-bar message (replaces any current one).
     pub fn set_status(&mut self, text: impl Into<String>, is_error: bool) {
-        self.status = Some(Status {
+        let status = Status {
             text: text.into(),
             is_error,
             raised: self.now(),
-        });
+        };
+        if self.status.as_ref() != Some(&status) {
+            self.status = Some(status);
+            self.semantic_changed();
+        }
     }
 
     /// Routes pasted text to whichever input dialog is active.
@@ -538,7 +617,9 @@ impl App {
 
     /// Dismisses the error dialog immediately (any key while it is open).
     pub fn clear_status(&mut self) {
-        self.status = None;
+        if self.status.take().is_some() {
+            self.semantic_changed();
+        }
     }
 
     /// Drops the status message once its TTL has elapsed.
@@ -548,7 +629,7 @@ impl App {
             .as_ref()
             .is_some_and(|s| self.now().saturating_duration_since(s.raised) >= STATUS_TTL)
         {
-            self.status = None;
+            self.clear_status();
         }
     }
 
@@ -639,7 +720,10 @@ impl App {
         }
         self.seen_drive_generation = gen;
         let drives = self.drive_cache.lock().unwrap().clone();
-        self.drives = Some(drives);
+        if self.drives.as_ref() != Some(&drives) {
+            self.drives = Some(drives);
+            self.semantic_changed();
+        }
     }
 
     pub fn list_files_from_selected_folder(&mut self) {
@@ -674,6 +758,7 @@ impl App {
         // async listing must never replace a newer sync/streamed one).
         self.panes[pane_index].listing_generation =
             self.panes[pane_index].listing_generation.wrapping_add(1);
+        self.semantic_changed();
         let Some(path) = self.panes[pane_index]
             .folder
             .as_ref()
@@ -704,7 +789,11 @@ impl App {
                     files.sort_by(|a, b| a.label.cmp(&b.label));
                     let len = files.len();
                     let pane = &mut self.panes[pane_index];
-                    pane.projection_generation = pane.projection_generation.wrapping_add(1);
+                    if !same_entries(&pane.files, &files)
+                        || pane.selected.iter().any(|selected| *selected)
+                    {
+                        pane.projection_generation = pane.projection_generation.wrapping_add(1);
+                    }
                     pane.files = files;
                     pane.selected = vec![false; len];
                     pane.render_scroll = 0;
@@ -732,7 +821,11 @@ impl App {
                     if let Some(q) = query {
                         let labels: Vec<String> =
                             pane.files.iter().map(|f| f.label.clone()).collect();
-                        pane.filter_indices = fuzzy_indices(&labels, &q);
+                        let indices = fuzzy_indices(&labels, &q);
+                        if pane.filter_indices != indices {
+                            pane.projection_generation = pane.projection_generation.wrapping_add(1);
+                        }
+                        pane.filter_indices = indices;
                     }
                     continue;
                 }
@@ -774,7 +867,9 @@ impl App {
         pane.render_scroll = 0;
         pane.state.select(None);
         let generation = pane.listing_generation;
-        let Some(path) = pane.folder.as_ref().map(|f| f.path.clone()) else {
+        let path = pane.folder.as_ref().map(|f| f.path.clone());
+        self.semantic_changed();
+        let Some(path) = path else {
             return;
         };
         let show_hidden = self.show_hidden;
@@ -815,7 +910,11 @@ impl App {
             }
             let pane = &mut self.panes[pane_index];
             if done {
-                pane.projection_generation = pane.projection_generation.wrapping_add(1);
+                if !same_entries(&pane.files, &files)
+                    || pane.selected.iter().any(|selected| *selected)
+                {
+                    pane.projection_generation = pane.projection_generation.wrapping_add(1);
+                }
                 pane.files = files;
                 pane.selected = vec![false; pane.files.len()];
                 pane.render_scroll = 0;
@@ -840,13 +939,19 @@ impl App {
                 let query = pane.filter_query.clone();
                 if let Some(q) = query {
                     let labels: Vec<String> = pane.files.iter().map(|f| f.label.clone()).collect();
-                    pane.filter_indices = fuzzy_indices(&labels, &q);
+                    let indices = fuzzy_indices(&labels, &q);
+                    if pane.filter_indices != indices {
+                        pane.projection_generation = pane.projection_generation.wrapping_add(1);
+                    }
+                    pane.filter_indices = indices;
                 }
             } else {
                 pane.listing_settled = false;
                 pane.selected
                     .extend(std::iter::repeat_n(false, files.len()));
-                pane.projection_generation = pane.projection_generation.wrapping_add(1);
+                if !files.is_empty() {
+                    pane.projection_generation = pane.projection_generation.wrapping_add(1);
+                }
                 pane.files.extend(files);
                 // While streaming, follow the pending target as soon as its
                 // entry arrives (transfer results land mid-stream). The
@@ -2091,6 +2196,7 @@ impl App {
     /// the open dialog's Size line), the metadata worker fills the dialog.
     fn drain_info_results(&mut self) {
         while let Ok(event) = self.info_rx.try_recv() {
+            let mut changed = false;
             match event {
                 InfoEvent::Progress {
                     path,
@@ -2098,6 +2204,7 @@ impl App {
                     items,
                     on_disk,
                 } => {
+                    changed = true;
                     self.size_cache.insert(
                         path.clone(),
                         SizeInfo {
@@ -2110,6 +2217,7 @@ impl App {
                     );
                 }
                 InfoEvent::Done { path, size } => {
+                    changed = true;
                     self.size_walks.remove(&path);
                     self.size_cache.insert(
                         path.clone(),
@@ -2128,11 +2236,15 @@ impl App {
                 InfoEvent::Meta { path, lines } => {
                     if let Some(dialog) = self.info.as_mut() {
                         if dialog.pending && dialog.path == path {
+                            changed = true;
                             dialog.pending = false;
                             dialog.lines = lines;
                         }
                     }
                 }
+            }
+            if changed {
+                self.semantic_changed();
             }
         }
         self.sync_dialog_size_line();
@@ -2154,6 +2266,7 @@ impl App {
         if si.complete && !dialog.lines.iter().any(|l| l.starts_with("Size:")) {
             let line = size_line_final(si);
             dialog.lines.insert(4.min(dialog.lines.len()), line);
+            self.semantic_changed();
         }
     }
 
@@ -2429,9 +2542,11 @@ impl App {
 
     fn drain_jobs(&mut self) {
         while let Ok(event) = self.job_rx.try_recv() {
+            let mut changed = false;
             match event {
                 JobEvent::Started { id, total_bytes } => {
                     if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id) {
+                        changed = j.total_bytes != total_bytes;
                         j.total_bytes = total_bytes;
                     }
                 }
@@ -2441,12 +2556,14 @@ impl App {
                     current,
                 } => {
                     if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id) {
+                        changed = j.copied_bytes != copied_bytes || j.current != current;
                         j.copied_bytes = copied_bytes;
                         j.current = current;
                     }
                 }
                 JobEvent::Done { id } => {
                     if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id) {
+                        changed = j.status != JobStatus::Done;
                         j.status = JobStatus::Done;
                         self.transfer_dest = None;
                         // Land the destination pane's cursor on the last
@@ -2482,12 +2599,14 @@ impl App {
                 }
                 JobEvent::Cancelled { id } => {
                     if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id) {
+                        changed = j.status != JobStatus::Cancelled;
                         j.status = JobStatus::Cancelled;
                     }
                     self.refresh_after_job();
                 }
                 JobEvent::Failed { id, error } => {
                     if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id) {
+                        changed = j.status != JobStatus::Failed(error.clone());
                         j.status = JobStatus::Failed(error);
                     }
                 }
@@ -2497,14 +2616,22 @@ impl App {
                     current,
                 } => {
                     if let Some(d) = self.deletion.as_mut() {
+                        changed = d.done != done
+                            || d.total != total
+                            || d.current.as_ref() != Some(&current);
                         d.done = done;
                         d.total = total;
                         d.current = Some(current.clone());
                     }
-                    self.deletion_generation = self.deletion_generation.wrapping_add(1);
-                    self.deleting_paths.remove(&current);
+                    if self.deleting_paths.remove(&current) {
+                        self.deletion_generation = self.deletion_generation.wrapping_add(1);
+                        changed = true;
+                    }
                 }
                 JobEvent::DeleteDone { cancelled, failed } => {
+                    changed = self.deletion.is_some()
+                        || !self.deleting_paths.is_empty()
+                        || self.deletion_box_hidden;
                     self.deletion = None;
                     self.deletion_generation = self.deletion_generation.wrapping_add(1);
                     self.deleting_paths.clear();
@@ -2527,6 +2654,9 @@ impl App {
                         self.set_status(format!("Failed to delete '{path}': {err}{more}"), true);
                     }
                 }
+            }
+            if changed {
+                self.semantic_changed();
             }
         }
     }
@@ -2766,7 +2896,11 @@ impl App {
         match query {
             Some(q) if !q.trim().is_empty() => {
                 let labels: Vec<String> = pane.files.iter().map(|f| f.label.clone()).collect();
-                pane.filter_indices = fuzzy_indices(&labels, &q);
+                let indices = fuzzy_indices(&labels, &q);
+                if pane.filter_indices != indices {
+                    pane.projection_generation = pane.projection_generation.wrapping_add(1);
+                }
+                pane.filter_indices = indices;
                 pane.projection_generation = pane.projection_generation.wrapping_add(1);
                 pane.filter_query = Some(q);
             }
@@ -2993,6 +3127,7 @@ impl App {
         if self.panes[0].folder.is_none() && self.navigation_generation[0] == 0 {
             if let Some(drive) = drives.iter().find(|d| !d.path.is_empty()) {
                 self.panes[0].folder = Some(drive.clone());
+                self.semantic_changed();
                 if !self.initializing {
                     self.request_pane_listing(0);
                 }
@@ -3256,6 +3391,7 @@ impl App {
             }
             return Ok(());
         }
+        let is_tick = matches!(&input, crate::input::Input::Tick);
         let context_before = self.input_context();
         let focus_before = self.focus_generation;
         match input {
@@ -3287,7 +3423,9 @@ impl App {
                 }
             }
         }
-        self.revision = self.revision.wrapping_add(1);
+        if !is_tick {
+            self.semantic_changed();
+        }
         Ok(())
     }
     pub fn dispatch_envelope(
@@ -3660,7 +3798,10 @@ impl App {
             if let Some(status) = result.status {
                 self.status = Some(status);
             }
-            self.drives = result.state.drives;
+            if self.drives != result.state.drives {
+                self.drives = result.state.drives;
+                self.semantic_changed();
+            }
         }
         self.host_requests.extend(result.host_requests);
         for (pane, streaming) in result.listings {
@@ -3838,6 +3979,7 @@ impl App {
         self.transfer_generation = self.transfer_generation.wrapping_add(1);
         self.transfer_probe_pending = None;
         self.transfer_dest = None;
+        self.semantic_changed();
     }
     pub fn attach_window(&mut self, window_generation: u64) {
         if window_generation != self.window_generation {
@@ -3861,6 +4003,7 @@ impl App {
         let Some(request) = self.pending_editor.take() else {
             return;
         };
+        self.semantic_changed();
         self.host_requests.retain(|r|!matches!(r,HostRequest::OpenEditor(queued) if queued.document_id==request.document_id) && !matches!(r,HostRequest::EditorKey{document_id,..}|HostRequest::EditorPaste{document_id,..} if *document_id==request.document_id));
         self.document_generation = self.document_generation.wrapping_add(1);
         if self.edit.is_none() {

@@ -1104,3 +1104,182 @@ fn snapshot_metadata_save_refreshes_entry_but_keeps_previous_snapshot_immutable(
     assert_eq!(app.snapshot().panes[0].rows[0].entry.size, 6);
     assert_eq!(old.panes[0].rows[0].entry.size, 3);
 }
+
+#[test]
+fn background_drive_semantics_advance_revision_without_input_but_identical_probe_is_stable() {
+    let mut app = fixture();
+    app.panes[0].folder = Some(Folder::new("fixture".into(), "/fixture".into(), '1'));
+    let first = app.snapshot();
+    app.apply_drives(vec![Folder::new("drive-a".into(), "/fixture".into(), '1')]);
+    let second = app.snapshot();
+    assert!(second.revision > first.revision);
+    app.apply_drives(vec![Folder::new("drive-b".into(), "/fixture".into(), '1')]);
+    let third = app.snapshot();
+    assert!(third.revision > second.revision);
+    assert_eq!(third.ack_sequence, 0);
+    app.apply_drives(third.drives.clone().unwrap());
+    app.tick();
+    assert_eq!(app.revision, third.revision);
+}
+
+#[test]
+fn background_listing_has_fresh_revision_and_unchanged_ticks_and_stale_results_are_stable() {
+    let mut app = fixture();
+    let before = app.snapshot();
+    app.tick();
+    app.dispatch(crate::input::Input::Tick).unwrap();
+    assert_eq!(app.revision, before.revision);
+    app.file_list_tx
+        .send((0, vec![entry("later.txt", 3)], false, 0))
+        .unwrap();
+    app.tick();
+    let changed = app.snapshot();
+    assert!(changed.revision > before.revision);
+    assert_eq!(changed.panes[0].rows.len(), 4);
+    assert_eq!(changed.ack_sequence, 0);
+    app.file_list_tx
+        .send((0, vec![entry("stale.txt", 3)], true, 99))
+        .unwrap();
+    app.tick();
+    assert_eq!(app.revision, changed.revision);
+    app.file_list_tx.send((0, Vec::new(), false, 0)).unwrap();
+    app.tick();
+    assert_eq!(app.revision, changed.revision);
+}
+
+fn revision_job() -> Job {
+    Job {
+        id: 7,
+        kind: JobKind::Copy,
+        overwrite: OverwritePolicy::AutoRename,
+        paths: vec!["/fixture/alpha.txt".into()],
+        dest_dir: "/destination".into(),
+        label: "copy".into(),
+        total_bytes: Some(100),
+        copied_bytes: 0,
+        current: String::new(),
+        status: JobStatus::Running,
+        started_at: Instant::now(),
+        control: JobControl::new(),
+    }
+}
+#[test]
+fn job_progress_changes_revision_but_duplicate_and_unknown_events_do_not() {
+    let mut app = fixture();
+    app.jobs.push(revision_job());
+    let before = app.snapshot();
+    let progress = JobEvent::Progress {
+        id: 7,
+        copied_bytes: 10,
+        current: "alpha.txt".into(),
+    };
+    app.job_tx.send(progress.clone()).unwrap();
+    app.tick();
+    let changed = app.snapshot();
+    assert!(changed.revision > before.revision);
+    assert_eq!(changed.jobs[0].copied_bytes, 10);
+    assert!(Arc::ptr_eq(&before.panes[0].rows, &changed.panes[0].rows));
+    app.job_tx.send(progress).unwrap();
+    app.job_tx
+        .send(JobEvent::Progress {
+            id: 99,
+            copied_bytes: 80,
+            current: "unknown".into(),
+        })
+        .unwrap();
+    app.tick();
+    assert_eq!(app.revision, changed.revision);
+}
+
+#[test]
+fn size_and_metadata_completions_and_status_expiry_advance_semantic_revision() {
+    let mut app = fixture();
+    let before = app.revision;
+    app.info_tx
+        .send(InfoEvent::Progress {
+            path: "/fixture/folder".into(),
+            bytes: 7,
+            items: 2,
+            on_disk: 8,
+        })
+        .unwrap();
+    app.tick();
+    assert!(app.revision > before);
+    let before = app.revision;
+    app.info_tx
+        .send(InfoEvent::Meta {
+            path: "wrong path".into(),
+            lines: vec!["stale".into()],
+        })
+        .unwrap();
+    app.tick();
+    assert_eq!(app.revision, before);
+    let clock = Instant::now();
+    app.clock_override = Some(clock);
+    app.set_status("expires", false);
+    let before = app.revision;
+    app.clock_override = Some(clock + STATUS_TTL + Duration::from_millis(1));
+    app.tick();
+    assert!(app.status.is_none());
+    assert!(app.revision > before);
+    let before = app.revision;
+    app.tick();
+    assert_eq!(app.revision, before);
+}
+
+#[test]
+fn identical_authoritative_listing_keeps_revision_and_row_identity() {
+    let mut app = fixture();
+    app.panes[0].selected.fill(false);
+    let before = app.snapshot();
+    app.file_list_tx
+        .send((0, app.panes[0].files.clone(), true, 0))
+        .unwrap();
+    app.tick();
+    let after = app.snapshot();
+    assert_eq!(after.revision, before.revision);
+    assert!(Arc::ptr_eq(&before.panes[0].rows, &after.panes[0].rows));
+}
+
+#[test]
+fn async_prompt_completion_advances_revision_without_input_even_when_context_is_unchanged() {
+    let mut app = fixture();
+    app.renaming = Some(RenamePrompt {
+        text: vec!['x'],
+        cursor: 1,
+        original: "x".into(),
+        index: 0,
+    });
+    app.new_entry = Some(NewEntryPrompt {
+        text: vec!['y'],
+        cursor: 1,
+    });
+    let before = app.operation_state();
+    let mut state = before.clone();
+    state.new_entry = None;
+    let source = std::array::from_fn(|i| {
+        (
+            app.panes[i].folder.as_ref().map(|f| f.path.clone()),
+            app.panes[i].listing_generation,
+        )
+    });
+    app.operation_result_tx
+        .send(OperationResult {
+            epoch: 0,
+            navigation_ticket: None,
+            before,
+            source,
+            state,
+            status: None,
+            listings: Vec::new(),
+            host_requests: Vec::new(),
+        })
+        .unwrap();
+    let before = app.snapshot();
+    app.tick();
+    let after = app.snapshot();
+    assert_eq!(before.input_context, after.input_context);
+    assert!(app.new_entry.is_none());
+    assert!(after.revision > before.revision);
+    assert_eq!(after.ack_sequence, 0);
+}

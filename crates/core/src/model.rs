@@ -110,7 +110,7 @@ pub struct RenamePrompt {
 
 /// A transient message shown in the bottom status bar. `is_error` styles it
 /// red; eject-busy and rename collisions are errors, "copied 3 items" is not.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Status {
     pub text: String,
     /// `true` renders red; `false` renders as an ordinary notice.
@@ -145,7 +145,7 @@ pub struct MultiInfoState {
 /// Live sync state while a transfer writes into a folder: the destination
 /// pane's listing is refreshed periodically so copied items appear live,
 /// even while the transfer is still running.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferDestSync {
     pub dest_dir: String,
     /// Destination path of the first item (cursor reveal target).
