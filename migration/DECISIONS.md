@@ -126,3 +126,21 @@ Recommendations from every advisor report are answered in this log. No terminal-
 - Advisor: architecture-advisor `reports/F-002/architecture-spec-review-2.md` R1-R4; platform-advisor `reports/F-002/platform-spec-review-2.md` R1-R4. All adopted/adapted as listed.
 - Adversarial: lifecycle red preparation in progress; ADV-27/29/30 open | Logic: LOG-05/06 open; LOG-01..04 resolved on reviewer branch.
 - Affects rows: F-002,F-150.
+
+## D-0015 Current structural contract after starter milestone
+- Context: historical F001 S2 demo button and S6 one-file restrictions at e346263 conflict with explicitly authorized full extraction and both-host data-loss fixes.
+- Decision: preserve the exact seven-test historical record and frozen1cad4ce oracle; evolve current S2/S6 to real lifecycle/actor wiring, neutral core, independent host graphs and exact reviewed root blobs. S5 still runs both locked builds and all unchanged root assertions; redundant build invocations are deduplicated, --no-fail-fast ensures all targets execute.
+- Authority: direct human migration edit/test/report/local-commit authorization; coordinator T030 approves independent .devteam/reports/T-030-boundary-recommendations.md. This authority approves contract evolution, not native feature completion or safety-gap closure.
+- Root allowance: only exact fixtures/approved-root-changes.json transfer source/test blobs; future safety/editor versions require specific reviewed hash/regression updates. No wildcard or oracle retag.
+- Advisor: pending
+- Adversarial: pending
+- Logic: pending
+- Affects rows: F001 and structural constraints across152 rows; no final status promotion.
+
+## D-0016 Terminal-native intent mapping proposals pending evidence
+- Context: terminal overlays/font inputs/TTY diagnostics and Linux mount integration need source-grounded observable mappings, not blanket waiver.
+- Decision: propose reconciliation/terminal-equivalence-proposals.md for F028,F068/F069/F070,F072/F073,F088. Keep every affected row UNVERIFIED pending actual native/platform evidence and required three-role signoffs. Diagnostics/version checks cannot waive font/protocol/TTY capability rows.
+- Advisor: pending
+- Adversarial: pending
+- Logic: pending
+- Affects rows: F028,F068,F069,F070,F072,F073,F088. No WAIVED or EQUIVALENT_VERIFIED transition.

@@ -1,9 +1,7 @@
 # Preview and external integration surfaces; source-derived unless capture note says runtime.
 key:normal:v
 key:normal:tab:text-preview-editor
-key:normal:enter:open-default
 key:normal:right:open-default-or-directory
-key:normal:l:open-default-or-directory
 key:normal:0:terminal-here
 key:normal:-:reveal-in-file-manager
 key:normal:ctrl-minus:eject-drive

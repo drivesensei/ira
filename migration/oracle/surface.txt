@@ -155,10 +155,8 @@ key:normal:down
 key:normal:drive-digit-1-9
 key:normal:e
 key:normal:enter
-key:normal:enter:open-default
 key:normal:escape
 key:normal:i
-key:normal:l:open-default-or-directory
 key:normal:left
 key:normal:left-bracket
 key:normal:m
@@ -309,6 +307,10 @@ msg:select a file
 msg:select-a-file
 msg:truncated
 msg:… truncated
+runtime:drive-rescan-2s
+state:drive-refresh-error-retention
+state:drive-refresh-unchanged-suppression
+state:drive-refresh-window-generation
 ui:actions-row
 ui:binary-preview-placeholder
 ui:bookmark-row
@@ -328,6 +330,7 @@ ui:deletion-progress-dialog
 ui:details-listing
 ui:details-relative-time
 ui:dialog-glass-chrome
+ui:drive-hotplug-refresh
 ui:drive-row
 ui:empty-common-folders
 ui:empty-file-preview

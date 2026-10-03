@@ -1,0 +1,3 @@
+# Historical F001 starter milestone
+
+This is the byte-exact structural test from e3462637c3072b304ab90f465cbea1e24d8f15a3 (blob4ffcc0f65eba650438923a9f12dc678d60a39ff1; SHA25603da310a58cb76e8f367c2906ae0f8b21fcc112020de39da54c58384e78ad261). It characterized the hello-button shell and one-file boundary at that milestone. It is preserved as history, not discovered as a current full-migration test. The frozen TUI oracle1cad4ce43cc72d52d4cc4eef920e0da22cb69568 is unchanged. T030 explicitly authorizes evolving S2/S6 for actual extraction; current executable checks retain identities, UI isolation, locked builds and every root assertion. Historical verification does not verify current native behavior.
