@@ -1403,14 +1403,7 @@ impl App {
         let permissions = edit.permissions.clone();
         let pane_index = edit.pane_index;
         let list_path = edit.path.clone();
-        let tmp = std::path::PathBuf::from(format!("{}.ira-tmp", fs_path.display()));
-        let write = || -> std::io::Result<()> {
-            std::fs::write(&tmp, content.as_bytes())?;
-            std::fs::set_permissions(&tmp, permissions)?;
-            std::fs::rename(&tmp, &fs_path)
-        };
-        if let Err(e) = write() {
-            let _ = std::fs::remove_file(&tmp);
+        if let Err(e) = editor_staging::save(&fs_path, content.as_bytes(), permissions) {
             self.set_status(format!("save failed: {e}"), true);
             return;
         }
@@ -6274,3 +6267,10 @@ mod preview_tests {
         );
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "editor_safety_tests.rs"]
+mod editor_safety_tests;
+
+#[path = "services/editor.rs"]
+mod editor_staging;

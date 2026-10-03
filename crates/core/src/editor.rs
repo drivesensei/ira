@@ -150,18 +150,12 @@ pub fn save_document(snapshot: &SaveSnapshot) -> Result<SaveCompletion, EditorEr
     } else {
         snapshot.content.clone()
     };
-    let mut tmp_name = doc.canonical_path.as_os_str().to_owned();
-    tmp_name.push(".ira-tmp");
-    let tmp = PathBuf::from(tmp_name);
-    let result = (|| -> std::io::Result<()> {
-        fs::write(&tmp, content.as_bytes())?;
-        fs::set_permissions(&tmp, doc.permissions.clone())?;
-        fs::rename(&tmp, &doc.canonical_path)
-    })();
-    if let Err(error) = result {
-        let _ = fs::remove_file(&tmp);
-        return Err(EditorError(format!("save failed: {error}")));
-    }
+    staging::save(
+        &doc.canonical_path,
+        content.as_bytes(),
+        doc.permissions.clone(),
+    )
+    .map_err(|error| EditorError(format!("save failed: {error}")))?;
     let (mtime, new_size) = fs::metadata(&doc.canonical_path)
         .map(|m| (m.modified().ok(), m.len()))
         .unwrap_or((None, 0));
@@ -217,3 +211,6 @@ impl EditorSession {
 #[cfg(test)]
 #[path = "editor_tests.rs"]
 mod tests;
+
+#[path = "editor_staging.rs"]
+mod staging;
