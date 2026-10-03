@@ -12,12 +12,15 @@ import tomllib
 import unittest
 from pathlib import Path
 from rust_source import rust_code, module_paths
+from git_provenance import git_at, candidate_errors, changed_root_paths, index_flags
 
-ROOT = Path(__file__).resolve().parents[2]
+CONTRACT = Path(__file__).resolve().parents[2]
+ROOT = Path(os.environ.get("IRA_BOUNDARY_ROOT", CONTRACT)).resolve()
 ORACLE = "1cad4ce43cc72d52d4cc4eef920e0da22cb69568"
 MILESTONE = "e3462637c3072b304ab90f465cbea1e24d8f15a3"
 HISTORICAL_HASH = "03da310a58cb76e8f367c2906ae0f8b21fcc112020de39da54c58384e78ad261"
-ALLOWED_ROOT_FILES = {"src/services/transfer.rs", "src/services/transfer_safety_tests.rs"}
+ALLOWED_ROOT_FILES = {'src/services/transfer.rs', 'src/services/editor_staging_tests.rs', 'src/services/editor.rs', 'src/editor_safety_tests.rs', 'src/app.rs', 'src/services/transfer_safety_tests.rs'}
+APPROVED_GRAPH_FILES = {'desktop/Cargo.toml', 'desktop/Cargo.lock', 'Cargo.lock', 'crates/core/Cargo.toml', 'Cargo.toml'}
 FORBIDDEN = {"gpui", "ratatui", "ratatui-image", "crossterm"}
 REQUIRED_MODULES = {"cursor", "domain", "services", "theme", "utils", "application", "model", "input", "observable", "editor"}
 
@@ -99,6 +102,7 @@ def structural_errors(root):
 def root_change_errors(changed, contents, approved):
     errors=[]
     if set(approved)!=ALLOWED_ROOT_FILES: errors.append("approval file identities changed")
+    for name in set(approved)-set(changed): errors.append("approved root change missing "+name)
     for name in changed:
         record=approved.get(name)
         if not record: errors.append("unapproved root source " + name)
@@ -107,11 +111,17 @@ def root_change_errors(changed, contents, approved):
     return errors
 
 
-def git(*args, root=ROOT):
-    return subprocess.check_output(["git",*args],cwd=root,text=True).strip()
+def graph_change_errors(contents, approved):
+    errors=[]
+    if set(approved)!=APPROVED_GRAPH_FILES: errors.append("approval graph identities changed")
+    for name,record in approved.items():
+        if name not in contents or hashlib.sha256(contents[name]).hexdigest()!=record["sha256"]:
+            errors.append("unapproved graph blob "+name)
+    return errors
 
-def changed_root_paths(root=ROOT):
-    return set(git("diff","--name-only","tui-oracle-baseline","--","src",root=root).splitlines()) | set(git("ls-files","--others","--","src",root=root).splitlines())
+
+def git(*args, root=ROOT):
+    return git_at(root,*args)
 
 
 def run_builds():
@@ -157,13 +167,20 @@ class F001BoundaryTests(unittest.TestCase):
             with self.subTest(command=result.args): self.assertEqual(result.returncode,0,"See preceding full command output: "+str(result.args))
 
     def test_s6_current_extraction_has_only_exact_approved_root_changes(self):
-        fixture=json.loads((ROOT/"tests/boundary/fixtures/approved-root-changes.json").read_text())
+        fixture=json.loads((CONTRACT/"tests/boundary/fixtures/approved-root-changes.json").read_text())
         self.assertEqual(git("rev-parse","tui-oracle-baseline^{}"),ORACLE)
         self.assertEqual(fixture["oracle"],ORACLE)
-        changed=changed_root_paths()
+        head=git("rev-parse","HEAD")
+        print("CANDIDATE_ROOT",str(ROOT),"HEAD",head,"CONTRACT",str(CONTRACT),flush=True)
+        if ROOT!=CONTRACT:
+            self.assertFalse(candidate_errors(ROOT,os.environ.get("IRA_BOUNDARY_EXPECTED_HEAD",fixture["snapshot"])))
+        graph_contents={p:(ROOT/p).read_bytes() for p in APPROVED_GRAPH_FILES if (ROOT/p).is_file() and not (ROOT/p).is_symlink()}
+        self.assertFalse(graph_change_errors(graph_contents,fixture["graphs"]))
+        self.assertFalse(index_flags(ROOT),"hidden Git index flags")
+        changed=changed_root_paths(ROOT)
         contents={p:(ROOT/p).read_bytes() for p in changed if (ROOT/p).is_file() and not (ROOT/p).is_symlink()}
         self.assertFalse(root_change_errors(changed,contents,fixture["files"]))
-        for name,record in fixture["files"].items():
+        for name,record in {**fixture["files"],**fixture["graphs"]}.items():
             self.assertEqual(git("rev-parse",record["commit"]+":"+name),record["blob"])
             data=subprocess.check_output(["git","show",record["commit"]+":"+name],cwd=ROOT)
             self.assertEqual(hashlib.sha256(data).hexdigest(),record["sha256"])
@@ -171,7 +188,7 @@ class F001BoundaryTests(unittest.TestCase):
         self.assertFalse(structural_errors(ROOT))
 
     def test_historical_milestone_is_preserved_and_oracle_is_unchanged(self):
-        historical=ROOT/"migration/historical/F-001-e346263/test_f001_boundary.py"
+        historical=CONTRACT/"migration/historical/F-001-e346263/test_f001_boundary.py"
         data=subprocess.check_output(["git","show",MILESTONE+":tests/boundary/test_f001_boundary.py"],cwd=ROOT)
         self.assertEqual(historical.read_bytes(),data)
         self.assertEqual(hashlib.sha256(data).hexdigest(),HISTORICAL_HASH)

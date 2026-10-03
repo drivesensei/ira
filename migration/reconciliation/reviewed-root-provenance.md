@@ -1,0 +1,9 @@
+# Exact reviewed root provenance promotion
+
+Candidate snapshot4940d2dd734e1df2290998d22b0949784d394a29 contains exactly six root source differences from the frozen oracle. Transfer/service safety tests are byte-equal reviewed7191d9d0314cc0f652ca104ae2002a757301ff55; App/editor helper and editor tests are byte-equal reviewed9e36730f3f58339d9bb192753a7bb3bfc96175b9. All hashes/git blobs and regression paths are pinned in tests/boundary/fixtures/approved-root-changes.json. This adds no path wildcard or exemption: absent/changed approved sources and any unknown tracked/untracked/ignored source still fail.
+
+Five graph artifacts are pinned exactly: root Cargo.toml/Cargo.lock, desktop Cargo.toml/Cargo.lock, and core Cargo.toml. Existing extraction/provider decisions D002/D006 plus narrow D009 rustix and D011 host image promotion define the approved graph provenance. Any byte drift/deletion or widened artifact identities fail. This does not authorize new dependencies or future graph upgrades.
+
+Independent approvals: shared .devteam/reports/T-033-reviewer-safety-final-followup.md (7191 scope,123 clean tests plus actual red/green probes); .devteam/reports/T-034-reviewer-editor-preview.md (9e editor/897 preview scope, actual root/core probes, exact graph pins). Their native/platform/durability boundaries remain. Previous d3e provenance is retained under migration/historical/T030-d3e46e5; original F001 milestone/tag/assertions stay frozen.
+
+Use an explicit clean read-only candidate and exact HEAD through the documented boundary override. The candidate is the actual root/core/desktop source, while fixture/history are owned contract artifacts. HEAD mismatch, dirty state, unknown source, missing required approved source and graph/blob drift fail. The older developer checkout still intentionally fails S6. All152 feature rows stay UNVERIFIED; these structural pins are not a full integrated or native completion claim.

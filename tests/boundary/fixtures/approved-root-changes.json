@@ -1,42 +1,160 @@
 {
-  "snapshot": "d3e46e5891f609cdb8f9c3b450d5788f5560f217",
+  "snapshot": "4940d2dd734e1df2290998d22b0949784d394a29",
   "oracle": "1cad4ce43cc72d52d4cc4eef920e0da22cb69568",
-  "approval": "Explicit human both-host data-loss fix authorization; T030 exact-stage allowance approved by coordinator. Structural provenance is not safety verification.",
+  "approval": "Coordinator-approved exact reviewed root safety7191/editor9e and D002/D006/D009/D011 graph provenance. No native parity or unrestricted source allowance.",
   "files": {
-    "src/services/transfer.rs": {
-      "commit": "4290fde018d60d48cc38742c5d4a2dc198392e8c",
-      "blob": "80d4438a2a391442bf084fdf2a692bd5881ffb06",
-      "sha256": "e0ab9e580b77264bcf719d79028c25a3eba77621461b703892944f7e1288964f",
+    "src/app.rs": {
+      "commit": "9e36730f3f58339d9bb192753a7bb3bfc96175b9",
+      "blob": "500c0dd49297b89c52cec62b7a42d99acf3d09a5",
+      "sha256": "4ae07e5ffc93ac70c6ac53f5ba5f738270a7c063f371056d33f5fe7e08398d44",
       "regressions": [
-        "src/services/transfer_safety_tests.rs",
-        ".devteam/reports/T-022-reviewer-safety.md",
-        ".devteam/reports/T-023-reviewer-safety-policy.md",
-        ".devteam/evidence/T-030/INDEX.md (exact stage S5:11 safety assertions pass, socket fixture fails SUN_LEN)"
+        ".devteam/reports/T-034-reviewer-editor-preview.md",
+        ".devteam/evidence/T-034/probe-root-red.txt",
+        ".devteam/evidence/T-034/probe-root-green.txt",
+        ".devteam/evidence/T-034/editor-root-exact-authorized-fixtures.txt"
       ],
-      "limits": "G0039/G0046 target/source race findings remain open; this snapshot allowance does not approve safety semantics.",
-      "regression_scope": "Later reviewed safety evidence demonstrates the authorized fix family only; current stage blobs are exact d3e46e5 and are not claimed safety-verified by these later logs.",
-      "historical_family_evidence": [
-        ".devteam/evidence/T-015/red-core-531f525.txt",
-        ".devteam/evidence/T-015/red-terminal-531f525.txt",
-        ".devteam/evidence/T-015/green-970878f.txt"
-      ]
+      "scope": "Exact reviewed production/test bytes; target snapshot byte-equal. Scoped safety/editor approval, native UI/platform limits remain."
+    },
+    "src/editor_safety_tests.rs": {
+      "commit": "9e36730f3f58339d9bb192753a7bb3bfc96175b9",
+      "blob": "c4d7f0ab454e245ea644d7c51c9acffc85378765",
+      "sha256": "88555898a1f6ca35b1acbd0896bbf5e8dbf7f76f7db69ca628c4aaddc49caea7",
+      "regressions": [
+        ".devteam/reports/T-034-reviewer-editor-preview.md",
+        ".devteam/evidence/T-034/probe-root-red.txt",
+        ".devteam/evidence/T-034/probe-root-green.txt",
+        ".devteam/evidence/T-034/editor-root-exact-authorized-fixtures.txt"
+      ],
+      "scope": "Exact reviewed production/test bytes; target snapshot byte-equal. Scoped safety/editor approval, native UI/platform limits remain."
+    },
+    "src/services/editor.rs": {
+      "commit": "9e36730f3f58339d9bb192753a7bb3bfc96175b9",
+      "blob": "79a66e37f71d1a563e234fd5c1b2ed70adf02bbc",
+      "sha256": "ebaee25efdcf4c7986a05097664d2e4e99a97b6d0f1f03eb39c4547a06c2e1d6",
+      "regressions": [
+        ".devteam/reports/T-034-reviewer-editor-preview.md",
+        ".devteam/evidence/T-034/probe-root-red.txt",
+        ".devteam/evidence/T-034/probe-root-green.txt",
+        ".devteam/evidence/T-034/editor-root-exact-authorized-fixtures.txt"
+      ],
+      "scope": "Exact reviewed production/test bytes; target snapshot byte-equal. Scoped safety/editor approval, native UI/platform limits remain."
+    },
+    "src/services/editor_staging_tests.rs": {
+      "commit": "9e36730f3f58339d9bb192753a7bb3bfc96175b9",
+      "blob": "c22bb45c0f0a16dced37acd1b2c2fc2fd379c3c9",
+      "sha256": "81e7d762341eb5031e06f9b3aac4c34a6311f8c75e8a0af00ebdc94c3cc6701e",
+      "regressions": [
+        ".devteam/reports/T-034-reviewer-editor-preview.md",
+        ".devteam/evidence/T-034/probe-root-red.txt",
+        ".devteam/evidence/T-034/probe-root-green.txt",
+        ".devteam/evidence/T-034/editor-root-exact-authorized-fixtures.txt"
+      ],
+      "scope": "Exact reviewed production/test bytes; target snapshot byte-equal. Scoped safety/editor approval, native UI/platform limits remain."
+    },
+    "src/services/transfer.rs": {
+      "commit": "7191d9d0314cc0f652ca104ae2002a757301ff55",
+      "blob": "b9851da95c13bedc9948d5b0091cae7ecca1f215",
+      "sha256": "7c22fedac59cd60993d2f634dbcc783fb1090ecd74a53a14881621876c9508e0",
+      "regressions": [
+        ".devteam/reports/T-033-reviewer-safety-final-followup.md",
+        ".devteam/evidence/T-033/followup-7191d9d/clean-tests.txt",
+        ".devteam/evidence/T-033/followup-7191d9d/g55-red.txt",
+        ".devteam/evidence/T-033/followup-7191d9d/g55-green.txt"
+      ],
+      "scope": "Exact reviewed production/test bytes; target snapshot byte-equal. Scoped safety/editor approval, native UI/platform limits remain."
     },
     "src/services/transfer_safety_tests.rs": {
-      "commit": "4290fde018d60d48cc38742c5d4a2dc198392e8c",
-      "blob": "c8e76e937bb0765728eb515fada328dc5d80553b",
-      "sha256": "3e51921688fb0718378dcadf6534cd8d8536289821882c9f7eb7d8afe2016d31",
+      "commit": "7191d9d0314cc0f652ca104ae2002a757301ff55",
+      "blob": "0219e1f923f5881e48c3c89e60af8bc2e34b3836",
+      "sha256": "7b546f163ea37276e7798d98295cdbd406cb4f04cc502d40d2aacfb981526931",
       "regressions": [
-        "src/services/transfer_safety_tests.rs",
-        ".devteam/reports/T-022-reviewer-safety.md",
-        ".devteam/reports/T-023-reviewer-safety-policy.md",
-        ".devteam/evidence/T-030/INDEX.md (exact stage S5:11 safety assertions pass, socket fixture fails SUN_LEN)"
+        ".devteam/reports/T-033-reviewer-safety-final-followup.md",
+        ".devteam/evidence/T-033/followup-7191d9d/clean-tests.txt",
+        ".devteam/evidence/T-033/followup-7191d9d/g55-red.txt",
+        ".devteam/evidence/T-033/followup-7191d9d/g55-green.txt"
       ],
-      "limits": "G0039/G0046 target/source race findings remain open; this snapshot allowance does not approve safety semantics.",
-      "regression_scope": "Later reviewed safety evidence demonstrates the authorized fix family only; current stage blobs are exact d3e46e5 and are not claimed safety-verified by these later logs.",
-      "historical_family_evidence": [
-        ".devteam/evidence/T-015/red-core-531f525.txt",
-        ".devteam/evidence/T-015/red-terminal-531f525.txt",
-        ".devteam/evidence/T-015/green-970878f.txt"
+      "scope": "Exact reviewed production/test bytes; target snapshot byte-equal. Scoped safety/editor approval, native UI/platform limits remain."
+    }
+  },
+  "graphs": {
+    "Cargo.toml": {
+      "commit": "4940d2dd734e1df2290998d22b0949784d394a29",
+      "blob": "77b091014b5341b022eabe515ae12e7828c06b2a",
+      "sha256": "7152504059428bb1fccbcc14a3c96cc0d3dae138edb0e3dd9c0e3538f610d8e2",
+      "decisions": [
+        "D002",
+        "D006",
+        "D009",
+        "D011"
+      ],
+      "regressions": [
+        ".devteam/reports/T-024-qa-runtime-d3e46e5.md",
+        ".devteam/reports/T-034-reviewer-editor-preview.md",
+        ".devteam/evidence/T-034/graph-pins.txt"
+      ]
+    },
+    "Cargo.lock": {
+      "commit": "4940d2dd734e1df2290998d22b0949784d394a29",
+      "blob": "ae541564e0a843254804bb58c9807df3f0293824",
+      "sha256": "b9fd04af13159525f1f98b96935b0ec499d2f1072369aae5e133dc28fdb166bc",
+      "decisions": [
+        "D002",
+        "D006",
+        "D009",
+        "D011"
+      ],
+      "regressions": [
+        ".devteam/reports/T-024-qa-runtime-d3e46e5.md",
+        ".devteam/reports/T-034-reviewer-editor-preview.md",
+        ".devteam/evidence/T-034/graph-pins.txt"
+      ]
+    },
+    "desktop/Cargo.toml": {
+      "commit": "4940d2dd734e1df2290998d22b0949784d394a29",
+      "blob": "fdd52907d7d1ac8e1007037f2ef05320ab8dd6fd",
+      "sha256": "bfe329595a923cb4f72502ecc5a4c94231aec719819b6cd9d7462a6af9d9fe76",
+      "decisions": [
+        "D002",
+        "D006",
+        "D009",
+        "D011"
+      ],
+      "regressions": [
+        ".devteam/reports/T-024-qa-runtime-d3e46e5.md",
+        ".devteam/reports/T-034-reviewer-editor-preview.md",
+        ".devteam/evidence/T-034/graph-pins.txt"
+      ]
+    },
+    "desktop/Cargo.lock": {
+      "commit": "4940d2dd734e1df2290998d22b0949784d394a29",
+      "blob": "3066ece9d39bdfe4e55f1bdbd328594492f191e2",
+      "sha256": "7dadf16acb29c449c95ce414512661c9bfcbe1fa6f7fb11ed9a725a48fa00f6b",
+      "decisions": [
+        "D002",
+        "D006",
+        "D009",
+        "D011"
+      ],
+      "regressions": [
+        ".devteam/reports/T-024-qa-runtime-d3e46e5.md",
+        ".devteam/reports/T-034-reviewer-editor-preview.md",
+        ".devteam/evidence/T-034/graph-pins.txt"
+      ]
+    },
+    "crates/core/Cargo.toml": {
+      "commit": "4940d2dd734e1df2290998d22b0949784d394a29",
+      "blob": "7dd8727ef92b77005c87b57264bef0ab8650466c",
+      "sha256": "56f2057943be9c943f6c00caaef5ec3fd935bef1787e79cbbb61e3fc5c8c9f80",
+      "decisions": [
+        "D002",
+        "D006",
+        "D009",
+        "D011"
+      ],
+      "regressions": [
+        ".devteam/reports/T-024-qa-runtime-d3e46e5.md",
+        ".devteam/reports/T-034-reviewer-editor-preview.md",
+        ".devteam/evidence/T-034/graph-pins.txt"
       ]
     }
   }
