@@ -1,4 +1,4 @@
-//! Reproducible actor publication measurement; synthetic in-memory source rows, no filesystem writes.
+//! Reproducible actor publication measurement; synthetic in-memory source rows, task-owned temporary persistence writes.
 use ira_core::{
     application::App,
     domain::data::Folder,
@@ -28,7 +28,18 @@ fn publication(runtime: &Runtime, sequence: u64) -> Publication {
 }
 #[test]
 fn measure_actual_actor_100k_cursor_publications_and_retained_rows() {
+    let fixture = std::env::temp_dir().join(format!(
+        "ira-actor-perf-state-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&fixture).unwrap();
     let mut app = App::default();
+    app.state_path = Some(fixture.join("state"));
+    app.bookmarks_path = Some(fixture.join("bookmarks"));
     app.window_generation = 7;
     app.panes[0].folder = Some(Folder::new(
         "Synthetic performance fixture".into(),
@@ -103,6 +114,12 @@ fn measure_actual_actor_100k_cursor_publications_and_retained_rows() {
         one_payload * identities.len()
     );
     runtime.stop(&[]);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !runtime.shutdown_complete() {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    std::fs::remove_dir_all(fixture).unwrap();
     drop(retained);
     drop(runtime);
     // Arc itself is the native foreground snapshot contract; no window or native provider was attached.

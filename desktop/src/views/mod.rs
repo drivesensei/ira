@@ -1592,6 +1592,7 @@ mod crossing_tests {
     use ira_core::{application::App, domain::data::Folder, services::list_files::list_files};
     #[gpui::test]
     fn recovery_board_survives_status_expiry_and_later_transfer_progress(cx: &mut TestAppContext) {
+        let _fixture_scope = crate::test_support::enter();
         use ira_core::{
             model::{STATUS_TTL, Status},
             services::{
@@ -1760,6 +1761,7 @@ mod crossing_tests {
     }
     #[gpui::test]
     fn grid_viewport_mouse_and_mode_changes_keep_path_targets(cx: &mut TestAppContext) {
+        let _fixture_scope = crate::test_support::enter();
         use ira_core::{model::PreviewMode, services::list_files::FEntry};
         let mut app = App::default();
         app.window_generation = 7;
@@ -1868,6 +1870,7 @@ mod crossing_tests {
     }
     #[gpui::test]
     fn duplicate_place_focus_uses_real_handle_without_navigation(cx: &mut TestAppContext) {
+        let _fixture_scope = crate::test_support::enter();
         let mut app = App::default();
         app.window_generation = 7;
         app.bookmarks = Some(vec![
@@ -1945,6 +1948,7 @@ mod crossing_tests {
     }
     #[gpui::test]
     fn real_virtualized_desktop_frame_records_clipped_path_geometry(cx: &mut TestAppContext) {
+        let _fixture_scope = crate::test_support::enter();
         let fixture = std::env::temp_dir().join(format!("ira-ax-frame-{}", std::process::id()));
         std::fs::create_dir_all(&fixture).unwrap();
         for index in 0..200 {
@@ -1999,6 +2003,7 @@ mod crossing_tests {
     fn measured_help_modal_preserves_absolute_overlay_and_visible_ax_geometry(
         cx: &mut TestAppContext,
     ) {
+        let _fixture_scope = crate::test_support::enter();
         let mut app = App::default();
         app.window_generation = 7;
         app.show_keybindings();
@@ -2054,6 +2059,7 @@ mod crossing_tests {
     fn pending_editor_does_not_create_empty_native_input_or_advance_ticket(
         cx: &mut TestAppContext,
     ) {
+        let _fixture_scope = crate::test_support::enter();
         cx.update(text_input::register);
         let mut app = App::default();
         app.window_generation = 7;
@@ -2113,6 +2119,7 @@ mod crossing_tests {
 
     #[gpui::test]
     fn column_text_tab_reaches_native_editor_and_escape_returns_to_pane(cx: &mut TestAppContext) {
+        let _fixture_scope = crate::test_support::enter();
         cx.update(text_input::register);
         let fixture = std::env::temp_dir().join(format!("ira-tab-editor-{}", std::process::id()));
         std::fs::create_dir_all(&fixture).unwrap();
@@ -2313,6 +2320,7 @@ mod crossing_tests {
     fn accessibility_rename_value_uses_native_draft_and_same_confirmation_gateway(
         cx: &mut TestAppContext,
     ) {
+        let _fixture_scope = crate::test_support::enter();
         cx.update(text_input::register);
         let fixture = std::env::temp_dir().join(format!("ira-ax-draft-{}", std::process::id()));
         std::fs::create_dir_all(&fixture).unwrap();
@@ -2423,6 +2431,7 @@ mod crossing_tests {
     fn actual_prepared_host_footer_expiry_and_feedback_match_painted_status(
         cx: &mut TestAppContext,
     ) {
+        let _fixture_scope = crate::test_support::enter();
         use ira_core::model::{STATUS_TTL, Status};
         let mut app = App::default();
         app.window_generation = 7;
@@ -2496,6 +2505,7 @@ mod crossing_tests {
     }
     #[gpui::test]
     fn actual_prepared_host_large_viewports_keep_foreground_work_sparse(cx: &mut TestAppContext) {
+        let _fixture_scope = crate::test_support::enter();
         use ira_core::services::list_files::FEntry;
         for count in [10_000, 100_000] {
             let mut app = App::default();
@@ -2688,6 +2698,7 @@ mod crossing_tests {
     }
     #[gpui::test]
     fn actual_status_expiry_keeps_accessible_rendered_fallback(cx: &mut TestAppContext) {
+        let _fixture_scope = crate::test_support::enter();
         use ira_core::model::{STATUS_TTL, Status};
         let mut app = App::default();
         app.window_generation = 7;

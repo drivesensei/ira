@@ -461,6 +461,7 @@ mod tests {
     }
     #[test]
     fn footer_projection_uses_host_revision_without_core_mutation() {
+        let _fixture_scope = crate::test_support::enter();
         let worker = test_worker();
         let first = request(1, "Enter: rename · Right: open · /: search · Space: select");
         let core_revision = first.snapshot.revision;
@@ -552,6 +553,7 @@ mod tests {
     }
     #[test]
     fn discarded_preparation_is_not_notification_baseline() {
+        let _fixture_scope = crate::test_support::enter();
         let worker = test_worker();
         let installed = semantic(&worker, 1, "installed");
         let id = installed
@@ -587,6 +589,7 @@ mod tests {
     }
     #[test]
     fn layout_pressure_cannot_overwrite_unconsumed_new_semantics() {
+        let _fixture_scope = crate::test_support::enter();
         let worker = test_worker();
         let old = semantic(&worker, 1, "old");
         let registry = Arc::new(MaterializedNodes::default());
@@ -638,6 +641,7 @@ mod tests {
 
     #[test]
     fn full_pending_mailbox_never_discards_caller_ownership() {
+        let _fixture_scope = crate::test_support::enter();
         let worker = test_worker();
         let shared = worker.shared.clone();
         let lock = shared.mailbox.lock().unwrap();
@@ -654,6 +658,7 @@ mod tests {
     }
     #[test]
     fn retire_and_close_drop_heavy_ownership_off_calling_thread() {
+        let _fixture_scope = crate::test_support::enter();
         struct Probe {
             thread: thread::ThreadId,
             tx: std::sync::mpsc::Sender<bool>,
@@ -706,6 +711,7 @@ mod physical_reclamation_tests {
 
     #[test]
     fn actual_close_handoffs_keep_four_permits_until_blocked_pins_finish() {
+        let _fixture_scope = crate::test_support::enter();
         let _exclusive = EXCLUSIVE_FOUR_SLOT_PROBE.lock().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let workers = reserve_four_atomically(deadline);
@@ -773,6 +779,7 @@ mod physical_reclamation_tests {
     }
     #[test]
     fn actual_preparation_cleanup_keeps_four_permits_until_retired_rows_finish() {
+        let _fixture_scope = crate::test_support::enter();
         let _exclusive = EXCLUSIVE_FOUR_SLOT_PROBE.lock().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let workers = reserve_four_atomically(deadline);

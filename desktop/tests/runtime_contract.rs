@@ -30,6 +30,7 @@ impl Fixture {
     fn app(&self) -> App {
         let mut app = App::default();
         app.state_path = Some(self.0.join("state"));
+        app.bookmarks_path = Some(self.0.join("bookmarks"));
         app.window_generation = 7;
         app.panes[0].folder = Some(Folder::new(
             "Fixture".into(),

@@ -102,15 +102,23 @@ impl Default for Host {
 }
 impl Host {
     fn configured(native: bool, retirement: super::accessibility_retirement::Retirement) -> Self {
+        Self::configured_mode(native, retirement, false)
+    }
+    fn configured_mode(
+        native: bool,
+        retirement: super::accessibility_retirement::Retirement,
+        compatibility: bool,
+    ) -> Self {
         Self {
             model: AccessibilityModel::default(),
-            prepared: super::accessibility_prepared::PreparedHost::try_new(
-                native,
-                retirement.clone(),
-            )
-            .ok(),
-            admission: Some((native, retirement)),
-            compatibility: false,
+            prepared: if compatibility {
+                None
+            } else {
+                super::accessibility_prepared::PreparedHost::try_new(native, retirement.clone())
+                    .ok()
+            },
+            admission: (!compatibility).then_some((native, retirement)),
+            compatibility,
             authority: Authority::default(),
             tree: None,
             frame: Rc::new(RefCell::new(LayoutSnapshot::default())),
@@ -132,11 +140,7 @@ impl Host {
     /// Legacy crossing fixtures retain their original synchronous projector coverage.
     #[cfg(test)]
     pub fn compatibility_headless() -> Self {
-        let mut host = Self::configured(false, Default::default());
-        host.prepared.take();
-        host.compatibility = true;
-        host.admission = None;
-        host
+        Self::configured_mode(false, Default::default(), true)
     }
     pub fn with_retirement(retirement: super::accessibility_retirement::Retirement) -> Self {
         Self::configured(true, retirement)
@@ -500,6 +504,7 @@ mod authority_tests {
     use super::*;
     #[test]
     fn caret_marked_and_focus_changes_preserve_core_and_text_revisions() {
+        let _fixture_scope = crate::test_support::enter();
         let snapshot = ira_core::application::App::default().snapshot();
         let mut authority = Authority::default();
         let mut text = NativeTextSnapshot {
@@ -572,6 +577,7 @@ mod reviewer_async_focus_probe {
     };
     #[test]
     fn actual_host_retains_observed_place_focus_across_pending_semantics() {
+        let _fixture_scope = crate::test_support::enter();
         let mut app = CoreApp::default();
         app.window_generation = 7;
         app.bookmarks = Some(vec![Folder::new(
@@ -655,6 +661,7 @@ mod reviewer_novel_focus_probe {
     };
     #[test]
     fn actual_host_resolves_newly_added_place_focus_on_latest_tree() {
+        let _fixture_scope = crate::test_support::enter();
         let mut app = CoreApp::default();
         app.window_generation = 7;
         app.bookmarks = Some(vec![Folder::new(

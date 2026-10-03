@@ -14,3 +14,6 @@ pub fn lifecycle_trace(event: &str) {
         eprintln!("IRA lifecycle {:?}: {event}", std::time::SystemTime::now());
     }
 }
+
+#[cfg(test)]
+pub(crate) mod test_support;

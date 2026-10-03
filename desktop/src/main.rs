@@ -165,10 +165,22 @@ fn main() {
 mod quit_tests {
     use super::*;
     #[gpui::test]
-    fn pinned_platform_quit_stops_actor_and_acknowledges_fixture_free_persistence(
+    fn pinned_platform_quit_stops_actor_and_acknowledges_temporary_persistence_drain(
         cx: &mut gpui::TestAppContext,
     ) {
-        let runtime = Runtime::with_factory(7, ira_core::application::App::default);
+        let fixture = std::env::temp_dir().join(format!(
+            "ira-platform-quit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&fixture).unwrap();
+        let mut app = ira_core::application::App::default();
+        app.state_path = Some(fixture.join("state"));
+        app.bookmarks_path = Some(fixture.join("bookmarks"));
+        let runtime = Runtime::with_factory(7, move || app);
         let witness = runtime.attach(7);
         let guard = witness.effect_guard(7);
         let retirement = Retirement::default();
@@ -189,7 +201,9 @@ mod quit_tests {
         assert!(!guard.is_current());
         assert!(
             witness.shutdown_complete(),
-            "platform observer must await actual persistence ACK when it finishes within GPUI's budget"
+            "platform observer must await legacy persistence drain when it finishes within GPUI's budget"
         );
+        assert!(fixture.join("state").is_file());
+        std::fs::remove_dir_all(fixture).unwrap();
     }
 }

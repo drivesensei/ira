@@ -219,12 +219,29 @@ impl Runtime {
         let stopping = Arc::new(AtomicBool::new(false));
         let shutdown_complete = Arc::new(AtomicBool::new(false));
         let actor_shutdown_complete = shutdown_complete.clone();
+        #[cfg(test)]
+        let fixture = Some(crate::test_support::current().expect(
+            "unit-test Runtime requires test_support::enter before actor creation; default persistence paths are forbidden",
+        ));
+        #[cfg(test)]
+        if let Some(fixture) = &fixture {
+            fixture.register(stopping.clone(), shutdown_complete.clone());
+        }
         let publication = latest.clone();
         let stop = stopping.clone();
         let attached_window = Arc::new(AtomicU64::new(window_generation));
         let attached = attached_window.clone();
         thread::spawn(move || {
             let (mut app, loader, font_family) = factory();
+            #[cfg(test)]
+            if let Some(fixture) = fixture {
+                if app.state_path.is_none() {
+                    app.state_path = Some(fixture.directory.join("state"));
+                }
+                if app.bookmarks_path.is_none() {
+                    app.bookmarks_path = Some(fixture.directory.join("bookmarks"));
+                }
+            }
             app.attach_window(window_generation);
             let (editor_tx, editor_rx) = mpsc::channel::<(u64, HostRequest)>();
             let (editor_done, editor_results) = mpsc::channel();

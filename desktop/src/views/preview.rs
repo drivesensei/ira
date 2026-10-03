@@ -62,6 +62,19 @@ impl Default for Host {
 }
 impl Host {
     pub fn new() -> Self {
+        #[cfg(test)]
+        {
+            let fixture = crate::test_support::current();
+            Self::start(move || {
+                let mut options = PreviewOptions::from_env();
+                options.cache_dir = fixture.as_ref().map(|f| f.directory.join("preview-cache"));
+                if let Some(fixture) = fixture {
+                    options.temp_dir = fixture.directory.join("preview-temp");
+                }
+                options
+            })
+        }
+        #[cfg(not(test))]
         Self::start(PreviewOptions::from_env)
     }
     fn start(options: impl FnOnce() -> PreviewOptions + Send + 'static) -> Self {
