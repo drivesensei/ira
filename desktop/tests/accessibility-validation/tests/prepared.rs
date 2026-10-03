@@ -585,4 +585,14 @@ fn queued_actions_capture_all_prepared_key_fields_and_reject_host_only_changes()
     let two = Arc::new(frame(next, Some(&one), 2, layout(&s, 2)));
     sink.install_prepared(&two, two.key, || {}).unwrap();
     assert!(matches!(rx.try_next().unwrap(), Err(Rejection::Stale)));
+    let old_callback = AccessibilityIntent {
+        node: id,
+        stamp: p.tree.stamp,
+        action: Action::Focus,
+    };
+    assert_eq!(
+        sink.try_dispatch_prepared(old_callback, p.key),
+        Err(Rejection::Stale)
+    );
+    assert!(rx.try_next().is_none());
 }
