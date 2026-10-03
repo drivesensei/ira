@@ -226,6 +226,27 @@ pub(super) fn native_gate_lifecycle_probe() {
     drop(external_proxy);
     assert_eq!(drops.get(), 1);
 
+    // A synchronous NO can change platform ownership without replacing the
+    // delegate; final restoration must revalidate pointers as well as identity.
+    let (gate, host, original, _, replies) = fixture();
+    host.ask();
+    let external_proxy = host.current_object();
+    let callback_original = original.clone();
+    let foreign_pointer = std::ptr::NonNull::<u64>::dangling().as_ptr().cast();
+    *host.ivars().hook.borrow_mut() = Some(Box::new(move |host, approved| {
+        assert!(!approved);
+        assert_eq!(host.ask(), 0);
+        mac::set_platform(callback_original.as_ref(), foreign_pointer).unwrap();
+    }));
+    drop(gate);
+    assert_eq!(&*replies.borrow(), &[false]);
+    assert!(
+        host.points_to(&external_proxy),
+        "Drop must not restore an original whose pointer changed during NO"
+    );
+    assert_eq!(mac::platform(original.as_ref()), Ok(foreign_pointer));
+    drop(external_proxy);
+
     // Public Drop mirrors GPUI's exact app/proxy null sequence before restore.
     let (gate, host, original, _, replies) = fixture();
     let external_proxy = host.current_object();
