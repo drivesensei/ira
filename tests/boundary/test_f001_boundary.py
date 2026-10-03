@@ -11,6 +11,7 @@ import tempfile
 import tomllib
 import unittest
 from pathlib import Path
+from rust_source import rust_code, module_paths
 
 ROOT = Path(__file__).resolve().parents[2]
 ORACLE = "1cad4ce43cc72d52d4cc4eef920e0da22cb69568"
@@ -35,42 +36,6 @@ def dependencies(manifest):
 def package(name, config):
     return config.get("package", name) if isinstance(config, dict) else name
 
-
-def rust_code(source):
-    """Mask strings/comments, preserving positions; nested block comments are supported."""
-    chars = list(source)
-    i = 0
-    while i < len(source):
-        end = i
-        if source.startswith("//", i):
-            end = source.find("\n", i)
-            if end < 0: end = len(source)
-        elif source.startswith("/*", i):
-            end, depth = i + 2, 1
-            while end < len(source) and depth:
-                if source.startswith("/*", end): depth += 1; end += 2
-                elif source.startswith("*/", end): depth -= 1; end += 2
-                else: end += 1
-        else:
-            raw = re.compile(r'(?:br|r)(#{0,32})"').match(source, i)
-            if raw:
-                stop = source.find('"' + raw[1], raw.end())
-                end = len(source) if stop < 0 else stop + 1 + len(raw[1])
-            elif source[i] == '"':
-                end = i + 1
-                while end < len(source):
-                    if source[end] == "\\": end += 2
-                    elif source[end] == '"': end += 1; break
-                    else: end += 1
-            elif source[i] == "'":
-                char = re.compile(r"'(?:\\.|[^'\\])'").match(source, i)
-                if char: end = char.end()
-        if end > i:
-            for j in range(i, min(end, len(chars))):
-                if chars[j] != "\n": chars[j] = " "
-            i = end
-        else: i += 1
-    return "".join(chars)
 
 
 def imports(source, names):
@@ -107,8 +72,8 @@ def structural_errors(root):
             if directory == core/"src":
                 if re.search(r"\bunsafe\b",code): errors.append("unsafe core source")
                 if re.search(r"\binclude\s*!",code): errors.append("unreviewed core include")
-                for m in re.finditer(r'#\[\s*path\s*=\s*"([^"]+)"\s*\]', source):
-                    if code[m.start()] == "#" and not (path.parent/m[1]).resolve().is_relative_to((core/"src").resolve()):
+                for module_path in module_paths(source):
+                    if not (path.parent/module_path).resolve().is_relative_to((core/"src").resolve()):
                         errors.append("core path escapes source boundary")
     core_source = (core/"src/lib.rs").read_text()
     if "#![forbid(unsafe_code)]" not in rust_code(core_source): errors.append("unsafe prohibition missing")
