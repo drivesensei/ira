@@ -37,6 +37,10 @@ fn main() {
         NativeBridge::attach(&BorrowedView(&view), sink.clone()),
         Err(BridgeError::NoNativeWindow)
     ));
+    assert!(matches!(
+        NativeBridge::attach_unpublished(&BorrowedView(&view), sink.clone()),
+        Err(BridgeError::NoNativeWindow)
+    ));
     let after: usize = unsafe { msg_send![&*view, retainCount] };
     assert_eq!(
         before, after,
@@ -47,7 +51,9 @@ fn main() {
         "failed pre-attachment must not steal ownership of sink"
     );
     assert!(view.window().is_none());
-    println!("PASS: main-thread view-only failed attachment balances retain; no NSWindow created");
+    println!(
+        "PASS: legacy and unpublished main-thread view-only failed attachment balance retain; no NSWindow created"
+    );
 }
 #[cfg(not(target_os = "macos"))]
 fn main() {

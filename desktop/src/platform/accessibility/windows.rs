@@ -532,6 +532,18 @@ pub struct NativeBridge {
 }
 impl NativeBridge {
     pub fn attach(window: &impl HasWindowHandle, sink: ActionSink) -> Result<Self> {
+        Self::attach_impl(window, sink, true)
+    }
+    /// Attach the actual immutable sink tree without a foreground logical-node scan.
+    /// Geometry starts empty; install the first ACK-based prepared frame separately.
+    pub fn attach_unpublished(window: &impl HasWindowHandle, sink: ActionSink) -> Result<Self> {
+        Self::attach_impl(window, sink, false)
+    }
+    fn attach_impl(
+        window: &impl HasWindowHandle,
+        sink: ActionSink,
+        publish_initial: bool,
+    ) -> Result<Self> {
         let handle =
             HasWindowHandle::window_handle(window).map_err(|_| Error::from_hresult(E_HANDLE))?;
         let RawWindowHandle::Win32(raw) = handle.as_raw() else {
@@ -576,8 +588,10 @@ impl NativeBridge {
             state,
             _main_thread: PhantomData,
         };
-        let initial = bridge.state.tree()?;
-        bridge.publish(initial)?;
+        if publish_initial {
+            let initial = bridge.state.tree()?;
+            bridge.publish(initial)?;
+        }
         Ok(bridge)
     }
     pub fn publish(&mut self, tree: Arc<SemanticTree>) -> Result<()> {
