@@ -108,6 +108,21 @@ impl ActionSink {
         )
     }
     pub fn try_dispatch(&self, intent: AccessibilityIntent) -> Result<(), Rejection> {
+        self.try_dispatch_inner(intent, None)
+    }
+    /// Preserve the exact prepared key observed by a concurrent native callback.
+    pub fn try_dispatch_prepared(
+        &self,
+        intent: AccessibilityIntent,
+        key: model::RequestKey,
+    ) -> Result<(), Rejection> {
+        self.try_dispatch_inner(intent, Some(key))
+    }
+    fn try_dispatch_inner(
+        &self,
+        intent: AccessibilityIntent,
+        expected: Option<model::RequestKey>,
+    ) -> Result<(), Rejection> {
         if self.shared.closing.load(Ordering::Acquire) {
             return Err(Rejection::Closing);
         }
@@ -116,6 +131,9 @@ impl ActionSink {
             .tree
             .try_lock()
             .map_err(|_| Rejection::Backpressure)?;
+        if expected.is_some() && expected != tree.frame.as_ref().map(|f| f.key.request) {
+            return Err(Rejection::Stale);
+        }
         resolve(&tree.tree, &intent)?;
         let queued = QueuedIntent {
             intent,

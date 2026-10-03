@@ -84,14 +84,26 @@ impl State {
         self.simple(id)?.cast()
     }
     fn send(&self, id: NodeId, action: Action) -> Result<()> {
-        let tree = self.tree()?;
-        self.sink
-            .try_dispatch(AccessibilityIntent {
-                node: id,
-                stamp: tree.stamp,
-                action,
-            })
-            .map_err(dispatch_error)
+        if self.closing.load(Ordering::Acquire) {
+            return Err(unavailable());
+        }
+        let (stamp, key) = {
+            let cache = self.cache.try_lock().map_err(|_| unavailable())?;
+            (
+                cache.tree.stamp,
+                cache.prepared.as_ref().map(|f| f.key.request),
+            )
+        };
+        let intent = AccessibilityIntent {
+            node: id,
+            stamp,
+            action,
+        };
+        match key {
+            Some(key) => self.sink.try_dispatch_prepared(intent, key),
+            None => self.sink.try_dispatch(intent),
+        }
+        .map_err(dispatch_error)
     }
     fn frame(&self, id: NodeId) -> Result<Rect> {
         if self.closing.load(Ordering::Acquire) {

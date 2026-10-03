@@ -214,14 +214,17 @@ impl AxElement {
             return false;
         }
         let stamp = state.tree.borrow().stamp;
-        state
-            .sink
-            .try_dispatch(AccessibilityIntent {
-                node: self.ivars().id,
-                stamp,
-                action,
-            })
-            .is_ok()
+        let intent = AccessibilityIntent {
+            node: self.ivars().id,
+            stamp,
+            action,
+        };
+        let key = state.prepared.borrow().as_ref().map(|f| f.key.request);
+        match key {
+            Some(key) => state.sink.try_dispatch_prepared(intent, key),
+            None => state.sink.try_dispatch(intent),
+        }
+        .is_ok()
     }
 }
 impl MacState {
