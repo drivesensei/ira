@@ -102,6 +102,7 @@ fn pinned_gpui_late_observer_is_not_an_earlier_termination_gate() {
     assert!(mac.contains("sel!(applicationWillTerminate:)"));
     assert!(!mac.contains("sel!(applicationShouldTerminate:)"));
     assert!(mac.contains("(*NSWindow::delegate(app)).set_ivar(MAC_PLATFORM_IVAR"));
+    assert!(mac.contains("extern \"C\" fn should_handle_reopen(this: &mut Object, _: Sel, _: id, has_open_windows: bool) {"));
 }
 
 /// Called by the separately compiled tiny main-thread evidence harness. This
@@ -141,7 +142,7 @@ pub(crate) fn native_contract_probe() {
             #[unsafe(method(handleGPUIMenuItem:))]
             fn menu(&self, _sender: &AnyObject) { self.ivars().calls.set(self.ivars().calls.get()+1); }
             #[unsafe(method(applicationShouldHandleReopen:hasVisibleWindows:))]
-            fn reopen(&self, _sender: &AnyObject, _visible: bool) -> bool { self.ivars().calls.set(self.ivars().calls.get()+1); true }
+            fn reopen(&self, _sender: &AnyObject, _visible: bool) { self.ivars().calls.set(self.ivars().calls.get()+1); }
             #[unsafe(method(applicationWillTerminate:))]
             fn will_terminate(&self, _notification: &AnyObject) { self.ivars().calls.set(self.ivars().calls.get()+1); }
         }
@@ -199,14 +200,13 @@ pub(crate) fn native_contract_probe() {
         objc2::runtime::Sel,
         *const AnyObject,
         objc2::runtime::Bool,
-    ) -> objc2::runtime::Bool =
-        unsafe { std::mem::transmute(objc_msgSend as unsafe extern "C" fn()) };
+    ) = unsafe { std::mem::transmute(objc_msgSend as unsafe extern "C" fn()) };
     let proxy_pointer = Retained::as_ptr(&proxy).cast::<AnyObject>();
     let app_pointer = Retained::as_ptr(&app).cast::<AnyObject>();
     unsafe {
         send_void(proxy_pointer, sel!(handleGPUIMenuItem:), app_pointer);
     }
-    let reopened = unsafe {
+    unsafe {
         send_reopen(
             proxy_pointer,
             sel!(applicationShouldHandleReopen:hasVisibleWindows:),
@@ -214,7 +214,6 @@ pub(crate) fn native_contract_probe() {
             objc2::runtime::Bool::NO,
         )
     };
-    assert!(reopened.as_bool());
     unsafe {
         send_void(proxy_pointer, sel!(applicationWillTerminate:), app_pointer);
     }
@@ -295,7 +294,12 @@ pub(crate) fn native_contract_probe() {
         Some(QuitError::WrongThread)
     );
     let _ = mtm;
+    gate_lifecycle::native_gate_lifecycle_probe();
     println!(
         "native synthetic adapter: forwarding, responds, protocol, repeat, reentry, cancellation, null-alias, foreign-pointer, strong lifetime, wrong-thread PASS"
     );
 }
+
+#[cfg(target_os = "macos")]
+#[path = "application_quit_gate_tests.rs"]
+mod gate_lifecycle;
