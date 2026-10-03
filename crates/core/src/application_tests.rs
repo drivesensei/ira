@@ -279,10 +279,12 @@ fn snapshots_are_owned_and_include_hidden_sources() {
     let snapshot = app.snapshot();
     assert_eq!(snapshot.panes[0].rows.len(), 1);
     assert_eq!(
-        snapshot.panes[0].selected_paths,
+        snapshot.panes[0].selected_paths.as_slice(),
         vec![PathBuf::from("/fixture/hidden.txt")]
     );
     app.panes[0].files[0].label = "changed".into();
+    app.invalidate_pane_projection(0);
+    assert_eq!(app.snapshot().panes[0].rows[0].entry.label, "changed");
     assert_eq!(snapshot.panes[0].rows[0].entry.label, "alpha.txt");
 }
 #[test]
@@ -956,4 +958,149 @@ fn cancellation_reaches_injected_transfer_worker_and_restores_captured_source() 
     });
     assert_eq!(std::fs::read(source).unwrap(), b"source");
     assert!(!dest.join("source.txt").exists());
+}
+
+#[test]
+fn snapshot_rows_reuse_identity_for_cursor_tick_and_unrelated_state() {
+    let mut app = fixture();
+    let first = app.snapshot();
+    app.next_item();
+    app.tick();
+    app.set_status("progress", false);
+    let next = app.snapshot();
+    assert_eq!(first.panes[0].rows.as_ptr(), next.panes[0].rows.as_ptr());
+    assert_ne!(first.panes[0].cursor, next.panes[0].cursor);
+    assert_eq!(first.panes[0].cursor, Some(0));
+    assert_eq!(next.panes[0].cursor, Some(1));
+}
+
+#[test]
+fn snapshot_projection_refreshes_selection_filter_sort_and_preserves_old_values() {
+    let mut app = fixture();
+    let first = app.snapshot();
+    app.toggle_select_current();
+    let selected = app.snapshot();
+    assert_ne!(
+        first.panes[0].rows.as_ptr(),
+        selected.panes[0].rows.as_ptr()
+    );
+    assert!(!first.panes[0].rows[0].selected);
+    assert!(selected.panes[0].rows[0].selected);
+    app.start_search();
+    app.push_search_char('b');
+    app.confirm_search();
+    let filtered = app.snapshot();
+    assert_eq!(filtered.panes[0].rows.len(), 1);
+    assert_eq!(filtered.panes[0].rows[0].entry.label, "beta.txt");
+    assert_eq!(filtered.panes[0].selected_paths.len(), 2);
+    assert!(filtered.panes[0]
+        .selected_paths
+        .iter()
+        .any(|p| p.ends_with("hidden.txt")));
+    app.cycle_sort();
+    let sorted = app.snapshot();
+    assert_ne!(
+        filtered.panes[0].rows.as_ptr(),
+        sorted.panes[0].rows.as_ptr()
+    );
+    assert_eq!(sorted.panes[0].rows[0].underlying_index, 2);
+    app.clear_filter();
+    assert_eq!(app.snapshot().panes[0].rows.len(), 3);
+    assert_eq!(first.panes[0].rows[0].entry.label, "alpha.txt");
+}
+
+#[test]
+fn snapshot_streaming_settle_and_deletion_invalidate_same_listing_generation() {
+    let mut app = fixture();
+    let first = app.snapshot();
+    app.file_list_tx
+        .send((0, vec![entry("later.txt", 4)], false, 0))
+        .unwrap();
+    app.pick_up_pane_listings();
+    let streamed = app.snapshot();
+    assert_eq!(streamed.panes[0].rows.len(), 4);
+    assert_eq!(first.panes[0].rows.len(), 3);
+    app.file_list_tx
+        .send((0, vec![entry("settled.txt", 8)], true, 0))
+        .unwrap();
+    app.pick_up_pane_listings();
+    let settled = app.snapshot();
+    assert_eq!(settled.panes[0].rows[0].entry.label, "settled.txt");
+    assert!(settled.panes[0].selected_paths.is_empty());
+    app.confirming = Some(Confirm {
+        action: ConfirmAction::Delete,
+        paths: vec!["/fixture/settled.txt".into()],
+        dest_dir: None,
+        label: "settled".into(),
+        policy: OverwritePolicy::AutoRename,
+    });
+    app.confirm_delete();
+    assert!(app.snapshot().panes[0].rows[0].deleting);
+    assert!(!settled.panes[0].rows[0].deleting);
+}
+
+#[test]
+fn live_search_cursor_reuses_projection_and_query_changes_refresh_it() {
+    let mut app = fixture();
+    app.start_search();
+    let empty = app.snapshot();
+    app.next_item();
+    let cursor = app.snapshot();
+    assert_eq!(empty.panes[0].rows.as_ptr(), cursor.panes[0].rows.as_ptr());
+    app.push_search_char('b');
+    let query = app.snapshot();
+    assert_eq!(query.panes[0].rows.len(), 1);
+    app.pop_search_char();
+    let restored = app.snapshot();
+    assert_eq!(restored.panes[0].rows.len(), 3);
+    assert_ne!(
+        query.panes[0].rows.as_ptr(),
+        restored.panes[0].rows.as_ptr()
+    );
+    app.cancel_search();
+    assert_eq!(app.snapshot().panes[0].rows.len(), 3);
+}
+
+#[test]
+fn snapshot_all_selection_inversion_and_split_are_independent() {
+    let mut app = fixture();
+    let old = app.snapshot();
+    app.toggle_select_all();
+    let all = app.snapshot();
+    assert_eq!(all.panes[0].selected_paths.len(), 3);
+    app.invert_selection();
+    assert!(app.snapshot().panes[0].selected_paths.is_empty());
+    app.toggle_split();
+    let split = app.snapshot();
+    assert_eq!(split.panes[1].rows.len(), 3);
+    assert!(split.panes[1].selected_paths.is_empty());
+    assert_eq!(old.panes[0].selected_paths.len(), 1);
+    assert!(old.panes[1].rows.is_empty());
+}
+
+#[test]
+fn snapshot_metadata_save_refreshes_entry_but_keeps_previous_snapshot_immutable() {
+    let temp = TempFixture::new();
+    let path = temp.0.join("save.txt");
+    std::fs::write(&path, "old").unwrap();
+    let mut app = App::default();
+    app.panes[0].files = vec![FEntry {
+        path: path.to_string_lossy().into_owned(),
+        label: "save.txt".into(),
+        is_dir: false,
+        size: 3,
+        modified: None,
+    }];
+    app.panes[0].selected = vec![false];
+    app.panes[0].state.select(Some(0));
+    app.open_edit();
+    let request = app.pending_editor_request().unwrap();
+    let doc = crate::editor::open_document(request.document_id, &path).unwrap();
+    assert!(app.apply_open_editor(request, Ok(doc)));
+    let old = app.snapshot();
+    assert!(app.update_editor_draft(app.edit.as_ref().unwrap().document_id, 1, "longer".into()));
+    let result = crate::editor::save_document(&app.editor_save_snapshot().unwrap()).unwrap();
+    assert!(app.apply_save_result(result.document_id, result.edit_revision, Ok(result)));
+    assert_eq!(app.snapshot().panes[0].rows[0].entry.size, 6);
+    assert_eq!(old.panes[0].rows[0].entry.size, 3);
 }

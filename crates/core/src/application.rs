@@ -84,7 +84,18 @@ enum PersistenceRequest {
     Bookmarks(Option<PathBuf>, Vec<Folder>),
     Barrier(mpsc::Sender<()>),
 }
+struct SearchProjection {
+    pane: usize,
+    generation: u64,
+    files: usize,
+    query: String,
+    indices: Arc<Vec<usize>>,
+}
+
 pub struct App {
+    search_projection: std::cell::RefCell<Option<SearchProjection>>,
+    pub(crate) snapshot_cache: [std::cell::RefCell<Option<crate::observable::PaneProjection>>; 2],
+    pub(crate) deletion_generation: u64,
     last_sequence: Option<u64>,
     operation_epoch: Arc<AtomicU64>,
     pending_editor: Option<OpenEditorRequest>,
@@ -250,6 +261,9 @@ impl Default for App {
         let (file_list_tx, file_list_rx) = mpsc::channel();
         let (info_tx, info_rx) = mpsc::channel();
         Self {
+            search_projection: std::cell::RefCell::new(None),
+            snapshot_cache: std::array::from_fn(|_| std::cell::RefCell::new(None)),
+            deletion_generation: 0,
             last_sequence: None,
             operation_epoch: Arc::new(AtomicU64::new(0)),
             pending_editor: None,
@@ -396,6 +410,19 @@ fn matching_drive<'a>(drives: &'a [Folder], folder_path: &str) -> Option<&'a Fol
 }
 
 impl App {
+    /// Mark an externally replaced or edited pane's files/selection/filter indices changed.
+    /// Actor commands do this automatically; factory/test direct field edits after publication
+    /// must call this before publishing another snapshot. Cursor changes need no invalidation.
+    pub fn invalidate_pane_projection(&mut self, pane_index: usize) {
+        if let Some(pane) = self.panes.get_mut(pane_index) {
+            pane.projection_generation = pane.projection_generation.wrapping_add(1);
+        }
+    }
+
+    fn invalidate_active_projection(&mut self) {
+        self.invalidate_pane_projection(self.active_pane);
+    }
+
     /// Install the host atomic no-replace primitive for future transfer workers.
     /// Already-running workers retain their provider; default core behavior stays fail-closed.
     pub fn set_transfer_provider(&mut self, provider: Arc<NoReplaceProvider>) {
@@ -677,6 +704,7 @@ impl App {
                     files.sort_by(|a, b| a.label.cmp(&b.label));
                     let len = files.len();
                     let pane = &mut self.panes[pane_index];
+                    pane.projection_generation = pane.projection_generation.wrapping_add(1);
                     pane.files = files;
                     pane.selected = vec![false; len];
                     pane.render_scroll = 0;
@@ -740,6 +768,7 @@ impl App {
         pane.listing_generation = pane.listing_generation.wrapping_add(1);
         // Clear the rows now: the pane shows "Loading…" until the first
         // chunk of the NEW folder arrives (never stale mixed content).
+        pane.projection_generation = pane.projection_generation.wrapping_add(1);
         pane.files.clear();
         pane.selected.clear();
         pane.render_scroll = 0;
@@ -786,6 +815,7 @@ impl App {
             }
             let pane = &mut self.panes[pane_index];
             if done {
+                pane.projection_generation = pane.projection_generation.wrapping_add(1);
                 pane.files = files;
                 pane.selected = vec![false; pane.files.len()];
                 pane.render_scroll = 0;
@@ -816,6 +846,7 @@ impl App {
                 pane.listing_settled = false;
                 pane.selected
                     .extend(std::iter::repeat_n(false, files.len()));
+                pane.projection_generation = pane.projection_generation.wrapping_add(1);
                 pane.files.extend(files);
                 // While streaming, follow the pending target as soon as its
                 // entry arrives (transfer results land mid-stream). The
@@ -861,14 +892,14 @@ impl App {
     pub fn selected_visible_entry_for(&self, pane_index: usize) -> Option<&FEntry> {
         let pane = &self.panes[pane_index];
         let vis = pane.state.selected()?;
-        let indices = if self.is_searching() {
-            self.search_matches()
+        let index = if self.is_searching() {
+            self.search_match_indices().get(vis).copied()
         } else if pane.filter_query.is_some() {
-            pane.filter_indices.clone()
+            pane.filter_indices.get(vis).copied()
         } else {
-            (0..pane.files.len()).collect::<Vec<usize>>()
+            Some(vis)
         };
-        indices.get(vis).and_then(|&i| pane.files.get(i))
+        index.and_then(|i| pane.files.get(i))
     }
     pub fn get_drive_shortcuts(&self) -> Vec<char> {
         self.drives
@@ -913,6 +944,7 @@ impl App {
 
         self.drives = Some(drives);
         let pane = self.pane_mut();
+        pane.projection_generation = pane.projection_generation.wrapping_add(1);
         pane.filter_query = None;
         pane.filter_indices.clear();
         pane.folder = Some(Folder {
@@ -988,6 +1020,7 @@ impl App {
             return;
         };
         let pane = self.pane_mut();
+        pane.projection_generation = pane.projection_generation.wrapping_add(1);
         pane.filter_query = None;
         pane.filter_indices.clear();
         pane.folder = Some(selected);
@@ -1020,6 +1053,7 @@ impl App {
 
         if let Ok(Some(actual_folder)) = get_directory(&path) {
             let pane = self.pane_mut();
+            pane.projection_generation = pane.projection_generation.wrapping_add(1);
             pane.filter_query = None;
             pane.filter_indices.clear();
             pane.pending_select = None;
@@ -1042,6 +1076,7 @@ impl App {
         match get_parent_directory(&current_path) {
             Ok(Some(folder)) => {
                 let pane = self.pane_mut();
+                pane.projection_generation = pane.projection_generation.wrapping_add(1);
                 pane.filter_query = None;
                 pane.filter_indices.clear();
                 // Remember the folder we are leaving: once the parent's
@@ -1173,6 +1208,7 @@ impl App {
                 _ => x.label.cmp(&y.label),
             }
         });
+        pane.projection_generation = pane.projection_generation.wrapping_add(1);
         pane.files = order.iter().map(|&i| files[i].clone()).collect();
         pane.selected = order
             .iter()
@@ -1282,6 +1318,7 @@ impl App {
             dst.user_navigated = false;
             if settled {
                 // Mirror the settled view verbatim — no extra disk walk.
+                dst.projection_generation = dst.projection_generation.wrapping_add(1);
                 dst.files = src.files.clone();
                 dst.selected = vec![false; dst.files.len()];
                 dst.filter_query = src.filter_query.clone();
@@ -1557,6 +1594,7 @@ impl App {
         };
         {
             let pane = self.pane_mut();
+            pane.projection_generation = pane.projection_generation.wrapping_add(1);
             pane.filter_query = None;
             pane.filter_indices.clear();
             pane.folder = Some(Folder::new(
@@ -1738,6 +1776,7 @@ impl App {
         let Some(file_idx) = self.visible_file_index(cursor) else {
             return;
         };
+        self.invalidate_active_projection();
         if let Some(slot) = self.pane_mut().selected.get_mut(file_idx) {
             *slot = !*slot;
         }
@@ -1752,6 +1791,7 @@ impl App {
         if indices.is_empty() {
             return;
         }
+        self.invalidate_active_projection();
         let any_unselected = indices.iter().any(|&i| !self.pane().selected[i]);
         for &i in &indices {
             self.pane_mut().selected[i] = any_unselected;
@@ -1761,6 +1801,7 @@ impl App {
     /// Inverts the multi-selection within the visible set.
     /// Bound to Super+I.
     pub fn invert_selection(&mut self) {
+        self.invalidate_active_projection();
         for i in self.visible_indices() {
             if let Some(s) = self.pane_mut().selected.get_mut(i) {
                 *s = !*s;
@@ -2238,6 +2279,7 @@ impl App {
         // focus stays on the source files pane and browsing continues, and
         // Tab reaches the board when you want to pause/cancel (mirroring the
         // preview panel). Select the new job so it is highlighted on arrival.
+        self.invalidate_active_projection();
         self.pane_mut().selected.fill(false);
         self.copy_board = true;
         self.copy_board_state.select(Some(self.jobs.len() - 1));
@@ -2353,6 +2395,7 @@ impl App {
         if confirm.paths.is_empty() {
             return;
         }
+        self.deletion_generation = self.deletion_generation.wrapping_add(1);
         self.deleting_paths = confirm.paths.iter().cloned().collect();
         let tx = self.job_tx.clone();
         let control = spawn_delete_job(confirm.paths.clone(), tx);
@@ -2458,13 +2501,16 @@ impl App {
                         d.total = total;
                         d.current = Some(current.clone());
                     }
+                    self.deletion_generation = self.deletion_generation.wrapping_add(1);
                     self.deleting_paths.remove(&current);
                 }
                 JobEvent::DeleteDone { cancelled, failed } => {
                     self.deletion = None;
+                    self.deletion_generation = self.deletion_generation.wrapping_add(1);
                     self.deleting_paths.clear();
                     self.deletion_box_hidden = false;
                     if !cancelled {
+                        self.invalidate_active_projection();
                         self.pane_mut().selected.fill(false);
                         self.refresh_after_job();
                     }
@@ -2583,9 +2629,29 @@ impl App {
 
     /// Indices into the active pane's files matching the current query, best match first.
     fn search_matches(&self) -> Vec<usize> {
+        self.search_match_indices().as_ref().clone()
+    }
+
+    fn search_match_indices(&self) -> Arc<Vec<usize>> {
+        let pane = self.pane();
         let query = self.search_query.as_deref().unwrap_or("");
-        let labels: Vec<String> = self.pane().files.iter().map(|f| f.label.clone()).collect();
-        fuzzy_indices(&labels, query)
+        let mut cache = self.search_projection.borrow_mut();
+        if cache.as_ref().is_none_or(|cached| {
+            cached.pane != self.active_pane
+                || cached.generation != pane.projection_generation
+                || cached.files != pane.files.len()
+                || cached.query != query
+        }) {
+            let labels: Vec<String> = pane.files.iter().map(|f| f.label.clone()).collect();
+            *cache = Some(SearchProjection {
+                pane: self.active_pane,
+                generation: pane.projection_generation,
+                files: pane.files.len(),
+                query: query.to_owned(),
+                indices: Arc::new(fuzzy_indices(&labels, query)),
+            });
+        }
+        Arc::clone(&cache.as_ref().expect("search initialized").indices)
     }
 
     /// Clears the pane's confirmed filter, keeping the cursor on the entry
@@ -2597,6 +2663,7 @@ impl App {
             .selected()
             .and_then(|vis| self.pane().filter_indices.get(vis).copied());
         let pane = self.pane_mut();
+        pane.projection_generation = pane.projection_generation.wrapping_add(1);
         pane.filter_query = None;
         pane.filter_indices.clear();
         match file_idx {
@@ -2648,19 +2715,30 @@ impl App {
 
     /// Maps a visible-list index to the underlying `files` index.
     fn visible_file_index(&self, visible_idx: usize) -> Option<usize> {
-        self.visible_indices().get(visible_idx).copied()
+        if self.is_searching() {
+            self.search_match_indices().get(visible_idx).copied()
+        } else if self.pane().filter_query.is_some() {
+            self.pane().filter_indices.get(visible_idx).copied()
+        } else {
+            (visible_idx < self.pane().files.len()).then_some(visible_idx)
+        }
     }
 
     pub fn visible_count(&self) -> usize {
-        self.visible_indices().len()
+        if self.is_searching() {
+            self.search_match_indices().len()
+        } else if self.pane().filter_query.is_some() {
+            self.pane().filter_indices.len()
+        } else {
+            self.pane().files.len()
+        }
     }
 
     /// Maps a visible-list index to the underlying file entry.
     fn visible_entry(&self, visible_idx: usize) -> Option<&FEntry> {
         let files = &self.pane().files;
-        self.visible_indices()
-            .get(visible_idx)
-            .and_then(|&i| files.get(i))
+        self.visible_file_index(visible_idx)
+            .and_then(|i| files.get(i))
     }
 
     pub fn start_search(&mut self) {
@@ -2689,9 +2767,11 @@ impl App {
             Some(q) if !q.trim().is_empty() => {
                 let labels: Vec<String> = pane.files.iter().map(|f| f.label.clone()).collect();
                 pane.filter_indices = fuzzy_indices(&labels, &q);
+                pane.projection_generation = pane.projection_generation.wrapping_add(1);
                 pane.filter_query = Some(q);
             }
             _ => {
+                pane.projection_generation = pane.projection_generation.wrapping_add(1);
                 pane.filter_query = None;
                 pane.filter_indices.clear();
             }
@@ -3126,6 +3206,8 @@ impl App {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
+                self.panes[pane_index].projection_generation =
+                    self.panes[pane_index].projection_generation.wrapping_add(1);
                 if let Some(entry) = self.panes[pane_index]
                     .files
                     .iter_mut()
@@ -3548,12 +3630,14 @@ impl App {
                 let pane = &mut self.panes[i];
                 if before.folder != after.folder {
                     pane.folder = after.folder.clone();
+                    pane.projection_generation = pane.projection_generation.wrapping_add(1);
                     pane.files.clear();
                     pane.selected.clear();
                     pane.state.select(None);
                     pane.listing_settled = false;
                 }
                 if before.filter_query != after.filter_query {
+                    pane.projection_generation = pane.projection_generation.wrapping_add(1);
                     pane.filter_query = after.filter_query.clone();
                     pane.filter_indices = after.filter_indices.clone();
                 }

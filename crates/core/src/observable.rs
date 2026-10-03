@@ -10,7 +10,7 @@ use crate::{
     },
     theme::{icons::IconSet, ThemePreset},
 };
-use std::{path::PathBuf, time::Instant};
+use std::{path::PathBuf, sync::Arc, time::Instant};
 #[derive(Debug, Clone)]
 pub struct Row {
     pub underlying_index: usize,
@@ -21,9 +21,9 @@ pub struct Row {
 #[derive(Debug, Clone)]
 pub struct PaneSnapshot {
     pub folder: Option<Folder>,
-    pub rows: Vec<Row>,
+    pub rows: Arc<Vec<Row>>,
     pub cursor: Option<usize>,
-    pub selected_paths: Vec<PathBuf>,
+    pub selected_paths: Arc<Vec<PathBuf>>,
     pub listing_settled: bool,
     pub listing_generation: u64,
     pub preview_mode: PreviewMode,
@@ -141,30 +141,82 @@ pub struct Snapshot {
     pub icons: IconSet,
     pub sizes: Vec<(PathBuf, SizeInfo)>,
 }
+#[derive(Clone, PartialEq, Eq)]
+struct ProjectionKey {
+    generation: u64,
+    listing: u64,
+    deletion: u64,
+    files: usize,
+    sort: usize,
+    filter: Option<String>,
+    search: Option<String>,
+}
+/// Actor-only cached owned values. Snapshots clone Arcs; old publications stay immutable.
+pub(crate) struct PaneProjection {
+    key: ProjectionKey,
+    rows: Arc<Vec<Row>>,
+    selected_paths: Arc<Vec<PathBuf>>,
+}
+impl App {
+    fn pane_projection(&self, pane_index: usize) -> std::cell::Ref<'_, PaneProjection> {
+        let pane = &self.panes[pane_index];
+        let key = ProjectionKey {
+            generation: pane.projection_generation,
+            listing: pane.listing_generation,
+            deletion: self.deletion_generation,
+            files: pane.files.len(),
+            sort: pane.sort_mode,
+            filter: pane.filter_query.clone(),
+            search: if pane_index == self.active_pane {
+                self.search_query.clone()
+            } else {
+                None
+            },
+        };
+        let cache = &self.snapshot_cache[pane_index];
+        if cache
+            .borrow()
+            .as_ref()
+            .is_none_or(|projection| projection.key != key)
+        {
+            let rows = self
+                .pane_visible_rows(pane_index)
+                .into_iter()
+                .map(|(i, e)| Row {
+                    underlying_index: i,
+                    entry: e.clone(),
+                    selected: pane.selected.get(i).copied().unwrap_or(false),
+                    deleting: self.deleting_started(&e.path).is_some(),
+                })
+                .collect();
+            let selected_paths = pane
+                .files
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| pane.selected.get(*i) == Some(&true))
+                .map(|(_, e)| PathBuf::from(&e.path))
+                .collect();
+            *cache.borrow_mut() = Some(PaneProjection {
+                key,
+                rows: Arc::new(rows),
+                selected_paths: Arc::new(selected_paths),
+            });
+        }
+        std::cell::Ref::map(cache.borrow(), |entry| {
+            entry.as_ref().expect("projection initialized")
+        })
+    }
+}
 impl App {
     pub fn snapshot(&self) -> Snapshot {
         let panes = std::array::from_fn(|pane_index| {
             let pane = &self.panes[pane_index];
+            let projection = self.pane_projection(pane_index);
             PaneSnapshot {
                 folder: pane.folder.clone(),
-                rows: self
-                    .pane_visible_rows(pane_index)
-                    .into_iter()
-                    .map(|(i, e)| Row {
-                        underlying_index: i,
-                        entry: e.clone(),
-                        selected: pane.selected.get(i).copied().unwrap_or(false),
-                        deleting: self.deleting_started(&e.path).is_some(),
-                    })
-                    .collect(),
+                rows: Arc::clone(&projection.rows),
                 cursor: pane.state.selected(),
-                selected_paths: pane
-                    .files
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| pane.selected.get(*i) == Some(&true))
-                    .map(|(_, e)| PathBuf::from(&e.path))
-                    .collect(),
+                selected_paths: Arc::clone(&projection.selected_paths),
                 listing_settled: pane.listing_settled,
                 listing_generation: pane.listing_generation,
                 preview_mode: pane.preview_mode,
