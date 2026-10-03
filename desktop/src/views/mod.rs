@@ -359,6 +359,16 @@ impl Desktop {
             return;
         };
         let mode = focus::input_mode(snapshot);
+        // Editor context starts while the actor's open worker still owns a focus
+        // ticket. Creating/focusing an empty native buffer here would invalidate
+        // that ticket before its document completion can be applied.
+        if mode == Some(InputMode::Editor) && snapshot.edit.is_none() {
+            self.input = None;
+            self.input_mode = None;
+            self.input_subscription = None;
+            window.focus(&self.focus);
+            return;
+        }
         if mode == self.input_mode
             && self.input.as_ref().is_none_or(|input| {
                 input.read(cx).stamp().document_generation == snapshot.document_generation
@@ -1854,6 +1864,158 @@ mod crossing_tests {
         });
         std::fs::remove_dir_all(fixture).unwrap();
     }
+    #[gpui::test]
+    fn pending_editor_does_not_create_empty_native_input_or_advance_ticket(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(text_input::register);
+        let mut app = App::default();
+        app.window_generation = 7;
+        app.panes[0].files = vec![ira_core::services::list_files::FEntry {
+            path: "/task-fixture/pending.txt".into(),
+            label: "pending.txt".into(),
+            is_dir: false,
+            size: 1,
+            modified: None,
+        }];
+        app.panes[0].selected = vec![false];
+        app.panes[0].state.select(Some(0));
+        app.panes[0].preview_mode = ira_core::model::PreviewMode::Column;
+        crate::runtime::apply(
+            &mut app,
+            crate::runtime::Envelope {
+                sequence: 1,
+                window_generation: 7,
+                input_generation: None,
+                command: Command::Input(actions::input(KeyCode::Tab)),
+            },
+        )
+        .unwrap();
+        let snapshot = Arc::new(app.snapshot());
+        assert_eq!(
+            snapshot.input_context,
+            ira_core::input::InputContext::Editor
+        );
+        assert!(snapshot.edit.is_none());
+        let (release, blocked) = mpsc::channel();
+        let runtime = Runtime::with_factory(7, move || {
+            let _ = blocked.recv();
+            app
+        });
+        let (view, cx) = cx.add_window_view(move |window, cx| {
+            let mut view = Desktop::new(runtime, crate::platform::geometry::Writer::new(None), cx);
+            view.accessibility = accessibility::Host::headless();
+            view.snapshot = Some(snapshot);
+            view.focus_main(window, cx);
+            view
+        });
+        view.update_in(cx, |view, window, cx| {
+            view.sync_input(window, cx);
+            assert!(
+                view.input.is_none(),
+                "pending editor must not expose an empty editable draft"
+            );
+            assert_eq!(
+                view.input_generation, 0,
+                "pending focus ticket must remain actor-owned"
+            );
+            view.runtime.stop(&view.controls);
+            view.close();
+        });
+        release.send(()).unwrap();
+    }
+
+    #[gpui::test]
+    fn column_text_tab_reaches_native_editor_and_escape_returns_to_pane(cx: &mut TestAppContext) {
+        cx.update(text_input::register);
+        let fixture = std::env::temp_dir().join(format!("ira-tab-editor-{}", std::process::id()));
+        std::fs::create_dir_all(&fixture).unwrap();
+        std::fs::write(fixture.join("fixture.txt"), b"editable fixture").unwrap();
+        let mut app = App::default();
+        app.window_generation = 7;
+        app.state_path = Some(fixture.join("state"));
+        app.panes[0].folder = Some(Folder::new(
+            "Fixture".into(),
+            fixture.to_string_lossy().into_owned(),
+            '#',
+        ));
+        app.panes[0].files = list_files(fixture.to_str().unwrap()).unwrap();
+        app.panes[0].selected = vec![false];
+        app.panes[0].listing_settled = true;
+        app.panes[0].listing_generation = 3;
+        app.panes[0].preview_mode = ira_core::model::PreviewMode::Column;
+        app.panes[0].state.select(Some(0));
+        assert!(app.pane_shows_text_preview(0));
+        let runtime = Runtime::with_factory(7, move || app);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let publication = loop {
+            if let Some(value) = runtime.try_snapshot() {
+                break value;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+        let (view, cx) = cx.add_window_view(move |window, cx| {
+            let mut view = Desktop::new(runtime, crate::platform::geometry::Writer::new(None), cx);
+            view.accessibility = accessibility::Host::headless();
+            view.snapshot = Some(publication.snapshot);
+            view.focus_main(window, cx);
+            view
+        });
+        cx.simulate_keystrokes("tab");
+        loop {
+            let ready = view.update_in(cx, |view, _, cx| {
+                view.poll(cx);
+                view.input_mode == Some(InputMode::Editor)
+                    && view.input.is_some()
+                    && view.snapshot.as_ref().is_some_and(|s| {
+                        s.edit.is_some() && s.focus_generation == view.input_generation
+                    })
+            });
+            if ready {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Tab did not reach native editor"
+            );
+            std::thread::yield_now();
+        }
+        view.update_in(cx, |view, _, cx| {
+            let native = view.native_text(cx).unwrap();
+            assert_eq!(native.text.as_ref(), "editable fixture");
+            assert!(native.multiline);
+            let tree = view.accessibility.tree.as_ref().unwrap();
+            assert!(
+                tree.nodes
+                    .values()
+                    .any(|n| matches!(n.target, Target::Text { .. })
+                        && n.capabilities.contains(&AxCapability::Value))
+            );
+        });
+        cx.simulate_keystrokes("escape");
+        loop {
+            let done = view.update_in(cx, |view, _, cx| {
+                view.poll(cx);
+                view.input.is_none() && view.snapshot.as_ref().is_some_and(|s| s.edit.is_none())
+            });
+            if done {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        view.update_in(cx, |view, _, _| {
+            view.runtime.stop(&view.controls);
+            view.close();
+        });
+        assert_eq!(
+            std::fs::read(fixture.join("fixture.txt")).unwrap(),
+            b"editable fixture"
+        );
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
     #[gpui::test]
     fn accessibility_rename_value_uses_native_draft_and_same_confirmation_gateway(
         cx: &mut TestAppContext,

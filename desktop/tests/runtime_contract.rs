@@ -1111,3 +1111,48 @@ fn unicode_search_draft_and_escape_preserve_running_window() {
     assert_eq!(app.window_generation, 7);
     assert!(app.search_query.is_none());
 }
+
+#[test]
+fn tab_preserves_neutral_editor_ticket_and_pending_escape_tab_help_cancel() {
+    use ira_core::{
+        input::Command as CoreCommand,
+        model::{HostRequest, PreviewMode},
+    };
+    let fixture = Fixture::new();
+    for cancellation in [
+        None,
+        Some(key(KeyCode::Esc)),
+        Some(key(KeyCode::Tab)),
+        Some(Command::Input(Input::Action(CoreCommand::ShowHelp))),
+    ] {
+        let mut app = fixture.app();
+        app.panes[0].preview_mode = PreviewMode::Column;
+        apply(&mut app, envelope(1, key(KeyCode::Tab))).unwrap();
+        let request = app
+            .take_host_requests()
+            .into_iter()
+            .find_map(|request| match request {
+                HostRequest::OpenEditor(request) => Some(request),
+                _ => None,
+            })
+            .expect("Tab must request text editor");
+        assert_eq!(
+            request.focus_generation, app.focus_generation,
+            "wrapper must preserve focus ticket stamped by neutral dispatch"
+        );
+        let document =
+            ira_core::editor::open_document(request.document_id, &request.target.path).unwrap();
+        if let Some(cancellation) = cancellation {
+            apply(&mut app, envelope(2, cancellation)).unwrap();
+            assert!(
+                !app.apply_open_editor(request, Ok(document)),
+                "cancelled editor cannot reopen late"
+            );
+            assert!(app.edit.is_none());
+        } else {
+            assert!(app.apply_open_editor(request, Ok(document)));
+            assert_eq!(app.edit.as_ref().unwrap().content, "fixture");
+        }
+        assert!(app.running);
+    }
+}

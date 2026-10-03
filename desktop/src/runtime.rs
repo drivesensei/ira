@@ -370,8 +370,9 @@ impl Runtime {
                 }
                 if last_tick.elapsed() >= Duration::from_millis(500) {
                     let context = app.input_context();
+                    let focus = app.focus_generation;
                     app.tick();
-                    if context != app.input_context() {
+                    if context != app.input_context() && focus == app.focus_generation {
                         app.focus_generation = app.focus_generation.wrapping_add(1);
                     }
                     for request in app.take_host_requests() {
@@ -549,6 +550,7 @@ pub fn apply(app: &mut App, envelope: Envelope) -> Result<(), String> {
         return Err("Input belongs to a closed document or focus".into());
     }
     let previous_context = app.input_context();
+    let previous_focus = app.focus_generation;
     let command = match envelope.command {
         Command::Accessibility(action) => {
             if (
@@ -776,7 +778,7 @@ pub fn apply(app: &mut App, envelope: Envelope) -> Result<(), String> {
         Command::HostResult(Ok(())) => {}
         Command::SetFocus(generation) => app.focus_generation = generation,
     }
-    if previous_context != app.input_context() {
+    if previous_context != app.input_context() && previous_focus == app.focus_generation {
         app.focus_generation = app.focus_generation.wrapping_add(1);
     }
     app.ack_sequence = envelope.sequence;
