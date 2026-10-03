@@ -222,3 +222,19 @@ fn macos_acl_denial_is_honored_and_allowed_acl_survives_publication() {
         .join("\n");
     assert_eq!(acl_before, acl_after);
 }
+
+#[test]
+fn public_checked_byte_publisher_preserves_caller_encoding_and_reports_failure() {
+    let f = Fixture::new();
+    let path = f.0.join("geometry");
+    let bytes = b"geometry=1\r\nwidth=1024\n\0exact caller bytes";
+    crate::services::persistence::try_publish_bytes(&path, bytes).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    let parent = f.0.join("blocked");
+    fs::write(&parent, b"old parent").unwrap();
+    let target = parent.join("geometry");
+    let error = crate::services::persistence::try_publish_bytes(&target, bytes).unwrap_err();
+    assert_eq!(error.path, Some(target));
+    assert_eq!(error.stage, "create directory");
+    assert_eq!(fs::read(parent).unwrap(), b"old parent");
+}
