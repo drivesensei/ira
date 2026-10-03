@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -119,13 +119,83 @@ fn save(path: &Path, value: Geometry) -> io::Result<()> {
     }
     result
 }
+/// Receipt for geometry writes accepted before a checked barrier.
+#[derive(Clone, Debug)]
+pub struct Receipt {
+    pub epoch: u64,
+}
+#[derive(Clone)]
+pub struct Failure {
+    pub epoch: u64,
+    pub message: String,
+    pub retry: Retry,
+}
+impl std::fmt::Debug for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeometryFailure")
+            .field("epoch", &self.epoch)
+            .field("message", &self.message)
+            .finish_non_exhaustive()
+    }
+}
+pub type Checked = Result<Receipt, Failure>;
+#[derive(Clone)]
+pub struct Retry {
+    _owner: Arc<mpsc::Sender<Request>>,
+    sender: mpsc::Sender<Request>,
+    epoch: u64,
+    value: Geometry,
+    busy: Arc<AtomicBool>,
+}
+impl Retry {
+    /// Retry the captured failed payload only; never capture current window state.
+    pub fn retry(&self) -> mpsc::Receiver<Checked> {
+        let (reply, receiver) = mpsc::channel();
+        if self
+            .busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            let _ = reply.send(Err(Failure {
+                epoch: self.epoch,
+                message: "Geometry retry already pending".into(),
+                retry: self.clone(),
+            }));
+            return receiver;
+        }
+        if let Err(error) = self.sender.send(Request::Retry {
+            epoch: self.epoch,
+            value: self.value,
+            reply,
+            retry: self.clone(),
+        }) {
+            self.busy.store(false, Ordering::Release);
+            if let Request::Retry { reply, .. } = error.0 {
+                let _ = reply.send(Err(Failure {
+                    epoch: self.epoch,
+                    message: "Geometry writer disconnected".into(),
+                    retry: self.clone(),
+                }));
+            }
+        }
+        receiver
+    }
+}
 enum Request {
     Load(mpsc::Sender<Option<Geometry>>),
     Save(Geometry),
     Barrier(mpsc::Sender<()>),
+    CheckedBarrier(mpsc::Sender<Checked>),
+    Retry {
+        epoch: u64,
+        value: Geometry,
+        reply: mpsc::Sender<Checked>,
+        retry: Retry,
+    },
 }
 #[derive(Clone)]
 pub struct Writer {
+    _owner: Arc<mpsc::Sender<Request>>,
     sender: mpsc::Sender<Request>,
     errors: Arc<Mutex<mpsc::Receiver<String>>>,
 }
@@ -133,9 +203,15 @@ impl Writer {
     pub fn new(path: Option<PathBuf>) -> Self {
         let (sender, receiver) = mpsc::channel();
         let (error_tx, errors) = mpsc::channel();
+        // A retained retry sender keeps this owner alive beyond Desktop destruction.
+        let weak_sender = Arc::new(sender.clone());
+        let retry_sender = Arc::downgrade(&weak_sender);
+        let busy = Arc::new(AtomicBool::new(false));
         thread::spawn(move || {
             let mut current = None;
             let mut loaded = false;
+            let mut epoch = 0;
+            let mut failure: Option<String> = None;
             while let Ok(request) = receiver.recv() {
                 match request {
                     Request::Load(reply) => {
@@ -149,17 +225,73 @@ impl Writer {
                         let _ = reply.send(current);
                     }
                     Request::Save(value) => {
+                        epoch += 1;
                         current = Some(value);
                         loaded = true;
-                        if let Some(path) = &path
-                            && let Err(error) = save(path, value)
-                        {
-                            let _ =
-                                error_tx.send(format!("Window state could not be saved: {error}"));
+                        failure = path
+                            .as_ref()
+                            .and_then(|path| save(path, value).err())
+                            .map(|error| format!("Window state could not be saved: {error}"));
+                        if let Some(error) = &failure {
+                            let _ = error_tx.send(error.clone());
                         }
                     }
                     Request::Barrier(reply) => {
                         let _ = reply.send(());
+                    }
+                    Request::CheckedBarrier(reply) => {
+                        let result = if let (Some(message), Some(value), Some(sender)) =
+                            (&failure, current, retry_sender.upgrade())
+                        {
+                            Err(Failure {
+                                epoch,
+                                message: message.clone(),
+                                retry: Retry {
+                                    _owner: sender.clone(),
+                                    sender: (*sender).clone(),
+                                    epoch,
+                                    value,
+                                    busy: busy.clone(),
+                                },
+                            })
+                        } else if failure.is_some() {
+                            // The receiver disconnects honestly if ownership is already gone.
+                            continue;
+                        } else {
+                            Ok(Receipt { epoch })
+                        };
+                        let _ = reply.send(result);
+                    }
+                    Request::Retry {
+                        epoch: required,
+                        value,
+                        reply,
+                        retry,
+                    } => {
+                        let result = if required != epoch {
+                            Err(Failure {
+                                epoch: required,
+                                message: "Geometry retry superseded by newer accepted state".into(),
+                                retry: retry.clone(),
+                            })
+                        } else if failure.is_none() {
+                            Ok(Receipt { epoch })
+                        } else {
+                            failure = path
+                                .as_ref()
+                                .and_then(|path| save(path, value).err())
+                                .map(|error| format!("Window state could not be saved: {error}"));
+                            match &failure {
+                                Some(message) => Err(Failure {
+                                    epoch,
+                                    message: message.clone(),
+                                    retry: retry.clone(),
+                                }),
+                                None => Ok(Receipt { epoch }),
+                            }
+                        };
+                        retry.busy.store(false, Ordering::Release);
+                        let _ = reply.send(result);
                     }
                 }
             }
@@ -167,6 +299,7 @@ impl Writer {
         Self {
             sender,
             errors: Arc::new(Mutex::new(errors)),
+            _owner: weak_sender,
         }
     }
     pub fn load(&self) -> mpsc::Receiver<Option<Geometry>> {
@@ -177,9 +310,15 @@ impl Writer {
     pub fn save(&self, value: Geometry) {
         let _ = self.sender.send(Request::Save(value));
     }
+    /// Legacy processing-only barrier, retained for source compatibility.
     pub fn barrier(&self) -> mpsc::Receiver<()> {
         let (tx, rx) = mpsc::channel();
         let _ = self.sender.send(Request::Barrier(tx));
+        rx
+    }
+    pub fn checked_barrier(&self) -> mpsc::Receiver<Checked> {
+        let (tx, rx) = mpsc::channel();
+        let _ = self.sender.send(Request::CheckedBarrier(tx));
         rx
     }
     pub fn try_error(&self) -> Option<String> {
@@ -188,4 +327,100 @@ impl Writer {
 }
 pub fn path() -> Option<PathBuf> {
     ira_core::theme::theme_file_path().map(|path| path.with_file_name("desktop-window"))
+}
+
+#[cfg(test)]
+mod checked_tests {
+    use super::*;
+    fn value(x: f32) -> Geometry {
+        Geometry {
+            x,
+            y: 0.,
+            width: 1080.,
+            height: 720.,
+            mode: 0,
+        }
+    }
+    #[test]
+    fn failed_geometry_receipt_survives_writer_and_retries_frozen_value() {
+        let _scope = crate::test_support::enter();
+        let fixture = crate::test_support::current().unwrap().directory.clone();
+        let parent = fixture.join("blocked");
+        fs::write(&parent, b"temporary obstruction").unwrap();
+        let path = parent.join("desktop-window");
+        let writer = Writer::new(Some(path.clone()));
+        writer.save(value(42.));
+        let original = writer.checked_barrier();
+        let failure = original
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(failure.epoch, 1);
+        drop(writer);
+        fs::remove_file(&parent).unwrap();
+        fs::create_dir(&parent).unwrap();
+        let receipt = failure
+            .retry
+            .retry()
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.epoch, failure.epoch);
+        assert_eq!(
+            Geometry::parse(&fs::read_to_string(&path).unwrap())
+                .unwrap()
+                .x,
+            42.
+        );
+        // A successful retry is idempotent, not a second filesystem publication.
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            failure
+                .retry
+                .retry()
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap()
+                .unwrap()
+                .epoch,
+            1
+        );
+        assert!(!path.exists());
+    }
+    #[test]
+    fn old_geometry_failure_cannot_overwrite_newer_success() {
+        let _scope = crate::test_support::enter();
+        let fixture = crate::test_support::current().unwrap().directory.clone();
+        let parent = fixture.join("blocked");
+        fs::write(&parent, b"temporary obstruction").unwrap();
+        let path = parent.join("desktop-window");
+        let writer = Writer::new(Some(path.clone()));
+        writer.save(value(42.));
+        let failure = writer
+            .checked_barrier()
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+            .unwrap_err();
+        fs::remove_file(&parent).unwrap();
+        fs::create_dir(&parent).unwrap();
+        writer.save(value(99.));
+        let receipt = writer
+            .checked_barrier()
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.epoch, 2);
+        let stale = failure
+            .retry
+            .retry()
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+            .unwrap_err();
+        assert!(stale.message.contains("superseded"));
+        assert_eq!(
+            Geometry::parse(&fs::read_to_string(&path).unwrap())
+                .unwrap()
+                .x,
+            99.
+        );
+    }
 }
