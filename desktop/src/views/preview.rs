@@ -347,13 +347,16 @@ mod tests {
     use super::*;
     #[test]
     fn blocked_decoder_startup_keeps_viewport_work_bounded_and_nonblocking() {
+        let _fixture_scope = crate::test_support::enter();
+        let fixture = crate::test_support::current().unwrap().directory.clone();
+        let decoder_temp = fixture.join("preview-temp");
         use ira_core::{application::App, services::list_files::FEntry};
         let (release, gate) = mpsc::channel();
         let mut host = Host::start(move || {
             gate.recv().unwrap();
             PreviewOptions {
                 cache_dir: None,
-                temp_dir: std::env::temp_dir(),
+                temp_dir: decoder_temp,
                 ffmpeg: "ffmpeg".into(),
                 pdftoppm: "pdftoppm".into(),
                 process_timeout: Duration::from_secs(1),
@@ -364,7 +367,10 @@ mod tests {
         app.panes[0].preview_mode = PreviewMode::Grid;
         app.panes[0].files = (0..1000)
             .map(|i| FEntry {
-                path: format!("/tmp/ira-queue-fixture-{i}.png"),
+                path: fixture
+                    .join(format!("queue-{i}.png"))
+                    .to_string_lossy()
+                    .into_owned(),
                 label: format!("{i}.png"),
                 is_dir: false,
                 size: 10,
@@ -404,9 +410,8 @@ mod tests {
     #[test]
     fn background_text_and_invalidation_reject_old_ticket() {
         use ira_core::{application::App, services::list_files::FEntry};
-        let fixture =
-            std::env::temp_dir().join(format!("ira-native-preview-{}", std::process::id()));
-        std::fs::create_dir_all(&fixture).unwrap();
+        let _fixture_scope = crate::test_support::enter();
+        let fixture = crate::test_support::current().unwrap().directory.clone();
         let path = fixture.join("text.txt");
         std::fs::write(&path, b"old preview").unwrap();
         let options = PreviewOptions {
