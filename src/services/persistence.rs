@@ -40,8 +40,7 @@ impl fmt::Display for PersistenceError {
     }
 }
 impl std::error::Error for PersistenceError {}
-pub(crate) fn publish(path: &Path, bytes: &[u8]) -> Result<(), PersistenceError> {
-    // Follow an existing symlink as the legacy fs::write did, preserving the link.
+fn resolve(path: &Path) -> Result<PathBuf, PersistenceError> {
     let mut destination = path.to_path_buf();
     let mut links = 0;
     while destination.is_symlink() {
@@ -64,13 +63,49 @@ pub(crate) fn publish(path: &Path, bytes: &[u8]) -> Result<(), PersistenceError>
         };
         links += 1;
     }
+    Ok(destination)
+}
+#[cfg(unix)]
+fn same_version(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    (
+        before.dev(),
+        before.ino(),
+        before.len(),
+        before.mtime(),
+        before.mtime_nsec(),
+        before.ctime(),
+        before.ctime_nsec(),
+    ) == (
+        after.dev(),
+        after.ino(),
+        after.len(),
+        after.mtime(),
+        after.mtime_nsec(),
+        after.ctime(),
+        after.ctime_nsec(),
+    )
+}
+#[cfg(not(unix))]
+fn same_version(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    before.len() == after.len() && before.modified().ok() == after.modified().ok()
+}
+pub(crate) fn publish(path: &Path, bytes: &[u8]) -> Result<(), PersistenceError> {
+    publish_with(path, bytes, || {})
+}
+fn publish_with(
+    path: &Path,
+    bytes: &[u8],
+    before_commit: impl FnOnce(),
+) -> Result<(), PersistenceError> {
+    // Follow aliases as fs::write did, including a dangling relative target.
+    let destination = resolve(path)?;
     let parent = destination
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(|e| PersistenceError::io(path, "create directory", e))?;
-    // Refuse read-only targets rather than replacing them through directory rights.
-    let permissions = match fs::metadata(&destination) {
+    let original = match fs::metadata(&destination) {
         Ok(m) => {
             #[cfg(unix)]
             {
@@ -83,14 +118,30 @@ pub(crate) fn publish(path: &Path, bytes: &[u8]) -> Result<(), PersistenceError>
                     ));
                 }
             }
-            if m.permissions().readonly() {
-                return Err(PersistenceError::io(
-                    path,
-                    "permissions",
-                    "destination is read-only",
-                ));
+            // Opening without truncate proves effective mode/ACL write access.
+            let handle = if m.is_file() {
+                Some(
+                    OpenOptions::new()
+                        .write(true)
+                        .open(&destination)
+                        .map_err(|e| PersistenceError::io(path, "permissions", e))?,
+                )
+            } else {
+                None
+            };
+            if let Some(handle) = &handle {
+                let opened = handle
+                    .metadata()
+                    .map_err(|e| PersistenceError::io(path, "metadata", e))?;
+                if !same_version(&m, &opened) {
+                    return Err(PersistenceError::io(
+                        path,
+                        "identity",
+                        "destination changed while opening",
+                    ));
+                }
             }
-            Some(m.permissions())
+            Some((m, handle))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(PersistenceError::io(path, "metadata", e)),
@@ -113,14 +164,42 @@ pub(crate) fn publish(path: &Path, bytes: &[u8]) -> Result<(), PersistenceError>
         }
     };
     let result = (|| {
-        if let Some(permissions) = permissions {
-            file.set_permissions(permissions)
+        if let Some((metadata, _)) = &original {
+            // Pinned Rust b940084d7 Apple std uses fcopyfile(COPYFILE_ALL)
+            // for an existing destination: this preserves ACLs and xattrs.
+            #[cfg(target_vendor = "apple")]
+            if metadata.is_file() {
+                fs::copy(&destination, &temporary)
+                    .map_err(|e| PersistenceError::io(path, "copy metadata", e))?;
+                file.set_len(0)
+                    .map_err(|e| PersistenceError::io(path, "prepare temporary", e))?;
+            }
+            file.set_permissions(metadata.permissions())
                 .map_err(|e| PersistenceError::io(path, "permissions", e))?;
         }
         file.write_all(bytes)
             .map_err(|e| PersistenceError::io(path, "write", e))?;
         file.sync_all()
             .map_err(|e| PersistenceError::io(path, "sync", e))?;
+        before_commit();
+        if resolve(path)? != destination {
+            return Err(PersistenceError::io(
+                path,
+                "identity",
+                "configuration alias changed before publication",
+            ));
+        }
+        match (&original, fs::metadata(&destination)) {
+            (Some((before, _)), Ok(after)) if same_version(before, &after) => {}
+            (None, Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
+            _ => {
+                return Err(PersistenceError::io(
+                    path,
+                    "identity",
+                    "destination changed before publication",
+                ))
+            }
+        }
         drop(file);
         fs::rename(&temporary, &destination).map_err(|e| PersistenceError::io(path, "publish", e))
     })();

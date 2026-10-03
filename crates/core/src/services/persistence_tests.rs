@@ -131,3 +131,94 @@ fn hard_link_destination_is_rejected_without_modifying_either_alias() {
     assert_eq!(fs::read(target).unwrap(), b"old");
     assert_eq!(fs::read(alias).unwrap(), b"old");
 }
+
+#[cfg(unix)]
+#[test]
+fn effective_destination_write_denial_preserves_old_bytes() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let path = f.0.join("state");
+    fs::write(&path, b"old").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o402)).unwrap();
+    assert!(OpenOptions::new().write(true).open(&path).is_err());
+    assert_eq!(publish(&path, b"new").unwrap_err().stage, "permissions");
+    assert_eq!(fs::read(&path).unwrap(), b"old");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+#[test]
+fn destination_replacement_before_commit_is_rejected_without_clobbering_foreign_bytes() {
+    let f = Fixture::new();
+    let path = f.0.join("state");
+    fs::write(&path, b"old").unwrap();
+    let replacement = f.0.join("replacement");
+    fs::write(&replacement, b"foreign replacement").unwrap();
+    assert_eq!(
+        publish_with(&path, b"new", || {
+            fs::rename(&replacement, &path).unwrap();
+        })
+        .unwrap_err()
+        .stage,
+        "identity"
+    );
+    assert_eq!(fs::read(&path).unwrap(), b"foreign replacement");
+    assert_eq!(fs::read_dir(&f.0).unwrap().count(), 1);
+}
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_acl_denial_is_honored_and_allowed_acl_survives_publication() {
+    use std::process::Command;
+    let f = Fixture::new();
+    let path = f.0.join("state");
+    fs::write(&path, b"old").unwrap();
+    assert!(Command::new("/bin/chmod")
+        .arg("+a")
+        .arg("everyone deny write")
+        .arg(&path)
+        .status()
+        .unwrap()
+        .success());
+    assert!(OpenOptions::new().write(true).open(&path).is_err());
+    assert!(publish(&path, b"new").is_err());
+    assert_eq!(fs::read(&path).unwrap(), b"old");
+    assert!(Command::new("/bin/chmod")
+        .arg("-N")
+        .arg(&path)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("/bin/chmod")
+        .arg("+a")
+        .arg("everyone allow read")
+        .arg(&path)
+        .status()
+        .unwrap()
+        .success());
+    let before = Command::new("/bin/ls")
+        .arg("-lde")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(before.status.success());
+    let acl_before = String::from_utf8(before.stdout)
+        .unwrap()
+        .lines()
+        .skip(1)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!acl_before.is_empty());
+    publish(&path, b"new").unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"new");
+    let after = Command::new("/bin/ls")
+        .arg("-lde")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(after.status.success());
+    let acl_after = String::from_utf8(after.stdout)
+        .unwrap()
+        .lines()
+        .skip(1)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(acl_before, acl_after);
+}
