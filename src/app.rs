@@ -6288,3 +6288,7 @@ mod editor_safety_tests;
 
 #[path = "services/editor.rs"]
 mod editor_staging;
+
+#[cfg(test)]
+#[path = "app_persistence_tests.rs"]
+mod persistence_tests;

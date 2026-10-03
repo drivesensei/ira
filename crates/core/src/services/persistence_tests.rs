@@ -62,6 +62,11 @@ fn checked_write_reports_parent_file_failure_and_preserves_old_file_on_readonly_
         .file_name()
         .to_string_lossy()
         .starts_with(".ira-persist")));
+    #[cfg(windows)]
+    {
+        permissions.set_readonly(false);
+        fs::set_permissions(&destination, permissions.clone()).unwrap();
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
