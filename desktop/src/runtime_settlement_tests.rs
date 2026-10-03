@@ -215,8 +215,11 @@ fn actual_original_startup_is_applied_before_immediate_stop_publishes_state() {
     );
     std::fs::write(&bookmarks, b"").unwrap();
     let path = state.clone();
-    let mut runtime =
-        Runtime::with_factory(7, move || App::new_with_paths(Some(path), Some(bookmarks)));
+    let mut runtime = Runtime::with_drive_probe(
+        7,
+        move || App::new_with_paths(Some(path), Some(bookmarks)),
+        || Ok(Vec::new()),
+    );
     runtime.stop(&[]);
     finish(&runtime);
     let saved = ira_core::services::state::load_state_from(&state);
