@@ -55,11 +55,8 @@ impl Fixture {
         app
     }
 }
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+// Fixtures intentionally remain as task-owned evidence. Actor and I/O worker
+// lifetimes may outlive Runtime drop; cleanup requires real checked receipts.
 fn key(code: KeyCode) -> Command {
     Command::Input(Input::Key(KeyEvent::new(code, KeyModifiers::NONE)))
 }

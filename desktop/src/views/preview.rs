@@ -457,7 +457,8 @@ mod tests {
         assert!(!host.poll(Some(&snapshot)));
         assert!(host.items.is_empty());
         drop(host);
-        std::fs::remove_dir_all(fixture).unwrap();
+        // Retain the task fixture: close cancels work but does not acknowledge
+        // the preview worker's final filesystem access.
     }
     #[test]
     fn malformed_pixel_transport_is_rejected() {
