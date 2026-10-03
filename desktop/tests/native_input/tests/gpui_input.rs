@@ -172,3 +172,31 @@ fn search_arrow_keys_emit_oracle_navigation_without_changing_query(cx: &mut Test
     );
     assert_eq!(input.read_with(cx, |i, _| i.snapshot().text), "query");
 }
+#[gpui::test]
+fn multiline_utf16_candidate_bounds_and_mouse_hit_use_correct_line(cx: &mut TestAppContext) {
+    let (input, cx) = cx.add_window_view(|_, cx| {
+        TextInput::new(
+            "one\n😀two",
+            InputOptions {
+                multiline: true,
+                ..Default::default()
+            },
+            cx,
+        )
+    });
+    input.update_in(cx, |input, w, cx| {
+        let bounds = w.bounds();
+        let first = input
+            .bounds_for_range(0..1, bounds, w, cx)
+            .expect("first line painted");
+        let second = input
+            .bounds_for_range(4..6, bounds, w, cx)
+            .expect("second line painted");
+        assert!(second.top() > first.top());
+        assert!(second.size.width > gpui::px(0.));
+        let index = input
+            .character_index_for_point(second.origin, w, cx)
+            .expect("painted hit");
+        assert_eq!(index, 4);
+    });
+}
