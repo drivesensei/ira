@@ -111,6 +111,9 @@ async fn registered_browse_actions_use_one_retained_receiver_and_shutdown_bypass
     // Actual global Quit still enters checked coordinator while the receiver is pending.
     cx.update(|cx| {
         cx.dispatch_action(&actions::Quit);
+    });
+    // The active-window action runs during the preceding update's effect flush.
+    cx.update(|cx| {
         assert!(cx.global::<Session>().shutdown.is_some());
         assert!(cx.global::<Session>().chooser.active().is_some());
     });
