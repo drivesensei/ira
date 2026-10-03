@@ -1,7 +1,7 @@
 """Source-backed surface/document reconciliation checks; no status promotion."""
 import subprocess
 import unittest
-from test_f001_boundary import ROOT, ORACLE
+from test_f001_boundary import CONTRACT as ROOT, ORACLE
 
 class ReconciliationFacts(unittest.TestCase):
     def frozen(self,path):

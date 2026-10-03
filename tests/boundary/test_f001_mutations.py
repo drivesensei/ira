@@ -8,7 +8,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
-from test_f001_boundary import ROOT, ALLOWED_ROOT_FILES, structural_errors, root_change_errors, rust_code, changed_root_paths
+from test_f001_boundary import ROOT, CONTRACT, APPROVED_GRAPH_FILES, graph_change_errors, candidate_errors, ALLOWED_ROOT_FILES, structural_errors, root_change_errors, rust_code, changed_root_paths
 
 @contextlib.contextmanager
 def fixture():
@@ -71,11 +71,16 @@ class F001MutationTests(unittest.TestCase):
             errors=structural_errors(root);self.assertIn("independent core lock",errors);self.assertIn("GPUI pin",errors)
 
     def test_unknown_root_files_modified_approved_blob_and_deletion_fail(self):
-        approved=json.loads((ROOT/"tests/boundary/fixtures/approved-root-changes.json").read_text())["files"]
+        approved=json.loads((CONTRACT/"tests/boundary/fixtures/approved-root-changes.json").read_text())["files"]
         data={name:(ROOT/name).read_bytes() for name in approved}
         self.assertEqual(root_change_errors(set(data),data,approved),[])
+        for pinned in approved:
+            mutated={**data,pinned:data[pinned]+b"\n// unrelated edit\n"}
+            self.assertIn("unapproved root blob "+pinned,root_change_errors(set(data),mutated,approved))
         self.assertIn("unapproved root source src/handler.rs",root_change_errors(set(data)|{"src/handler.rs"},data,approved))
-        name="src/services/transfer.rs";data[name]+=b"\n// unrelated edit\n"
+        name="src/services/transfer.rs"
+        self.assertIn("approved root change missing "+name,root_change_errors(set(data)-{name},data,approved))
+        data[name]+=b"\n// unrelated edit\n"
         self.assertIn("unapproved root blob "+name,root_change_errors(set(data),data,approved))
         del data[name]
         self.assertIn("unapproved root blob "+name,root_change_errors(ALLOWED_ROOT_FILES,data,approved))
@@ -94,10 +99,49 @@ class F001MutationTests(unittest.TestCase):
             def command(*args):
                 subprocess.run(["git","-c","commit.gpgsign=false","-c","user.name=T030","-c","user.email=t030@example.invalid",*args],cwd=root,env=env,check=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
             command("init");command("add","src");command("commit","-m","synthetic baseline");command("tag","tui-oracle-baseline")
+            head=subprocess.check_output(["git","rev-parse","HEAD"],cwd=root,text=True).strip()
+            self.assertEqual(candidate_errors(root,head),[])
+            self.assertIn("candidate HEAD mismatch",candidate_errors(root,"0"*40))
+            for flag in ["--assume-unchanged","--skip-worktree"]:
+                with self.subTest(index_flag=flag):
+                    command("update-index",flag,"src/main.rs")
+                    (root/"src/main.rs").write_text("fn unknown_root_edit(){}")
+                    try:
+                        print("INDEX_FLAG",flag,subprocess.check_output(["git","ls-files","-v","--","src"],cwd=root,env=env,text=True).strip(),flush=True)
+                        self.assertIn("src/main.rs",changed_root_paths(root))
+                        self.assertIn("candidate index flags",candidate_errors(root,head))
+                    finally:
+                        command("update-index","--no-assume-unchanged","src/main.rs")
+                        command("update-index","--no-skip-worktree","src/main.rs")
+                        (root/"src/main.rs").write_text("fn main(){}")
+            # Same-sized source edits with restored mtime and ignored ctime
+            # must still be detected from actual bytes, not index stat caches.
+            command("config","core.trustctime","false");command("config","core.checkstat","minimal")
+            command("update-index","--refresh")
+            source=root/"src/main.rs";original=source.stat()
+            source.write_text("fn leak(){}")
+            os.utime(source,ns=(original.st_atime_ns,original.st_mtime_ns))
+            self.assertIn("src/main.rs",changed_root_paths(root))
+            self.assertIn("dirty candidate",candidate_errors(root,head))
+            source.write_text("fn main(){}")
             (root/".gitignore").write_text("src/ignored.rs\n")
             (root/"src/unknown.rs").write_text("pub fn leak(){}")
             (root/"src/ignored.rs").write_text("pub fn hidden(){}")
             self.assertEqual(changed_root_paths(root),{"src/unknown.rs","src/ignored.rs"})
+            self.assertIn("dirty candidate",candidate_errors(root,head))
+
+    def test_exact_manifest_and_lock_provenance_rejects_drift_deletion_and_widening(self):
+        approved=json.loads((CONTRACT/"tests/boundary/fixtures/approved-root-changes.json").read_text())["graphs"]
+        data={name:(ROOT/name).read_bytes() for name in APPROVED_GRAPH_FILES}
+        self.assertEqual(graph_change_errors(data,approved),[])
+        for pinned in approved:
+            mutated={**data,pinned:data[pinned]+b"\n# unrelated graph edit\n"}
+            self.assertIn("unapproved graph blob "+pinned,graph_change_errors(mutated,approved))
+        name="Cargo.toml";data[name]+=b"\n# unrelated graph edit\n"
+        self.assertIn("unapproved graph blob "+name,graph_change_errors(data,approved))
+        del data[name];self.assertIn("unapproved graph blob "+name,graph_change_errors(data,approved))
+        widened={**approved,"other/Cargo.toml":{"sha256":"0"*64}}
+        self.assertIn("approval graph identities changed",graph_change_errors(data,widened))
 
     def test_nested_comments_raw_strings_and_lifetimes_do_not_fake_host_imports(self):
         source='/* outer /* use gpui::App; */ unsafe {} */ fn valid<\'a>(s:&\'a str){let x=r###"use ::gpui::App; unsafe {}"###;}'
