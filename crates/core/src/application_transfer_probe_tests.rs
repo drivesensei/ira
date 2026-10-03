@@ -188,3 +188,80 @@ fn spawn_failure_releases_admission_and_retries_without_fake_reply() {
     called_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     wait_worker_finished(&app);
 }
+
+#[test]
+fn core_real_transfer_replacement_keeps_one_physical_probe() {
+    let base = std::env::temp_dir().join(format!("ira-t041-core-replace-{}", std::process::id()));
+    std::fs::create_dir(&base).unwrap();
+    let mut app = running_app();
+    app.next_job_id = 100;
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let worker_gate = Arc::clone(&gate);
+    app.transfer_probe_test = Some(Arc::new(move |_| {
+        entered_tx.send(()).unwrap();
+        let (lock, changed) = &*worker_gate;
+        let mut released = lock.lock().unwrap();
+        while !*released {
+            released = changed.wait(released).unwrap();
+        }
+        finished_tx.send(()).unwrap();
+        false
+    }));
+    app.tick();
+    let mut count = usize::from(entered_rx.recv_timeout(Duration::from_millis(100)).is_ok());
+    for i in 0..6 {
+        let dest = base.join(format!("dest-{i}"));
+        std::fs::create_dir(&dest).unwrap();
+        // A deliberately missing owned source fails without writing user data.
+        app.spawn_transfer_jobs(
+            JobKind::Copy,
+            vec![base
+                .join(format!("missing-{i}"))
+                .to_string_lossy()
+                .into_owned()],
+            dest.to_string_lossy().into_owned(),
+            OverwritePolicy::SkipExisting,
+        );
+        app.clock_override = Some(app.now() + Duration::from_secs(2));
+        app.tick();
+        if entered_rx.recv_timeout(Duration::from_millis(100)).is_ok() {
+            count += 1;
+        }
+    }
+    // Release all metadata calls before any assertions/fixture cleanup.
+    let (lock, changed) = &*gate;
+    *lock.lock().unwrap() = true;
+    changed.notify_all();
+    for _ in 0..count {
+        finished_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while app
+        .jobs
+        .iter()
+        .skip(1)
+        .any(|job| matches!(job.status, JobStatus::Running | JobStatus::Paused))
+        && Instant::now() < deadline
+    {
+        app.tick();
+        thread::yield_now();
+    }
+    let jobs_finished = app
+        .jobs
+        .iter()
+        .skip(1)
+        .all(|job| matches!(job.status, JobStatus::Failed(_)));
+    app.cancel_pending_work();
+    drop(app);
+    std::fs::remove_dir_all(&base).unwrap();
+    assert!(
+        jobs_finished,
+        "all owned missing-source workers must finish before cleanup"
+    );
+    assert_eq!(
+        count, 1,
+        "{count} simultaneously blocked probes from actual core transfer replacement"
+    );
+}
