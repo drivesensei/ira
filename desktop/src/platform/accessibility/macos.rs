@@ -84,10 +84,10 @@ define_class!(
         fn ax_frame(&self)->NSRect {
             // A non-materialized/offscreen element has no hit target. AppKit requires a rect return;
             // an empty rect denotes unavailable geometry and is never inserted into the hit map.
-            self.ivars().state.upgrade().and_then(|s|s.frames.borrow().get(&self.ivars().id).copied()).unwrap_or_default()
+            self.node().and_then(|_|self.ivars().state.upgrade()).and_then(|s|s.frames.borrow().get(&self.ivars().id).copied()).unwrap_or_default()
         }
         #[unsafe(method(isAccessibilityHidden))]
-        fn ax_hidden(&self)->bool {self.ivars().state.upgrade().is_none_or(|s|!s.attached.get() || !s.tree.borrow().in_modal_scope(self.ivars().id) || !s.tree.borrow().nodes.contains_key(&self.ivars().id))}
+        fn ax_hidden(&self)->bool {self.ivars().state.upgrade().is_none_or(|s|!s.attached.get() || s.tree.borrow().query_node(self.ivars().id).is_none())}
         #[unsafe(method_id(accessibilityParent))]
         fn ax_parent(&self)->Option<Retained<AnyObject>> { (|| {
             let state=self.ivars().state.upgrade()?; let node=self.node()?;
@@ -95,25 +95,25 @@ define_class!(
         })() }
         #[unsafe(method_id(accessibilityChildren))]
         fn ax_children(&self)->Option<Retained<NSArray>> { (|| {
-            let state=self.ivars().state.upgrade()?; let node=state.tree.borrow().nodes.get(&self.ivars().id)?.clone();
+            let state=self.ivars().state.upgrade()?; if !state.attached.get() {return None;} let node=state.tree.borrow().query_node(self.ivars().id)?.clone();
             let elements:Vec<Retained<AnyObject>>=node.children.iter().filter_map(|id|state.element(*id).map(|e|e.into_super().into_super().into_super())).collect();
             Some(NSArray::from_retained_slice(&elements))
         })() }
         #[unsafe(method_id(accessibilitySelectedChildren))]
         fn ax_selected_children(&self)->Option<Retained<NSArray>> { (|| {
-            let state=self.ivars().state.upgrade()?; let node=state.tree.borrow().nodes.get(&self.ivars().id)?.clone();
+            let state=self.ivars().state.upgrade()?; if !state.attached.get() {return None;} let node=state.tree.borrow().query_node(self.ivars().id)?.clone();
             let ids:Vec<_>=node.children.iter().copied().filter(|id|state.tree.borrow().nodes.get(id).is_some_and(|n|n.selected)).collect();
             let elements:Vec<Retained<AnyObject>>=ids.into_iter().filter_map(|id|state.element(id).map(|e|e.into_super().into_super().into_super())).collect();
             Some(NSArray::from_retained_slice(&elements))
         })() }
         #[unsafe(method_id(accessibilityFocusedUIElement))]
         fn ax_focused_element(&self)->Option<Retained<AnyObject>> { (|| {
-            let state=self.ivars().state.upgrade()?; let id=state.tree.borrow().focused?;
+            let state=self.ivars().state.upgrade()?; self.node()?; let id=state.tree.borrow().focused?;
             state.element(id).map(|e|e.into_super().into_super().into_super())
         })() }
         #[unsafe(method_id(accessibilityHitTest:))]
         fn ax_hit_test(&self,point:NSPoint)->Option<Retained<AnyObject>> { (|| {
-            let state=self.ivars().state.upgrade()?; if !state.attached.get() {return None;}
+            let state=self.ivars().state.upgrade()?; self.node()?; if !state.attached.get() {return None;}
             if let Some(frame)=state.prepared.borrow().as_ref() {
                 let frames=state.frames.borrow();
                 let id=frame.geometry.ordered_ids().find(|id|frames.get(id).is_some_and(|r|point.x>=r.origin.x && point.x<r.origin.x+r.size.width && point.y>=r.origin.y && point.y<r.origin.y+r.size.height))?;
@@ -202,8 +202,7 @@ impl AxElement {
         state
             .tree
             .borrow()
-            .nodes
-            .get(&self.ivars().id)
+            .query_node(self.ivars().id)
             .map(Node::clone_metadata)
     }
     fn dispatch(&self, action: Action) -> bool {
@@ -229,7 +228,7 @@ impl AxElement {
 }
 impl MacState {
     fn element(self: &Rc<Self>, id: NodeId) -> Option<Retained<AxElement>> {
-        if !self.attached.get() || !self.tree.borrow().nodes.contains_key(&id) {
+        if !self.attached.get() || self.tree.borrow().query_node(id).is_none() {
             return None;
         }
         if let Some(e) = self.elements.borrow().get(&id) {

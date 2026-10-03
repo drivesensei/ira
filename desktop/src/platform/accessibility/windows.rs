@@ -76,6 +76,31 @@ impl State {
             .map(|c| c.tree.clone())
             .map_err(|_| unavailable())
     }
+    fn publication(&self) -> Result<(Arc<SemanticTree>, Option<Arc<PreparedFrame>>)> {
+        let cache = self.cache.try_lock().map_err(|_| unavailable())?;
+        if self.closing.load(Ordering::Acquire) {
+            return Err(unavailable());
+        }
+        Ok((cache.tree.clone(), cache.prepared.clone()))
+    }
+    fn send_observed(
+        &self,
+        id: NodeId,
+        action: Action,
+        tree: &SemanticTree,
+        prepared: Option<&PreparedFrame>,
+    ) -> Result<()> {
+        let intent = AccessibilityIntent {
+            node: id,
+            stamp: tree.stamp,
+            action,
+        };
+        match prepared {
+            Some(frame) => self.sink.try_dispatch_prepared(intent, frame.key.request),
+            None => self.sink.try_dispatch(intent),
+        }
+        .map_err(dispatch_error)
+    }
     fn simple(self: &Arc<Self>, id: NodeId) -> Result<IRawElementProviderSimple> {
         self.materialized.record(id).map_err(dispatch_error)?;
         Ok(new_provider(self.clone(), id))
@@ -109,9 +134,11 @@ impl State {
         if self.closing.load(Ordering::Acquire) {
             return Err(unavailable());
         };
-        self.cache
-            .try_lock()
-            .map_err(|_| unavailable())?
+        let cache = self.cache.try_lock().map_err(|_| unavailable())?;
+        if self.closing.load(Ordering::Acquire) || cache.tree.query_node(id).is_none() {
+            return Err(unavailable());
+        }
+        cache
             .frames
             .get(&id)
             .copied()
@@ -135,11 +162,7 @@ struct Provider {
 impl Provider_Impl {
     fn node(&self) -> Result<Node> {
         let tree = self.state.tree()?;
-        if !tree.in_modal_scope(self.id) && self.id != tree.root {
-            return Err(unavailable());
-        };
-        tree.nodes
-            .get(&self.id)
+        tree.query_node(self.id)
             .map(Node::clone_metadata)
             .ok_or_else(unavailable)
     }
@@ -155,7 +178,8 @@ impl IRawElementProviderSimple_Impl for Provider_Impl {
         Ok(ProviderOptions_ServerSideProvider | ProviderOptions_UseComThreading)
     }
     fn GetPatternProvider(&self, id: UIA_PATTERN_ID) -> Result<IUnknown> {
-        let n = self.node()?;
+        let (tree, prepared) = self.state.publication()?;
+        let n = tree.query_node(self.id).ok_or_else(unavailable)?;
         match id {
             UIA_InvokePatternId
                 if n.capabilities.iter().any(|c| {
@@ -172,18 +196,15 @@ impl IRawElementProviderSimple_Impl for Provider_Impl {
             }
             UIA_SelectionPatternId
                 if n.role == Role::List && {
-                    let cache = self.state.cache.try_lock().map_err(|_| unavailable())?;
-                    cache.prepared.as_ref().map_or_else(
+                    prepared.as_ref().map_or_else(
                         || {
-                            cache.tree.nodes.get(&self.id).is_some_and(|n| {
-                                n.children.iter().any(|id| {
-                                    cache.tree.nodes.get(id).is_some_and(|n| {
-                                        n.capabilities.contains(&Capability::Selection)
-                                    })
+                            n.children.iter().any(|id| {
+                                tree.query_node(*id).is_some_and(|n| {
+                                    n.capabilities.contains(&Capability::Selection)
                                 })
                             })
                         },
-                        |f| f.semantic.selection_containers.contains(&self.id),
+                        |frame| frame.semantic.selection_containers.contains(&self.id),
                     )
                 } =>
             {
@@ -248,50 +269,32 @@ impl IRawElementProviderSimple_Impl for Provider_Impl {
 #[allow(non_upper_case_globals)] // Exact pinned Win32 constant names in patterns.
 impl IRawElementProviderFragment_Impl for Provider_Impl {
     fn Navigate(&self, direction: NavigateDirection) -> Result<IRawElementProviderFragment> {
-        let tree = self.state.tree()?;
-        let n = tree.nodes.get(&self.id).ok_or_else(unavailable)?;
-        let prepared = self
-            .state
-            .cache
-            .try_lock()
-            .map_err(|_| unavailable())?
-            .prepared
-            .clone();
-        let id = match direction {
-            NavigateDirection_Parent => n.parent,
-            NavigateDirection_FirstChild => n.children.first().copied(),
-            NavigateDirection_LastChild => n.children.last().copied(),
-            NavigateDirection_NextSibling | NavigateDirection_PreviousSibling => {
-                if let Some(frame) = &prepared {
-                    frame
-                        .semantic
-                        .siblings
-                        .get(&self.id)
-                        .and_then(|(previous, next)| {
-                            if direction == NavigateDirection_NextSibling {
-                                *next
-                            } else {
-                                *previous
-                            }
-                        })
-                } else {
-                    n.parent.and_then(|p| tree.nodes.get(&p)).and_then(|p| {
-                        p.children
-                            .iter()
-                            .position(|id| *id == self.id)
-                            .and_then(|i| {
-                                if direction == NavigateDirection_NextSibling {
-                                    p.children.get(i + 1).copied()
-                                } else {
-                                    i.checked_sub(1).and_then(|i| p.children.get(i).copied())
-                                }
-                            })
-                    })
-                }
-            }
-            _ => return Err(Error::from_hresult(E_INVALIDARG)),
+        let cache = self.state.cache.try_lock().map_err(|_| unavailable())?;
+        if self.state.closing.load(Ordering::Acquire) {
+            return Err(unavailable());
         }
-        .ok_or_else(unsupported)?;
+        let direction = match direction {
+            NavigateDirection_Parent => super::model::NavigationDirection::Parent,
+            NavigateDirection_FirstChild => super::model::NavigationDirection::FirstChild,
+            NavigateDirection_LastChild => super::model::NavigationDirection::LastChild,
+            NavigateDirection_NextSibling => super::model::NavigationDirection::NextSibling,
+            NavigateDirection_PreviousSibling => super::model::NavigationDirection::PreviousSibling,
+            _ => return Err(Error::from_hresult(E_INVALIDARG)),
+        };
+        let id = super::model::navigation_destination(
+            &cache.tree,
+            cache.prepared.as_ref().map(|frame| &*frame.semantic),
+            self.id,
+            direction,
+        )
+        .map_err(|error| {
+            if error == Rejection::Unsupported {
+                unsupported()
+            } else {
+                dispatch_error(error)
+            }
+        })?;
+        drop(cache);
         self.state.fragment(id)
     }
     fn GetRuntimeId(&self) -> Result<*mut SAFEARRAY> {
@@ -323,13 +326,14 @@ impl IRawElementProviderFragment_Impl for Provider_Impl {
     }
     fn FragmentRoot(&self) -> Result<IRawElementProviderFragmentRoot> {
         let t = self.state.tree()?;
+        t.query_node(self.id).ok_or_else(unavailable)?;
         self.state.simple(t.root)?.cast()
     }
 }
 impl IRawElementProviderFragmentRoot_Impl for Provider_Impl {
     fn ElementProviderFromPoint(&self, x: f64, y: f64) -> Result<IRawElementProviderFragment> {
         let cache = self.state.cache.try_lock().map_err(|_| unavailable())?;
-        if self.state.closing.load(Ordering::Acquire) || !cache.tree.nodes.contains_key(&self.id) {
+        if self.state.closing.load(Ordering::Acquire) || cache.tree.query_node(self.id).is_none() {
             return Err(unavailable());
         }
         if let Some(frame) = &cache.prepared {
@@ -366,12 +370,16 @@ impl IRawElementProviderFragmentRoot_Impl for Provider_Impl {
     }
     fn GetFocus(&self) -> Result<IRawElementProviderFragment> {
         let t = self.state.tree()?;
-        self.state.fragment(t.focused.ok_or_else(unsupported)?)
+        t.query_node(self.id).ok_or_else(unavailable)?;
+        let focused = t.focused.ok_or_else(unsupported)?;
+        t.query_node(focused).ok_or_else(unavailable)?;
+        self.state.fragment(focused)
     }
 }
 impl IInvokeProvider_Impl for Provider_Impl {
     fn Invoke(&self) -> Result<()> {
-        let n = self.node()?;
+        let (tree, prepared) = self.state.publication()?;
+        let n = tree.query_node(self.id).ok_or_else(unavailable)?;
         let action = if n.capabilities.contains(&Capability::Activate) {
             Action::Activate
         } else if n.capabilities.contains(&Capability::Pause) {
@@ -383,18 +391,18 @@ impl IInvokeProvider_Impl for Provider_Impl {
         } else {
             return Err(unsupported());
         };
-        self.state.send(self.id, action)
+        self.state
+            .send_observed(self.id, action, &tree, prepared.as_deref())
     }
 }
 impl ISelectionProvider_Impl for Provider_Impl {
     fn GetSelection(&self) -> Result<*mut SAFEARRAY> {
-        self.node()?;
         let t = self.state.tree()?;
-        let n = t.nodes.get(&self.id).ok_or_else(unavailable)?;
+        let n = t.query_node(self.id).ok_or_else(unavailable)?;
         let values: Vec<IUnknown> = n
             .children
             .iter()
-            .filter(|id| t.nodes.get(id).is_some_and(|n| n.selected))
+            .filter(|id| t.query_node(**id).is_some_and(|n| n.selected))
             .map(|id| self.state.simple(*id)?.cast())
             .collect::<Result<_>>()?;
         interfaces(&values)
