@@ -83,12 +83,21 @@ pub enum JobEvent {
     },
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+struct GateWaitTest {
+    entered: mpsc::Sender<()>,
+    released: mpsc::Receiver<()>,
+}
+
 /// Shared cancellation + pause state between the UI and the worker thread.
 #[derive(Debug)]
 pub struct JobControl {
     cancel: AtomicBool,
     pause: Mutex<bool>,
     resume: Condvar,
+    #[cfg(test)]
+    before_wait: Mutex<Option<GateWaitTest>>,
 }
 
 impl JobControl {
@@ -97,10 +106,15 @@ impl JobControl {
             cancel: AtomicBool::new(false),
             pause: Mutex::new(false),
             resume: Condvar::new(),
+            #[cfg(test)]
+            before_wait: Mutex::new(None),
         })
     }
 
     pub fn request_cancel(&self) {
+        // Serialize publication with the paused predicate's check/registration.
+        // The named guard covers both store and notification; no business I/O.
+        let _paused = self.pause.lock();
         self.cancel.store(true, Ordering::Relaxed);
         self.resume.notify_all();
     }
@@ -125,6 +139,15 @@ impl JobControl {
         while *paused {
             if self.cancel.load(Ordering::Relaxed) {
                 return Err(JobError::Cancelled);
+            }
+            #[cfg(test)]
+            if let Some(hook) = self.before_wait.lock().take() {
+                let _ = hook.entered.send(());
+                // Bounded, test-only observation of the real check/wait gap.
+                // Disconnection/timeout merely releases the hook, never cancels.
+                let _ = hook
+                    .released
+                    .recv_timeout(std::time::Duration::from_secs(5));
             }
             self.resume.wait(&mut paused);
         }
@@ -1200,3 +1223,7 @@ mod batch_tests;
 #[cfg(test)]
 #[path = "transfer_safety_tests.rs"]
 mod safety_tests;
+
+#[cfg(test)]
+#[path = "transfer_cancel_wake_tests.rs"]
+mod cancel_wake_tests;

@@ -873,7 +873,8 @@ impl Runtime {
     pub fn shutdown_complete(&self) -> bool {
         self.shutdown_complete.load(Ordering::Acquire)
     }
-    /// Does not enqueue, lock or join. Known worker controls are canceled immediately.
+    /// Does not enqueue business work, wait on App/session locks, do I/O or join workers.
+    /// Cancelling known controls briefly synchronizes each pause predicate; it may contend.
     pub fn stop(&self, controls: &[Arc<JobControl>]) {
         self.stopping.store(true, Ordering::Release);
         for control in controls {
