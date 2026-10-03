@@ -353,3 +353,347 @@ fn native_reveal_selects_files_and_directories_with_source_arguments() {
         )
     );
 }
+
+#[test]
+fn wheel_uses_current_pane_cursor_and_cannot_bypass_modal_priority() {
+    let fixture = Fixture::new();
+    let mut app = fixture.app();
+    apply(
+        &mut app,
+        envelope(
+            1,
+            Command::Wheel {
+                pane: 0,
+                listing_generation: 3,
+                next: true,
+            },
+        ),
+    )
+    .unwrap();
+    assert_eq!(app.panes[0].state.selected(), Some(1));
+    assert!(
+        apply(
+            &mut app,
+            envelope(
+                2,
+                Command::Wheel {
+                    pane: 0,
+                    listing_generation: 2,
+                    next: false
+                }
+            )
+        )
+        .is_err()
+    );
+    assert_eq!(app.panes[0].state.selected(), Some(1));
+    apply(&mut app, envelope(3, key(KeyCode::Enter))).unwrap();
+    assert!(
+        apply(
+            &mut app,
+            envelope(
+                4,
+                Command::Wheel {
+                    pane: 0,
+                    listing_generation: 3,
+                    next: false
+                }
+            )
+        )
+        .is_err()
+    );
+    assert_eq!(app.panes[0].state.selected(), Some(1));
+}
+
+#[test]
+fn job_pointer_pause_resolves_stable_id_after_job_reorder() {
+    use ira_core::services::transfer::{Job, JobControl, JobKind, JobStatus, OverwritePolicy};
+    use ira_desktop::runtime::JobVerb;
+    let fixture = Fixture::new();
+    let mut app = fixture.app();
+    app.copy_board = true;
+    for id in [40, 30] {
+        app.jobs.push(Job {
+            id,
+            kind: JobKind::Copy,
+            overwrite: OverwritePolicy::SkipExisting,
+            paths: vec![],
+            dest_dir: fixture.0.to_string_lossy().into_owned(),
+            label: format!("job{id}"),
+            total_bytes: None,
+            copied_bytes: 0,
+            current: String::new(),
+            status: JobStatus::Running,
+            started_at: Instant::now(),
+            control: JobControl::new(),
+        });
+    }
+    apply(
+        &mut app,
+        envelope(
+            1,
+            Command::Job {
+                id: 30,
+                verb: JobVerb::Pause,
+            },
+        ),
+    )
+    .unwrap();
+    assert!(app.board_focused);
+    assert_eq!(app.copy_board_state.selected(), Some(1));
+    assert!(matches!(app.jobs[1].status, JobStatus::Paused));
+    assert!(matches!(app.jobs[0].status, JobStatus::Running));
+    app.jobs.swap(0, 1);
+    apply(
+        &mut app,
+        envelope(
+            2,
+            Command::Job {
+                id: 30,
+                verb: JobVerb::Pause,
+            },
+        ),
+    )
+    .unwrap();
+    assert_eq!(app.copy_board_state.selected(), Some(0));
+    assert!(matches!(app.jobs[0].status, JobStatus::Running));
+    assert!(
+        apply(
+            &mut app,
+            envelope(
+                3,
+                Command::Job {
+                    id: 999,
+                    verb: JobVerb::Pause
+                }
+            )
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn native_color_preserves_rgb_named_indexed_and_reset_resolution() {
+    use ira_core::theme::Color;
+    for (source, expected) in [
+        (Color::Rgb(17, 34, 51), 0x112233ff),
+        (Color::Red, 0x800000ff),
+        (Color::Indexed(196), 0xff0000ff),
+        (Color::Reset, 0x1e1e2eff),
+    ] {
+        assert_eq!(
+            ira_desktop::views::native_color(source),
+            gpui::rgba(expected)
+        );
+    }
+}
+
+#[test]
+fn geometry_round_trip_is_separate_from_session_state_and_ordered_on_reopen() {
+    use ira_desktop::platform::geometry::{Geometry, Writer};
+    let fixture = Fixture::new();
+    let path = fixture.0.join("desktop-window");
+    let writer = Writer::new(Some(path.clone()));
+    assert_eq!(
+        writer.load().recv_timeout(Duration::from_secs(2)).unwrap(),
+        None
+    );
+    let first = Geometry {
+        x: 20.,
+        y: 30.,
+        width: 960.,
+        height: 640.,
+        mode: 0,
+    };
+    let last = Geometry {
+        x: 40.,
+        y: 50.,
+        width: 1080.,
+        height: 720.,
+        mode: 1,
+    };
+    writer.save(first);
+    writer.save(last);
+    assert_eq!(
+        writer.load().recv_timeout(Duration::from_secs(2)).unwrap(),
+        Some(last)
+    );
+    writer
+        .barrier()
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(
+        Geometry::parse(&std::fs::read_to_string(path).unwrap()),
+        Some(last)
+    );
+    assert!(!fixture.0.join("state").exists());
+    assert!(writer.try_error().is_none());
+}
+
+#[test]
+fn geometry_rejects_corrupt_nonfinite_and_unbounded_values() {
+    use ira_desktop::platform::geometry::Geometry;
+    for text in [
+        "",
+        "ira-window-v1 0 0 NaN 720 0",
+        "ira-window-v1 inf 0 1080 720 0",
+        "ira-window-v1 0 0 100000 720 0",
+        "ira-window-v1 0 0 1080 720 3",
+        "ira-window-v0 0 0 1080 720 0",
+    ] {
+        assert!(Geometry::parse(text).is_none(), "{text}");
+    }
+}
+
+#[test]
+fn geometry_removed_monitor_restores_visible_fallback_and_window_mode() {
+    use ira_desktop::platform::geometry::Geometry;
+    let display = gpui::Bounds {
+        origin: gpui::point(gpui::px(0.), gpui::px(0.)),
+        size: gpui::size(gpui::px(1440.), gpui::px(900.)),
+    };
+    let fallback = gpui::Bounds {
+        origin: gpui::point(gpui::px(180.), gpui::px(90.)),
+        size: gpui::size(gpui::px(1080.), gpui::px(720.)),
+    };
+    let restored = Geometry {
+        x: 3000.,
+        y: 2000.,
+        width: 1080.,
+        height: 720.,
+        mode: 2,
+    }
+    .restore(&[display], fallback);
+    assert!(matches!(restored, gpui::WindowBounds::Fullscreen(_)));
+    assert_eq!(restored.get_bounds(), fallback);
+}
+
+#[test]
+fn queued_native_copy_is_rejected_observably_after_window_replacement() {
+    let fixture = Fixture::new();
+    let mut app = fixture.app();
+    app.copy_folder_path();
+    let mut old = Runtime::with_factory(7, move || app);
+    old.enqueue(Command::Input(Input::Tick), None);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if old
+            .try_snapshot()
+            .is_some_and(|publication| publication.snapshot.ack_sequence >= 1)
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    old.detach();
+    let reopened = old.attach(8);
+    let guard = reopened.effect_guard(7);
+    assert!(!guard.is_current());
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match reopened.try_completion() {
+            Some(Completion::Rejected {
+                window_generation: 7,
+                reason,
+                ..
+            }) => {
+                assert!(reason.contains("replaced window"));
+                break;
+            }
+            Some(Completion::Host { .. }) => panic!("Old window native effect escaped the guard"),
+            _ => {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+    reopened.stop(&[]);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !matches!(reopened.try_completion(), Some(Completion::Closed)) {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn recurring_drive_worker_does_not_block_input_and_rejects_old_window_results() {
+    let fixture = Fixture::new();
+    let app = fixture.app();
+    let folder_path = fixture.0.to_string_lossy().into_owned();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (gate_tx, gate_rx) = mpsc::channel();
+    let mut first = true;
+    let mut runtime = Runtime::with_drive_probe(
+        7,
+        move || app,
+        move || {
+            if first {
+                first = false;
+                entered_tx.send(()).unwrap();
+                gate_rx.recv().unwrap();
+                Ok(vec![Folder::new(
+                    "old-mounted".into(),
+                    folder_path.clone(),
+                    '1',
+                )])
+            } else {
+                Ok(vec![Folder::new(
+                    "new-mounted".into(),
+                    folder_path.clone(),
+                    '1',
+                )])
+            }
+        },
+    );
+    entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    runtime.enqueue(key(KeyCode::Down), None);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if runtime.try_snapshot().is_some_and(|publication| {
+            publication.snapshot.ack_sequence >= 1
+                && publication.snapshot.panes[0].cursor == Some(1)
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "input blocked behind drive enumeration"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let reopened = runtime.attach(8);
+    gate_tx.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(publication) = reopened.try_snapshot() {
+            assert!(
+                publication
+                    .snapshot
+                    .drives
+                    .as_ref()
+                    .is_none_or(|drives| drives.iter().all(|drive| drive.label != "old-mounted")),
+                "Old enumeration mutated the reopened window"
+            );
+            if publication.snapshot.window_generation == 8
+                && publication.snapshot.drives.as_ref().is_some_and(|drives| {
+                    drives
+                        .first()
+                        .is_some_and(|drive| drive.label == "new-mounted")
+                })
+            {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "recurring fresh drive scan was not published"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    reopened.stop(&[]);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !matches!(reopened.try_completion(), Some(Completion::Closed)) {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}

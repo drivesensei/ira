@@ -5,12 +5,12 @@ use crate::{
     },
     focus::{self, InputMode},
     keymap,
-    runtime::{Command, Completion, PlaceKind, Runtime, TargetVerb},
+    runtime::{Command, Completion, JobVerb, PlaceKind, Runtime, TargetVerb},
 };
 use gpui::{
     ClickEvent, ClipboardItem, Context, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent,
-    Render, Subscription, Task, UniformListScrollHandle, Window, div, prelude::*, px, rgb,
-    uniform_list,
+    Render, ScrollStrategy, ScrollWheelEvent, Subscription, Task, UniformListScrollHandle, Window,
+    div, prelude::*, px, uniform_list,
 };
 use ira_core::{
     input::{Input, KeyCode, KeyEvent, KeyModifiers},
@@ -36,11 +36,19 @@ pub struct Desktop {
     input_subscription: Option<Subscription>,
     polling: Option<Task<()>>,
     feedback: Option<String>,
+    theme: ira_core::theme::Theme,
+    font_family: Option<String>,
+    geometry: crate::platform::geometry::Writer,
+    geometry_subscription: Option<Subscription>,
     host_tx: mpsc::Sender<Result<(), String>>,
     host_rx: mpsc::Receiver<Result<(), String>>,
 }
 impl Desktop {
-    pub fn new(runtime: Runtime, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        runtime: Runtime,
+        geometry: crate::platform::geometry::Writer,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let (host_tx, host_rx) = mpsc::channel();
         let polling = cx.spawn(async move |entity, cx| {
             loop {
@@ -64,12 +72,22 @@ impl Desktop {
             input_subscription: None,
             polling: Some(polling),
             feedback: None,
+            theme: ira_core::theme::ThemePreset::default().theme(),
+            font_family: None,
+            geometry,
+            geometry_subscription: None,
             host_tx,
             host_rx,
         }
     }
-    pub fn focus_main(&self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn focus_main(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus);
+        self.geometry_subscription = Some(cx.observe_window_bounds(window, |this, window, _| {
+            this.geometry
+                .save(crate::platform::geometry::Geometry::from_bounds(
+                    window.window_bounds(),
+                ));
+        }));
         cx.notify();
     }
     pub fn close(&mut self) {
@@ -79,10 +97,24 @@ impl Desktop {
     }
     fn poll(&mut self, cx: &mut Context<Self>) {
         self.runtime.flush();
+        if let Some(error) = self.geometry.try_error() {
+            self.runtime.enqueue(Command::HostResult(Err(error)), None);
+        }
         let mut changed = false;
         if let Some(publication) = self.runtime.try_snapshot()
             && publication.snapshot.window_generation == self.runtime.window_generation
         {
+            for (index, pane) in publication.snapshot.panes.iter().enumerate() {
+                if self.snapshot.as_ref().is_none_or(|old| {
+                    old.panes[index].cursor != pane.cursor
+                        || old.panes[index].listing_generation != pane.listing_generation
+                }) && let Some(cursor) = pane.cursor
+                {
+                    self.scroll[index].scroll_to_item(cursor, ScrollStrategy::Center);
+                }
+            }
+            self.theme = publication.theme;
+            self.font_family = publication.font_family;
             self.snapshot = Some(publication.snapshot);
             self.controls = publication.cancellation;
             changed = true;
@@ -93,10 +125,41 @@ impl Desktop {
                 break;
             };
             match completion {
-                Completion::Rejected { reason, .. } => self.feedback = Some(reason),
-                Completion::Host { request, .. } => self.host(request, cx),
+                Completion::Rejected {
+                    window_generation,
+                    reason,
+                    ..
+                } => {
+                    if window_generation == self.runtime.window_generation {
+                        self.feedback = Some(reason);
+                    }
+                }
+                Completion::Host {
+                    window_generation,
+                    input_generation,
+                    request,
+                    ..
+                } => {
+                    if input_generation.is_some_and(|generation| {
+                        self.snapshot.as_ref().is_none_or(|snapshot| {
+                            generation != (snapshot.document_generation, snapshot.focus_generation)
+                        })
+                    }) {
+                        continue;
+                    }
+                    self.host(request, self.runtime.effect_guard(window_generation), cx)
+                }
                 Completion::Closed => {
-                    cx.quit();
+                    let barrier = self.geometry.barrier();
+                    cx.spawn(async move |_, cx| {
+                        cx.background_executor()
+                            .spawn(async move {
+                                let _ = barrier.recv_timeout(Duration::from_secs(1));
+                            })
+                            .await;
+                        let _ = cx.update(|cx| cx.quit());
+                    })
+                    .detach();
                     return;
                 }
             }
@@ -120,7 +183,15 @@ impl Desktop {
             cx.notify();
         }
     }
-    fn host(&mut self, request: HostRequest, cx: &mut Context<Self>) {
+    fn host(
+        &mut self,
+        request: HostRequest,
+        guard: crate::runtime::EffectGuard,
+        cx: &mut Context<Self>,
+    ) {
+        if !guard.is_current() {
+            return;
+        }
         match request {
             HostRequest::CopyText(text) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -139,7 +210,9 @@ impl Desktop {
             request => {
                 let tx = self.host_tx.clone();
                 std::thread::spawn(move || {
-                    let _ = tx.send(crate::platform::execute(request));
+                    if guard.is_current() {
+                        let _ = tx.send(crate::platform::execute(request));
+                    }
                 });
             }
         }
@@ -335,7 +408,7 @@ impl Desktop {
             .px_3()
             .py_1()
             .rounded_md()
-            .bg(rgb(0x313244))
+            .bg(native_color(self.theme.surface))
             .cursor_pointer()
             .child(label)
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.dispatch(code, cx)))
@@ -354,10 +427,10 @@ impl Desktop {
         let header = div()
             .px_3()
             .py_2()
-            .bg(rgb(if snapshot.active_pane == index {
-                0x45475a
+            .bg(native_color(if snapshot.active_pane == index {
+                self.theme.border_active
             } else {
-                0x313244
+                self.theme.surface
             }))
             .child(title);
         let mut body = div()
@@ -367,7 +440,7 @@ impl Desktop {
             .flex()
             .flex_col()
             .border_1()
-            .border_color(rgb(0x45475a))
+            .border_color(native_color(self.theme.border))
             .child(header);
         if pane.rows.is_empty() {
             body = body.child(div().p_4().child(if !pane.listing_settled {
@@ -383,9 +456,11 @@ impl Desktop {
                 let pane=&snapshot.panes[index];
                 range.filter_map(|row_index|pane.rows.get(row_index).map(|row|{
                     let target=EntryTarget{pane:index,path:PathBuf::from(&row.entry.path),listing_generation:pane.listing_generation};
-                    let label=format!("{} {} {}",if row.selected{"☑"}else{"☐"},if row.entry.is_dir{"▸"}else{"·"},row.entry.label);
+                    let (glyph, category) = ira_core::theme::icons::icon_for(&row.entry, snapshot.icons);
+                    let label=format!("{} {} {}",if row.selected{"☑"}else{"☐"},glyph,row.entry.label);
+                    let foreground = if pane.cursor == Some(row_index) && snapshot.active_pane == index { this.theme.cursor_fg } else { this.theme.color_for(category) };
                     let size=if row.entry.is_dir{"Folder".to_string()}else{format!("{} B",row.entry.size)};
-                    div().id(("row",row_index)).h(px(30.)).px_3().flex().justify_between().items_center().bg(rgb(if pane.cursor==Some(row_index)&&snapshot.active_pane==index{0x585b70}else{0x1e1e2e})).cursor_pointer().child(label).child(div().text_sm().text_color(rgb(0xa6adc8)).child(size))
+                    div().id(("row",row_index)).h(px(30.)).px_3().flex().justify_between().items_center().bg(native_color(if pane.cursor==Some(row_index)&&snapshot.active_pane==index{this.theme.cursor_bg}else if row.selected{this.theme.selection}else{this.theme.bg})).text_color(native_color(foreground)).cursor_pointer().child(label).child(div().text_sm().text_color(native_color(this.theme.text_muted)).child(size))
                         .on_click(cx.listener(move|this,event:&ClickEvent,window,cx|{
                             let double=matches!(event,ClickEvent::Mouse(e) if e.down.click_count>=2);
                             let modifiers=event.modifiers();
@@ -395,6 +470,24 @@ impl Desktop {
                 })).collect::<Vec<_>>()
             })).track_scroll(self.scroll[index].clone()).flex_1().min_h_0());
         }
+        body = body.on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, _, cx| {
+            let delta = event.delta.pixel_delta(px(30.)).y;
+            if delta == px(0.) {
+                return;
+            }
+            if let Some(snapshot) = &this.snapshot {
+                this.runtime.enqueue(
+                    Command::Wheel {
+                        pane: index,
+                        listing_generation: snapshot.panes[index].listing_generation,
+                        next: delta < px(0.),
+                    },
+                    None,
+                );
+                cx.stop_propagation();
+                cx.notify();
+            }
+        }));
         body.into_any_element()
     }
     fn places(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -405,14 +498,19 @@ impl Desktop {
             .flex_col()
             .gap_2()
             .p_3()
-            .bg(rgb(0x181825));
+            .bg(native_color(self.theme.surface_alt));
         if let Some(snapshot) = &self.snapshot {
             for (heading, folders) in [
                 ("Drives", &snapshot.drives),
                 ("Places", &snapshot.folders),
                 ("Bookmarks", &snapshot.bookmarks),
             ] {
-                list = list.child(div().text_sm().text_color(rgb(0xa6adc8)).child(heading));
+                list = list.child(
+                    div()
+                        .text_sm()
+                        .text_color(native_color(self.theme.text_muted))
+                        .child(heading),
+                );
                 if let Some(folders) = folders {
                     for (i, folder) in folders.iter().enumerate() {
                         let key = if heading == "Drives" {
@@ -462,9 +560,9 @@ impl Desktop {
             .right(px(90.))
             .p_5()
             .rounded_lg()
-            .bg(rgb(0x313244))
+            .bg(native_color(self.theme.surface))
             .border_1()
-            .border_color(rgb(0x89b4fa))
+            .border_color(native_color(self.theme.border_active))
             .flex()
             .flex_col()
             .gap_3();
@@ -552,15 +650,62 @@ impl Render for Desktop {
         if let Some(snapshot) = &self.snapshot
             && snapshot.copy_board
         {
-            let mut board = div().p_3().bg(rgb(0x181825)).child("Copy Board");
-            for job in &snapshot.jobs {
-                board = board.child(format!(
-                    "{} · {:?} · {} / {} B",
-                    job.label,
-                    job.status,
-                    job.copied_bytes,
-                    job.total_bytes.unwrap_or(0)
-                ));
+            let mut board = div()
+                .p_3()
+                .bg(native_color(self.theme.surface_alt))
+                .child("Copy Board");
+            for (index, job) in snapshot.jobs.iter().enumerate() {
+                let id = job.id;
+                let mut row = div()
+                    .id(("job", index))
+                    .p_2()
+                    .flex()
+                    .gap_3()
+                    .items_center()
+                    .bg(native_color(
+                        if snapshot.board_focused && snapshot.copy_board_cursor == Some(index) {
+                            self.theme.cursor_bg
+                        } else {
+                            self.theme.surface_alt
+                        },
+                    ))
+                    .child(format!(
+                        "{} · {:?} · {} / {} B",
+                        job.label,
+                        job.status,
+                        job.copied_bytes,
+                        job.total_bytes.unwrap_or(0)
+                    ))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        window.focus(&this.focus);
+                        this.runtime.enqueue(
+                            Command::Job {
+                                id,
+                                verb: JobVerb::Focus,
+                            },
+                            None,
+                        );
+                        cx.notify();
+                    }));
+                for (label, verb) in [
+                    ("Pause / Resume", JobVerb::Pause),
+                    ("Cancel", JobVerb::Cancel),
+                ] {
+                    row = row.child(
+                        div()
+                            .id((label, index))
+                            .px_2()
+                            .cursor_pointer()
+                            .child(label)
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                window.focus(&this.focus);
+                                this.runtime.enqueue(Command::Job { id, verb }, None);
+                                cx.stop_propagation();
+                                cx.notify();
+                            })),
+                    );
+                }
+                board = board.child(row);
             }
             content = content.child(board);
         }
@@ -582,8 +727,8 @@ impl Render for Desktop {
                 .size_full()
                 .flex()
                 .flex_col()
-                .bg(rgb(0x1e1e2e))
-                .text_color(rgb(0xcdd6f4))
+                .bg(native_color(self.theme.bg))
+                .text_color(native_color(self.theme.text))
                 .on_key_down(cx.listener(Self::key))
                 .on_action(cx.listener(|this, _: &actions::Quit, _, _cx| {
                     this.runtime.stop(&this.controls);
@@ -666,7 +811,16 @@ impl Render for Desktop {
                         .child(self.places(cx))
                         .child(content),
                 )
-                .child(div().p_2().text_sm().bg(rgb(0x181825)).child(status));
+                .child(
+                    div()
+                        .p_2()
+                        .text_sm()
+                        .bg(native_color(self.theme.surface_alt))
+                        .child(status),
+                );
+        if let Some(family) = &self.font_family {
+            root = root.font_family(family.clone());
+        }
         if let Some(modal) = self.modal(window.bounds().size.height, cx) {
             root = root.child(modal);
         }
@@ -677,4 +831,17 @@ impl Drop for Desktop {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+/// The UI-neutral palette owns quantization and named-color resolution.
+pub fn native_color(color: ira_core::theme::Color) -> gpui::Rgba {
+    let c = color.rgba(ira_core::theme::Rgba {
+        r: 30,
+        g: 30,
+        b: 46,
+        a: 255,
+    });
+    gpui::rgba(
+        (u32::from(c.r) << 24) | (u32::from(c.g) << 16) | (u32::from(c.b) << 8) | u32::from(c.a),
+    )
 }

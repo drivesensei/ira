@@ -1,4 +1,5 @@
-//! Explicit native requests run on workers, never during Render.
+pub mod geometry;
+// Explicit native requests run on workers, never during Render.
 use ira_core::model::HostRequest;
 use std::{
     path::{Path, PathBuf},
@@ -280,9 +281,34 @@ pub fn drives() -> std::io::Result<Vec<ira_core::domain::data::Folder>> {
 }
 #[cfg(target_os = "windows")]
 mod windows {
+    use std::{io, os::windows::ffi::OsStrExt, path::Path};
+    pub fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+        fn wide(path: &Path) -> io::Result<Vec<u16>> {
+            let mut value: Vec<_> = path.as_os_str().encode_wide().collect();
+            if value.contains(&0) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Path contains NUL",
+                ));
+            }
+            value.push(0);
+            Ok(value)
+        }
+        let source = wide(source)?;
+        let destination = wide(destination)?;
+        // Zero flags forbid replacement and cross-volume copying. Both buffers remain live.
+        if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), 0) } == 0 {
+            let error = unsafe { GetLastError() };
+            Err(io::Error::from_raw_os_error(error as i32))
+        } else {
+            Ok(())
+        }
+    }
     pub struct Labels;
     #[link(name = "kernel32")]
     unsafe extern "system" {
+        fn MoveFileExW(source: *const u16, destination: *const u16, flags: u32) -> i32;
+        fn GetLastError() -> u32;
         fn GetVolumeInformationW(
             root: *const u16,
             label: *mut u16,
@@ -325,3 +351,6 @@ mod windows {
         }
     }
 }
+
+#[cfg(target_os = "windows")]
+pub use windows::rename_no_replace;

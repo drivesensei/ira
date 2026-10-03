@@ -6,6 +6,7 @@ use ira_core::{
     model::{EntryTarget, HostRequest, OpenEditorRequest},
     observable::Snapshot,
     services::transfer::JobControl,
+    theme::{Loader, Theme, ThemeCapabilities},
 };
 use std::{
     collections::VecDeque,
@@ -22,6 +23,15 @@ use std::{
 #[derive(Clone, Debug)]
 pub enum Command {
     Input(Input),
+    Wheel {
+        pane: usize,
+        listing_generation: u64,
+        next: bool,
+    },
+    Job {
+        id: u64,
+        verb: JobVerb,
+    },
     Place {
         kind: PlaceKind,
         path: String,
@@ -49,6 +59,12 @@ pub enum Command {
     SetFocus(u64),
 }
 #[derive(Clone, Copy, Debug)]
+pub enum JobVerb {
+    Focus,
+    Pause,
+    Cancel,
+}
+#[derive(Clone, Copy, Debug)]
 pub enum PlaceKind {
     Drive,
     Common,
@@ -71,10 +87,21 @@ pub struct Envelope {
 pub struct Publication {
     pub snapshot: Arc<Snapshot>,
     pub cancellation: Vec<Arc<JobControl>>,
+    pub theme: Theme,
+    pub font_family: Option<String>,
 }
 pub enum Completion {
-    Rejected { sequence: u64, reason: String },
-    Host { sequence: u64, request: HostRequest },
+    Rejected {
+        sequence: u64,
+        window_generation: u64,
+        reason: String,
+    },
+    Host {
+        sequence: u64,
+        window_generation: u64,
+        input_generation: Option<(u64, u64)>,
+        request: HostRequest,
+    },
     Closed,
 }
 /// Latest snapshots can be coalesced. Semantic completions use a separate FIFO.
@@ -108,9 +135,70 @@ impl Runtime {
     pub fn start(window_generation: u64) -> Self {
         Self::with_factory(window_generation, App::new)
     }
+    pub fn start_with_fonts(window_generation: u64, text: Arc<gpui::TextSystem>) -> Self {
+        Self::with_resources(
+            window_generation,
+            true,
+            Box::new(crate::platform::drives),
+            move || {
+                let mut app = App::new();
+                let font_family = text.all_font_names().into_iter().find(|family| {
+                    let id = text.resolve_font(&gpui::font(family.clone()));
+                    ['\u{f07b}', '\u{e718}', '\u{e0b6}']
+                        .into_iter()
+                        .all(|glyph| text.advance(id, gpui::px(14.), glyph).is_ok())
+                });
+                let caps = ThemeCapabilities {
+                    truecolor: true,
+                    nerd_font: font_family.is_some(),
+                    wide_emoji: true,
+                };
+                let mut loader = Loader::from_env(caps);
+                app.icons = loader.resolve_icons(std::env::var("IRA_ICONS").ok().as_deref());
+                loader.set_icon_set(app.icons);
+                // Seed TOML/default before drain_startup applies an optional persisted state key.
+                app.theme_preset = loader.resolve_preset(None).0;
+                (app, loader, font_family)
+            },
+        )
+    }
     pub fn with_factory(
         window_generation: u64,
         factory: impl FnOnce() -> App + Send + 'static,
+    ) -> Self {
+        Self::with_resources(
+            window_generation,
+            false,
+            Box::new(crate::platform::drives),
+            move || {
+                (
+                    factory(),
+                    Loader::from_toml("", ThemeCapabilities::default()),
+                    None,
+                )
+            },
+        )
+    }
+    pub fn with_drive_probe(
+        window_generation: u64,
+        factory: impl FnOnce() -> App + Send + 'static,
+        probe: impl FnMut() -> std::io::Result<Vec<ira_core::domain::data::Folder>> + Send + 'static,
+    ) -> Self {
+        Self::with_resources(window_generation, true, Box::new(probe), move || {
+            (
+                factory(),
+                Loader::from_toml("", ThemeCapabilities::default()),
+                None,
+            )
+        })
+    }
+    fn with_resources(
+        window_generation: u64,
+        poll_drives: bool,
+        mut drive_probe: Box<
+            dyn FnMut() -> std::io::Result<Vec<ira_core::domain::data::Folder>> + Send,
+        >,
+        factory: impl FnOnce() -> (App, Loader, Option<String>) + Send + 'static,
     ) -> Self {
         let (sender, commands) = mpsc::sync_channel::<Envelope>(256);
         let (completed, completions) = mpsc::channel();
@@ -121,10 +209,42 @@ impl Runtime {
         let attached_window = Arc::new(AtomicU64::new(window_generation));
         let attached = attached_window.clone();
         thread::spawn(move || {
-            let mut app = factory();
+            let (mut app, loader, font_family) = factory();
             app.attach_window(window_generation);
             let (editor_tx, editor_rx) = mpsc::channel::<(u64, HostRequest)>();
             let (editor_done, editor_results) = mpsc::channel();
+            let (drive_tx, drive_rx) = mpsc::channel::<u64>();
+            let drive_stop = stop.clone();
+            let drive_attached = attached.clone();
+            let drive_done = editor_done.clone();
+            thread::spawn(move || {
+                let mut generation = 0u64;
+                while !drive_stop.load(Ordering::Acquire) {
+                    let epoch = match drive_rx.recv_timeout(Duration::from_secs(2)) {
+                        Ok(epoch) => epoch,
+                        Err(mpsc::RecvTimeoutError::Timeout) if poll_drives => {
+                            drive_attached.load(Ordering::Acquire)
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
+                    if epoch == 0
+                        || drive_attached.load(Ordering::Acquire) != epoch
+                        || drive_stop.load(Ordering::Acquire)
+                    {
+                        continue;
+                    }
+                    generation = generation.wrapping_add(1);
+                    let result = drive_probe().map_err(|error| error.to_string());
+                    if drive_done
+                        .send(EditorResult::Drives(epoch, generation, result))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            let mut drive_generation = 0;
             let editor_stop = stop.clone();
             let editor_attached = attached.clone();
             thread::spawn(move || {
@@ -137,10 +257,6 @@ impl Runtime {
                         continue;
                     }
                     let result = match request {
-                        HostRequest::RefreshDrives => EditorResult::Drives(
-                            epoch,
-                            crate::platform::drives().map_err(|e| e.to_string()),
-                        ),
                         HostRequest::OpenEditor(request) => {
                             let result = ira_core::editor::open_document(
                                 request.document_id,
@@ -172,19 +288,44 @@ impl Runtime {
                 }
             });
             let mut last_tick = Instant::now();
-            publish(&app, &publication);
+            publish(&app, &publication, &loader, &font_family);
             while !stop.load(Ordering::Acquire) && app.running {
                 let attached = attached.load(Ordering::Acquire);
                 if app.window_generation != attached {
+                    let old_window = app.window_generation;
+                    let abandoned = app.take_host_requests();
                     app.attach_window(attached);
-                    publish(&app, &publication);
+                    for request in abandoned {
+                        if matches!(request, HostRequest::RefreshDrives) {
+                            route_host(
+                                &app,
+                                request,
+                                app.ack_sequence,
+                                &editor_tx,
+                                &drive_tx,
+                                &completed,
+                            );
+                        } else {
+                            let _ = completed.send(Completion::Rejected {
+                                sequence: app.ack_sequence,
+                                window_generation: old_window,
+                                reason: "Native request belongs to a replaced window".into(),
+                            });
+                        }
+                    }
+                    publish(&app, &publication, &loader, &font_family);
                 }
                 for result in editor_results.try_iter() {
                     match result {
-                        EditorResult::Drives(epoch, result) if epoch == app.window_generation => {
+                        EditorResult::Drives(epoch, generation, result)
+                            if epoch == app.window_generation && generation > drive_generation =>
+                        {
+                            drive_generation = generation;
                             match result {
-                                Ok(drives) => app.apply_drives(drives),
-                                Err(error) => app.set_status(error, true),
+                                Ok(drives) if app.drives.as_ref() != Some(&drives) => {
+                                    app.apply_drives(drives)
+                                }
+                                _ => {}
                             }
                         }
                         EditorResult::Opened(epoch, request, result)
@@ -199,18 +340,23 @@ impl Runtime {
                         }
                         _ => {}
                     }
-                    publish(&app, &publication);
+                    publish(&app, &publication, &loader, &font_family);
                 }
                 match commands.recv_timeout(Duration::from_millis(20)) {
                     Ok(envelope) => {
                         let sequence = envelope.sequence;
+                        let window_generation = envelope.window_generation;
                         if let Err(reason) = apply(&mut app, envelope) {
-                            let _ = completed.send(Completion::Rejected { sequence, reason });
+                            let _ = completed.send(Completion::Rejected {
+                                sequence,
+                                window_generation,
+                                reason,
+                            });
                         }
                         for request in app.take_host_requests() {
-                            route_host(&app, request, sequence, &editor_tx, &completed);
+                            route_host(&app, request, sequence, &editor_tx, &drive_tx, &completed);
                         }
-                        publish(&app, &publication);
+                        publish(&app, &publication, &loader, &font_family);
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -222,12 +368,20 @@ impl Runtime {
                         app.focus_generation = app.focus_generation.wrapping_add(1);
                     }
                     for request in app.take_host_requests() {
-                        route_host(&app, request, app.ack_sequence, &editor_tx, &completed);
+                        route_host(
+                            &app,
+                            request,
+                            app.ack_sequence,
+                            &editor_tx,
+                            &drive_tx,
+                            &completed,
+                        );
                     }
-                    publish(&app, &publication);
+                    publish(&app, &publication, &loader, &font_family);
                     last_tick = Instant::now();
                 }
             }
+            stop.store(true, Ordering::Release);
             app.cancel_pending_work();
             cancel_all(&app);
             app.persist_state();
@@ -308,8 +462,30 @@ impl Runtime {
     pub fn try_snapshot(&self) -> Option<Publication> {
         self.latest.try_take()
     }
+    pub fn effect_guard(&self, window_generation: u64) -> EffectGuard {
+        EffectGuard {
+            attached: self.attached_window.clone(),
+            stopping: self.stopping.clone(),
+            window_generation,
+        }
+    }
     pub fn try_completion(&self) -> Option<Completion> {
-        self.completions.try_lock().ok()?.try_recv().ok()
+        let completion = self.completions.try_lock().ok()?.try_recv().ok()?;
+        if let Completion::Host {
+            sequence,
+            window_generation,
+            ..
+        } = &completion
+            && (*window_generation != self.window_generation
+                || !self.effect_guard(*window_generation).is_current())
+        {
+            return Some(Completion::Rejected {
+                sequence: *sequence,
+                window_generation: *window_generation,
+                reason: "Native request belongs to a replaced window".into(),
+            });
+        }
+        Some(completion)
     }
     /// Does not enqueue, lock or join. Known worker controls are canceled immediately.
     pub fn stop(&self, controls: &[Arc<JobControl>]) {
@@ -328,7 +504,7 @@ fn cancel_all(app: &App) {
         deletion.control.request_cancel();
     }
 }
-fn publish(app: &App, latest: &Latest<Publication>) {
+fn publish(app: &App, latest: &Latest<Publication>, loader: &Loader, font_family: &Option<String>) {
     // Build the owned projection without holding the mailbox lock.
     let snapshot = Arc::new(app.snapshot());
     let mut cancellation: Vec<_> = app.jobs.iter().map(|job| job.control.clone()).collect();
@@ -338,6 +514,8 @@ fn publish(app: &App, latest: &Latest<Publication>) {
     latest.publish(Publication {
         snapshot,
         cancellation,
+        theme: loader.theme_for(app.theme_preset),
+        font_family: font_family.clone(),
     });
 }
 pub fn apply(app: &mut App, envelope: Envelope) -> Result<(), String> {
@@ -355,6 +533,51 @@ pub fn apply(app: &mut App, envelope: Envelope) -> Result<(), String> {
     let previous_context = app.input_context();
     match envelope.command {
         Command::Input(input) => app.dispatch(input).map_err(|error| error.to_string())?,
+        Command::Wheel {
+            pane,
+            listing_generation,
+            next,
+        } => {
+            if !matches!(
+                app.input_context(),
+                ira_core::input::InputContext::Pane(_) | ira_core::input::InputContext::Search
+            ) {
+                return Err("An input or dialog owns focus".into());
+            }
+            if pane >= 2
+                || (pane == 1 && !app.split)
+                || app.panes[pane].listing_generation != listing_generation
+            {
+                return Err("Listing changed during wheel input".into());
+            }
+            app.active_pane = pane;
+            app.dispatch(Input::Key(KeyEvent::new(
+                if next { KeyCode::Down } else { KeyCode::Up },
+                KeyModifiers::NONE,
+            )))
+            .map_err(|error| error.to_string())?;
+        }
+        Command::Job { id, verb } => {
+            if !matches!(
+                app.input_context(),
+                ira_core::input::InputContext::Pane(_) | ira_core::input::InputContext::Board
+            ) || !app.copy_board
+            {
+                return Err("An input or dialog owns focus".into());
+            }
+            let index = app
+                .jobs
+                .iter()
+                .position(|job| job.id == id)
+                .ok_or_else(|| "Job is no longer available".to_string())?;
+            app.board_focused = true;
+            app.copy_board_state.select(Some(index));
+            match verb {
+                JobVerb::Focus => {}
+                JobVerb::Pause => app.toggle_selected_job_pause(),
+                JobVerb::Cancel => app.cancel_selected_job(),
+            }
+        }
         Command::Place { kind, path } => {
             if !matches!(
                 app.input_context(),
@@ -455,7 +678,11 @@ pub fn apply(app: &mut App, envelope: Envelope) -> Result<(), String> {
 }
 
 enum EditorResult {
-    Drives(u64, Result<Vec<ira_core::domain::data::Folder>, String>),
+    Drives(
+        u64,
+        u64,
+        Result<Vec<ira_core::domain::data::Folder>, String>,
+    ),
     Opened(u64, OpenEditorRequest, Result<EditorDocument, EditorError>),
     Saved(u64, u64, u64, Result<SaveCompletion, EditorError>),
 }
@@ -464,14 +691,40 @@ fn route_host(
     request: HostRequest,
     sequence: u64,
     editor: &mpsc::Sender<(u64, HostRequest)>,
+    drives: &mpsc::Sender<u64>,
     completed: &mpsc::Sender<Completion>,
 ) {
-    if matches!(
+    if matches!(request, HostRequest::RefreshDrives) {
+        let _ = drives.send(app.window_generation);
+    } else if matches!(
         request,
-        HostRequest::OpenEditor(_) | HostRequest::SaveEditor(_) | HostRequest::RefreshDrives
+        HostRequest::OpenEditor(_) | HostRequest::SaveEditor(_)
     ) {
         let _ = editor.send((app.window_generation, request));
     } else {
-        let _ = completed.send(Completion::Host { sequence, request });
+        let input_generation = matches!(
+            request,
+            HostRequest::EditorKey { .. } | HostRequest::EditorPaste { .. }
+        )
+        .then_some((app.document_generation, app.focus_generation));
+        let _ = completed.send(Completion::Host {
+            sequence,
+            window_generation: app.window_generation,
+            input_generation,
+            request,
+        });
+    }
+}
+
+#[derive(Clone)]
+pub struct EffectGuard {
+    attached: Arc<AtomicU64>,
+    stopping: Arc<AtomicBool>,
+    window_generation: u64,
+}
+impl EffectGuard {
+    pub fn is_current(&self) -> bool {
+        self.attached.load(Ordering::Acquire) == self.window_generation
+            && !self.stopping.load(Ordering::Acquire)
     }
 }
