@@ -55,6 +55,7 @@ fn measure_actual_actor_100k_cursor_publications_and_retained_rows() {
     assert_eq!(first.snapshot.panes[0].rows.len(), 100_000);
     let mut retained = vec![first.snapshot];
     let mut latency = Vec::new();
+    let mut previous_cursor = 0;
     for index in 1..=25 {
         let start = Instant::now();
         let sequence = runtime.enqueue(
@@ -62,7 +63,10 @@ fn measure_actual_actor_100k_cursor_publications_and_retained_rows() {
             None,
         );
         let value = publication(&runtime, sequence);
-        assert_eq!(value.snapshot.panes[0].cursor, Some(index));
+        // Frozen handler accelerates closely repeated Down keys; assert actual forward progress.
+        let cursor = value.snapshot.panes[0].cursor.unwrap();
+        assert!(cursor > previous_cursor && cursor < 100_000);
+        previous_cursor = cursor;
         if index > 5 {
             latency.push(start.elapsed().as_micros());
         }
