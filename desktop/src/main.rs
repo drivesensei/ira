@@ -5,7 +5,7 @@ use ira_desktop::{
     components::text_input,
     platform::geometry::{self, Geometry, Writer},
     runtime::Runtime,
-    views::Desktop,
+    views::{Desktop, accessibility_retirement::Retirement},
 };
 struct Session {
     runtime: Runtime,
@@ -15,11 +15,14 @@ struct Session {
 }
 impl gpui::Global for Session {}
 fn open_main_window(cx: &mut App) {
+    if cx.global::<Retirement>().quit_committed() {
+        return;
+    }
     if let Some(window) = cx.windows().first().copied() {
         let _ = window.update(cx, |_, window, _| window.activate_window());
         return;
     }
-    if cx.global::<Session>().opening {
+    if !cx.global::<Retirement>().can_open() || cx.global::<Session>().opening {
         return;
     }
     cx.update_global::<Session, _>(|session, _| session.opening = true);
@@ -34,6 +37,10 @@ fn open_main_window(cx: &mut App) {
     .detach();
 }
 fn open_loaded_window(geometry: Option<Geometry>, cx: &mut App) {
+    if !cx.global::<Retirement>().can_open() {
+        cx.update_global::<Session, _>(|session, _| session.opening = false);
+        return;
+    }
     ira_desktop::lifecycle_trace("native window opening");
     cx.update_global::<Session, _>(|session, _| session.opening = false);
     let runtime = cx.update_global::<Session, _>(|session, _| {
@@ -90,7 +97,22 @@ fn main() {
     }
     let app = Application::new();
     app.on_reopen(open_main_window);
-    app.run(|cx| {
+    let keeper = Retirement::default();
+    let owned_queue = keeper.clone();
+    app.run(move |cx| {
+        cx.set_global(owned_queue.clone());
+        let pump = owned_queue.clone();
+        cx.spawn(async move |cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(16))
+                    .await;
+                if cx.update(|_| pump.pump(64)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         actions::register(cx);
         text_input::register(cx);
         cx.set_global(Session {
@@ -101,4 +123,5 @@ fn main() {
         });
         open_main_window(cx)
     });
+    keeper.retain_at_process_exit();
 }

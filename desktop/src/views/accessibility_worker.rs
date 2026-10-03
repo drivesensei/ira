@@ -4,7 +4,7 @@ use crate::platform::accessibility::{
     Rejection,
     model::{
         AccessibilityModel, FrameKey, HostPresentationSnapshot, LayoutSnapshot, MaterializedNodes,
-        NativeTextSnapshot, NodeId, PreparedFrame, PreparedSemantic, RequestKey,
+        NativeTextSnapshot, NodeId, PreparedFrame, PreparedSemantic, RequestKey, SemanticTree,
         prepare_frame_cancellable,
     },
 };
@@ -51,6 +51,7 @@ struct Mailbox {
     layout: Option<Box<LayoutRequest>>,
     result: Option<PreparedResult>,
     ack: Option<Arc<PreparedFrame>>,
+    seed: Option<(Arc<SemanticTree>, RequestKey)>,
     retired: Vec<Retirement>,
 }
 struct Shared {
@@ -113,6 +114,23 @@ impl Worker {
     }
     /// Seed sequence0 from the ACTUALLY installed compatibility tree, then ACK only
     /// committed native installs (including installs whose notification delivery failed).
+    /// O(1) foreground capture of the actual sink/cache tree; construction is off UI.
+    /// Accepted seed is processed before any geometry request in the same mailbox.
+    pub fn seed_actual_installed(
+        &self,
+        tree: Arc<SemanticTree>,
+        key: RequestKey,
+    ) -> Result<(), (Arc<SemanticTree>, RequestKey)> {
+        let Ok(mut state) = self.shared.mailbox.try_lock() else {
+            return Err((tree, key));
+        };
+        if self.shared.stopping.load(Ordering::Acquire) || state.seed.is_some() {
+            return Err((tree, key));
+        }
+        state.seed = Some((tree, key));
+        self.shared.wake.notify_one();
+        Ok(())
+    }
     pub fn acknowledge(&self, frame: Arc<PreparedFrame>) -> Result<(), Arc<PreparedFrame>> {
         let Ok(mut state) = self.shared.mailbox.try_lock() else {
             return Err(frame);
@@ -141,6 +159,11 @@ impl Worker {
         self.shared.wake.notify_one();
         Ok(())
     }
+    /// Stop computation immediately, retaining ownership for later native retirement.
+    pub fn cancel(&self) {
+        self.shared.stopping.store(true, Ordering::Release);
+        self.shared.wake.notify_one();
+    }
     /// Close bypasses queues and running work. The handoff thread owns final UI
     /// pins immediately; it never joins the preparation thread or waits on UI.
     pub fn close_with<T: Send + 'static>(&self, pins: T) {
@@ -162,7 +185,7 @@ fn run(shared: Arc<Shared>) {
     let mut frame_pin: Option<Arc<PreparedFrame>> = None;
     let mut publication = 0u64;
     loop {
-        let (semantic, layout, retired) = {
+        let (semantic, layout, retired, seed) = {
             let Ok(mut state) = shared.mailbox.lock() else {
                 break;
             };
@@ -172,6 +195,7 @@ fn run(shared: Arc<Shared>) {
             if state.semantic.is_none()
                 && (state.layout.is_none() || state.result.is_some())
                 && state.ack.is_none()
+                && state.seed.is_none()
                 && state.retired.is_empty()
             {
                 let Ok(next) = shared.wake.wait_timeout(state, Duration::from_millis(100)) else {
@@ -196,9 +220,25 @@ fn run(shared: Arc<Shared>) {
             } else {
                 None
             };
-            (semantic, layout, std::mem::take(&mut state.retired))
+            (
+                semantic,
+                layout,
+                std::mem::take(&mut state.retired),
+                state.seed.take(),
+            )
         };
         drop(retired);
+        if let Some((tree, key)) = seed {
+            match PreparedFrame::compatibility_baseline(tree, key) {
+                Ok(installed) => {
+                    publication = installed.publication_seq;
+                    baseline = Some(Arc::new(installed));
+                }
+                Err(_) => {
+                    continue;
+                }
+            }
+        }
         let result = if let Some(request) = semantic {
             let start = Instant::now();
             let cancelled = || {

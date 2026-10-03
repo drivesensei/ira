@@ -1,4 +1,6 @@
 pub mod accessibility;
+pub mod accessibility_prepared;
+pub mod accessibility_retirement;
 pub mod accessibility_worker;
 pub mod preview;
 pub mod rows;
@@ -46,6 +48,8 @@ pub struct Desktop {
     grid_columns: [usize; 2],
     input: Option<Entity<TextInput>>,
     input_mode: Option<InputMode>,
+    native_text_cache: Option<crate::platform::accessibility::model::NativeTextSnapshot>,
+    forwarded_input: Option<text_input::InputStamp>,
     input_generation: u64,
     input_subscription: Option<Subscription>,
     polling: Option<Task<()>>,
@@ -76,7 +80,13 @@ impl Desktop {
         });
         Self {
             runtime,
-            accessibility: accessibility::Host::default(),
+            accessibility: if cx.has_global::<accessibility_retirement::Retirement>() {
+                accessibility::Host::with_retirement(
+                    cx.global::<accessibility_retirement::Retirement>().clone(),
+                )
+            } else {
+                accessibility::Host::headless()
+            },
             preview: preview::Host::new(),
             accessibility_actions: Vec::new(),
             snapshot: None,
@@ -87,6 +97,8 @@ impl Desktop {
             grid_columns: [1; 2],
             input: None,
             input_mode: None,
+            native_text_cache: None,
+            forwarded_input: None,
             input_generation: 0,
             input_subscription: None,
             polling: Some(polling),
@@ -112,6 +124,12 @@ impl Desktop {
     pub fn close(&mut self) {
         crate::lifecycle_trace("Desktop close/detach");
         self.preview.close();
+        if let Some(text) = self.native_text_cache.take() {
+            self.accessibility.retire_native_text(text);
+        }
+        if let Some(snapshot) = self.snapshot.take() {
+            self.accessibility.retire_snapshot(snapshot);
+        }
         self.accessibility.close();
         self.accessibility_actions.clear();
         self.runtime.detach();
@@ -119,6 +137,9 @@ impl Desktop {
         self.polling.take();
     }
     fn poll(&mut self, cx: &mut Context<Self>) {
+        if self.accessibility.poll() {
+            cx.notify();
+        }
         if self.preview.poll(self.snapshot.as_deref()) {
             cx.notify();
         }
@@ -127,7 +148,8 @@ impl Desktop {
             self.runtime.enqueue(Command::HostResult(Err(error)), None);
         }
         let mut changed = false;
-        if let Some(publication) = self.runtime.try_snapshot()
+        if self.accessibility.can_accept_snapshot()
+            && let Some(publication) = self.runtime.try_snapshot()
             && publication.snapshot.window_generation == self.runtime.window_generation
         {
             for (index, pane) in publication.snapshot.panes.iter().enumerate() {
@@ -148,7 +170,9 @@ impl Desktop {
             }
             self.theme = publication.theme;
             self.font_family = publication.font_family;
-            self.snapshot = Some(publication.snapshot);
+            if let Some(old) = self.snapshot.replace(publication.snapshot) {
+                self.accessibility.retire_snapshot(old);
+            }
             self.controls = publication.cancellation;
             changed = true;
         }
@@ -185,12 +209,36 @@ impl Desktop {
                 Completion::Closed => {
                     crate::lifecycle_trace("actor Closed received; application quit scheduled");
                     let barrier = self.geometry.barrier();
+                    let retirement = cx
+                        .has_global::<accessibility_retirement::Retirement>()
+                        .then(|| cx.global::<accessibility_retirement::Retirement>().clone());
+                    if let Some(queue) = &retirement {
+                        queue.begin_quit();
+                    }
+                    self.close();
                     cx.spawn(async move |_, cx| {
+                        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+                        let geometry_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        let signal = geometry_done.clone();
                         cx.background_executor()
                             .spawn(async move {
-                                let _ = barrier.recv_timeout(Duration::from_secs(1));
+                                let _ = barrier.recv_timeout(
+                                    deadline.saturating_duration_since(std::time::Instant::now()),
+                                );
+                                signal.store(true, std::sync::atomic::Ordering::Release);
                             })
-                            .await;
+                            .detach();
+                        loop {
+                            if std::time::Instant::now() >= deadline
+                                || (geometry_done.load(std::sync::atomic::Ordering::Acquire)
+                                    && retirement.as_ref().is_none_or(|q| q.is_empty()))
+                            {
+                                break;
+                            }
+                            cx.background_executor()
+                                .timer(Duration::from_millis(8))
+                                .await;
+                        }
                         let _ = cx.update(|cx| cx.quit());
                     })
                     .detach();
@@ -364,6 +412,9 @@ impl Desktop {
         // that ticket before its document completion can be applied.
         if mode == Some(InputMode::Editor) && snapshot.edit.is_none() {
             self.input = None;
+            if let Some(text) = self.native_text_cache.take() {
+                self.accessibility.retire_native_text(text);
+            }
             self.input_mode = None;
             self.input_subscription = None;
             window.focus(&self.focus);
@@ -381,6 +432,9 @@ impl Desktop {
         self.runtime
             .enqueue(Command::SetFocus(self.input_generation), None);
         self.input_mode = mode;
+        if let Some(text) = self.native_text_cache.take() {
+            self.accessibility.retire_native_text(text);
+        }
         self.input = None;
         self.input_subscription = None;
         let Some(mode) = mode else {
@@ -420,11 +474,14 @@ impl Desktop {
             focus_generation: self.input_generation,
             ..Default::default()
         };
+        let read_only = options.access == text_input::InputAccess::ReadOnly;
         let input = cx.new(|cx| TextInput::new(text, options, cx));
         self.input_subscription = Some(cx.subscribe(&input, |this, _, event: &InputEvent, cx| {
             this.input_event(event, cx)
         }));
         input.update(cx, |input, cx| input.focus(window, cx));
+        self.native_text_cache = Some(accessibility::native_text(&input, mode, read_only, cx));
+        self.forwarded_input = Some(input.read(cx).stamp());
         self.input = Some(input);
     }
     fn input_event(&mut self, event: &InputEvent, cx: &mut Context<Self>) {
@@ -435,6 +492,45 @@ impl Desktop {
             event.stamp.document_generation,
             event.stamp.focus_generation,
         ));
+        let selection_only = matches!(&event.kind, InputEventKind::Changed(_))
+            && self.forwarded_input == Some(event.stamp);
+        if let InputEventKind::Changed(buffer) = &event.kind {
+            let range = |range: std::ops::Range<usize>| {
+                buffer.text[..range.start].encode_utf16().count()
+                    ..buffer.text[..range.end].encode_utf16().count()
+            };
+            let text = self
+                .native_text_cache
+                .as_ref()
+                .filter(|old| {
+                    old.revision == event.stamp.value_revision
+                        && old.document_generation == event.stamp.document_generation
+                })
+                .map(|old| old.text.clone())
+                .unwrap_or_else(|| Arc::<str>::from(buffer.text.as_str()));
+            let native = crate::platform::accessibility::model::NativeTextSnapshot {
+                document_generation: event.stamp.document_generation,
+                focus_generation: event.stamp.focus_generation,
+                revision: event.stamp.value_revision,
+                text,
+                selection_utf16: range(buffer.selection.clone()),
+                marked_utf16: buffer.marked.clone().map(range),
+                read_only: self
+                    .snapshot
+                    .as_ref()
+                    .and_then(|s| s.edit.as_ref())
+                    .is_some_and(|e| e.read_only),
+                disabled: false,
+                multiline: self.input_mode == Some(InputMode::Editor),
+            };
+            if let Some(old) = self.native_text_cache.replace(native) {
+                self.accessibility.retire_native_text(old);
+            }
+        }
+        if selection_only && self.input_mode == Some(InputMode::Editor) {
+            cx.notify();
+            return;
+        }
         let command = match &event.kind {
             InputEventKind::Changed(buffer) if self.input_mode == Some(InputMode::Editor) => {
                 let Some(edit) = self
@@ -498,22 +594,45 @@ impl Desktop {
                 }))
             }
         };
+        if matches!(&event.kind, InputEventKind::Changed(_)) {
+            self.forwarded_input = Some(event.stamp);
+        }
         self.runtime.enqueue(command, generation);
         cx.notify();
     }
-    fn native_text(
-        &self,
-        cx: &gpui::App,
-    ) -> Option<crate::platform::accessibility::model::NativeTextSnapshot> {
-        Some(accessibility::native_text(
-            self.input.as_ref()?,
-            self.input_mode?,
+    fn refresh_native_text(&mut self, cx: &gpui::App) {
+        let Some(input) = &self.input else { return };
+        let Some(mode) = self.input_mode else { return };
+        let native = accessibility::native_text(
+            input,
+            mode,
             self.snapshot
                 .as_ref()
                 .and_then(|s| s.edit.as_ref())
                 .is_some_and(|e| e.read_only),
             cx,
-        ))
+        );
+        if let Some(old) = self.native_text_cache.replace(native) {
+            self.accessibility.retire_native_text(old);
+        }
+    }
+    fn native_text(
+        &self,
+        cx: &gpui::App,
+    ) -> Option<crate::platform::accessibility::model::NativeTextSnapshot> {
+        let _ = cx;
+        self.native_text_cache.clone()
+    }
+    fn rendered_footer(&self) -> Arc<str> {
+        self.feedback
+            .clone()
+            .or_else(|| {
+                self.snapshot
+                    .as_ref()
+                    .and_then(|s| s.status.as_ref().map(|s| s.text.clone()))
+            })
+            .unwrap_or_else(|| "Enter: rename · Right: open · /: search · Space: select".into())
+            .into()
     }
     fn accessibility_actions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         for action in std::mem::take(&mut self.accessibility_actions) {
@@ -521,19 +640,24 @@ impl Desktop {
                 continue;
             };
             let text = self.native_text(cx);
-            if (
-                action.stamp.window,
-                action.stamp.document,
-                action.stamp.focus,
-                action.stamp.revision,
-                action.stamp.text_revision,
-            ) != (
-                snapshot.window_generation,
-                snapshot.document_generation,
-                snapshot.focus_generation,
-                snapshot.revision,
-                text.as_ref().map_or(0, |t| t.revision),
-            ) {
+            let footer = self.rendered_footer();
+            let key = self.accessibility.observe(snapshot, text.as_ref(), footer);
+            let prepared_matches = action.prepared_key == Some(key);
+            if (!prepared_matches && !self.accessibility.is_compatibility())
+                || (
+                    action.stamp.window,
+                    action.stamp.document,
+                    action.stamp.focus,
+                    action.stamp.revision,
+                    action.stamp.text_revision,
+                ) != (
+                    snapshot.window_generation,
+                    snapshot.document_generation,
+                    snapshot.focus_generation,
+                    snapshot.revision,
+                    text.as_ref().map_or(0, |t| t.revision),
+                )
+            {
                 crate::lifecycle_trace(&format!(
                     "AX action rejected: window={} document={} focus={} semantic={} native_text={}",
                     action.stamp.window != snapshot.window_generation,
@@ -567,6 +691,8 @@ impl Desktop {
                             input.update(cx, |input, cx| input.edit_value(value, window, cx));
                         if let Err(error) = result {
                             self.feedback = Some(format!("Accessibility text edit: {error:?}"));
+                        } else {
+                            self.refresh_native_text(cx);
                         }
                     }
                 }
@@ -580,6 +706,8 @@ impl Desktop {
                         if let Err(error) = result {
                             self.feedback =
                                 Some(format!("Accessibility text selection: {error:?}"));
+                        } else {
+                            self.refresh_native_text(cx);
                         }
                     }
                 }
@@ -1111,15 +1239,24 @@ impl Render for Desktop {
             }
         }
         self.sync_input(window, cx);
-        self.accessibility_actions(window, cx);
         self.accessibility.focused_target = self
             .place_focus
             .iter()
             .find(|(_, handle)| handle.is_focused(window))
-            .map(|(target, _)| target.clone());
+            .map(|(target, _)| target.clone())
+            .or_else(|| {
+                self.input
+                    .as_ref()
+                    .filter(|input| input.focus_handle(cx).is_focused(window))
+                    .map(|_| AxTarget::Text {
+                        document: self.snapshot.as_ref().map_or(0, |s| s.document_generation),
+                    })
+            });
+        self.accessibility_actions(window, cx);
         if let Some(snapshot) = &self.snapshot {
             let text = self.native_text(cx);
-            self.accessibility.begin(snapshot, text.as_ref());
+            self.accessibility
+                .begin_prepared(snapshot.clone(), text, self.rendered_footer());
         }
         let mut panes = div().flex().flex_1().min_h_0().child(self.pane(0, cx));
         if self.snapshot.as_ref().is_some_and(|s| s.split) {
@@ -1281,15 +1418,7 @@ impl Render for Desktop {
             }
             content = content.child(board);
         }
-        let status = self
-            .feedback
-            .clone()
-            .or_else(|| {
-                self.snapshot
-                    .as_ref()
-                    .and_then(|s| s.status.as_ref().map(|s| s.text.clone()))
-            })
-            .unwrap_or_else(|| "Enter: rename · Right: open · /: search · Space: select".into());
+        let status = self.rendered_footer();
         let mut root =
             div()
                 .id("ira-root")
@@ -1391,7 +1520,7 @@ impl Render for Desktop {
                             .p_2()
                             .text_sm()
                             .bg(native_color(self.theme.surface_alt))
-                            .child(status),
+                            .child(status.to_string()),
                         AxTarget::Window,
                         Some(AxRole::Status),
                         None,
@@ -1535,7 +1664,7 @@ mod crossing_tests {
         };
         let (view, cx) = cx.add_window_view(move |_, cx| {
             let mut view = Desktop::new(runtime, crate::platform::geometry::Writer::new(None), cx);
-            view.accessibility = accessibility::Host::headless();
+            view.accessibility = accessibility::Host::compatibility_headless();
             view.snapshot = Some(publication.snapshot);
             view
         });
@@ -1663,7 +1792,7 @@ mod crossing_tests {
         };
         let (view, cx) = cx.add_window_view(move |_, cx| {
             let mut view = Desktop::new(runtime, crate::platform::geometry::Writer::new(None), cx);
-            view.accessibility = accessibility::Host::headless();
+            view.accessibility = accessibility::Host::compatibility_headless();
             view.snapshot = Some(publication.snapshot);
             view
         });
@@ -1755,7 +1884,7 @@ mod crossing_tests {
         };
         let (view, cx) = cx.add_window_view(move |_, cx| {
             let mut view = Desktop::new(runtime, crate::platform::geometry::Writer::new(None), cx);
-            view.accessibility = accessibility::Host::headless();
+            view.accessibility = accessibility::Host::compatibility_headless();
             view.snapshot = Some(publication.snapshot);
             view
         });
@@ -1843,7 +1972,7 @@ mod crossing_tests {
         };
         let (view, cx) = cx.add_window_view(move |_, cx| {
             let mut view = Desktop::new(runtime, crate::platform::geometry::Writer::new(None), cx);
-            view.accessibility = accessibility::Host::headless();
+            view.accessibility = accessibility::Host::compatibility_headless();
             view.snapshot = Some(publication.snapshot);
             view
         });
@@ -1883,7 +2012,7 @@ mod crossing_tests {
         };
         let (view, cx) = cx.add_window_view(move |_, cx| {
             let mut view = Desktop::new(runtime, crate::platform::geometry::Writer::new(None), cx);
-            view.accessibility = accessibility::Host::headless();
+            view.accessibility = accessibility::Host::compatibility_headless();
             view.snapshot = Some(publication.snapshot);
             view
         });
@@ -1960,7 +2089,7 @@ mod crossing_tests {
         });
         let (view, cx) = cx.add_window_view(move |window, cx| {
             let mut view = Desktop::new(runtime, crate::platform::geometry::Writer::new(None), cx);
-            view.accessibility = accessibility::Host::headless();
+            view.accessibility = accessibility::Host::compatibility_headless();
             view.snapshot = Some(snapshot);
             view.focus_main(window, cx);
             view
@@ -1986,7 +2115,11 @@ mod crossing_tests {
         cx.update(text_input::register);
         let fixture = std::env::temp_dir().join(format!("ira-tab-editor-{}", std::process::id()));
         std::fs::create_dir_all(&fixture).unwrap();
-        std::fs::write(fixture.join("fixture.txt"), b"editable fixture").unwrap();
+        std::fs::write(
+            fixture.join("fixture.txt"),
+            "文😀e\u{301}\nfixture".as_bytes(),
+        )
+        .unwrap();
         let mut app = App::default();
         app.window_generation = 7;
         app.state_path = Some(fixture.join("state"));
@@ -2037,9 +2170,39 @@ mod crossing_tests {
             );
             std::thread::yield_now();
         }
+        loop {
+            let ready = view.update_in(cx, |view, _, cx| {
+                view.poll(cx);
+                view.accessibility
+                    .prepared_frame_for_test()
+                    .is_some_and(|f| {
+                        f.publication_seq > 0
+                            && Some(f.key.request) == view.accessibility.authoritative_key()
+                            && view
+                                .accessibility
+                                .id(
+                                    &Target::Text {
+                                        document: view
+                                            .snapshot
+                                            .as_ref()
+                                            .unwrap()
+                                            .document_generation,
+                                    },
+                                    None,
+                                    Some(AxCapability::Value),
+                                )
+                                .is_some()
+                    })
+            });
+            if ready {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
         view.update_in(cx, |view, _, cx| {
             let native = view.native_text(cx).unwrap();
-            assert_eq!(native.text.as_ref(), "editable fixture");
+            assert_eq!(native.text.as_ref(), "文😀e\u{301}\nfixture");
             assert!(native.multiline);
             let tree = view.accessibility.tree.as_ref().unwrap();
             assert!(
@@ -2048,6 +2211,69 @@ mod crossing_tests {
                     .any(|n| matches!(n.target, Target::Text { .. })
                         && n.capabilities.contains(&AxCapability::Value))
             );
+        });
+        let before = view.update_in(cx, |view, _, _| {
+            view.accessibility.authoritative_key().unwrap()
+        });
+        view.update_in(cx, |view, window, cx| {
+            let tree = view.accessibility.tree.as_ref().unwrap();
+            let id = view
+                .accessibility
+                .id(
+                    &Target::Text {
+                        document: view.snapshot.as_ref().unwrap().document_generation,
+                    },
+                    None,
+                    Some(AxCapability::Value),
+                )
+                .unwrap();
+            view.accessibility
+                .sink_for_test()
+                .try_dispatch(AccessibilityIntent {
+                    node: id,
+                    stamp: tree.stamp,
+                    action: Action::SetValue("STALE SHOULD NOT APPLY".into()),
+                })
+                .unwrap();
+            let input = view.input.as_ref().unwrap().clone();
+            input
+                .update(cx, |input, cx| {
+                    input.set_selection_utf16(3..3, false, window, cx)
+                })
+                .unwrap();
+            view.refresh_native_text(cx);
+            view.poll(cx);
+            view.accessibility_actions(window, cx);
+            assert_eq!(
+                view.native_text(cx).unwrap().text.as_ref(),
+                "文😀e\u{301}\nfixture"
+            );
+            assert!(!view.snapshot.as_ref().unwrap().edit.as_ref().unwrap().dirty);
+            let after = view.accessibility.authoritative_key().unwrap();
+            assert_eq!(after.native_text_revision, before.native_text_revision);
+            assert_eq!(after.semantic_revision, before.semantic_revision);
+            assert_ne!(after.host_focus_revision, before.host_focus_revision);
+            input.update(cx, |input, cx| {
+                gpui::EntityInputHandler::replace_and_mark_text_in_range(
+                    input,
+                    Some(3..5),
+                    "e\u{301}",
+                    Some(2..2),
+                    window,
+                    cx,
+                )
+            });
+            view.refresh_native_text(cx);
+            let text = view.native_text(cx).unwrap();
+            assert_eq!(text.text.as_ref(), "文😀e\u{301}\nfixture");
+            assert_eq!(text.revision, before.native_text_revision);
+            assert_eq!(text.marked_utf16, Some(3..5));
+            let marked = view.accessibility.observe(
+                view.snapshot.as_ref().unwrap(),
+                Some(&text),
+                view.rendered_footer(),
+            );
+            assert_ne!(marked.host_focus_revision, after.host_focus_revision);
         });
         cx.simulate_keystrokes("escape");
         loop {
@@ -2067,7 +2293,7 @@ mod crossing_tests {
         });
         assert_eq!(
             std::fs::read(fixture.join("fixture.txt")).unwrap(),
-            b"editable fixture"
+            "文😀e\u{301}\nfixture".as_bytes()
         );
         std::fs::remove_dir_all(fixture).unwrap();
     }
@@ -2108,7 +2334,7 @@ mod crossing_tests {
         };
         let (view, cx) = cx.add_window_view(move |_, cx| {
             let mut view = Desktop::new(runtime, crate::platform::geometry::Writer::new(None), cx);
-            view.accessibility = accessibility::Host::headless();
+            view.accessibility = accessibility::Host::compatibility_headless();
             view.snapshot = Some(publication.snapshot);
             view
         });
@@ -2181,5 +2407,324 @@ mod crossing_tests {
         });
         assert_eq!(std::fs::read(fixture.join("é-ax.txt")).unwrap(), b"fixture");
         std::fs::remove_dir_all(fixture).unwrap();
+    }
+    #[gpui::test]
+    fn actual_prepared_host_footer_expiry_and_feedback_match_painted_status(
+        cx: &mut TestAppContext,
+    ) {
+        use ira_core::model::{STATUS_TTL, Status};
+        let mut app = App::default();
+        app.window_generation = 7;
+        app.status = Some(Status {
+            text: "Transient host status".into(),
+            is_error: false,
+            raised: std::time::Instant::now() - STATUS_TTL + Duration::from_millis(250),
+        });
+        let runtime = Runtime::with_factory(7, move || app);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let publication = loop {
+            if let Some(p) = runtime.try_snapshot() {
+                break p;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            let mut view = Desktop::new(runtime, crate::platform::geometry::Writer::new(None), cx);
+            view.accessibility = accessibility::Host::headless(); // The production worker adapter.
+            view.snapshot = Some(publication.snapshot);
+            view
+        });
+        let wait = |cx: &mut gpui::VisualTestContext, expected: &str| {
+            loop {
+                let ready = view.update_in(cx, |view, _, cx| {
+                    view.poll(cx);
+                    let Some(frame) = view.accessibility.prepared_frame_for_test() else {
+                        return false;
+                    };
+                    let Some(key) = view.accessibility.authoritative_key() else {
+                        return false;
+                    };
+                    if frame.publication_seq == 0 || frame.key.request != key {
+                        return false;
+                    }
+                    let Some(id) = view
+                        .accessibility
+                        .id(&Target::Window, Some(Role::Status), None)
+                    else {
+                        return false;
+                    };
+                    frame.semantic.tree.nodes[&id].value.as_deref() == Some(expected)
+                        && frame.geometry.nodes.contains_key(&id)
+                });
+                if ready {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "prepared status failed: {expected}"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        wait(cx, "Transient host status");
+        wait(
+            cx,
+            "Enter: rename · Right: open · /: search · Space: select",
+        );
+        assert!(cx.debug_bounds("ira-status-footer").unwrap().size.height > px(0.));
+        view.update_in(cx, |view, _, cx| {
+            view.feedback = Some("Native feedback wins".into());
+            cx.notify();
+        });
+        wait(cx, "Native feedback wins");
+        view.update_in(cx, |view, _, _| {
+            view.runtime.stop(&view.controls);
+            view.close();
+        });
+    }
+    #[gpui::test]
+    fn actual_prepared_host_large_viewports_keep_foreground_work_sparse(cx: &mut TestAppContext) {
+        use ira_core::services::list_files::FEntry;
+        for count in [10_000, 100_000] {
+            let mut app = App::default();
+            app.window_generation = 7;
+            app.panes[0].folder = Some(Folder::new(
+                "Performance fixture".into(),
+                "/tmp/ira-host-perf".into(),
+                '#',
+            ));
+            app.panes[0].files = (0..count)
+                .map(|i| FEntry {
+                    path: format!("/tmp/ira-host-perf/file-{i:06}"),
+                    label: format!("file-{i:06}"),
+                    is_dir: false,
+                    size: 0,
+                    modified: None,
+                })
+                .collect();
+            app.panes[0].selected = vec![false; count];
+            app.panes[0].listing_settled = true;
+            app.panes[0].state.select(Some(0));
+            let runtime = Runtime::with_factory(7, move || app);
+            let deadline = std::time::Instant::now() + Duration::from_secs(12);
+            let publication = loop {
+                if let Some(p) = runtime.try_snapshot() {
+                    break p;
+                }
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            };
+            let (view, cx) = cx.add_window_view(move |_, cx| {
+                let mut view =
+                    Desktop::new(runtime, crate::platform::geometry::Writer::new(None), cx);
+                view.accessibility = accessibility::Host::headless();
+                view.snapshot = Some(publication.snapshot);
+                view
+            });
+            loop {
+                let ready = view.update_in(cx, |view, _, cx| {
+                    view.poll(cx);
+                    view.accessibility
+                        .prepared_frame_for_test()
+                        .is_some_and(|frame| {
+                            frame.publication_seq > 0
+                                && Some(frame.key.request) == view.accessibility.authoritative_key()
+                        })
+                });
+                if ready {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{count} row host failed preparation"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let old_rows = view.update_in(cx, |view, _, _| {
+                view.snapshot.as_ref().unwrap().panes[0].rows.clone()
+            });
+            let mut timings = Vec::new();
+            for _ in 0..30 {
+                let start = std::time::Instant::now();
+                view.update_in(cx, |_, _, cx| cx.notify());
+                timings.push(start.elapsed().as_nanos());
+            }
+            timings.sort_unstable();
+            let (target, original_key) = view.update_in(cx, |view, _, _| {
+                let snapshot = view.snapshot.as_ref().unwrap();
+                let target = Target::Entry {
+                    pane: 0,
+                    path: snapshot.panes[0].rows[0].entry.path.clone().into(),
+                    listing_generation: snapshot.panes[0].listing_generation,
+                };
+                let id = view
+                    .accessibility
+                    .id(&target, Some(Role::Row), Some(AxCapability::Selection))
+                    .unwrap();
+                let frame = view.accessibility.prepared_frame_for_test().unwrap();
+                let key = frame.key.request;
+                view.accessibility
+                    .sink_for_test()
+                    .try_dispatch(AccessibilityIntent {
+                        node: id,
+                        stamp: frame.semantic.tree.stamp,
+                        action: Action::SetSelected(true),
+                    })
+                    .unwrap();
+                (target, key)
+            });
+            view.update_in(cx, |view, _, cx| {
+                view.scroll[0].scroll_to_item(80, ScrollStrategy::Center);
+                cx.notify();
+            });
+            view.update_in(cx, |view, window, cx| {
+                assert_eq!(
+                    view.accessibility.authoritative_key(),
+                    Some(original_key),
+                    "pure viewport movement cannot expire a semantic action"
+                );
+                view.poll(cx);
+                view.accessibility_actions(window, cx);
+            });
+            loop {
+                let selected = view.update_in(cx, |view, _, cx| { view.poll(cx); view.snapshot.as_ref().unwrap().panes[0].rows.iter().any(|row| matches!(&target, Target::Entry { path, .. } if std::path::Path::new(&row.entry.path) == path) && row.selected) });
+                if selected {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "layout-only change rejected valid semantic selection"
+                );
+                std::thread::yield_now();
+            }
+            view.update_in(cx, |view, _, _| {
+                view.runtime.enqueue(
+                    Command::Input(Input::Action(ira_core::input::Command::CycleSort)),
+                    None,
+                )
+            });
+            loop {
+                let replaced = view.update_in(cx, |view, _, cx| {
+                    view.poll(cx);
+                    !Arc::ptr_eq(&view.snapshot.as_ref().unwrap().panes[0].rows, &old_rows)
+                });
+                if replaced && Arc::strong_count(&old_rows) == 1 {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "old actor/worker snapshot rows retained"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            struct RowDropProof {
+                rows: Arc<Vec<ira_core::observable::Row>>,
+                tx: mpsc::Sender<(std::thread::ThreadId, usize, usize)>,
+            }
+            impl Drop for RowDropProof {
+                fn drop(&mut self) {
+                    let _ = self.tx.send((
+                        std::thread::current().id(),
+                        Arc::strong_count(&self.rows),
+                        self.rows.len(),
+                    ));
+                }
+            }
+            let (tx, rx) = mpsc::channel();
+            view.update_in(cx, |view, _, _| {
+                view.accessibility
+                    .retire_probe(RowDropProof { rows: old_rows, tx })
+            });
+            let proof = loop {
+                if let Ok(proof) = rx.try_recv() {
+                    break proof;
+                }
+                view.update_in(cx, |view, _, cx| view.poll(cx));
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            };
+            assert_ne!(
+                proof.0,
+                std::thread::current().id(),
+                "last real source row allocation dropped on UI"
+            );
+            assert_eq!(
+                proof.1, 1,
+                "probe must own the final real row allocation Arc"
+            );
+            assert_eq!(proof.2, count);
+            eprintln!(
+                "actual_source_row_last_drop rows={} strong_count={} off_ui={}",
+                proof.2,
+                proof.1,
+                proof.0 != std::thread::current().id()
+            );
+            view.update_in(cx, |view, _, _| {
+                let frame = view.accessibility.prepared_frame_for_test().unwrap();
+                assert_eq!(frame.semantic.tree.nodes.values().filter(|n| n.role == Role::Row && matches!(n.target, Target::Entry { .. })).count(), count);
+                assert!(!frame.geometry.nodes.is_empty());
+                assert!(frame.geometry.nodes.len() < 100, "foreground geometry must be viewport-bounded");
+                let (_, visits) = frame.geometry.hit_test_with_visits(-100., -100.);
+                assert!(visits <= frame.geometry.nodes.len());
+                eprintln!("actual_host rows={count} geometry={} hit_visits={visits} render_ns_p50={} p95={} max={}", frame.geometry.nodes.len(), timings[15], timings[28], timings[29]);
+                view.runtime.stop(&view.controls);
+                view.close();
+            });
+        }
+    }
+    #[gpui::test]
+    fn actual_status_expiry_keeps_accessible_rendered_fallback(cx: &mut TestAppContext) {
+        use ira_core::model::{STATUS_TTL, Status};
+        let mut app = App::default();
+        app.window_generation = 7;
+        app.status = Some(Status {
+            text: "Transient".into(),
+            is_error: false,
+            raised: std::time::Instant::now() - STATUS_TTL + Duration::from_millis(80),
+        });
+        let runtime = Runtime::with_factory(7, move || app);
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        let publication = loop {
+            if let Some(p) = runtime.try_snapshot() {
+                break p;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            let mut view = Desktop::new(runtime, crate::platform::geometry::Writer::new(None), cx);
+            view.accessibility = accessibility::Host::headless();
+            view.snapshot = Some(publication.snapshot);
+            view
+        });
+        loop {
+            let ready = view.update_in(cx, |view, _, cx| {
+                view.poll(cx);
+                view.snapshot.as_ref().is_some_and(|s| s.status.is_none())
+                    && view.accessibility.tree.as_ref().is_some_and(|tree| {
+                        tree.nodes.values().any(|node| {
+                            node.role == Role::Status
+                                && node.value.as_deref()
+                                    == Some(
+                                        "Enter: rename · Right: open · /: search · Space: select",
+                                    )
+                        })
+                    })
+            });
+            if ready {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "actual painted fallback footer lost its accessible Status value after expiry"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(cx.debug_bounds("ira-status-footer").unwrap().size.height > px(0.));
+        view.update_in(cx, |view, _, _| {
+            view.runtime.stop(&view.controls);
+            view.close();
+        });
     }
 }
