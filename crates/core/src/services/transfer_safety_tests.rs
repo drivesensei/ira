@@ -991,3 +991,129 @@ fn recovery_locator_preserves_non_utf8_paths_and_fresh_process_discovery() {
     );
     assert!(String::from_utf8_lossy(&child.stdout).contains("1 passed"));
 }
+
+#[test]
+fn cancelled_restore_conflict_remains_in_persistent_final_event() {
+    let f = Fixture::new();
+    fs::write(f.path("src/file"), b"SOURCE").unwrap();
+    fs::write(f.path("src/second"), b"SECOND").unwrap();
+    let control = JobControl::new();
+    let provider_control = control.clone();
+    let source = f.path("src/file");
+    let provider = move |from: &Path, to: &Path| {
+        rename_no_replace(from, to)?;
+        if to.file_name().is_some_and(|name| name == "captured") {
+            fs::write(&source, b"ACTOR")?;
+            provider_control.request_cancel();
+        }
+        Ok(())
+    };
+    let job = Job {
+        id: 1,
+        kind: JobKind::Move,
+        overwrite: OverwritePolicy::AutoRename,
+        paths: vec![
+            f.path("src/file").to_string_lossy().into_owned(),
+            f.path("src/second").to_string_lossy().into_owned(),
+        ],
+        dest_dir: f.path("dst").to_string_lossy().into_owned(),
+        label: String::new(),
+        total_bytes: None,
+        copied_bytes: 0,
+        current: String::new(),
+        status: JobStatus::Queued,
+        started_at: Instant::now(),
+        control,
+    };
+    let (tx, rx) = mpsc::channel();
+    spawn_job_with_provider(&job, tx, Arc::new(provider));
+    let final_event = loop {
+        let event = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        if matches!(
+            event,
+            JobEvent::Done { .. } | JobEvent::Failed { .. } | JobEvent::Cancelled { .. }
+        ) {
+            break event;
+        }
+    };
+    let retained = source_stages(&f);
+    assert_eq!(retained.len(), 1);
+    assert_eq!(fs::read(retained[0].join("captured")).unwrap(), b"SOURCE");
+    assert_eq!(fs::read(f.path("src/file")).unwrap(), b"ACTOR");
+    assert_eq!(fs::read(f.path("src/second")).unwrap(), b"SECOND");
+    assert!(!f.path("dst/second").exists());
+    match final_event {
+        JobEvent::Failed { error, .. } => {
+            assert!(error.contains(&retained[0].display().to_string()));
+            assert!(error.contains("cancelled"));
+            assert!(!error.contains("WAS published"));
+        }
+        other => panic!("recovery must persist in final status: {other:?}"),
+    }
+}
+#[test]
+fn later_committed_recovery_includes_prior_failed_item_recovery_path() {
+    let f = Fixture::new();
+    fs::write(f.path("src/file"), b"SOURCE").unwrap();
+    fs::write(f.path("src/second"), b"SECOND").unwrap();
+    fs::write(f.path("dst/file"), b"PRECIOUS").unwrap();
+    fs::write(f.path("dst/second"), b"OLD SECOND").unwrap();
+    let source = f.path("src/file");
+    let destination = f.path("dst/file");
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let capture_count = count.clone();
+    let provider = move |from: &Path, to: &Path| {
+        if from == destination && to.file_name().is_some_and(|name| name == "backup") {
+            return Err(std::io::Error::other(
+                "injected first destination capture failure",
+            ));
+        }
+        if from.file_name().is_some_and(|name| name == "captured")
+            && to.file_name().is_some_and(|name| name == "payload")
+            && capture_count.load(Ordering::Relaxed) == 2
+        {
+            return Err(std::io::Error::from(ErrorKind::CrossesDevices));
+        }
+        rename_no_replace(from, to)?;
+        if to.file_name().is_some_and(|name| name == "captured")
+            && capture_count.fetch_add(1, Ordering::Relaxed) == 0
+        {
+            fs::write(&source, b"ACTOR")?;
+        }
+        Ok(())
+    };
+    let control = JobControl::new();
+    let (tx, _rx) = mpsc::channel();
+    let error = run_batch_with_provider(
+        1,
+        JobKind::Move,
+        &[
+            f.path("src/file").to_string_lossy().into_owned(),
+            f.path("src/second").to_string_lossy().into_owned(),
+        ],
+        &f.path("dst"),
+        OverwritePolicy::Overwrite,
+        &control,
+        &tx,
+        &provider,
+    )
+    .unwrap_err();
+    assert!(matches!(error, JobError::CommittedWithRecovery(_)));
+    let old = stages(&f);
+    let copied = source_stages(&f);
+    assert_eq!(old.len(), 1);
+    assert_eq!(copied.len(), 1);
+    assert_eq!(fs::read(old[0].join("payload")).unwrap(), b"SOURCE");
+    assert_eq!(fs::read(copied[0].join("captured")).unwrap(), b"SECOND");
+    assert_eq!(fs::read(f.path("src/file")).unwrap(), b"ACTOR");
+    assert_eq!(fs::read(f.path("dst/file")).unwrap(), b"PRECIOUS");
+    assert_eq!(fs::read(f.path("dst/second")).unwrap(), b"SECOND");
+    let diagnostic = format!("{error:?}");
+    for path in [&old[0], &copied[0]] {
+        assert!(
+            diagnostic.contains(&path.display().to_string()),
+            "missing {path:?}: {diagnostic}"
+        );
+    }
+    assert!(diagnostic.contains("WAS published"));
+}

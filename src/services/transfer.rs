@@ -275,6 +275,23 @@ fn run_batch(
         &rename_no_replace,
     )
 }
+fn preserve_batch_recovery(error: JobError, previous_failures: &[String]) -> JobError {
+    if previous_failures.is_empty() {
+        return error;
+    }
+    let previous = previous_failures.join("; ");
+    match error {
+        JobError::Cancelled => JobError::Io(format!(
+            "batch cancelled; prior failed items and recovery locations: {previous}"
+        )),
+        JobError::CommittedWithRecovery(message) => JobError::CommittedWithRecovery(format!(
+            "{message}; prior failed items and recovery locations: {previous}"
+        )),
+        JobError::Io(message) => JobError::Io(format!(
+            "{message}; prior failed items and recovery locations: {previous}"
+        )),
+    }
+}
 #[allow(clippy::too_many_arguments)]
 fn run_batch_with_provider(
     id: u64,
@@ -304,7 +321,9 @@ fn run_batch_with_provider(
     let mut failed = 0usize;
     let mut failure_details = Vec::new();
     for p in paths {
-        control.gate()?;
+        if let Err(error) = control.gate() {
+            return Err(preserve_batch_recovery(error, &failure_details));
+        }
         let src = Path::new(p);
         let Some(dst) = resolve_destination(src, dest_dir, policy) else {
             failed += 1;
@@ -327,12 +346,18 @@ fn run_batch_with_provider(
             Ok(()) => {}
             Err(JobError::Cancelled) => {
                 // Staged copies clean only their private working directory.
-                return Err(JobError::Cancelled);
+                return Err(preserve_batch_recovery(
+                    JobError::Cancelled,
+                    &failure_details,
+                ));
             }
             Err(JobError::CommittedWithRecovery(msg)) => {
-                return Err(JobError::CommittedWithRecovery(format!(
-                    "{msg}; remaining batch items were not processed"
-                )));
+                return Err(preserve_batch_recovery(
+                    JobError::CommittedWithRecovery(format!(
+                        "{msg}; remaining batch items were not processed"
+                    )),
+                    &failure_details,
+                ));
             }
             Err(JobError::Io(msg)) => {
                 failed += 1;
