@@ -136,6 +136,7 @@ impl JobControl {
 enum JobError {
     Cancelled,
     Io(String),
+    CommittedWithRecovery(String),
 }
 
 impl From<std::io::Error> for JobError {
@@ -203,7 +204,9 @@ pub fn spawn_job_with_provider(
         let event = match result {
             Ok(()) => JobEvent::Done { id },
             Err(JobError::Cancelled) => JobEvent::Cancelled { id },
-            Err(JobError::Io(msg)) => JobEvent::Failed { id, error: msg },
+            Err(JobError::Io(msg) | JobError::CommittedWithRecovery(msg)) => {
+                JobEvent::Failed { id, error: msg }
+            }
         };
         let _ = tx.send(event);
     });
@@ -326,6 +329,11 @@ fn run_batch_with_provider(
                 // Staged copies clean only their private working directory.
                 return Err(JobError::Cancelled);
             }
+            Err(JobError::CommittedWithRecovery(msg)) => {
+                return Err(JobError::CommittedWithRecovery(format!(
+                    "{msg}; remaining batch items were not processed"
+                )));
+            }
             Err(JobError::Io(msg)) => {
                 failed += 1;
                 failure_details.push(format!("{p}: {msg}"));
@@ -417,14 +425,63 @@ struct TransferContext<'a> {
     provider: &'a NoReplaceProvider,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PayloadOwnership {
+    Generated,
+    CapturedSource,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StagePoint {
+    BeforeSourceCapture,
+    SourceCaptured,
     PayloadReady,
     BackupCaptured,
     BeforePublication,
     Published,
-    BeforeSourceRemoval,
 }
-
+fn same_entry(expected: &fs::Metadata, actual: &fs::Metadata) -> bool {
+    if expected.file_type() != actual.file_type() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        expected.dev() == actual.dev() && expected.ino() == actual.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    } // Native Windows identity proof remains a documented gap.
+}
+fn entry_present(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+fn cleanup_generated_container(stage: &Path) -> std::io::Result<()> {
+    for entry in fs::read_dir(stage)? {
+        if entry?.file_name() != "recovery.txt" {
+            return Err(std::io::Error::new(
+                ErrorKind::DirectoryNotEmpty,
+                "captured or incomplete data remains",
+            ));
+        }
+    }
+    match fs::remove_file(stage.join("recovery.txt")) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    fs::remove_dir(stage) // Never recursive: captured entries make cleanup fail safely.
+}
+fn write_recovery(
+    stage: &Path,
+    src: &Path,
+    dst: &Path,
+    source_stage: Option<&Path>,
+    destination_stage: &Path,
+    phase: &str,
+) -> std::io::Result<()> {
+    fs::write(stage.join("recovery.txt"), format!("IRA transfer recovery\nphase={phase}\nsource={}\ndestination={}\nsource_stage={}\ndestination_stage={}\nNo automatic disposal of retained captures.\n",src.display(),dst.display(),source_stage.map(|p|p.display().to_string()).unwrap_or_default(),destination_stage.display()))
+}
+#[cfg(test)]
 fn copy_staged(
     src: &Path,
     dst: &Path,
@@ -456,24 +513,116 @@ fn transfer_staged(
     force_copy_move: bool,
     mut hook: impl FnMut(StagePoint, &Path) -> Result<(), JobError>,
 ) -> Result<(), JobError> {
-    let stage = create_stage(
+    context.control.gate()?;
+    let expected_source = fs::symlink_metadata(src)?;
+    let expected_destination = if replace {
+        Some(fs::symlink_metadata(dst)?)
+    } else {
+        None
+    };
+    let source_stage = if kind == JobKind::Move {
+        Some(create_stage(src.parent().ok_or_else(|| {
+            JobError::Io("source has no parent".into())
+        })?)?)
+    } else {
+        None
+    };
+    let stage = match create_stage(
         dst.parent()
             .ok_or_else(|| JobError::Io("destination has no parent".into()))?,
-    )?;
+    ) {
+        Ok(stage) => stage,
+        Err(error) => {
+            if let Some(s) = &source_stage {
+                let _ = fs::remove_dir(s);
+            }
+            return Err(error);
+        }
+    };
     let payload = stage.join("payload");
     let backup = stage.join("backup");
-    let mut source_moved = false;
+    let captured = source_stage.as_ref().map(|s| s.join("captured"));
+    let mut source_location = captured.clone();
+    let mut ownership = PayloadOwnership::Generated;
     let mut published = false;
-    let mut backup_captured = false;
     let result = (|| {
-        if kind == JobKind::Move && !force_copy_move {
-            match (context.provider)(src, &payload) {
-                Ok(()) => source_moved = true,
-                Err(error) if error.kind() == ErrorKind::CrossesDevices => {}
-                Err(error) => return Err(error.into()),
-            }
+        write_recovery(
+            &stage,
+            src,
+            dst,
+            source_stage.as_deref(),
+            &stage,
+            "before capture",
+        )?;
+        if let Some(s) = &source_stage {
+            write_recovery(
+                s,
+                src,
+                dst,
+                source_stage.as_deref(),
+                &stage,
+                "before source capture",
+            )?;
         }
-        if !source_moved {
+        hook(StagePoint::BeforeSourceCapture, &payload)?;
+        if let Some(captured) = &captured {
+            (context.provider)(src, captured)?;
+            if !same_entry(&expected_source, &fs::symlink_metadata(captured)?) {
+                return Err(JobError::Io("captured source identity/type changed".into()));
+            }
+            hook(StagePoint::SourceCaptured, captured)?;
+            context.control.gate()?;
+            let moved = if force_copy_move {
+                false
+            } else {
+                match (context.provider)(captured, &payload) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        if entry_present(&payload) && !entry_present(captured) {
+                            ownership = PayloadOwnership::CapturedSource;
+                            source_location = Some(payload.clone());
+                            return Err(e.into());
+                        }
+                        if e.kind() == ErrorKind::CrossesDevices {
+                            false
+                        } else {
+                            return Err(e.into());
+                        }
+                    }
+                }
+            };
+            if moved {
+                ownership = PayloadOwnership::CapturedSource;
+                source_location = Some(payload.clone());
+            } else {
+                #[cfg(not(unix))]
+                if fs::symlink_metadata(captured)?.file_type().is_symlink()
+                    || expected_source.is_dir()
+                {
+                    return Err(JobError::Io("Windows captured-tree/symlink fallback requires original-parent resolution; unsupported without native proof".into()));
+                }
+                let before_copy = fs::symlink_metadata(captured)?;
+                copy_entry(
+                    captured,
+                    &payload,
+                    context.control,
+                    context.id,
+                    context.tx,
+                    context.bytes,
+                )?;
+                let after_copy = fs::symlink_metadata(captured)?;
+                if !same_entry(&before_copy, &after_copy)
+                    || before_copy.len() != after_copy.len()
+                    || before_copy.modified().ok() != after_copy.modified().ok()
+                {
+                    return Err(JobError::Io(
+                        "captured source changed while copying; publication refused".into(),
+                    ));
+                }
+                // Metadata stability does not exclude open-handle/hard-link
+                // writes, so the copied source remains retained after commit.
+            }
+        } else {
             copy_entry(
                 src,
                 &payload,
@@ -485,98 +634,178 @@ fn transfer_staged(
         }
         hook(StagePoint::PayloadReady, &payload)?;
         context.control.gate()?;
-        if replace {
-            // Capture first; no path-check followed by deletion of a public entry.
+        if let Some(expected) = &expected_destination {
             (context.provider)(dst, &backup)?;
-            backup_captured = true;
-            // The object actually captured can differ from the earlier lookup.
-            // Existing directories are refused, then restored without clobbering.
-            if fs::symlink_metadata(&backup)?.is_dir() {
-                return Err(std::io::Error::new(
-                    ErrorKind::AlreadyExists,
-                    "captured destination is a directory",
-                )
-                .into());
+            let actual = fs::symlink_metadata(&backup)?;
+            if !same_entry(expected, &actual) {
+                return Err(JobError::Io(
+                    "captured destination identity/type changed".into(),
+                ));
+            }
+            if actual.is_dir()
+                && (kind != JobKind::Move
+                    || !expected_source.is_dir()
+                    || fs::read_dir(&backup)?.next().transpose()?.is_some())
+            {
+                return Err(JobError::Io(
+                    "captured destination directory is not an eligible empty Move target".into(),
+                ));
             }
             hook(StagePoint::BackupCaptured, &payload)?;
         }
         hook(StagePoint::BeforePublication, &payload)?;
         context.control.gate()?;
-        (context.provider)(&payload, dst)?;
+        if let Err(error) = (context.provider)(&payload, dst) {
+            if !entry_present(&payload) {
+                published = true;
+            }
+            return Err(error.into());
+        }
         published = true;
         hook(StagePoint::Published, &payload)?;
-        if kind == JobKind::Move && !source_moved {
-            hook(StagePoint::BeforeSourceRemoval, &payload)?;
-            remove_tree(src)?;
-        }
+        context.control.gate()?;
         Ok(())
     })();
-    if let Err(primary) = result {
-        let mut recovery = Vec::new();
-        // A published path can have been replaced by another actor. Capture it
-        // atomically and retain it; never blindly delete it during rollback.
-        let mut retain = published;
-        if published {
-            if let Err(error) = (context.provider)(dst, &payload) {
-                recovery.push(format!("published entry recovery failed: {error}"));
+    if !published {
+        let primary = result
+            .err()
+            .unwrap_or_else(|| JobError::Io("publication did not commit".into()));
+        let mut errors = Vec::new();
+        if entry_present(&backup) {
+            if let Err(e) = (context.provider)(&backup, dst) {
+                errors.push(format!("destination restore failed: {e}"));
             }
         }
-        if backup_captured {
-            if let Err(error) = (context.provider)(&backup, dst) {
-                retain = true;
-                recovery.push(format!("destination restore failed: {error}"));
+        if let Some(location) = &source_location {
+            if entry_present(location) {
+                if let Err(e) = (context.provider)(location, src) {
+                    errors.push(format!("source restore failed: {e}"));
+                }
             }
         }
-        if source_moved && !published {
-            if let Err(error) = (context.provider)(&payload, src) {
-                retain = true;
-                recovery.push(format!("source restore failed: {error}"));
+        // A provider may report failure after moving into a private path.
+        // Discover and restore/retain that capture rather than recursively deleting it.
+        if let Some(captured) = &captured {
+            if entry_present(captured) && source_location.as_ref() != Some(captured) {
+                if let Err(e) = (context.provider)(captured, src) {
+                    errors.push(format!("uncertain source restore failed: {e}"));
+                }
             }
         }
-        // Even a provider which reports an error after creating a backup must
-        // not cause that backup to be destroyed by generic staging cleanup.
-        if fs::symlink_metadata(&backup).is_ok() {
-            retain = true;
+        if ownership == PayloadOwnership::Generated && entry_present(&payload) {
+            if let Err(e) = remove_tree(&payload) {
+                errors.push(format!("generated payload cleanup failed: {e:?}"));
+            }
         }
-        if retain {
-            return Err(JobError::Io(format!(
+        let mut retained = Vec::new();
+        if let Err(e) = cleanup_generated_container(&stage) {
+            errors.push(format!("destination stage retained: {e}"));
+            retained.push(stage.clone());
+        }
+        if let Some(s) = &source_stage {
+            if let Err(e) = cleanup_generated_container(s) {
+                errors.push(format!("source stage retained: {e}"));
+                retained.push(s.clone());
+            }
+        }
+        if !retained.is_empty() {
+            for s in &retained {
+                let _ = write_recovery(
+                    s,
+                    src,
+                    dst,
+                    source_stage.as_deref(),
+                    &stage,
+                    &format!(
+                        "failed before publication; restore incomplete; {primary:?}; {}",
+                        errors.join("; ")
+                    ),
+                );
+            }
+        }
+        return if errors.is_empty() {
+            Err(primary)
+        } else {
+            Err(JobError::Io(format!(
                 "{primary:?}; {}; recoverable transfer data retained at {}",
-                recovery.join("; "),
-                stage.display()
-            )));
-        }
-        return match fs::remove_dir_all(&stage) {
-            Ok(()) => Err(primary),
-            Err(cleanup) => Err(JobError::Io(format!(
-                "{primary:?}; staging cleanup failed at {}: {cleanup}",
-                stage.display()
-            ))),
+                errors.join("; "),
+                retained
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )))
         };
     }
-    // Backup destruction is allowed only after publication and move-source
-    // deletion have both committed successfully. It is inside the private root.
-    fs::remove_dir_all(&stage).map_err(|cleanup| {
-        JobError::Io(format!(
-            "staging cleanup failed at {}: {cleanup}",
-            stage.display()
-        ))
-    })
+    // Successful no-replace publication commits this item. Never touch the
+    // public destination again, including after cancellation or actor replacement.
+    let mut errors = Vec::new();
+    if let Err(e) = result {
+        errors.push(format!("after publication: {e:?}"));
+    }
+    if errors.is_empty() && entry_present(&backup) {
+        let cleanup = match fs::symlink_metadata(&backup) {
+            Ok(meta) if meta.is_dir() => fs::remove_dir(&backup), // Atomic empty-only disposal.
+            Ok(_) => fs::remove_file(&backup), // Policy-authorized captured file overwrite.
+            Err(e) => Err(e),
+        };
+        if let Err(e) = cleanup {
+            errors.push(format!("captured destination retained: {e}"));
+        }
+    }
+    let mut retained = Vec::new();
+    if let Err(e) = cleanup_generated_container(&stage) {
+        errors.push(format!("destination stage retained: {e}"));
+        retained.push(stage.clone());
+    }
+    if let Some(s) = &source_stage {
+        if let Err(e) = cleanup_generated_container(s) {
+            errors.push(format!("captured source retained: {e}"));
+            retained.push(s.clone());
+        }
+    }
+    if !errors.is_empty() || !retained.is_empty() {
+        for s in &retained {
+            let _ = write_recovery(
+                s,
+                src,
+                dst,
+                source_stage.as_deref(),
+                &stage,
+                &format!(
+                    "destination WAS published; recovery retained; {}",
+                    errors.join("; ")
+                ),
+            );
+        }
+        return Err(JobError::CommittedWithRecovery(format!(
+            "destination WAS published at {}; {}; retained recovery paths: {}",
+            dst.display(),
+            errors.join("; "),
+            retained
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    Ok(())
 }
-/// Unix rename atomically replaces an empty real directory and refuses a
-/// nonempty one. Failure leaves both public entries in place; no cleanup or
-/// cross-volume copying is authorized for this legacy directory move case.
 #[cfg(unix)]
 fn move_directory_over_directory(
     src: &Path,
     dst: &Path,
-    context: &TransferContext<'_>,
-    before_rename: impl FnOnce(),
+    context: &mut TransferContext<'_>,
+    before_capture: impl FnOnce(),
 ) -> Result<(), JobError> {
-    context.control.gate()?;
-    before_rename();
-    fs::rename(src, dst).map_err(Into::into)
+    let mut before_capture = Some(before_capture);
+    transfer_staged(src, dst, JobKind::Move, true, context, false, |point, _| {
+        if point == StagePoint::BeforeSourceCapture {
+            before_capture.take().unwrap()();
+        }
+        Ok(())
+    })
 }
-
 fn transfer_entry(
     src: &Path,
     dst: &Path,
@@ -585,31 +814,28 @@ fn transfer_entry(
     context: &mut TransferContext<'_>,
 ) -> Result<(), JobError> {
     let destination = match fs::symlink_metadata(dst) {
-        Ok(metadata) => Some(metadata),
-        Err(error) if error.kind() == ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
+        Ok(meta) => Some(meta),
+        Err(e) if e.kind() == ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
     };
     if policy == OverwritePolicy::Overwrite
         && destination.as_ref().is_some_and(fs::Metadata::is_dir)
     {
         #[cfg(unix)]
         if kind == JobKind::Move && fs::symlink_metadata(src)?.is_dir() {
-            // symlink_metadata excludes source/target links. The OS validates
-            // entry types and destination emptiness at the atomic rename.
             return move_directory_over_directory(src, dst, context, || {});
         }
-        return Err(std::io::Error::new(
-            ErrorKind::AlreadyExists,
-            "destination directory already exists",
-        )
-        .into());
+        return Err(JobError::Io("destination directory already exists".into()));
     }
-    let replace = policy == OverwritePolicy::Overwrite && destination.is_some();
-    if kind == JobKind::Copy {
-        copy_staged(src, dst, replace, context, |_| {})
-    } else {
-        transfer_staged(src, dst, kind, replace, context, false, |_, _| Ok(()))
-    }
+    transfer_staged(
+        src,
+        dst,
+        kind,
+        policy == OverwritePolicy::Overwrite && destination.is_some(),
+        context,
+        false,
+        |_, _| Ok(()),
+    )
 }
 
 /// Windows fallback for symlink sources: creating symlinks needs
