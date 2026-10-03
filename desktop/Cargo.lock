@@ -2845,6 +2845,7 @@ name = "ira-core"
 version = "0.1.0"
 dependencies = [
  "dirs-next",
+ "image",
  "parking_lot",
  "rustix 1.1.4",
  "serde",
@@ -2856,6 +2857,7 @@ name = "ira-desktop"
 version = "0.1.0"
 dependencies = [
  "gpui",
+ "image",
  "ira-core",
  "objc2",
  "objc2-app-kit",

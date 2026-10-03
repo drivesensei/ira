@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 ira-core = { path = "../crates/core" }
+image = { version = "=0.25.10", default-features = false }
 unicode-segmentation = "=1.13.3"
 raw-window-handle = "=0.6.2"
 

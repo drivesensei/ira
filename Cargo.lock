@@ -721,6 +721,7 @@ name = "ira-core"
 version = "0.1.0"
 dependencies = [
  "dirs-next",
+ "image",
  "parking_lot",
  "rustix 1.1.4",
  "serde",

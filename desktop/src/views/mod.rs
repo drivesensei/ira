@@ -1,4 +1,5 @@
 pub mod accessibility;
+pub mod preview;
 use crate::platform::accessibility::{
     ResolvedAction,
     model::{Action as AxAction, Capability as AxCapability, Role as AxRole, Target as AxTarget},
@@ -33,6 +34,7 @@ use std::{
 pub struct Desktop {
     runtime: Runtime,
     accessibility: accessibility::Host,
+    preview: preview::Host,
     accessibility_actions: Vec<ResolvedAction>,
     snapshot: Option<Arc<Snapshot>>,
     controls: Vec<Arc<JobControl>>,
@@ -72,6 +74,7 @@ impl Desktop {
         Self {
             runtime,
             accessibility: accessibility::Host::default(),
+            preview: preview::Host::new(),
             accessibility_actions: Vec::new(),
             snapshot: None,
             controls: Vec::new(),
@@ -103,6 +106,7 @@ impl Desktop {
         cx.notify();
     }
     pub fn close(&mut self) {
+        self.preview.close();
         self.accessibility.close();
         self.accessibility_actions.clear();
         self.runtime.detach();
@@ -110,6 +114,9 @@ impl Desktop {
         self.polling.take();
     }
     fn poll(&mut self, cx: &mut Context<Self>) {
+        if self.preview.poll(self.snapshot.as_deref()) {
+            cx.notify();
+        }
         self.runtime.flush();
         if let Some(error) = self.geometry.try_error() {
             self.runtime.enqueue(Command::HostResult(Err(error)), None);
@@ -234,7 +241,9 @@ impl Desktop {
             HostRequest::OpenEditor(_) | HostRequest::SaveEditor(_) => {
                 unreachable!("editor requests stay on actor worker lane")
             }
-            HostRequest::InvalidatePreview(_) => {}
+            HostRequest::InvalidatePreview(path) => {
+                self.preview.invalidate(&path);
+            }
             HostRequest::EditorKey { .. } | HostRequest::EditorPaste { .. } => {
                 self.feedback = Some("Native editor input requires a current document".into());
             }
@@ -911,11 +920,60 @@ impl Render for Desktop {
                 None,
             ));
         }
+        for index in 0..if self.snapshot.as_ref().is_some_and(|s| s.split) {
+            2
+        } else {
+            1
+        } {
+            if let Some(key) = self
+                .snapshot
+                .as_ref()
+                .and_then(|s| preview::Host::key(s, index))
+            {
+                let mut column = div()
+                    .w(px(260.))
+                    .h_full()
+                    .min_h_0()
+                    .p_3()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .bg(native_color(self.theme.surface_alt))
+                    .child(format!("Preview · pane {}", index + 1));
+                column = match self.preview.content(&key) {
+                    Some(preview::Content::Image(image)) => column.child(
+                        gpui::img(image.clone())
+                            .w_full()
+                            .max_h(px(500.))
+                            .object_fit(gpui::ObjectFit::Contain),
+                    ),
+                    Some(preview::Content::Text(text)) => column.child(
+                        div()
+                            .id(("preview-text", index))
+                            .overflow_y_scroll()
+                            .flex_1()
+                            .min_h_0()
+                            .child(text.clone()),
+                    ),
+                    Some(preview::Content::Error(error)) => column.child(
+                        div()
+                            .text_color(native_color(self.theme.text_muted))
+                            .child(error.clone()),
+                    ),
+                    None => column.child("Loading preview…"),
+                };
+                panes = panes.child(column);
+            }
+        }
         content = content.child(panes);
         if let Some(snapshot) = &self.snapshot
             && snapshot.copy_board
         {
             let mut board = div()
+                .id("ira-copy-board")
+                .max_h(px(240.))
+                .overflow_y_scroll()
+                .flex_shrink_0()
                 .p_3()
                 .bg(native_color(self.theme.surface_alt))
                 .child("Copy Board");
@@ -925,8 +983,11 @@ impl Render for Desktop {
                     .id(("job", index))
                     .p_2()
                     .flex()
-                    .gap_3()
-                    .items_center()
+                    .flex_col()
+                    .gap_2()
+                    .items_start()
+                    .w_full()
+                    .min_w_0()
                     .bg(native_color(
                         if snapshot.board_focused && snapshot.copy_board_cursor == Some(index) {
                             self.theme.cursor_bg
@@ -952,6 +1013,15 @@ impl Render for Desktop {
                         );
                         cx.notify();
                     }));
+                if let ira_core::services::transfer::JobStatus::Failed(error) = &job.status {
+                    row = row.child(
+                        div()
+                            .w_full()
+                            .whitespace_normal()
+                            .text_sm()
+                            .child(error.clone()),
+                    );
+                }
                 for (label, verb) in [
                     ("Pause / Resume", JobVerb::Pause),
                     ("Cancel", JobVerb::Cancel),
