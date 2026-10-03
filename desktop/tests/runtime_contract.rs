@@ -874,3 +874,112 @@ fn background_semantic_publications_advance_revision_without_input() {
         std::thread::sleep(Duration::from_millis(5));
     }
 }
+
+#[test]
+fn queued_accessibility_entry_is_rejected_after_same_path_relisting() {
+    use ira_desktop::platform::accessibility::{
+        AccessibilityIntent, ActionSink,
+        model::{AccessibilityModel, Action, LayoutSnapshot, Role, Target},
+    };
+    let fixture = Fixture::new();
+    let app = fixture.app();
+    let mut runtime = Runtime::with_factory(7, move || app);
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let first = loop {
+        if let Some(publication) = runtime.try_snapshot() {
+            break publication.snapshot;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    };
+    let mut model = AccessibilityModel::default();
+    let tree = Arc::new(model.project(&first, None, &LayoutSnapshot::default()));
+    let node = tree
+        .nodes
+        .values()
+        .find(|n| {
+            n.role == Role::Row
+                && matches!(&n.target, Target::Entry { path, .. } if path.ends_with("alpha.txt"))
+        })
+        .unwrap();
+    let id = node.id;
+    let (sink, receiver) = ActionSink::channel(tree.clone(), 4);
+    sink.try_dispatch(AccessibilityIntent {
+        node: id,
+        stamp: tree.stamp,
+        action: Action::SetSelected(true),
+    })
+    .unwrap();
+    let queued = receiver.try_next().unwrap().unwrap();
+    let token = first.panes[0].listing_generation;
+    runtime.enqueue(key(KeyCode::Char('.')), None);
+    let next = loop {
+        if let Some(publication) = runtime.try_snapshot()
+            && publication.snapshot.panes[0].listing_generation > token
+            && publication.snapshot.panes[0].listing_settled
+        {
+            break publication.snapshot;
+        }
+        assert!(Instant::now() < deadline, "relisting failed to settle");
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    let fresh_tree = Arc::new(model.project(&next, None, &LayoutSnapshot::default()));
+    let fresh = &fresh_tree.nodes[&id];
+    assert!(
+        matches!(&fresh.target, Target::Entry { path, listing_generation, .. } if path.ends_with("alpha.txt") && *listing_generation > token)
+    );
+    runtime.enqueue(Command::Accessibility(queued), None);
+    loop {
+        if let Some(Completion::Rejected { reason, .. }) = runtime.try_completion() {
+            assert!(reason.contains("older semantic frame"));
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    loop {
+        if let Some(publication) = runtime.try_snapshot()
+            && publication.snapshot.ack_sequence == 1
+        {
+            assert!(
+                publication.snapshot.panes[0]
+                    .rows
+                    .iter()
+                    .all(|row| !row.selected),
+                "rejected old intent mutated selection"
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    sink.publish(fresh_tree.clone()).unwrap();
+    sink.try_dispatch(AccessibilityIntent {
+        node: id,
+        stamp: fresh_tree.stamp,
+        action: Action::SetSelected(true),
+    })
+    .unwrap();
+    runtime.enqueue(
+        Command::Accessibility(receiver.try_next().unwrap().unwrap()),
+        None,
+    );
+    loop {
+        if let Some(publication) = runtime.try_snapshot()
+            && publication.snapshot.ack_sequence >= 3
+        {
+            assert!(
+                publication.snapshot.panes[0]
+                    .rows
+                    .iter()
+                    .find(|r| r.entry.label == "alpha.txt")
+                    .unwrap()
+                    .selected
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    runtime.stop(&[]);
+}
