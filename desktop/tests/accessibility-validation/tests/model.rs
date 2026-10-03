@@ -420,7 +420,11 @@ fn native_wrong_thread_rejects_before_reading_raw_handle() {
     let (sink, _rx) = ActionSink::channel(tree, 1);
     std::thread::spawn(move || {
         assert!(matches!(
-            NativeBridge::attach(&NeverRead, sink),
+            NativeBridge::attach(&NeverRead, sink.clone()),
+            Err(BridgeError::WrongThread)
+        ));
+        assert!(matches!(
+            NativeBridge::attach_unpublished(&NeverRead, sink),
             Err(BridgeError::WrongThread)
         ));
     })
