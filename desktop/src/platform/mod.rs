@@ -1,3 +1,4 @@
+pub mod accessibility;
 pub mod geometry;
 // Explicit native requests run on workers, never during Render.
 use ira_core::model::HostRequest;

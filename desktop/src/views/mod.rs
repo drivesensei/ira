@@ -1,3 +1,8 @@
+pub mod accessibility;
+use crate::platform::accessibility::{
+    ResolvedAction,
+    model::{Action as AxAction, Capability as AxCapability, Role as AxRole, Target as AxTarget},
+};
 use crate::{
     actions,
     components::text_input::{
@@ -26,6 +31,8 @@ use std::{
 
 pub struct Desktop {
     runtime: Runtime,
+    accessibility: accessibility::Host,
+    accessibility_actions: Vec<ResolvedAction>,
     snapshot: Option<Arc<Snapshot>>,
     controls: Vec<Arc<JobControl>>,
     focus: FocusHandle,
@@ -62,6 +69,8 @@ impl Desktop {
         });
         Self {
             runtime,
+            accessibility: accessibility::Host::default(),
+            accessibility_actions: Vec::new(),
             snapshot: None,
             controls: Vec::new(),
             focus: cx.focus_handle(),
@@ -91,6 +100,8 @@ impl Desktop {
         cx.notify();
     }
     pub fn close(&mut self) {
+        self.accessibility.close();
+        self.accessibility_actions.clear();
         self.runtime.detach();
         self.runtime.cancel_jobs(&self.controls);
         self.polling.take();
@@ -177,6 +188,23 @@ impl Desktop {
                 "{} commands waiting for the worker",
                 self.runtime.backlog()
             ));
+            changed = true;
+        }
+        for _ in 0..64 {
+            let Some(action) = self
+                .accessibility
+                .receiver
+                .as_ref()
+                .and_then(|receiver| receiver.try_next())
+            else {
+                break;
+            };
+            match action {
+                Ok(action) => self.accessibility_actions.push(action),
+                Err(error) => {
+                    self.feedback = Some(format!("Accessibility request rejected: {error:?}"))
+                }
+            }
             changed = true;
         }
         if changed {
@@ -386,6 +414,100 @@ impl Desktop {
         self.runtime.enqueue(command, generation);
         cx.notify();
     }
+    fn native_text(
+        &self,
+        cx: &gpui::App,
+    ) -> Option<crate::platform::accessibility::model::NativeTextSnapshot> {
+        Some(accessibility::native_text(
+            self.input.as_ref()?,
+            self.input_mode?,
+            self.snapshot
+                .as_ref()
+                .and_then(|s| s.edit.as_ref())
+                .is_some_and(|e| e.read_only),
+            cx,
+        ))
+    }
+    fn accessibility_actions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for action in std::mem::take(&mut self.accessibility_actions) {
+            let Some(snapshot) = &self.snapshot else {
+                continue;
+            };
+            let text = self.native_text(cx);
+            if (
+                action.stamp.window,
+                action.stamp.document,
+                action.stamp.focus,
+                action.stamp.revision,
+                action.stamp.text_revision,
+            ) != (
+                snapshot.window_generation,
+                snapshot.document_generation,
+                snapshot.focus_generation,
+                snapshot.revision,
+                text.as_ref().map_or(0, |t| t.revision),
+            ) {
+                self.feedback = Some("Accessibility request belongs to an older frame".into());
+                continue;
+            }
+            match (&action.target, &action.action) {
+                (AxTarget::Text { document }, AxAction::Focus)
+                    if *document == snapshot.document_generation =>
+                {
+                    if let Some(input) = &self.input {
+                        input.update(cx, |input, cx| input.focus(window, cx));
+                    }
+                }
+                (AxTarget::Text { document }, AxAction::SetValue(value))
+                    if *document == snapshot.document_generation =>
+                {
+                    if let Some(input) = &self.input {
+                        let result =
+                            input.update(cx, |input, cx| input.edit_value(value, window, cx));
+                        if let Err(error) = result {
+                            self.feedback = Some(format!("Accessibility text edit: {error:?}"));
+                        }
+                    }
+                }
+                (AxTarget::Text { document }, AxAction::SetSelection(range))
+                    if *document == snapshot.document_generation =>
+                {
+                    if let Some(input) = &self.input {
+                        let result = input.update(cx, |input, cx| {
+                            input.set_selection_utf16(range.clone(), false, window, cx)
+                        });
+                        if let Err(error) = result {
+                            self.feedback =
+                                Some(format!("Accessibility text selection: {error:?}"));
+                        }
+                    }
+                }
+                (
+                    AxTarget::Entry {
+                        pane,
+                        path,
+                        listing_generation,
+                    },
+                    AxAction::Reveal,
+                ) => {
+                    if snapshot
+                        .panes
+                        .get(*pane)
+                        .is_some_and(|p| p.listing_generation == *listing_generation)
+                        && let Some(index) = snapshot.panes[*pane]
+                            .rows
+                            .iter()
+                            .position(|r| std::path::Path::new(&r.entry.path) == path)
+                    {
+                        self.scroll[*pane].scroll_to_item(index, ScrollStrategy::Center);
+                    }
+                }
+                _ => {
+                    self.runtime.enqueue(Command::Accessibility(action), None);
+                }
+            }
+        }
+    }
     fn target(
         &mut self,
         target: EntryTarget,
@@ -403,7 +525,7 @@ impl Desktop {
         code: KeyCode,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        div()
+        let button = div()
             .id(label)
             .px_3()
             .py_1()
@@ -411,8 +533,21 @@ impl Desktop {
             .bg(native_color(self.theme.surface))
             .cursor_pointer()
             .child(label)
-            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.dispatch(code, cx)))
-            .into_any_element()
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.dispatch(code, cx)));
+        if label == "Confirm" || label == "Cancel" {
+            self.accessibility.measured(
+                button,
+                AxTarget::Modal,
+                Some(AxRole::Button),
+                Some(if label == "Confirm" {
+                    AxCapability::Activate
+                } else {
+                    AxCapability::Dismiss
+                }),
+            )
+        } else {
+            button.into_any_element()
+        }
     }
     fn pane(&self, index: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
         let Some(snapshot) = &self.snapshot else {
@@ -460,13 +595,14 @@ impl Desktop {
                     let label=format!("{} {} {}",if row.selected{"☑"}else{"☐"},glyph,row.entry.label);
                     let foreground = if pane.cursor == Some(row_index) && snapshot.active_pane == index { this.theme.cursor_fg } else { this.theme.color_for(category) };
                     let size=if row.entry.is_dir{"Folder".to_string()}else{format!("{} B",row.entry.size)};
-                    div().id(("row",row_index)).h(px(30.)).px_3().flex().justify_between().items_center().bg(native_color(if pane.cursor==Some(row_index)&&snapshot.active_pane==index{this.theme.cursor_bg}else if row.selected{this.theme.selection}else{this.theme.bg})).text_color(native_color(foreground)).cursor_pointer().child(label).child(div().text_sm().text_color(native_color(this.theme.text_muted)).child(size))
+                    let element=div().id(("row",row_index)).h(px(30.)).px_3().flex().justify_between().items_center().bg(native_color(if pane.cursor==Some(row_index)&&snapshot.active_pane==index{this.theme.cursor_bg}else if row.selected{this.theme.selection}else{this.theme.bg})).text_color(native_color(foreground)).cursor_pointer().child(label).child(div().text_sm().text_color(native_color(this.theme.text_muted)).child(size))
                         .on_click(cx.listener(move|this,event:&ClickEvent,window,cx|{
                             let double=matches!(event,ClickEvent::Mouse(e) if e.down.click_count>=2);
                             let modifiers=event.modifiers();
                             let verb=if double{TargetVerb::Open}else if modifiers.platform||modifiers.control{TargetVerb::Toggle}else{TargetVerb::Focus};
                             this.target(target.clone(),verb,window,cx);
-                        })).into_any_element()
+                        }));
+                    this.accessibility.measured(element,AxTarget::Entry{pane:index,path:PathBuf::from(&row.entry.path),listing_generation:pane.listing_generation},Some(AxRole::Row),None)
                 })).collect::<Vec<_>>()
             })).track_scroll(self.scroll[index].clone()).flex_1().min_h_0());
         }
@@ -488,7 +624,8 @@ impl Desktop {
                 cx.notify();
             }
         }));
-        body.into_any_element()
+        self.accessibility
+            .measured(body, AxTarget::Pane(index), Some(AxRole::List), None)
     }
     fn places(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let mut list = div()
@@ -525,24 +662,44 @@ impl Desktop {
                             "Places" => PlaceKind::Common,
                             _ => PlaceKind::Bookmark,
                         };
+                        let ax_kind = match kind {
+                            PlaceKind::Drive => {
+                                crate::platform::accessibility::model::PlaceKind::Drive
+                            }
+                            PlaceKind::Common => {
+                                crate::platform::accessibility::model::PlaceKind::Common
+                            }
+                            PlaceKind::Bookmark => {
+                                crate::platform::accessibility::model::PlaceKind::Bookmark
+                            }
+                        };
+                        let ax_target = AxTarget::Place {
+                            kind: ax_kind,
+                            path: PathBuf::from(&path),
+                        };
                         list = list.child(
-                            div()
-                                .id((heading, i))
-                                .px_2()
-                                .py_1()
-                                .rounded_sm()
-                                .cursor_pointer()
-                                .child(label)
-                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                    this.runtime.enqueue(
-                                        Command::Place {
-                                            kind,
-                                            path: path.clone(),
-                                        },
-                                        None,
-                                    );
-                                    cx.notify();
-                                })),
+                            self.accessibility.measured(
+                                div()
+                                    .id((heading, i))
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .child(label)
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.runtime.enqueue(
+                                            Command::Place {
+                                                kind,
+                                                path: path.clone(),
+                                            },
+                                            None,
+                                        );
+                                        cx.notify();
+                                    })),
+                                ax_target,
+                                Some(AxRole::Button),
+                                Some(AxCapability::Activate),
+                            ),
                         );
                     }
                 }
@@ -580,7 +737,14 @@ impl Desktop {
             return Some(
                 modal
                     .child(label)
-                    .child(input.clone())
+                    .child(self.accessibility.measured(
+                        div().child(input.clone()),
+                        AxTarget::Text {
+                            document: snapshot.document_generation,
+                        },
+                        None,
+                        None,
+                    ))
                     .child("Enter to confirm · Esc to cancel")
                     .into_any_element(),
             );
@@ -625,7 +789,10 @@ impl Desktop {
         } else {
             return None;
         }
-        Some(modal.into_any_element())
+        Some(
+            self.accessibility
+                .measured(modal, AxTarget::Modal, Some(AxRole::Dialog), None),
+        )
     }
 }
 impl Focusable for Desktop {
@@ -636,6 +803,11 @@ impl Focusable for Desktop {
 impl Render for Desktop {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_input(window, cx);
+        self.accessibility_actions(window, cx);
+        if let Some(snapshot) = &self.snapshot {
+            let text = self.native_text(cx);
+            self.accessibility.begin(snapshot, text.as_ref());
+        }
         let mut panes = div().flex().flex_1().min_h_0().child(self.pane(0, cx));
         if self.snapshot.as_ref().is_some_and(|s| s.split) {
             panes = panes.child(self.pane(1, cx));
@@ -644,7 +816,14 @@ impl Render for Desktop {
         if self.input_mode == Some(InputMode::Search)
             && let Some(input) = &self.input
         {
-            content = content.child(div().px_3().py_2().child(input.clone()));
+            content = content.child(self.accessibility.measured(
+                div().px_3().py_2().child(input.clone()),
+                AxTarget::Text {
+                    document: self.snapshot.as_ref().map_or(0, |s| s.document_generation),
+                },
+                None,
+                None,
+            ));
         }
         content = content.child(panes);
         if let Some(snapshot) = &self.snapshot
@@ -692,20 +871,34 @@ impl Render for Desktop {
                     ("Cancel", JobVerb::Cancel),
                 ] {
                     row = row.child(
-                        div()
-                            .id((label, index))
-                            .px_2()
-                            .cursor_pointer()
-                            .child(label)
-                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                window.focus(&this.focus);
-                                this.runtime.enqueue(Command::Job { id, verb }, None);
-                                cx.stop_propagation();
-                                cx.notify();
-                            })),
+                        self.accessibility.measured(
+                            div()
+                                .id((label, index))
+                                .px_2()
+                                .cursor_pointer()
+                                .child(label)
+                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    window.focus(&this.focus);
+                                    this.runtime.enqueue(Command::Job { id, verb }, None);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                })),
+                            AxTarget::Job(id),
+                            Some(AxRole::Button),
+                            Some(if matches!(verb, JobVerb::Pause) {
+                                AxCapability::Pause
+                            } else {
+                                AxCapability::Cancel
+                            }),
+                        ),
                     );
                 }
-                board = board.child(row);
+                board = board.child(self.accessibility.measured(
+                    row,
+                    AxTarget::Job(id),
+                    Some(AxRole::Row),
+                    None,
+                ));
             }
             content = content.child(board);
         }
@@ -812,11 +1005,16 @@ impl Render for Desktop {
                         .child(content),
                 )
                 .child(
-                    div()
-                        .p_2()
-                        .text_sm()
-                        .bg(native_color(self.theme.surface_alt))
-                        .child(status),
+                    self.accessibility.measured(
+                        div()
+                            .p_2()
+                            .text_sm()
+                            .bg(native_color(self.theme.surface_alt))
+                            .child(status),
+                        AxTarget::Window,
+                        Some(AxRole::Status),
+                        None,
+                    ),
                 );
         if let Some(family) = &self.font_family {
             root = root.font_family(family.clone());
@@ -824,7 +1022,32 @@ impl Render for Desktop {
         if let Some(modal) = self.modal(window.bounds().size.height, cx) {
             root = root.child(modal);
         }
-        root
+        let entity = cx.entity().downgrade();
+        let expected_frame = self.accessibility.frame.clone();
+        let root = self
+            .accessibility
+            .measured(root, AxTarget::Window, Some(AxRole::Window), None);
+        div().relative().size_full().child(root).child(
+            gpui::canvas(
+                |_, _, _| {},
+                move |_, _, window, cx| {
+                    let _ = entity.update(cx, |this, cx| {
+                        if !std::rc::Rc::ptr_eq(&expected_frame, &this.accessibility.frame) {
+                            return;
+                        }
+                        let text = this.native_text(cx);
+                        if let Some(snapshot) = &this.snapshot
+                            && let Err(error) =
+                                this.accessibility.publish(snapshot, text.as_ref(), window)
+                        {
+                            this.feedback = Some(error);
+                        }
+                    });
+                },
+            )
+            .absolute()
+            .inset_0(),
+        )
     }
 }
 impl Drop for Desktop {
@@ -844,4 +1067,177 @@ pub fn native_color(color: ira_core::theme::Color) -> gpui::Rgba {
     gpui::rgba(
         (u32::from(c.r) << 24) | (u32::from(c.g) << 16) | (u32::from(c.b) << 8) | u32::from(c.a),
     )
+}
+
+#[cfg(test)]
+mod crossing_tests {
+    use super::*;
+    use crate::platform::accessibility::{
+        AccessibilityIntent,
+        model::{Action, Role, Target},
+    };
+    use gpui::TestAppContext;
+    use ira_core::{application::App, domain::data::Folder, services::list_files::list_files};
+    #[gpui::test]
+    fn real_virtualized_desktop_frame_records_clipped_path_geometry(cx: &mut TestAppContext) {
+        let fixture = std::env::temp_dir().join(format!("ira-ax-frame-{}", std::process::id()));
+        std::fs::create_dir_all(&fixture).unwrap();
+        for index in 0..200 {
+            std::fs::write(fixture.join(format!("file-{index:03}.txt")), b"fixture").unwrap();
+        }
+        let mut app = App::default();
+        app.window_generation = 7;
+        app.panes[0].folder = Some(Folder::new(
+            "Fixture".into(),
+            fixture.to_string_lossy().into_owned(),
+            '#',
+        ));
+        app.panes[0].files = list_files(fixture.to_str().unwrap()).unwrap();
+        app.panes[0].selected = vec![false; 200];
+        app.panes[0].listing_settled = true;
+        app.panes[0].listing_generation = 3;
+        app.panes[0].state.select(Some(0));
+        let runtime = Runtime::with_factory(7, move || app);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let publication = loop {
+            if let Some(p) = runtime.try_snapshot() {
+                break p;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            let mut view = Desktop::new(runtime, crate::platform::geometry::Writer::new(None), cx);
+            view.accessibility = accessibility::Host::headless();
+            view.snapshot = Some(publication.snapshot);
+            view
+        });
+        view.update_in(cx,|view,_,cx|{
+            let tree=view.accessibility.tree.as_ref().expect("actual root paint published frame");
+            let rows:Vec<_>=tree.nodes.values().filter(|n|n.role==Role::Row).collect();
+            assert_eq!(rows.len(),200);
+            let materialized:Vec<_>=rows.iter().filter_map(|n|n.geometry).collect();
+            assert!(!materialized.is_empty());assert!(materialized.len()<200);
+            for geometry in materialized {assert!(geometry.visible.valid());assert_eq!(geometry.bounds.intersection(geometry.visible),Some(geometry.visible));}
+            let first=rows.iter().find(|n|matches!(&n.target,Target::Entry{path,..} if path.ends_with("file-000.txt"))).unwrap();
+            let bounds=first.geometry.expect("first actual row painted").visible;
+            assert_eq!(tree.hit_test(bounds.x+bounds.width/2.,bounds.y+bounds.height/2.),Some(first.id));
+            let intent=AccessibilityIntent{node:first.id,stamp:tree.stamp,action:Action::SetSelected(true)};
+            view.accessibility.sink_for_test().try_dispatch(intent).unwrap();
+            view.poll(cx);
+            assert_eq!(view.accessibility_actions.len(),1);
+            view.runtime.stop(&view.controls);view.close();
+        });
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+    #[gpui::test]
+    fn accessibility_rename_value_uses_native_draft_and_same_confirmation_gateway(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(text_input::register);
+        let fixture = std::env::temp_dir().join(format!("ira-ax-draft-{}", std::process::id()));
+        std::fs::create_dir_all(&fixture).unwrap();
+        std::fs::write(fixture.join("original.txt"), b"fixture").unwrap();
+        let mut app = App::default();
+        app.window_generation = 7;
+        app.panes[0].folder = Some(Folder::new(
+            "Fixture".into(),
+            fixture.to_string_lossy().into_owned(),
+            '#',
+        ));
+        app.panes[0].files = list_files(fixture.to_str().unwrap()).unwrap();
+        app.panes[0].selected = vec![false];
+        app.panes[0].listing_settled = true;
+        app.panes[0].listing_generation = 3;
+        app.panes[0].state.select(Some(0));
+        app.dispatch(Input::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        let runtime = Runtime::with_factory(7, move || app);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let publication = loop {
+            if let Some(p) = runtime.try_snapshot() {
+                break p;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            let mut view = Desktop::new(runtime, crate::platform::geometry::Writer::new(None), cx);
+            view.accessibility = accessibility::Host::headless();
+            view.snapshot = Some(publication.snapshot);
+            view
+        });
+        loop {
+            let ready = view.update_in(cx, |view, _, cx| {
+                view.poll(cx);
+                view.snapshot
+                    .as_ref()
+                    .is_some_and(|s| s.focus_generation == view.input_generation)
+            });
+            if ready {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        view.update_in(cx, |view, window, cx| {
+            let tree = view.accessibility.tree.as_ref().unwrap();
+            let node = tree
+                .nodes
+                .values()
+                .find(|n| matches!(n.target, Target::Text { .. }))
+                .unwrap();
+            assert!(node.geometry.is_some());
+            let stale = view
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .renaming
+                .as_ref()
+                .unwrap()
+                .text
+                .clone();
+            view.accessibility
+                .sink_for_test()
+                .try_dispatch(AccessibilityIntent {
+                    node: node.id,
+                    stamp: tree.stamp,
+                    action: Action::SetValue("é-ax.txt".into()),
+                })
+                .unwrap();
+            view.poll(cx);
+            view.accessibility_actions(window, cx);
+            assert_eq!(view.native_text(cx).unwrap().text.as_ref(), "é-ax.txt");
+            assert_eq!(
+                view.snapshot
+                    .as_ref()
+                    .unwrap()
+                    .renaming
+                    .as_ref()
+                    .unwrap()
+                    .text,
+                stale,
+                "actor snapshot is still older than authoritative native edit"
+            );
+        });
+        // Enter uses the existing eventful native submit path; actor FIFO applies the AX draft first.
+        cx.simulate_keystrokes("enter");
+        loop {
+            if fixture.join("é-ax.txt").exists() {
+                break;
+            }
+            view.update_in(cx, |view, _, cx| view.poll(cx));
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        view.update_in(cx, |view, _, _| {
+            view.runtime.stop(&view.controls);
+            view.close();
+        });
+        assert_eq!(std::fs::read(fixture.join("é-ax.txt")).unwrap(), b"fixture");
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
 }

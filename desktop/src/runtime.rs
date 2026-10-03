@@ -23,6 +23,8 @@ use std::{
 #[derive(Clone, Debug)]
 pub enum Command {
     Input(Input),
+    Accessibility(crate::platform::accessibility::ResolvedAction),
+    FocusPane(usize),
     Wheel {
         pane: usize,
         listing_generation: u64,
@@ -74,6 +76,8 @@ pub enum PlaceKind {
 pub enum TargetVerb {
     Focus,
     Toggle,
+    Selected(bool),
+    SelectOnly,
     Open,
 }
 #[derive(Clone, Debug)]
@@ -534,7 +538,39 @@ pub fn apply(app: &mut App, envelope: Envelope) -> Result<(), String> {
         return Err("Input belongs to a closed document or focus".into());
     }
     let previous_context = app.input_context();
-    match envelope.command {
+    let command = match envelope.command {
+        Command::Accessibility(action) => {
+            if (
+                action.stamp.window,
+                action.stamp.document,
+                action.stamp.focus,
+                action.stamp.revision,
+            ) != (
+                app.window_generation,
+                app.document_generation,
+                app.focus_generation,
+                app.revision,
+            ) {
+                return Err("Accessibility action belongs to an older semantic frame".into());
+            }
+            crate::views::accessibility::actor_command(action)?
+        }
+        command => command,
+    };
+    match command {
+        Command::Accessibility(_) => unreachable!("resolved above"),
+        Command::FocusPane(pane) => {
+            if pane >= 2
+                || (pane == 1 && !app.split)
+                || !matches!(
+                    app.input_context(),
+                    ira_core::input::InputContext::Pane(_) | ira_core::input::InputContext::Search
+                )
+            {
+                return Err("Pane is unavailable or modal input owns focus".into());
+            }
+            app.active_pane = pane;
+        }
         Command::Input(input) => app.dispatch(input).map_err(|error| error.to_string())?,
         Command::Wheel {
             pane,
@@ -624,6 +660,27 @@ pub fn apply(app: &mut App, envelope: Envelope) -> Result<(), String> {
             match verb {
                 TargetVerb::Focus => {}
                 TargetVerb::Toggle => app.toggle_select_current(),
+                TargetVerb::Selected(selected) => {
+                    let index = app.panes[target.pane]
+                        .files
+                        .iter()
+                        .position(|entry| Path::new(&entry.path) == target.path)
+                        .ok_or("Entry is no longer available")?;
+                    if let Some(slot) = app.panes[target.pane].selected.get_mut(index) {
+                        *slot = selected;
+                    }
+                }
+                TargetVerb::SelectOnly => {
+                    let index = app.panes[target.pane]
+                        .files
+                        .iter()
+                        .position(|entry| Path::new(&entry.path) == target.path)
+                        .ok_or("Entry is no longer available")?;
+                    app.panes[target.pane].selected.fill(false);
+                    if let Some(slot) = app.panes[target.pane].selected.get_mut(index) {
+                        *slot = true;
+                    }
+                }
                 TargetVerb::Open => app
                     .dispatch(Input::Key(KeyEvent::new(
                         KeyCode::Right,

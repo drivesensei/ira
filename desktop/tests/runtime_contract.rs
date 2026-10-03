@@ -775,3 +775,50 @@ fn first_reopened_command_refreshes_epoch_after_blocked_receive() {
         }
     }
 }
+
+fn ax_entry(app: &App, action: ira_desktop::platform::accessibility::model::Action) -> Command {
+    use ira_desktop::platform::accessibility::{
+        ResolvedAction,
+        model::{NodeId, Stamp, Target},
+    };
+    Command::Accessibility(ResolvedAction {
+        node: NodeId {
+            window: 7,
+            serial: 1,
+        },
+        stamp: Stamp {
+            window: 7,
+            document: app.document_generation,
+            focus: app.focus_generation,
+            revision: app.revision,
+            text_revision: 0,
+        },
+        target: Target::Entry {
+            pane: 0,
+            path: PathBuf::from(&app.panes[0].files[0].path),
+            listing_generation: app.panes[0].listing_generation,
+        },
+        action,
+    })
+}
+#[test]
+fn accessibility_selected_is_idempotent_exclusive_and_generation_checked() {
+    use ira_desktop::platform::accessibility::model::Action;
+    let fixture = Fixture::new();
+    let mut app = fixture.app();
+    let first = ax_entry(&app, Action::SetSelected(true));
+    apply(&mut app, envelope(1, first)).unwrap();
+    assert_eq!(app.panes[0].selected, vec![true, false]);
+    assert_eq!(app.panes[0].state.selected(), Some(0));
+    let second = ax_entry(&app, Action::SetSelected(true));
+    apply(&mut app, envelope(2, second)).unwrap();
+    assert_eq!(app.panes[0].selected, vec![true, false]);
+    app.panes[0].selected[1] = true;
+    let only = ax_entry(&app, Action::SelectOnly);
+    apply(&mut app, envelope(3, only)).unwrap();
+    assert_eq!(app.panes[0].selected, vec![true, false]);
+    let stale = ax_entry(&app, Action::SetSelected(false));
+    app.revision += 1;
+    assert!(apply(&mut app, envelope(4, stale)).is_err());
+    assert!(app.panes[0].selected[0]);
+}
