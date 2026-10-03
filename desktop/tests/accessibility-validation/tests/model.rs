@@ -187,7 +187,8 @@ fn logical_navigation_includes_virtual_rows_without_fake_geometry() {
     let mut s = fixture();
     s.panes[0].rows = (0..10000)
         .map(|i| row(&format!("{i}.txt"), false))
-        .collect();
+        .collect::<Vec<_>>()
+        .into();
     let t = tree(&s);
     let list = t
         .nodes
