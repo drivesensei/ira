@@ -68,26 +68,33 @@ fn main() -> AppResult<()> {
             Event::Resize(_, _) => {}
         }
     }
-    // Persist session state (split layout and pane folders) on exit.
+    finish_exit(&mut app, |app| {
+        app.close_overlay();
+        // Graphics-protocol cleanup: transmitted kitty images persist in the
+        // terminal beyond the program's lifetime unless explicitly deleted.
+        if matches!(
+            app.picker.as_ref().map(|p| p.protocol_type()),
+            Some(ProtocolType::Kitty)
+        ) {
+            let mut out: Box<dyn Write> = if use_stdout {
+                Box::new(io::stdout())
+            } else {
+                Box::new(io::stderr())
+            };
+            let _ = write!(out, "\x1b_Ga=d,d=e\x1b\\");
+            let _ = out.flush();
+        }
+        // Exit the user interface.
+        tui.exit()?;
+        Ok(())
+    })
+}
+
+/// The normal terminal-exit path. Cleanup is injected so regression tests use
+/// owned synthetic state and never initialize a terminal or call App::new.
+fn finish_exit(app: &mut App, cleanup: impl FnOnce(&mut App) -> AppResult<()>) -> AppResult<()> {
     app.persist_state();
-    app.close_overlay();
-    // Graphics-protocol cleanup: transmitted kitty images persist in the
-    // terminal beyond the program's lifetime unless explicitly deleted.
-    if matches!(
-        app.picker.as_ref().map(|p| p.protocol_type()),
-        Some(ProtocolType::Kitty)
-    ) {
-        let mut out: Box<dyn Write> = if use_stdout {
-            Box::new(io::stdout())
-        } else {
-            Box::new(io::stderr())
-        };
-        let _ = write!(out, "\x1b_Ga=d,d=e\x1b\\");
-        let _ = out.flush();
-    }
-    // Exit the user interface.
-    tui.exit()?;
-    Ok(())
+    cleanup(app)
 }
 
 /// Prints detected terminal capabilities and exits. Useful when icons
@@ -175,3 +182,7 @@ fn print_terminal_check() {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "main_exit_tests.rs"]
+mod main_exit_tests;
