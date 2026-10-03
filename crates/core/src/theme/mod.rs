@@ -1,5 +1,18 @@
 //! UI-neutral preset identity and file classification.
 pub mod icons;
+mod load;
+mod palette;
+#[cfg(test)]
+use icons::IconSet;
+#[cfg(test)]
+use load::load_from;
+#[cfg(test)]
+use load::TermCaps;
+pub use load::{
+    load, load_with_persisted, resolve_icon_set, theme_file_path, Loaded, Loader, PresetSource,
+    ThemeCapabilities,
+};
+pub use palette::{ChipStyle, Color, Rgba, Theme};
 
 /// Built-in palettes, in `\` cycle order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -70,3 +83,7 @@ impl ThemePreset {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "theme_tests.rs"]
+mod tests;
