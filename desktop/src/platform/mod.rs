@@ -1,3 +1,4 @@
+pub mod application_quit;
 pub mod accessibility;
 pub mod geometry;
 // Explicit native requests run on workers, never during Render.
