@@ -6435,3 +6435,7 @@ mod editor_staging;
 #[cfg(test)]
 #[path = "app_transfer_probe_tests.rs"]
 mod transfer_probe_tests;
+
+#[cfg(test)]
+#[path = "app_persistence_tests.rs"]
+mod persistence_tests;
