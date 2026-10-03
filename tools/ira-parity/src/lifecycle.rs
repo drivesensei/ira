@@ -285,10 +285,16 @@ impl PtySession {
     ) -> Result<Vec<u8>, String> {
         let end = Instant::now() + deadline;
         while Instant::now() < end {
-            self.receive_until(end)?;
-            if self.output.windows(needle.len()).any(|w| w == needle) {
+            if let Some(error) = &self.reader_error {
+                return Err(error.clone());
+            }
+            if needle.is_empty() || self.output.windows(needle.len()).any(|w| w == needle) {
                 return Ok(self.output.clone());
             }
+            if self.reader_closed {
+                break;
+            }
+            self.receive_until(end)?;
         }
         Err(self.reader_error.clone().unwrap_or_else(|| {
             format!(
@@ -332,8 +338,9 @@ impl PtySession {
         {
             Ok(message) => self.accept(message),
             Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) if self.reader_closed => {}
             Err(RecvTimeoutError::Disconnected) => {
-                return Err("PTY output reader channel closed".into())
+                return Err("PTY output reader channel closed without EOF".into())
             }
         }
         if let Some(error) = &self.reader_error {

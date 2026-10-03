@@ -193,6 +193,7 @@ impl ChildEnvironment {
             }
             values.insert((*k).into(), c.to_string_lossy().into());
         }
+        let root = std::fs::canonicalize(&root).map_err(|e| EnvironmentError(e.to_string()))?;
         Ok(Self { values, root })
     }
     pub fn build_with_root(

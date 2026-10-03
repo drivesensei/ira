@@ -156,3 +156,20 @@ fn extracted_session_records_teardown_order_and_composes_cleanup_error() {
     );
     std::fs::remove_dir_all(&fixture_path).unwrap();
 }
+
+#[test]
+fn closed_reader_retains_already_observed_output_for_readiness() {
+    let fixture = tempfile::tempdir().unwrap();
+    let mut session = PtySession::spawn(helper("success"), fixture, size(), config()).unwrap();
+    session
+        .wait_for_child_exit_and_drain(Duration::from_secs(5))
+        .unwrap();
+    let output = session
+        .wait_for_output(b"IRA_HELPER_READY_SUCCESS", Duration::from_secs(1))
+        .unwrap();
+    assert!(output
+        .windows(b"IRA_HELPER_READY_SUCCESS".len())
+        .any(|bytes| bytes == b"IRA_HELPER_READY_SUCCESS"));
+    let report = session.shutdown().unwrap();
+    assert!(report.child_reaped && report.reader_joined);
+}
