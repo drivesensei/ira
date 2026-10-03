@@ -7,7 +7,7 @@ pub struct NodeId {
     pub window: u64,
     pub serial: u64,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Role {
     Window,
     Group,
@@ -59,7 +59,7 @@ pub enum Action {
     Pause,
     Cancel,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Capability {
     Focus,
     Activate,
@@ -704,4 +704,272 @@ pub fn valid_text_range(text: &str, range: &Range<usize>) -> bool {
         end |= offset == range.end;
     }
     start && end
+}
+
+/// Exact authoritative semantic identity; unrelated document/focus revisions are not ordered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestKey {
+    pub window_generation: u64,
+    pub semantic_revision: u64,
+    pub document_generation: u64,
+    pub focus_generation: u64,
+    pub native_text_revision: u64,
+    pub host_focus_revision: u64,
+}
+impl RequestKey {
+    pub fn stamp(self) -> Stamp {
+        Stamp {
+            window: self.window_generation,
+            revision: self.semantic_revision,
+            document: self.document_generation,
+            focus: self.focus_generation,
+            text_revision: self.native_text_revision,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameKey {
+    pub request: RequestKey,
+    pub request_seq: u64,
+    pub layout_revision: u64,
+}
+/// All supported selector combinations are indexed, including unspecified selectors.
+type SelectorIndex = BTreeMap<(Option<Role>, Option<Capability>), NodeId>;
+#[derive(Debug, Default)]
+pub struct TargetIndex {
+    targets: BTreeMap<Target, SelectorIndex>,
+}
+impl TargetIndex {
+    fn build(tree: &SemanticTree) -> Self {
+        let mut index = Self::default();
+        for node in tree.nodes.values() {
+            let selectors = index.targets.entry(node.target.clone()).or_default();
+            for role in [None, Some(node.role)] {
+                selectors.entry((role, None)).or_insert(node.id);
+                for capability in &node.capabilities {
+                    selectors
+                        .entry((role, Some(*capability)))
+                        .or_insert(node.id);
+                }
+            }
+        }
+        index
+    }
+    pub fn lookup(
+        &self,
+        target: &Target,
+        role: Option<Role>,
+        capability: Option<Capability>,
+    ) -> Option<NodeId> {
+        self.targets.get(target)?.get(&(role, capability)).copied()
+    }
+}
+#[derive(Debug)]
+pub struct PreparedSemantic {
+    pub key: RequestKey,
+    pub tree: Arc<SemanticTree>,
+    pub index: TargetIndex,
+    hit_order: BTreeMap<NodeId, usize>,
+}
+impl PreparedSemantic {
+    /// Pure worker preparation. Never build an index on the foreground publication path.
+    pub fn from_tree(tree: Arc<SemanticTree>, key: RequestKey) -> Result<Self, super::Rejection> {
+        if tree.stamp != key.stamp() {
+            return Err(super::Rejection::Stale);
+        }
+        let index = TargetIndex::build(&tree);
+        let mut hit_order = BTreeMap::new();
+        let mut stack = vec![(tree.active_modal.unwrap_or(tree.root), false)];
+        while let Some((id, visited)) = stack.pop() {
+            if visited {
+                hit_order.insert(id, hit_order.len());
+            } else if let Some(node) = tree.nodes.get(&id) {
+                stack.push((id, true));
+                // LIFO visits the last logical child first, matching legacy hit_test.
+                stack.extend(node.children.iter().map(|child| (*child, false)));
+            }
+        }
+        Ok(Self {
+            key,
+            tree,
+            index,
+            hit_order,
+        })
+    }
+}
+impl AccessibilityModel {
+    /// Registry deliberately retains window-lifetime identities across arbitrary refiltering.
+    /// Its memory is O(unique identities visited in this window), not O(visible rows).
+    pub fn prepare(
+        &mut self,
+        snapshot: &Snapshot,
+        text: Option<&NativeTextSnapshot>,
+        key: RequestKey,
+        host_focused: Option<NodeId>,
+    ) -> Result<PreparedSemantic, super::Rejection> {
+        let tree =
+            self.project_with_host_focus(snapshot, text, &LayoutSnapshot::default(), host_focused);
+        PreparedSemantic::from_tree(Arc::new(tree), key)
+    }
+}
+#[derive(Debug, Default)]
+pub struct SparseGeometry {
+    pub nodes: BTreeMap<NodeId, Geometry>,
+    hit_order: Vec<NodeId>,
+}
+impl SparseGeometry {
+    pub fn hit_test(&self, x: f64, y: f64) -> Option<NodeId> {
+        self.hit_test_with_visits(x, y).0
+    }
+    /// Measures actual sparse production traversal, including misses.
+    pub fn hit_test_with_visits(&self, x: f64, y: f64) -> (Option<NodeId>, usize) {
+        for (visit, id) in self.hit_order.iter().enumerate() {
+            if self.nodes[id].visible.contains(x, y) {
+                return (Some(*id), visit + 1);
+            }
+        }
+        (None, self.hit_order.len())
+    }
+}
+pub type ValueChange = (Option<Arc<str>>, Option<Arc<str>>);
+#[derive(Debug, Default)]
+pub struct NotificationPlan {
+    pub focused: Option<NodeId>,
+    pub layout_changed: bool,
+    pub structure_changed: bool,
+    pub selected_parents: Vec<NodeId>,
+    pub selected_items: BTreeMap<NodeId, (bool, bool)>,
+    pub values: BTreeMap<NodeId, ValueChange>,
+    pub text_selections: Vec<NodeId>,
+    pub removed: Vec<NodeId>,
+}
+#[derive(Debug)]
+pub struct PreparedFrame {
+    pub publication_seq: u64,
+    pub base_publication_seq: u64,
+    pub key: FrameKey,
+    pub semantic: Arc<PreparedSemantic>,
+    pub geometry: SparseGeometry,
+    pub notifications: NotificationPlan,
+    pub(crate) base_tree: Option<Arc<SemanticTree>>,
+}
+/// Call only on the background worker, with the last successfully installed/ACKed frame.
+pub fn prepare_frame(
+    base: Option<&PreparedFrame>,
+    semantic: Arc<PreparedSemantic>,
+    key: FrameKey,
+    layout: LayoutSnapshot,
+    publication_seq: u64,
+) -> Result<PreparedFrame, super::Rejection> {
+    if semantic.key != key.request
+        || layout.window_generation != key.request.window_generation
+        || layout.semantic_revision != key.request.semantic_revision
+        || layout.revision != key.layout_revision
+        || publication_seq == 0
+        || base.is_some_and(|b| {
+            publication_seq <= b.publication_seq
+                || b.key.request.window_generation != key.request.window_generation
+        })
+    {
+        return Err(super::Rejection::Stale);
+    }
+    let mut geometry = SparseGeometry::default();
+    for (id, g) in layout.nodes {
+        if semantic.hit_order.contains_key(&id)
+            && g.bounds.valid()
+            && g.visible.valid()
+            && g.bounds.intersection(g.visible) == Some(g.visible)
+        {
+            geometry.nodes.insert(id, g);
+        }
+    }
+    geometry.hit_order.extend(geometry.nodes.keys().copied());
+    geometry
+        .hit_order
+        .sort_unstable_by_key(|id| semantic.hit_order[id]);
+    let tree = &semantic.tree;
+    let mut notifications = NotificationPlan::default();
+    if let Some(base) = base {
+        let old = &base.semantic.tree;
+        notifications.focused = (old.focused != tree.focused)
+            .then_some(tree.focused)
+            .flatten();
+        notifications.layout_changed =
+            base.key.layout_revision != key.layout_revision || old.nodes.len() != tree.nodes.len();
+        notifications.structure_changed =
+            old.nodes.len() != tree.nodes.len() || old.active_modal != tree.active_modal;
+        let mut parents = std::collections::BTreeSet::new();
+        for (id, node) in &tree.nodes {
+            if let Some(before) = old.nodes.get(id) {
+                if before.children != node.children {
+                    notifications.structure_changed = true;
+                }
+                if before.selected != node.selected {
+                    parents.insert(node.parent.unwrap_or(tree.root));
+                    notifications
+                        .selected_items
+                        .insert(*id, (before.selected, node.selected));
+                }
+                if before.value != node.value {
+                    notifications
+                        .values
+                        .insert(*id, (before.value.clone(), node.value.clone()));
+                }
+                if before.text_selection != node.text_selection {
+                    notifications.text_selections.push(*id);
+                }
+            } else {
+                notifications.structure_changed = true;
+            }
+        }
+        notifications.selected_parents.extend(parents);
+        notifications.removed.extend(
+            old.nodes
+                .keys()
+                .filter(|id| !tree.nodes.contains_key(id))
+                .copied(),
+        );
+    } else {
+        notifications.focused = tree.focused;
+        notifications.layout_changed = true;
+        notifications.structure_changed = true;
+    }
+    Ok(PreparedFrame {
+        publication_seq,
+        base_publication_seq: base.map_or(0, |b| b.publication_seq),
+        key,
+        semantic,
+        geometry,
+        notifications,
+        base_tree: base.map(|b| b.semantic.tree.clone()),
+    })
+}
+
+impl PreparedFrame {
+    /// Capture the actual installed compatibility tree on the worker before first publication.
+    pub fn compatibility_baseline(
+        tree: Arc<SemanticTree>,
+        key: RequestKey,
+    ) -> Result<Self, super::Rejection> {
+        let layout = LayoutSnapshot {
+            window_generation: key.window_generation,
+            semantic_revision: key.semantic_revision,
+            revision: tree.layout_revision,
+            nodes: tree
+                .nodes
+                .iter()
+                .filter_map(|(id, n)| n.geometry.map(|g| (*id, g)))
+                .collect(),
+        };
+        let frame_key = FrameKey {
+            request: key,
+            request_seq: 0,
+            layout_revision: tree.layout_revision,
+        };
+        let semantic = Arc::new(PreparedSemantic::from_tree(tree, key)?);
+        let mut frame = prepare_frame(None, semantic, frame_key, layout, 1)?;
+        frame.publication_seq = 0;
+        frame.notifications = NotificationPlan::default();
+        Ok(frame)
+    }
 }

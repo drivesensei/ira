@@ -6,7 +6,7 @@ pub mod model;
 pub mod windows;
 #[cfg(target_os = "macos")]
 pub use macos::NativeBridge;
-use model::{Action, NodeId, SemanticTree, Stamp, Target};
+use model::{Action, FrameKey, NodeId, PreparedFrame, SemanticTree, Stamp, Target};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -36,8 +36,18 @@ pub struct ResolvedAction {
     pub target: Target,
     pub action: Action,
 }
+struct PublicationState {
+    tree: Arc<SemanticTree>,
+    frame: Option<Arc<PreparedFrame>>,
+    sequence: u64,
+}
+/// Transfer this ownership to the preparation worker; dropping it may destroy O(N) nodes.
+pub struct RetiredPublication {
+    pub tree: Arc<SemanticTree>,
+    pub frame: Option<Arc<PreparedFrame>>,
+}
 struct Shared {
-    tree: Mutex<Arc<SemanticTree>>,
+    tree: Mutex<PublicationState>,
     closing: AtomicBool,
 }
 #[derive(Clone)]
@@ -76,7 +86,11 @@ impl ActionSink {
     pub fn channel(tree: Arc<SemanticTree>, capacity: usize) -> (Self, ActionReceiver) {
         let (sender, receiver) = mpsc::sync_channel(capacity.max(1));
         let shared = Arc::new(Shared {
-            tree: Mutex::new(tree),
+            tree: Mutex::new(PublicationState {
+                tree,
+                frame: None,
+                sequence: 0,
+            }),
             closing: AtomicBool::new(false),
         });
         (
@@ -96,7 +110,7 @@ impl ActionSink {
             .tree
             .try_lock()
             .map_err(|_| Rejection::Backpressure)?;
-        resolve(&tree, &intent)?;
+        resolve(&tree.tree, &intent)?;
         self.sender.try_send(intent).map_err(|e| match e {
             TrySendError::Full(_) => Rejection::Backpressure,
             TrySendError::Disconnected(_) => Rejection::Closing,
@@ -111,24 +125,74 @@ impl ActionSink {
             .tree
             .try_lock()
             .map_err(|_| Rejection::Backpressure)?;
-        if slot.stamp.window != tree.stamp.window
-            || tree.stamp.revision < slot.stamp.revision
-            || (tree.stamp.revision == slot.stamp.revision
-                && tree.layout_revision < slot.layout_revision)
-            || (tree.stamp.document == slot.stamp.document
-                && tree.stamp.focus == slot.stamp.focus
-                && tree.stamp.text_revision < slot.stamp.text_revision)
+        if slot.tree.stamp.window != tree.stamp.window
+            || tree.stamp.revision < slot.tree.stamp.revision
+            || (tree.stamp.revision == slot.tree.stamp.revision
+                && tree.layout_revision < slot.tree.layout_revision)
+            || (tree.stamp.document == slot.tree.stamp.document
+                && tree.stamp.focus == slot.tree.stamp.focus
+                && tree.stamp.text_revision < slot.tree.stamp.text_revision)
         {
             return Err(Rejection::Stale);
         }
-        *slot = tree;
+        slot.tree = tree;
+        slot.frame = None;
+        slot.sequence = 0;
         Ok(())
+    }
+    /// Commit sink and native cache under one gate. The closure must be infallible and
+    /// must not call native notification/client code while the gate is held.
+    pub fn install_prepared(
+        &self,
+        frame: &Arc<PreparedFrame>,
+        expected: FrameKey,
+        install_cache: impl FnOnce(),
+    ) -> Result<RetiredPublication, Rejection> {
+        if self.is_closing() {
+            return Err(Rejection::Closing);
+        }
+        if frame.key != expected {
+            return Err(Rejection::Stale);
+        }
+        let mut slot = self
+            .shared
+            .tree
+            .try_lock()
+            .map_err(|_| Rejection::Backpressure)?;
+        if self.is_closing() {
+            return Err(Rejection::Closing);
+        }
+        if frame.base_publication_seq != slot.sequence
+            || frame.publication_seq <= slot.sequence
+            || frame.semantic.tree.stamp.window != slot.tree.stamp.window
+            || frame
+                .base_tree
+                .as_ref()
+                .is_none_or(|base| !Arc::ptr_eq(base, &slot.tree))
+        {
+            return Err(Rejection::Stale);
+        }
+        install_cache();
+        let tree = std::mem::replace(&mut slot.tree, frame.semantic.tree.clone());
+        let retired_frame = slot.frame.replace(frame.clone());
+        slot.sequence = frame.publication_seq;
+        Ok(RetiredPublication {
+            tree,
+            frame: retired_frame,
+        })
+    }
+    pub fn current_frame(&self) -> Result<Option<Arc<PreparedFrame>>, Rejection> {
+        self.shared
+            .tree
+            .try_lock()
+            .map(|slot| slot.frame.clone())
+            .map_err(|_| Rejection::Backpressure)
     }
     pub fn current(&self) -> Result<Arc<SemanticTree>, Rejection> {
         self.shared
             .tree
             .try_lock()
-            .map(|t| t.clone())
+            .map(|t| t.tree.clone())
             .map_err(|_| Rejection::Backpressure)
     }
     pub fn close(&self) {
@@ -149,7 +213,7 @@ impl ActionReceiver {
                     .tree
                     .try_lock()
                     .map_err(|_| Rejection::Backpressure)
-                    .and_then(|tree| resolve(&tree, &intent))
+                    .and_then(|tree| resolve(&tree.tree, &intent))
             }),
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
         }
