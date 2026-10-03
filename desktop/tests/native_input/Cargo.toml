@@ -1,0 +1,9 @@
+[package]
+name="ira-native-input-validation"
+version="0.1.0"
+edition="2024"
+publish=false
+[workspace]
+[dependencies]
+gpui={version="=0.2.2",default-features=false,features=["font-kit","runtime_shaders","test-support"]}
+unicode-segmentation="=1.13.3"
