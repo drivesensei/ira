@@ -166,9 +166,10 @@ mod mac {
                 own || self.ivars().original.respondsToSelector(selector)
             }
         }
-        unsafe impl NSApplicationDelegate for Proxy {
+        unsafe impl NSApplicationDelegate for Proxy {}
+        impl Proxy {
             #[unsafe(method(applicationShouldTerminate:))]
-            fn should_terminate(&self, _sender: &NSApplication) -> objc2_app_kit::NSApplicationTerminateReply {
+            fn should_terminate(&self, _sender: &AnyObject) -> objc2_app_kit::NSApplicationTerminateReply {
                 objc2_app_kit::NSApplicationTerminateReply(self.ivars().requests.should_terminate())
             }
         }
@@ -265,8 +266,38 @@ mod mac {
         }
         Err(QuitError::UnsupportedDelegate)
     }
+    // Both variants send the same native selectors. The test variant is a
+    // real initialized NSObject, never an NSApplication cast or global app.
+    enum NativeHost {
+        Application(Retained<NSApplication>),
+        #[cfg(test)]
+        Fixture(Retained<AnyObject>),
+    }
+    impl NativeHost {
+        fn object(&self) -> &AnyObject {
+            match self {
+                Self::Application(app) => app.as_ref(),
+                #[cfg(test)]
+                Self::Fixture(object) => object,
+            }
+        }
+        fn delegate(&self) -> Option<Retained<ProtocolObject<dyn NSApplicationDelegate>>> {
+            // SAFETY: NSApplication and the initialized test fixture implement
+            // this exact object-returning selector and weak-delegate contract.
+            objc2::rc::autoreleasepool(|_| unsafe { msg_send![self.object(), delegate] })
+        }
+        fn set_delegate(&self, delegate: &ProtocolObject<dyn NSApplicationDelegate>) {
+            // SAFETY: both host variants implement the same object argument.
+            let _: () = unsafe { msg_send![self.object(), setDelegate: delegate] };
+        }
+        fn reply(&self, approved: bool) {
+            // SAFETY: both hosts implement AppKit's BOOL argument/void result.
+            let _: () =
+                unsafe { msg_send![self.object(), replyToApplicationShouldTerminate: approved] };
+        }
+    }
     pub struct ApplicationQuitGate {
-        app: Retained<NSApplication>,
+        app: NativeHost,
         proxy: Retained<Proxy>,
         original_platform: *mut c_void,
     }
@@ -292,6 +323,19 @@ mod mac {
             let gate = NEXT_GATE
                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
                 .map_err(|_| QuitError::RequestExhausted)?;
+            Self::attach(
+                NativeHost::Application(app),
+                original,
+                gate,
+                original_platform,
+            )
+        }
+        fn attach(
+            app: NativeHost,
+            original: Retained<ProtocolObject<dyn NSApplicationDelegate>>,
+            gate: u64,
+            original_platform: *mut c_void,
+        ) -> Result<Self, QuitError> {
             let original_identity = Retained::as_ptr(&original);
             let proxy = new_proxy(original, gate, original_platform)?;
             if !app
@@ -300,13 +344,23 @@ mod mac {
             {
                 return Err(QuitError::DelegateChanged);
             }
-            // Both delegates are strongly owned before assigning the weak property.
-            app.setDelegate(Some(ProtocolObject::from_ref(&*proxy)));
+            app.set_delegate(ProtocolObject::from_ref(&*proxy));
             Ok(Self {
                 app,
                 proxy,
                 original_platform,
             })
+        }
+        #[cfg(test)]
+        pub(super) fn fixture(app: Retained<AnyObject>, gate: u64) -> Result<Self, QuitError> {
+            MainThreadMarker::new().ok_or(QuitError::WrongThread)?;
+            let app = NativeHost::Fixture(app);
+            let original = app.delegate().ok_or(QuitError::MissingDelegate)?;
+            let pointer = platform(original_object(&original))?;
+            if pointer.is_null() || platform(app.object())? != pointer {
+                return Err(QuitError::UnsupportedDelegate);
+            }
+            Self::attach(app, original, gate, pointer)
         }
         fn check_delegate(&self) -> Result<(), QuitError> {
             if MainThreadMarker::new().is_none() {
@@ -333,14 +387,13 @@ mod mac {
         pub fn reply(&self, request: QuitRequest, decision: QuitDecision) -> Result<(), QuitError> {
             self.check_delegate()?;
             self.proxy.ivars().requests.begin_reply(request, decision)?;
-            self.app
-                .replyToApplicationShouldTerminate(decision == QuitDecision::Approve);
+            self.app.reply(decision == QuitDecision::Approve);
             self.proxy.ivars().requests.finish_reply(decision);
             Ok(())
         }
         fn synchronize_returned_loop(&self) -> Result<(), QuitError> {
             synchronize_platform_alias(
-                self.app.as_ref(),
+                self.app.object(),
                 self.proxy.as_ref(),
                 original_object(&self.proxy.ivars().original),
                 self.original_platform,
@@ -355,11 +408,11 @@ mod mac {
             if self.check_delegate().is_ok() && self.synchronize_returned_loop().is_ok() {
                 if self.is_pending() {
                     self.proxy.ivars().requests.phase.set(Phase::Cancelling);
-                    self.app.replyToApplicationShouldTerminate(false);
+                    self.app.reply(false);
                 }
                 // A synchronous cancellation may have installed another delegate.
                 if self.check_delegate().is_ok() {
-                    self.app.setDelegate(Some(&self.proxy.ivars().original));
+                    self.app.set_delegate(&self.proxy.ivars().original);
                 }
             }
         }
