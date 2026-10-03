@@ -25,7 +25,7 @@ use crate::{
     },
 };
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::{
     error,
     path::{Path, PathBuf},
@@ -33,6 +33,22 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime},
 };
+#[cfg(test)]
+type TransferProbeTest = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+// Process-wide admission survives App/window destruction. Root and neutral core
+// each have one finite lane; a mixed process therefore has at most two lanes.
+static TRANSFER_PROBE_BUSY: AtomicBool = AtomicBool::new(false);
+struct TransferProbeOccupancy(Arc<AtomicBool>);
+impl Drop for TransferProbeOccupancy {
+    fn drop(&mut self) {
+        // A reply, if any, was sent before this completion signal. A panic or
+        // failed spawn also completes physical work without inventing a reply.
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+        TRANSFER_PROBE_BUSY.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 pub type AppResult<T> = std::result::Result<T, Box<dyn error::Error>>;
 struct WalkSlot {
     handle: WalkHandle,
@@ -135,7 +151,12 @@ pub struct App {
     transfer_probe_rx: mpsc::Receiver<(u64, TransferDestSync, bool)>,
     transfer_generation: u64,
     transfer_probe_pending: Option<u64>,
+    transfer_probe_finished: Option<Arc<AtomicBool>>,
     transfer_probe_last_attempt: Option<Instant>,
+    #[cfg(test)]
+    transfer_probe_test: Option<TransferProbeTest>,
+    #[cfg(test)]
+    transfer_probe_spawn_error: bool,
     startup_tx: mpsc::Sender<(SessionState, Vec<(String, String)>)>,
     startup_rx: mpsc::Receiver<(SessionState, Vec<(String, String)>)>,
     initializing: bool,
@@ -287,7 +308,12 @@ impl Default for App {
             transfer_probe_rx,
             transfer_generation: 0,
             transfer_probe_pending: None,
+            transfer_probe_finished: None,
             transfer_probe_last_attempt: None,
+            #[cfg(test)]
+            transfer_probe_test: None,
+            #[cfg(test)]
+            transfer_probe_spawn_error: false,
             startup_tx,
             startup_rx,
             initializing: false,
@@ -2653,6 +2679,10 @@ impl App {
     /// folder (or are inside it) once per second, so copied items appear
     /// live. Never blocks the UI: listings run on background workers.
     fn refresh_transfer_destinations(&mut self) {
+        let finished = self
+            .transfer_probe_finished
+            .as_ref()
+            .is_some_and(|finished| finished.load(std::sync::atomic::Ordering::Acquire));
         while let Ok((generation, sync, exists)) = self.transfer_probe_rx.try_recv() {
             if generation != self.transfer_generation {
                 continue;
@@ -2666,6 +2696,12 @@ impl App {
             if exists && current {
                 self.apply_transfer_destination_refresh(sync);
             }
+        }
+        if finished {
+            // The worker can unwind or fail to spawn without delivering a
+            // result. Such completion must not wedge semantic pending forever.
+            self.transfer_probe_finished = None;
+            self.transfer_probe_pending = None;
         }
         let Some(sync) = self.transfer_dest.clone() else {
             return;
@@ -2687,14 +2723,52 @@ impl App {
         {
             return;
         }
+        if TRANSFER_PROBE_BUSY
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            // Do not consume the attempt or pending slot on denied admission.
+            return;
+        }
+        let completed = Arc::new(AtomicBool::new(false));
+        let occupancy = TransferProbeOccupancy(Arc::clone(&completed));
+        self.transfer_probe_finished = Some(completed);
         let generation = self.transfer_generation;
         self.transfer_probe_pending = Some(generation);
         self.transfer_probe_last_attempt = Some(now);
         let tx = self.transfer_probe_tx.clone();
-        thread::spawn(move || {
+        #[cfg(test)]
+        let probe = self.transfer_probe_test.clone();
+        let worker = move || {
+            let _occupancy = occupancy;
+            #[cfg(test)]
+            let exists = probe.as_ref().map_or_else(
+                || std::fs::metadata(&sync.dest_dir).is_ok(),
+                |probe| probe(&sync.dest_dir),
+            );
+            #[cfg(not(test))]
             let exists = std::fs::metadata(&sync.dest_dir).is_ok();
             let _ = tx.send((generation, sync, exists));
-        });
+        };
+        #[cfg(test)]
+        let spawn_result = if self.transfer_probe_spawn_error {
+            drop(worker);
+            Err(std::io::Error::other(
+                "fixture metadata worker spawn failure",
+            ))
+        } else {
+            thread::Builder::new().spawn(worker)
+        };
+        #[cfg(not(test))]
+        let spawn_result = thread::Builder::new().spawn(worker);
+        if spawn_result.is_err() {
+            self.transfer_probe_pending = None;
+        }
     }
     fn apply_transfer_destination_refresh(&mut self, sync: TransferDestSync) {
         for i in 0..self.panes.len() {
@@ -4018,3 +4092,7 @@ pub use application_persistence::{PersistenceFailure, PersistenceReceipt, Persis
 #[cfg(test)]
 #[path = "application_persistence_tests.rs"]
 mod persistence_tests;
+
+#[cfg(test)]
+#[path = "application_transfer_probe_tests.rs"]
+mod transfer_probe_tests;

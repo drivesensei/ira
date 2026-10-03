@@ -43,6 +43,20 @@ use crate::{
     },
 };
 type TransferProbeResult = (u64, TransferDestSync, [u64; 2], bool);
+
+// Process-wide admission survives App/window destruction. Root and neutral core
+// each have one finite lane; a mixed process therefore has at most two lanes.
+static TRANSFER_PROBE_BUSY: AtomicBool = AtomicBool::new(false);
+struct TransferProbeOccupancy(Arc<AtomicBool>);
+impl Drop for TransferProbeOccupancy {
+    fn drop(&mut self) {
+        // A reply, if any, was sent before this completion signal. A panic or
+        // failed spawn also completes physical work without inventing a reply.
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+        TRANSFER_PROBE_BUSY.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 #[cfg(test)]
 type TransferProbeTest = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
@@ -359,9 +373,12 @@ pub struct App {
     transfer_probe_rx: mpsc::Receiver<TransferProbeResult>,
     transfer_generation: u64,
     transfer_probe_pending: Option<u64>,
+    transfer_probe_finished: Option<Arc<AtomicBool>>,
     transfer_probe_last_attempt: Option<Instant>,
     #[cfg(test)]
     transfer_probe_test: Option<TransferProbeTest>,
+    #[cfg(test)]
+    transfer_probe_spawn_error: bool,
     /// Keybindings help dialog (`*`); closed by any key.
     pub keybindings_visible: bool,
     /// Marquee scroll offset (chars) for the contextual hint bar; advanced
@@ -658,9 +675,12 @@ impl Default for App {
             transfer_probe_rx,
             transfer_generation: 0,
             transfer_probe_pending: None,
+            transfer_probe_finished: None,
             transfer_probe_last_attempt: None,
             #[cfg(test)]
             transfer_probe_test: None,
+            #[cfg(test)]
+            transfer_probe_spawn_error: false,
             info: None,
             multi_info: None,
             status: None,
@@ -3714,6 +3734,10 @@ impl App {
     /// Probe transfer destination existence on a worker, at most once per second.
     /// Current results retain the source reveal and navigation-preservation rules.
     fn refresh_transfer_destinations(&mut self) {
+        let finished = self
+            .transfer_probe_finished
+            .as_ref()
+            .is_some_and(|finished| finished.load(std::sync::atomic::Ordering::Acquire));
         // Terminal events are drained first by tick. Also reject results when
         // no transfer is live, even if a caller changed job state directly.
         if !self
@@ -3725,6 +3749,9 @@ impl App {
                 self.invalidate_transfer_probe();
             }
             while self.transfer_probe_rx.try_recv().is_ok() {}
+            if finished {
+                self.transfer_probe_finished = None;
+            }
             return;
         }
         while let Ok((generation, sync, listing_generations, exists)) =
@@ -3743,6 +3770,12 @@ impl App {
                 self.apply_transfer_destination_refresh(sync, listing_generations);
             }
         }
+        if finished {
+            // The worker can unwind or fail to spawn without delivering a
+            // result. Such completion must not wedge semantic pending forever.
+            self.transfer_probe_finished = None;
+            self.transfer_probe_pending = None;
+        }
         let Some(sync) = self.transfer_dest.clone() else {
             return;
         };
@@ -3755,6 +3788,21 @@ impl App {
         {
             return;
         }
+        if TRANSFER_PROBE_BUSY
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            // Do not consume the attempt or pending slot on denied admission.
+            return;
+        }
+        let completed = Arc::new(AtomicBool::new(false));
+        let occupancy = TransferProbeOccupancy(Arc::clone(&completed));
+        self.transfer_probe_finished = Some(completed);
         let generation = self.transfer_generation;
         let listing_generations = self.panes.each_ref().map(|pane| pane.listing_generation);
         self.transfer_probe_pending = Some(generation);
@@ -3762,7 +3810,8 @@ impl App {
         let tx = self.transfer_probe_tx.clone();
         #[cfg(test)]
         let probe = self.transfer_probe_test.clone();
-        thread::spawn(move || {
+        let worker = move || {
+            let _occupancy = occupancy;
             #[cfg(test)]
             let exists = probe.as_ref().map_or_else(
                 || std::fs::metadata(&sync.dest_dir).is_ok(),
@@ -3771,7 +3820,21 @@ impl App {
             #[cfg(not(test))]
             let exists = std::fs::metadata(&sync.dest_dir).is_ok();
             let _ = tx.send((generation, sync, listing_generations, exists));
-        });
+        };
+        #[cfg(test)]
+        let spawn_result = if self.transfer_probe_spawn_error {
+            drop(worker);
+            Err(std::io::Error::other(
+                "fixture metadata worker spawn failure",
+            ))
+        } else {
+            thread::Builder::new().spawn(worker)
+        };
+        #[cfg(not(test))]
+        let spawn_result = thread::Builder::new().spawn(worker);
+        if spawn_result.is_err() {
+            self.transfer_probe_pending = None;
+        }
     }
 
     fn apply_transfer_destination_refresh(
