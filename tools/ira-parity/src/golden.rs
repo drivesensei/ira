@@ -1,3 +1,5 @@
+#[path = "staging.rs"]
+mod staging;
 use crate::trace::Trace;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -87,8 +89,17 @@ impl GoldenStore {
     /// use `capture_run_to_staging` for actual observed golden evidence.
     pub fn capture_to_staging(&self, stage: impl AsRef<Path>, t: &Trace) -> Result<(), String> {
         let stage = stage.as_ref();
-        fs::create_dir_all(stage).map_err(|e| e.to_string())?;
-        fs::write(stage.join("initial_screen.toml"), t.to_toml()).map_err(|e| e.to_string())?;
+        let stage = staging::Directory::stage(stage)?;
+        stage.ensure_absent(&[
+            "initial_screen.toml",
+            "metadata.toml",
+            ".capture-owner",
+            "manifest.toml",
+            "manifest.pending",
+            "observations",
+        ])?;
+        stage.write_new(".capture-owner", b"")?;
+        stage.write_new("initial_screen.toml", t.to_toml().as_bytes())?;
         let metadata = GoldenMetadata::from_trace(
             "1cad4ce43cc72d52d4cc4eef920e0da22cb69568",
             t,
@@ -99,11 +110,12 @@ impl GoldenStore {
             },
             &current_capture_date(),
         );
-        fs::write(
-            stage.join("metadata.toml"),
-            toml::to_string(&metadata).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
+        stage.write_new(
+            "metadata.toml",
+            toml::to_string(&metadata)
+                .map_err(|e| e.to_string())?
+                .as_bytes(),
+        )?;
         let _ = &self.approved;
         Ok(())
     }
@@ -349,9 +361,19 @@ impl GoldenStore {
         bundle: &ObservationBundle,
     ) -> Result<(), String> {
         let stage = stage.as_ref();
-        fs::create_dir_all(stage).map_err(|e| e.to_string())?;
-        // Existing captures are immutable. A failed attempt has no completion manifest.
-        fs::create_dir(stage.join("observations")).map_err(|e| e.to_string())?;
+        let stage = staging::Directory::stage(stage)?;
+        stage.ensure_absent(&[
+            "initial_screen.toml",
+            "metadata.toml",
+            ".capture-owner",
+            "manifest.toml",
+            "manifest.pending",
+            "observations",
+        ])?;
+        stage.write_new(".capture-owner", b"")?;
+        // Reserve metadata exclusively before allocating any payload. Existing bundles/links are immutable.
+        let mut metadata = stage.create_file("metadata.toml")?;
+        let observations = stage.child("observations")?;
         let mut records = Vec::new();
         for (i, item) in bundle.observations.iter().enumerate() {
             let payload = match &item.value {
@@ -370,11 +392,12 @@ impl GoldenStore {
                 },
             };
             let relative = format!("observations/{i:06}.toml");
-            fs::write(
-                stage.join(&relative),
-                toml::to_string(&payload).map_err(|e| e.to_string())?,
-            )
-            .map_err(|e| e.to_string())?;
+            observations.write_new(
+                &format!("{i:06}.toml"),
+                toml::to_string(&payload)
+                    .map_err(|e| e.to_string())?
+                    .as_bytes(),
+            )?;
             records.push(RecordManifest {
                 kind: item.kind.clone(),
                 path: item.relative_path.as_deref().map(encode_path),
@@ -389,24 +412,20 @@ impl GoldenStore {
             events: bundle.events.clone(),
             observations: records,
         };
-        fs::write(
-            stage.join("metadata.toml"),
-            toml::to_string(&bundle.metadata).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
         use std::io::Write;
-        let mut pending = tempfile::NamedTempFile::new_in(stage).map_err(|e| e.to_string())?;
-        pending
+        metadata
             .write_all(
-                toml::to_string(&manifest)
+                toml::to_string(&bundle.metadata)
                     .map_err(|e| e.to_string())?
                     .as_bytes(),
             )
             .map_err(|e| e.to_string())?;
-        pending.as_file().sync_all().map_err(|e| e.to_string())?;
-        pending
-            .persist_noclobber(stage.join("manifest.toml"))
-            .map_err(|e| e.to_string())?;
+        metadata.sync_all().map_err(|e| e.to_string())?;
+        stage.publish_manifest(
+            toml::to_string(&manifest)
+                .map_err(|e| e.to_string())?
+                .as_bytes(),
+        )?;
         Ok(())
     }
 }
