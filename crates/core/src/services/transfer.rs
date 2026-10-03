@@ -354,12 +354,12 @@ fn run_batch_with_provider(
     }
 
     if failed > 0 {
-        return Err(JobError::Io(format!(
-            "{} of {} items failed; {}",
-            failed,
-            paths.len(),
-            failure_details.join("; ")
-        )));
+        let mut summary = format!("{} of {} items failed", failed, paths.len());
+        if !failure_details.is_empty() {
+            summary.push_str("; ");
+            summary.push_str(&failure_details.join("; "));
+        }
+        return Err(JobError::Io(summary));
     }
     Ok(())
 }
@@ -479,6 +479,32 @@ fn cleanup_generated_container(stage: &Path) -> std::io::Result<()> {
     }
     fs::remove_dir(stage) // Never recursive: captured entries make cleanup fail safely.
 }
+fn encoded_path(path: &Path) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let mut value = String::from("unix-bytes-hex:");
+        for byte in path.as_os_str().as_bytes() {
+            use std::fmt::Write;
+            write!(value, "{byte:02x}").expect("String write");
+        }
+        value
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let mut value = String::from("windows-utf16-hex:");
+        for unit in path.as_os_str().encode_wide() {
+            use std::fmt::Write;
+            write!(value, "{unit:04x}").expect("String write");
+        }
+        value
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        format!("unsupported-path-encoding:{path:?}")
+    }
+}
 fn write_recovery(
     stage: &Path,
     src: &Path,
@@ -487,7 +513,9 @@ fn write_recovery(
     destination_stage: &Path,
     phase: &str,
 ) -> std::io::Result<()> {
-    fs::write(stage.join("recovery.txt"), format!("IRA transfer recovery\nphase={phase}\nsource={}\ndestination={}\nsource_stage={}\ndestination_stage={}\nNo automatic disposal of retained captures.\n",src.display(),dst.display(),source_stage.map(|p|p.display().to_string()).unwrap_or_default(),destination_stage.display()))
+    fs::write(stage.join("recovery.txt"),format!(
+        "IRA transfer recovery v1\nphase={phase:?}\nsource={src:?}\ndestination={dst:?}\nsource_raw={}\ndestination_raw={}\nsource_stage_raw={}\ndestination_stage_raw={}\nNo automatic disposal of retained captures.\n",
+        encoded_path(src),encoded_path(dst),source_stage.map(encoded_path).unwrap_or_else(||"none".into()),encoded_path(destination_stage)))
 }
 #[cfg(test)]
 fn copy_staged(

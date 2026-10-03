@@ -876,3 +876,118 @@ fn provider_uncertain_publication_preserves_public_entry_and_backup() {
     assert_eq!(retained.len(), 1);
     assert_eq!(fs::read(retained[0].join("backup")).unwrap(), b"PRECIOUS");
 }
+
+#[test]
+fn skip_only_batch_failure_has_no_dangling_detail_separator() {
+    let f = Fixture::new();
+    fs::write(f.path("src/file"), b"SOURCE").unwrap();
+    fs::write(f.path("dst/file"), b"PRECIOUS").unwrap();
+    let result = transfer(&f, JobKind::Copy, "file", OverwritePolicy::SkipExisting);
+    match result {
+        Err(JobError::Io(message)) => assert_eq!(message, "1 of 1 items failed"),
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+    assert_eq!(fs::read(f.path("src/file")).unwrap(), b"SOURCE");
+    assert_eq!(fs::read(f.path("dst/file")).unwrap(), b"PRECIOUS");
+}
+
+#[cfg(unix)]
+#[test]
+fn recovery_locator_preserves_non_utf8_paths_and_fresh_process_discovery() {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    if let Some(record) = std::env::var_os("IRA_T015_RECOVERY_RECORD") {
+        let text = fs::read_to_string(&record).unwrap();
+        let encoded = text
+            .lines()
+            .find_map(|line| line.strip_prefix("source_raw=unix-bytes-hex:"))
+            .unwrap();
+        let bytes: Vec<u8> = (0..encoded.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&encoded[i..i + 2], 16).unwrap())
+            .collect();
+        let recovered = PathBuf::from(std::ffi::OsString::from_vec(bytes));
+        assert_eq!(
+            recovered.as_os_str().as_bytes(),
+            std::env::var_os("IRA_T015_EXPECTED_SOURCE")
+                .unwrap()
+                .as_os_str()
+                .as_bytes()
+        );
+        assert_eq!(fs::read(&recovered).unwrap(), b"ACTOR");
+        assert_eq!(
+            fs::read(Path::new(&record).parent().unwrap().join("captured")).unwrap(),
+            b"SOURCE"
+        );
+        return;
+    }
+    let f = Fixture::new();
+    // This macOS filesystem rejects non-UTF8 entry names. Prove raw
+    // encoding roundtrip separately, then exercise newline-safe disk records
+    // and actual restart discovery with a supported filesystem name.
+    let invalid_path = f
+        .path("src")
+        .join(std::ffi::OsString::from_vec(vec![b'f', 0xff, b'\n']));
+    let encoded = encoded_path(&invalid_path);
+    let hex = encoded.strip_prefix("unix-bytes-hex:").unwrap();
+    let decoded: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect();
+    assert_eq!(decoded, invalid_path.as_os_str().as_bytes());
+    let src = f.path("src/file\nliteral source_raw=field");
+    let dst = f.path("dst/file");
+    fs::write(&src, b"SOURCE").unwrap();
+    fs::write(&dst, b"PRECIOUS").unwrap();
+    let control = JobControl::new();
+    let (tx, _rx) = mpsc::channel();
+    let mut bytes = 0;
+    let mut context = TransferContext {
+        control: &control,
+        id: 1,
+        tx: &tx,
+        bytes: &mut bytes,
+        provider: &rename_no_replace,
+    };
+    let error = transfer_staged(
+        &src,
+        &dst,
+        JobKind::Move,
+        true,
+        &mut context,
+        false,
+        |point, path| {
+            if point == StagePoint::SourceCaptured {
+                let text = fs::read_to_string(path.parent().unwrap().join("recovery.txt")).unwrap();
+                assert!(text.contains("before source capture"));
+                assert!(text
+                    .lines()
+                    .any(|line| line.starts_with("destination_stage_raw=unix-bytes-hex:")));
+                fs::write(&src, b"ACTOR").unwrap();
+                return Err(JobError::Cancelled);
+            }
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    let retained = source_stages(&f);
+    assert_eq!(retained.len(), 1);
+    let record = retained[0].join("recovery.txt");
+    assert!(format!("{error:?}").contains(&retained[0].display().to_string()));
+    let test_name = format!(
+        "{}::recovery_locator_preserves_non_utf8_paths_and_fresh_process_discovery",
+        module_path!().split_once("::").unwrap().1
+    );
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &test_name, "--nocapture"])
+        .env("IRA_T015_RECOVERY_RECORD", &record)
+        .env("IRA_T015_EXPECTED_SOURCE", src.as_os_str())
+        .output()
+        .unwrap();
+    assert!(
+        child.status.success(),
+        "child stdout={} stderr={}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+    assert!(String::from_utf8_lossy(&child.stdout).contains("1 passed"));
+}
