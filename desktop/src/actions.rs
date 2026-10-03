@@ -4,6 +4,7 @@ actions!(
     ira,
     [
         Quit,
+        RetryShutdown,
         Rename,
         Open,
         Parent,
@@ -31,7 +32,10 @@ pub fn register(cx: &mut App) {
     cx.set_menus(vec![
         Menu {
             name: "IRA".into(),
-            items: vec![MenuItem::action("Quit IRA", Quit)],
+            items: vec![
+                MenuItem::action("Quit IRA", Quit),
+                MenuItem::action("Retry shutdown saves", RetryShutdown),
+            ],
         },
         Menu {
             name: "File".into(),

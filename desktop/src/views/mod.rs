@@ -115,6 +115,9 @@ impl Desktop {
     pub fn focus_main(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus);
         self.geometry_subscription = Some(cx.observe_window_bounds(window, |this, window, _| {
+            if this.runtime.is_stopping() {
+                return;
+            }
             this.geometry
                 .save(crate::platform::geometry::Geometry::from_bounds(
                     window.window_bounds(),
@@ -136,6 +139,21 @@ impl Desktop {
         self.runtime.detach();
         self.runtime.cancel_jobs(&self.controls);
         self.polling.take();
+    }
+    pub fn shutdown_feedback(&mut self, message: String, cx: &mut Context<Self>) {
+        self.runtime.stop(&self.controls);
+        if let Some(input) = &self.input {
+            input.update(cx, |input, cx| {
+                input.set_access(text_input::InputAccess::Disabled, cx)
+            });
+        }
+        if self.feedback.as_ref() != Some(&message) {
+            self.feedback = Some(message);
+            cx.notify();
+        }
+    }
+    pub fn is_stopping(&self) -> bool {
+        self.runtime.is_stopping()
     }
     fn poll(&mut self, cx: &mut Context<Self>) {
         if self.accessibility.poll() {
@@ -208,42 +226,8 @@ impl Desktop {
                     self.host(request, self.runtime.effect_guard(window_generation), cx)
                 }
                 Completion::Closed => {
-                    crate::lifecycle_trace("actor Closed received; application quit scheduled");
-                    let barrier = self.geometry.barrier();
-                    let retirement = cx
-                        .has_global::<accessibility_retirement::Retirement>()
-                        .then(|| cx.global::<accessibility_retirement::Retirement>().clone());
-                    if let Some(queue) = &retirement {
-                        queue.begin_quit();
-                    }
-                    self.close();
-                    cx.spawn(async move |_, cx| {
-                        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-                        let geometry_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                        let signal = geometry_done.clone();
-                        cx.background_executor()
-                            .spawn(async move {
-                                let _ = barrier.recv_timeout(
-                                    deadline.saturating_duration_since(std::time::Instant::now()),
-                                );
-                                signal.store(true, std::sync::atomic::Ordering::Release);
-                            })
-                            .detach();
-                        loop {
-                            if std::time::Instant::now() >= deadline
-                                || (geometry_done.load(std::sync::atomic::Ordering::Acquire)
-                                    && retirement.as_ref().is_none_or(|q| q.is_empty()))
-                            {
-                                break;
-                            }
-                            cx.background_executor()
-                                .timer(Duration::from_millis(8))
-                                .await;
-                        }
-                        let _ = cx.update(|cx| cx.quit());
-                    })
-                    .detach();
-                    return;
+                    // A checked business receipt is complete. AppGlobal owns the
+                    // geometry receipt/native token and is the only quit approver.
                 }
             }
             changed = true;
@@ -320,11 +304,18 @@ impl Desktop {
         }
     }
     fn dispatch(&mut self, code: KeyCode, cx: &mut Context<Self>) {
+        if self.runtime.is_stopping() {
+            return;
+        }
         self.runtime
             .enqueue(Command::Input(actions::input(code)), None);
         cx.notify();
     }
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.runtime.is_stopping() {
+            cx.stop_propagation();
+            return;
+        }
         if self.input.is_some() {
             // Input widgets own composition/caret keys. Ctrl+A in search remains a file action.
             if self.input_mode == Some(InputMode::Search)
@@ -636,6 +627,10 @@ impl Desktop {
             .into()
     }
     fn accessibility_actions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.runtime.is_stopping() {
+            self.accessibility_actions.clear();
+            return;
+        }
         for action in std::mem::take(&mut self.accessibility_actions) {
             let Some(snapshot) = &self.snapshot else {
                 continue;

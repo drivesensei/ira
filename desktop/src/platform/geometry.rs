@@ -1,12 +1,11 @@
 //! A separate native window file, read and written only by one background owner.
 use gpui::{Bounds, Pixels, Point, WindowBounds, px, size};
 use std::{
-    fs,
-    io::{self, Write},
+    fs, io,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         mpsc,
     },
     thread,
@@ -90,34 +89,8 @@ impl Geometry {
     }
 }
 fn save(path: &Path, value: Geometry) -> io::Result<()> {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Window state has no parent"))?;
-    fs::create_dir_all(parent)?;
-    let temporary = parent.join(format!(
-        ".ira-window-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&temporary)?;
-    let result = (|| {
-        file.write_all(value.encode().as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&temporary, path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+    ira_core::services::persistence::try_publish_bytes(path, value.encode().as_bytes())
+        .map_err(io::Error::other)
 }
 /// Receipt for geometry writes accepted before a checked barrier.
 #[derive(Clone, Debug)]
@@ -185,7 +158,7 @@ enum Request {
     Load(mpsc::Sender<Option<Geometry>>),
     Save(Geometry),
     Barrier(mpsc::Sender<()>),
-    CheckedBarrier(mpsc::Sender<Checked>),
+    CheckedBarrier(mpsc::Sender<Checked>, bool),
     Retry {
         epoch: u64,
         value: Geometry,
@@ -212,6 +185,7 @@ impl Writer {
             let mut loaded = false;
             let mut epoch = 0;
             let mut failure: Option<String> = None;
+            let mut sealed = false;
             while let Ok(request) = receiver.recv() {
                 match request {
                     Request::Load(reply) => {
@@ -225,6 +199,12 @@ impl Writer {
                         let _ = reply.send(current);
                     }
                     Request::Save(value) => {
+                        if sealed {
+                            let _ = error_tx.send(
+                                "Geometry write rejected after shutdown snapshot was sealed".into(),
+                            );
+                            continue;
+                        }
                         epoch += 1;
                         current = Some(value);
                         loaded = true;
@@ -239,7 +219,8 @@ impl Writer {
                     Request::Barrier(reply) => {
                         let _ = reply.send(());
                     }
-                    Request::CheckedBarrier(reply) => {
+                    Request::CheckedBarrier(reply, seal) => {
+                        sealed |= seal;
                         let result = if let (Some(message), Some(value), Some(sender)) =
                             (&failure, current, retry_sender.upgrade())
                         {
@@ -318,7 +299,13 @@ impl Writer {
     }
     pub fn checked_barrier(&self) -> mpsc::Receiver<Checked> {
         let (tx, rx) = mpsc::channel();
-        let _ = self.sender.send(Request::CheckedBarrier(tx));
+        let _ = self.sender.send(Request::CheckedBarrier(tx, false));
+        rx
+    }
+    /// Seal write admission and capture the final geometry receipt once.
+    pub fn final_receipt(&self) -> mpsc::Receiver<Checked> {
+        let (tx, rx) = mpsc::channel();
+        let _ = self.sender.send(Request::CheckedBarrier(tx, true));
         rx
     }
     pub fn try_error(&self) -> Option<String> {
@@ -330,97 +317,5 @@ pub fn path() -> Option<PathBuf> {
 }
 
 #[cfg(test)]
-mod checked_tests {
-    use super::*;
-    fn value(x: f32) -> Geometry {
-        Geometry {
-            x,
-            y: 0.,
-            width: 1080.,
-            height: 720.,
-            mode: 0,
-        }
-    }
-    #[test]
-    fn failed_geometry_receipt_survives_writer_and_retries_frozen_value() {
-        let _scope = crate::test_support::enter();
-        let fixture = crate::test_support::current().unwrap().directory.clone();
-        let parent = fixture.join("blocked");
-        fs::write(&parent, b"temporary obstruction").unwrap();
-        let path = parent.join("desktop-window");
-        let writer = Writer::new(Some(path.clone()));
-        writer.save(value(42.));
-        let original = writer.checked_barrier();
-        let failure = original
-            .recv_timeout(std::time::Duration::from_secs(3))
-            .unwrap()
-            .unwrap_err();
-        assert_eq!(failure.epoch, 1);
-        drop(writer);
-        fs::remove_file(&parent).unwrap();
-        fs::create_dir(&parent).unwrap();
-        let receipt = failure
-            .retry
-            .retry()
-            .recv_timeout(std::time::Duration::from_secs(3))
-            .unwrap()
-            .unwrap();
-        assert_eq!(receipt.epoch, failure.epoch);
-        assert_eq!(
-            Geometry::parse(&fs::read_to_string(&path).unwrap())
-                .unwrap()
-                .x,
-            42.
-        );
-        // A successful retry is idempotent, not a second filesystem publication.
-        fs::remove_file(&path).unwrap();
-        assert_eq!(
-            failure
-                .retry
-                .retry()
-                .recv_timeout(std::time::Duration::from_secs(3))
-                .unwrap()
-                .unwrap()
-                .epoch,
-            1
-        );
-        assert!(!path.exists());
-    }
-    #[test]
-    fn old_geometry_failure_cannot_overwrite_newer_success() {
-        let _scope = crate::test_support::enter();
-        let fixture = crate::test_support::current().unwrap().directory.clone();
-        let parent = fixture.join("blocked");
-        fs::write(&parent, b"temporary obstruction").unwrap();
-        let path = parent.join("desktop-window");
-        let writer = Writer::new(Some(path.clone()));
-        writer.save(value(42.));
-        let failure = writer
-            .checked_barrier()
-            .recv_timeout(std::time::Duration::from_secs(3))
-            .unwrap()
-            .unwrap_err();
-        fs::remove_file(&parent).unwrap();
-        fs::create_dir(&parent).unwrap();
-        writer.save(value(99.));
-        let receipt = writer
-            .checked_barrier()
-            .recv_timeout(std::time::Duration::from_secs(3))
-            .unwrap()
-            .unwrap();
-        assert_eq!(receipt.epoch, 2);
-        let stale = failure
-            .retry
-            .retry()
-            .recv_timeout(std::time::Duration::from_secs(3))
-            .unwrap()
-            .unwrap_err();
-        assert!(stale.message.contains("superseded"));
-        assert_eq!(
-            Geometry::parse(&fs::read_to_string(&path).unwrap())
-                .unwrap()
-                .x,
-            99.
-        );
-    }
-}
+#[path = "geometry_tests.rs"]
+mod checked_tests;

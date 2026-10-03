@@ -1,6 +1,6 @@
 //! One background owner; foreground reads never wait for the actor.
 use ira_core::{
-    application::App,
+    application::{App, PersistenceFailure},
     editor::{EditorDocument, EditorError, EditorSession, SaveCompletion},
     input::{Input, KeyCode, KeyEvent, KeyModifiers},
     model::{EntryTarget, HostRequest, OpenEditorRequest},
@@ -131,6 +131,14 @@ impl<T> Latest<T> {
         self.0.try_lock().ok()?.take()
     }
 }
+#[derive(Clone, Debug)]
+pub enum ShutdownState {
+    Running,
+    Pending,
+    Success { epoch: u64 },
+    Failure(Arc<PersistenceFailure>),
+    Disconnected,
+}
 pub struct Runtime {
     sender: SyncSender<Envelope>,
     latest: Arc<Latest<Publication>>,
@@ -138,6 +146,8 @@ pub struct Runtime {
     attached_window: Arc<AtomicU64>,
     stopping: Arc<AtomicBool>,
     shutdown_complete: Arc<AtomicBool>,
+    shutdown: Arc<Mutex<ShutdownState>>,
+    retry_shutdown: SyncSender<()>,
     pub window_generation: u64,
     next_sequence: Arc<AtomicU64>,
     pending: VecDeque<Envelope>,
@@ -219,6 +229,9 @@ impl Runtime {
         let stopping = Arc::new(AtomicBool::new(false));
         let shutdown_complete = Arc::new(AtomicBool::new(false));
         let actor_shutdown_complete = shutdown_complete.clone();
+        let shutdown = Arc::new(Mutex::new(ShutdownState::Running));
+        let actor_shutdown = shutdown.clone();
+        let (retry_shutdown, retry_requests) = mpsc::sync_channel(1);
         #[cfg(test)]
         let fixture = Some(crate::test_support::current().expect(
             "unit-test Runtime requires test_support::enter before actor creation; default persistence paths are forbidden",
@@ -417,14 +430,51 @@ impl Runtime {
             stop.store(true, Ordering::Release);
             app.cancel_pending_work();
             cancel_all(&app);
+            *actor_shutdown.lock().unwrap() = ShutdownState::Pending;
+            // A stop during async startup must not publish uninitialized defaults
+            // over the saved session. Original startup receipt stays owned offUI.
+            while app.is_initializing() {
+                app.tick();
+                thread::sleep(Duration::from_millis(20));
+            }
+            app.cancel_pending_work();
             app.persist_state();
-            // Persistence drain is off both GPUI and command lanes and has an explicit bound.
-            let persisted = app
-                .persistence_barrier()
-                .recv_timeout(Duration::from_secs(2))
-                .is_ok();
-            actor_shutdown_complete.store(persisted, Ordering::Release);
-            let _ = completed.send(Completion::Closed);
+            // Keep this ORIGINAL receipt and owner after timeout; only a checked
+            // write success acknowledges the final accepted snapshot.
+            let mut receipt = app.checked_persistence_barrier();
+            *actor_shutdown.lock().unwrap() = ShutdownState::Pending;
+            let mut failed = None;
+            loop {
+                match receipt.recv_timeout(Duration::from_millis(20)) {
+                    Ok(Ok(success)) => {
+                        *actor_shutdown.lock().unwrap() = ShutdownState::Success {
+                            epoch: success.epoch,
+                        };
+                        actor_shutdown_complete.store(true, Ordering::Release);
+                        let _ = completed.send(Completion::Closed);
+                        break;
+                    }
+                    Ok(Err(error)) => {
+                        let error = Arc::new(error);
+                        *actor_shutdown.lock().unwrap() = ShutdownState::Failure(error.clone());
+                        failed = Some(error);
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        if failed.is_none() {
+                            *actor_shutdown.lock().unwrap() = ShutdownState::Disconnected;
+                        }
+                        // No automatic success, state recapture, or business replay.
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                }
+                if retry_requests.try_recv().is_ok()
+                    && let Some(error) = failed.take()
+                {
+                    receipt = error.retry.retry();
+                    *actor_shutdown.lock().unwrap() = ShutdownState::Pending;
+                }
+            }
         });
         Self {
             sender,
@@ -433,6 +483,8 @@ impl Runtime {
             attached_window,
             stopping,
             shutdown_complete,
+            shutdown,
+            retry_shutdown,
             window_generation,
             next_sequence: Arc::new(AtomicU64::new(1)),
             pending: VecDeque::new(),
@@ -440,6 +492,9 @@ impl Runtime {
     }
     pub fn enqueue(&mut self, command: Command, input_generation: Option<(u64, u64)>) -> u64 {
         let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
+        if self.is_stopping() {
+            return sequence;
+        }
         self.pending.push_back(Envelope {
             sequence,
             window_generation: self.window_generation,
@@ -450,6 +505,10 @@ impl Runtime {
         sequence
     }
     pub fn flush(&mut self) {
+        if self.is_stopping() {
+            self.pending.clear();
+            return;
+        }
         while let Some(envelope) = self.pending.pop_front() {
             match self.sender.try_send(envelope) {
                 Ok(()) => {}
@@ -475,6 +534,8 @@ impl Runtime {
             attached_window: self.attached_window.clone(),
             stopping: self.stopping.clone(),
             shutdown_complete: self.shutdown_complete.clone(),
+            shutdown: self.shutdown.clone(),
+            retry_shutdown: self.retry_shutdown.clone(),
             window_generation,
             next_sequence: self.next_sequence.clone(),
             pending: VecDeque::new(),
@@ -530,7 +591,17 @@ impl Runtime {
         }
         Some(completion)
     }
-    /// Cheap acknowledgment after actor cancellation and a successful persistence barrier.
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::Acquire)
+    }
+    pub fn shutdown_state(&self) -> Option<ShutdownState> {
+        self.shutdown.try_lock().ok().map(|state| state.clone())
+    }
+    pub fn retry_shutdown(&self) -> bool {
+        matches!(self.shutdown_state(), Some(ShutdownState::Failure(_)))
+            && self.retry_shutdown.try_send(()).is_ok()
+    }
+    /// Cheap acknowledgment after actor cancellation and a successful checked persistence receipt.
     /// Clones share it across window epochs; reading it never consumes UI completions.
     pub fn shutdown_complete(&self) -> bool {
         self.shutdown_complete.load(Ordering::Acquire)

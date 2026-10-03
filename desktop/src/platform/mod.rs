@@ -1,6 +1,7 @@
-pub mod application_quit;
 pub mod accessibility;
+pub mod application_quit;
 pub mod geometry;
+pub mod shutdown;
 // Explicit native requests run on workers, never during Render.
 use ira_core::model::HostRequest;
 use std::{
