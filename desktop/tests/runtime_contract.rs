@@ -983,3 +983,101 @@ fn queued_accessibility_entry_is_rejected_after_same_path_relisting() {
     }
     runtime.stop(&[]);
 }
+
+#[test]
+fn no_input_relisting_rejects_queued_full_stamp_on_same_entry_node() {
+    use ira_desktop::platform::accessibility::{
+        AccessibilityIntent, ActionSink,
+        model::{AccessibilityModel, Action, LayoutSnapshot, Role, Target},
+    };
+    let fixture = Fixture::new();
+    let mut app = fixture.app();
+    let old = app.snapshot();
+    let mut model = AccessibilityModel::default();
+    let old_tree = Arc::new(model.project(&old, None, &LayoutSnapshot::default()));
+    let node = old_tree
+        .nodes
+        .values()
+        .find(|n| {
+            n.role == Role::Row
+                && matches!(&n.target, Target::Entry { path, .. } if path.ends_with("alpha.txt"))
+        })
+        .unwrap();
+    let id = node.id;
+    let (sink, actions) = ActionSink::channel(old_tree.clone(), 4);
+    sink.try_dispatch(AccessibilityIntent {
+        node: id,
+        stamp: old_tree.stamp,
+        action: Action::SetSelected(true),
+    })
+    .unwrap();
+    let queued = actions.try_next().unwrap().unwrap();
+    app.list_files_from_selected_folder();
+    let mut runtime = Runtime::with_factory(7, move || app);
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let current = loop {
+        if let Some(p) = runtime.try_snapshot()
+            && p.snapshot.panes[0].listing_settled
+        {
+            assert_eq!(
+                p.snapshot.ack_sequence, 0,
+                "background listing must settle without input"
+            );
+            assert!(p.snapshot.revision > old.revision);
+            break p.snapshot;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    let tree = Arc::new(model.project(&current, None, &LayoutSnapshot::default()));
+    assert!(
+        matches!(&tree.nodes[&id].target, Target::Entry { path, listing_generation, .. } if path.ends_with("alpha.txt") && *listing_generation > old.panes[0].listing_generation)
+    );
+    runtime.enqueue(Command::Accessibility(queued), None);
+    loop {
+        if let Some(Completion::Rejected { reason, .. }) = runtime.try_completion() {
+            assert!(reason.contains("older semantic frame"));
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    loop {
+        if let Some(p) = runtime.try_snapshot() {
+            assert!(p.snapshot.panes[0].rows.iter().all(|r| !r.selected));
+            assert_eq!(p.snapshot.ack_sequence, 0);
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    sink.publish(tree.clone()).unwrap();
+    sink.try_dispatch(AccessibilityIntent {
+        node: id,
+        stamp: tree.stamp,
+        action: Action::SetSelected(true),
+    })
+    .unwrap();
+    runtime.enqueue(
+        Command::Accessibility(actions.try_next().unwrap().unwrap()),
+        None,
+    );
+    loop {
+        if let Some(p) = runtime.try_snapshot()
+            && p.snapshot.ack_sequence >= 2
+        {
+            assert!(
+                p.snapshot.panes[0]
+                    .rows
+                    .iter()
+                    .find(|r| r.entry.label == "alpha.txt")
+                    .unwrap()
+                    .selected
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    runtime.stop(&[]);
+}

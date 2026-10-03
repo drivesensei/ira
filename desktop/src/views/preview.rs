@@ -25,6 +25,7 @@ pub struct Key {
     path: PathBuf,
     mtime: Option<i64>,
     size: u64,
+    grid: bool,
 }
 pub enum Content {
     Image(Arc<RenderImage>),
@@ -52,6 +53,7 @@ pub struct Host {
     items: BTreeMap<Key, Item>,
     next: u64,
     stopped: Arc<AtomicBool>,
+    visible: BTreeMap<usize, Vec<Key>>,
 }
 impl Default for Host {
     fn default() -> Self {
@@ -70,8 +72,11 @@ impl Host {
         std::thread::spawn(move || {
             let mut pool = PreviewPool::new(options());
             let mut keys = BTreeMap::new();
+            let mut pending: Option<(Key, PreviewRequest)> = None;
             while !stop.load(Ordering::Acquire) {
-                if let Ok(work) = commands.recv_timeout(Duration::from_millis(5)) {
+                if pending.is_none()
+                    && let Ok(work) = commands.recv_timeout(Duration::from_millis(5))
+                {
                     let request = PreviewRequest {
                         session_id: work.key.window,
                         pane: work.key.pane,
@@ -79,22 +84,32 @@ impl Host {
                         path: work.key.path.clone(),
                         mtime: work.key.mtime,
                         size: work.key.size,
-                        surface: PreviewSurface::Column,
+                        surface: if work.key.grid {
+                            PreviewSurface::Grid
+                        } else {
+                            PreviewSurface::Column
+                        },
                         cancellation: work.cancellation,
                     };
-                    keys.insert(work.ticket, work.key);
-                    if let Err(error) = pool.submit(request, true) {
-                        let request = match error {
-                            mpsc::TrySendError::Full(request)
-                            | mpsc::TrySendError::Disconnected(request) => request,
-                        };
-                        if let Some(key) = keys.remove(&request.generation) {
+                    pending = Some((work.key, request));
+                }
+                if let Some((key, request)) = pending.take()
+                    && !request.cancellation.cancelled()
+                {
+                    let ticket = request.generation;
+                    match pool.submit(request, true) {
+                        Ok(()) => {
+                            keys.insert(ticket, key);
+                        }
+                        Err(mpsc::TrySendError::Full(request)) => {
+                            pending = Some((key, request));
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(mpsc::TrySendError::Disconnected(request)) => {
                             let _ = events.send(Event {
                                 key,
                                 ticket: request.generation,
-                                content: Content::Error(
-                                    "Preview queue is full; change selection to retry".into(),
-                                ),
+                                content: Content::Error("Preview workers stopped".into()),
                             });
                         }
                     }
@@ -146,6 +161,7 @@ impl Host {
             items: BTreeMap::new(),
             next: 0,
             stopped,
+            visible: BTreeMap::new(),
         }
     }
     pub fn key(snapshot: &Snapshot, pane: usize) -> Option<Key> {
@@ -153,8 +169,27 @@ impl Host {
         if p.preview_mode != PreviewMode::Column {
             return None;
         }
-        let row = p.rows.get(p.cursor?)?;
+        Self::row_key(snapshot, pane, p.cursor?, false)
+    }
+    pub fn grid_key(snapshot: &Snapshot, pane: usize, row: usize) -> Option<Key> {
+        let p = snapshot.panes.get(pane)?;
+        if p.preview_mode != PreviewMode::Grid {
+            return None;
+        }
+        Self::row_key(snapshot, pane, row, true)
+    }
+    fn row_key(snapshot: &Snapshot, pane: usize, row: usize, grid: bool) -> Option<Key> {
+        let p = snapshot.panes.get(pane)?;
+        let row = p.rows.get(row)?;
         if row.entry.is_dir {
+            return None;
+        }
+        if grid
+            && matches!(
+                ira_core::preview::preview_kind(&row.entry.path),
+                None | Some(ira_core::preview::PreviewKind::Text)
+            )
+        {
             return None;
         }
         Some(Key {
@@ -164,10 +199,24 @@ impl Host {
             path: PathBuf::from(&row.entry.path),
             mtime: row.entry.modified,
             size: row.entry.size,
+            grid,
         })
     }
+    /// Only the real virtualized viewport supplies tile work. No full-folder traversal.
+    pub fn visible_grid(
+        &mut self,
+        snapshot: &Snapshot,
+        pane: usize,
+        range: std::ops::Range<usize>,
+    ) {
+        let keys: Vec<_> = range
+            .take(128)
+            .filter_map(|row| Self::grid_key(snapshot, pane, row))
+            .collect();
+        self.visible.insert(pane, keys);
+    }
     pub fn request(&mut self, key: Key) {
-        if self.items.contains_key(&key) {
+        if self.items.contains_key(&key) || self.items.len() >= 256 {
             return;
         }
         self.next = self.next.wrapping_add(1);
@@ -192,10 +241,29 @@ impl Host {
         if self.stopped.load(Ordering::Acquire) {
             return false;
         }
-        let current: Vec<_> = snapshot
+        let mut current: Vec<_> = snapshot
             .into_iter()
             .flat_map(|s| (0..if s.split { 2 } else { 1 }).filter_map(|pane| Self::key(s, pane)))
             .collect();
+        if let Some(snapshot) = snapshot {
+            for (pane, keys) in &self.visible {
+                if snapshot
+                    .panes
+                    .get(*pane)
+                    .is_some_and(|p| p.preview_mode == PreviewMode::Grid)
+                    && (*pane == 0 || snapshot.split)
+                {
+                    current.extend(
+                        keys.iter()
+                            .filter(|key| {
+                                key.window == snapshot.window_generation
+                                    && key.listing == snapshot.panes[*pane].listing_generation
+                            })
+                            .cloned(),
+                    );
+                }
+            }
+        }
         self.items.retain(|key, item| {
             let keep = current.contains(key);
             if !keep {
@@ -237,6 +305,7 @@ impl Host {
             item.cancellation.cancel();
         }
         self.items.clear();
+        self.visible.clear();
     }
 }
 impl Drop for Host {
@@ -263,6 +332,52 @@ fn raw_image(pixels: ira_core::preview::Pixels) -> Result<Arc<RenderImage>, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn blocked_decoder_startup_keeps_viewport_work_bounded_and_nonblocking() {
+        use ira_core::{application::App, services::list_files::FEntry};
+        let (release, gate) = mpsc::channel();
+        let mut host = Host::start(move || {
+            gate.recv().unwrap();
+            PreviewOptions {
+                cache_dir: None,
+                temp_dir: std::env::temp_dir(),
+                ffmpeg: "ffmpeg".into(),
+                pdftoppm: "pdftoppm".into(),
+                process_timeout: Duration::from_secs(1),
+            }
+        });
+        let mut app = App::default();
+        app.window_generation = 9;
+        app.panes[0].preview_mode = PreviewMode::Grid;
+        app.panes[0].files = (0..1000)
+            .map(|i| FEntry {
+                path: format!("/tmp/ira-queue-fixture-{i}.png"),
+                label: format!("{i}.png"),
+                is_dir: false,
+                size: 10,
+                modified: None,
+            })
+            .collect();
+        app.panes[0].selected = vec![false; 1000];
+        let snapshot = app.snapshot();
+        host.visible_grid(&snapshot, 0, 0..1000);
+        assert_eq!(host.visible[&0].len(), 128);
+        let begin = std::time::Instant::now();
+        host.poll(Some(&snapshot));
+        eprintln!(
+            "blocked_preview_enqueue_us={} pending_items={}",
+            begin.elapsed().as_micros(),
+            host.items.len()
+        );
+        assert_eq!(
+            host.items.len(),
+            64,
+            "foreground enqueue respects the bounded channel even while startup has no receiver"
+        );
+        host.close();
+        release.send(()).unwrap();
+        assert!(!host.poll(Some(&snapshot)));
+    }
     #[test]
     fn raw_rgba_transport_swizzles_without_encoding() {
         let image = raw_image(ira_core::preview::Pixels {

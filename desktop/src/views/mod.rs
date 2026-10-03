@@ -1,5 +1,6 @@
 pub mod accessibility;
 pub mod preview;
+pub mod rows;
 use crate::platform::accessibility::{
     ResolvedAction,
     model::{Action as AxAction, Capability as AxCapability, Role as AxRole, Target as AxTarget},
@@ -41,6 +42,7 @@ pub struct Desktop {
     focus: FocusHandle,
     place_focus: BTreeMap<AxTarget, FocusHandle>,
     scroll: [UniformListScrollHandle; 2],
+    grid_columns: [usize; 2],
     input: Option<Entity<TextInput>>,
     input_mode: Option<InputMode>,
     input_generation: u64,
@@ -81,6 +83,7 @@ impl Desktop {
             focus: cx.focus_handle(),
             place_focus: BTreeMap::new(),
             scroll: std::array::from_fn(|_| UniformListScrollHandle::new()),
+            grid_columns: [1; 2],
             input: None,
             input_mode: None,
             input_generation: 0,
@@ -131,7 +134,14 @@ impl Desktop {
                         || old.panes[index].listing_generation != pane.listing_generation
                 }) && let Some(cursor) = pane.cursor
                 {
-                    self.scroll[index].scroll_to_item(cursor, ScrollStrategy::Center);
+                    self.scroll[index].scroll_to_item(
+                        if pane.preview_mode == ira_core::model::PreviewMode::Grid {
+                            cursor / self.grid_columns[index]
+                        } else {
+                            cursor
+                        },
+                        ScrollStrategy::Center,
+                    );
                 }
             }
             self.theme = publication.theme;
@@ -567,7 +577,16 @@ impl Desktop {
                             .iter()
                             .position(|r| std::path::Path::new(&r.entry.path) == path)
                     {
-                        self.scroll[*pane].scroll_to_item(index, ScrollStrategy::Center);
+                        self.scroll[*pane].scroll_to_item(
+                            if snapshot.panes[*pane].preview_mode
+                                == ira_core::model::PreviewMode::Grid
+                            {
+                                index / self.grid_columns[*pane]
+                            } else {
+                                index
+                            },
+                            ScrollStrategy::Center,
+                        );
                     }
                 }
                 _ => {
@@ -617,6 +636,133 @@ impl Desktop {
             button.into_any_element()
         }
     }
+    fn file_row(
+        &self,
+        index: usize,
+        row_index: usize,
+        grid: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(snapshot) = &self.snapshot else {
+            return div().into_any_element();
+        };
+        let pane = &snapshot.panes[index];
+        let Some(row) = pane.rows.get(row_index) else {
+            return div().into_any_element();
+        };
+        let target = EntryTarget {
+            pane: index,
+            path: PathBuf::from(&row.entry.path),
+            listing_generation: pane.listing_generation,
+        };
+        let (glyph, category) = ira_core::theme::icons::icon_for(&row.entry, snapshot.icons);
+        let label = format!(
+            "{} {} {}",
+            if row.selected { "☑" } else { "☐" },
+            glyph,
+            row.entry.label
+        );
+        let current = pane.cursor == Some(row_index) && snapshot.active_pane == index;
+        let foreground = if current {
+            self.theme.cursor_fg
+        } else {
+            self.theme.color_for(category)
+        };
+        let mut element = div()
+            .id(("row", row_index))
+            .px_3()
+            .flex()
+            .bg(native_color(if current {
+                self.theme.cursor_bg
+            } else if row.selected {
+                self.theme.selection
+            } else {
+                self.theme.bg
+            }))
+            .text_color(native_color(foreground))
+            .cursor_pointer();
+        if grid {
+            element = element
+                .flex_col()
+                .w(px(172.))
+                .h(px(160.))
+                .justify_between()
+                .py_2();
+            let thumbnail = preview::Host::grid_key(snapshot, index, row_index)
+                .and_then(|key| self.preview.content(&key));
+            element = match thumbnail {
+                Some(preview::Content::Image(image)) => element.child(
+                    gpui::img(image.clone())
+                        .w_full()
+                        .h(px(112.))
+                        .object_fit(gpui::ObjectFit::Contain),
+                ),
+                _ => element.child(
+                    div()
+                        .h(px(112.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_xl()
+                        .child(glyph),
+                ),
+            };
+            element = element.child(div().w_full().truncate().text_sm().child(label));
+        } else {
+            element = element
+                .h(px(30.))
+                .items_center()
+                .gap_3()
+                .child(div().flex_1().min_w_0().truncate().child(label));
+            if pane.preview_mode == ira_core::model::PreviewMode::Details {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                element = element
+                    .child(
+                        div()
+                            .w(px(90.))
+                            .flex_shrink_0()
+                            .text_right()
+                            .text_sm()
+                            .text_color(native_color(self.theme.text_muted))
+                            .child(rows::detail_size(&row.entry)),
+                    )
+                    .child(
+                        div()
+                            .w(px(132.))
+                            .flex_shrink_0()
+                            .text_right()
+                            .text_sm()
+                            .text_color(native_color(self.theme.text_muted))
+                            .child(rows::modified_ago(row.entry.modified, now)),
+                    );
+            }
+        }
+        let element = element.on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+            let double = matches!(event,ClickEvent::Mouse(e) if e.down.click_count>=2);
+            let modifiers = event.modifiers();
+            let verb = if double {
+                TargetVerb::Open
+            } else if modifiers.platform || modifiers.control {
+                TargetVerb::Toggle
+            } else {
+                TargetVerb::Focus
+            };
+            this.target(target.clone(), verb, window, cx);
+        }));
+        self.accessibility.measured(
+            element,
+            AxTarget::Entry {
+                pane: index,
+                path: PathBuf::from(&row.entry.path),
+                listing_generation: pane.listing_generation,
+            },
+            Some(AxRole::Row),
+            None,
+        )
+    }
     fn pane(&self, index: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
         let Some(snapshot) = &self.snapshot else {
             return div().flex_1().child("Loading…").into_any_element();
@@ -653,26 +799,54 @@ impl Desktop {
             } else {
                 "Empty folder"
             }));
+        } else if pane.preview_mode == ira_core::model::PreviewMode::Grid {
+            let columns = self.grid_columns[index];
+            body = body.child(
+                uniform_list(
+                    ("grid-files", index),
+                    pane.rows.len().div_ceil(columns),
+                    cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                        let Some(snapshot) = this.snapshot.clone() else {
+                            return Vec::new();
+                        };
+                        this.preview.visible_grid(
+                            &snapshot,
+                            index,
+                            range.start * columns..range.end * columns,
+                        );
+                        range
+                            .map(|grid_row| {
+                                let mut row = div().h(px(168.)).flex().gap_2().px_2();
+                                for tile in grid_row * columns
+                                    ..((grid_row + 1) * columns)
+                                        .min(snapshot.panes[index].rows.len())
+                                {
+                                    row = row.child(this.file_row(index, tile, true, cx));
+                                }
+                                row.into_any_element()
+                            })
+                            .collect::<Vec<_>>()
+                    }),
+                )
+                .track_scroll(self.scroll[index].clone())
+                .flex_1()
+                .min_h_0(),
+            );
         } else {
-            body=body.child(uniform_list(("files",index),pane.rows.len(),cx.processor(move|this,range:std::ops::Range<usize>,_,cx|{
-                let Some(snapshot)=this.snapshot.as_ref() else{return Vec::new();};
-                let pane=&snapshot.panes[index];
-                range.filter_map(|row_index|pane.rows.get(row_index).map(|row|{
-                    let target=EntryTarget{pane:index,path:PathBuf::from(&row.entry.path),listing_generation:pane.listing_generation};
-                    let (glyph, category) = ira_core::theme::icons::icon_for(&row.entry, snapshot.icons);
-                    let label=format!("{} {} {}",if row.selected{"☑"}else{"☐"},glyph,row.entry.label);
-                    let foreground = if pane.cursor == Some(row_index) && snapshot.active_pane == index { this.theme.cursor_fg } else { this.theme.color_for(category) };
-                    let size=if row.entry.is_dir{"Folder".to_string()}else{format!("{} B",row.entry.size)};
-                    let element=div().id(("row",row_index)).h(px(30.)).px_3().flex().justify_between().items_center().bg(native_color(if pane.cursor==Some(row_index)&&snapshot.active_pane==index{this.theme.cursor_bg}else if row.selected{this.theme.selection}else{this.theme.bg})).text_color(native_color(foreground)).cursor_pointer().child(label).child(div().text_sm().text_color(native_color(this.theme.text_muted)).child(size))
-                        .on_click(cx.listener(move|this,event:&ClickEvent,window,cx|{
-                            let double=matches!(event,ClickEvent::Mouse(e) if e.down.click_count>=2);
-                            let modifiers=event.modifiers();
-                            let verb=if double{TargetVerb::Open}else if modifiers.platform||modifiers.control{TargetVerb::Toggle}else{TargetVerb::Focus};
-                            this.target(target.clone(),verb,window,cx);
-                        }));
-                    this.accessibility.measured(element,AxTarget::Entry{pane:index,path:PathBuf::from(&row.entry.path),listing_generation:pane.listing_generation},Some(AxRole::Row),None)
-                })).collect::<Vec<_>>()
-            })).track_scroll(self.scroll[index].clone()).flex_1().min_h_0());
+            body = body.child(
+                uniform_list(
+                    ("files", index),
+                    pane.rows.len(),
+                    cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                        range
+                            .map(|row_index| this.file_row(index, row_index, false, cx))
+                            .collect::<Vec<_>>()
+                    }),
+                )
+                .track_scroll(self.scroll[index].clone())
+                .flex_1()
+                .min_h_0(),
+            );
         }
         body = body.on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, _, cx| {
             let delta = event.delta.pixel_delta(px(30.)).y;
@@ -892,6 +1066,26 @@ impl Focusable for Desktop {
 }
 impl Render for Desktop {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let visible_panes = if self.snapshot.as_ref().is_some_and(|s| s.split) {
+            2.0
+        } else {
+            1.0
+        };
+        let columns = (((f32::from(window.bounds().size.width) - 190.).max(1.) / visible_panes)
+            / 180.)
+            .floor()
+            .max(1.) as usize;
+        for index in 0..2 {
+            if self.grid_columns[index] != columns {
+                self.grid_columns[index] = columns;
+                if let Some(pane) = self.snapshot.as_ref().map(|s| &s.panes[index])
+                    && pane.preview_mode == ira_core::model::PreviewMode::Grid
+                    && let Some(cursor) = pane.cursor
+                {
+                    self.scroll[index].scroll_to_item(cursor / columns, ScrollStrategy::Center);
+                }
+            }
+        }
         self.sync_input(window, cx);
         self.accessibility_actions(window, cx);
         self.accessibility.focused_target = self
@@ -971,6 +1165,7 @@ impl Render for Desktop {
         {
             let mut board = div()
                 .id("ira-copy-board")
+                .debug_selector(|| "ira-copy-board".into())
                 .max_h(px(240.))
                 .overflow_y_scroll()
                 .flex_shrink_0()
@@ -979,6 +1174,10 @@ impl Render for Desktop {
                 .child("Copy Board");
             for (index, job) in snapshot.jobs.iter().enumerate() {
                 let id = job.id;
+                let lifecycle = match &job.status {
+                    ira_core::services::transfer::JobStatus::Failed(_) => "Failed".to_string(),
+                    status => format!("{status:?}"),
+                };
                 let mut row = div()
                     .id(("job", index))
                     .p_2()
@@ -996,9 +1195,9 @@ impl Render for Desktop {
                         },
                     ))
                     .child(format!(
-                        "{} · {:?} · {} / {} B",
+                        "{} · {} · {} / {} B",
                         job.label,
-                        job.status,
+                        lifecycle,
                         job.copied_bytes,
                         job.total_bytes.unwrap_or(0)
                     ))
@@ -1163,6 +1362,7 @@ impl Render for Desktop {
                 .child(
                     self.accessibility.measured(
                         div()
+                            .debug_selector(|| "ira-status-footer".into())
                             .p_2()
                             .text_sm()
                             .bg(native_color(self.theme.surface_alt))
@@ -1234,6 +1434,282 @@ mod crossing_tests {
     };
     use gpui::TestAppContext;
     use ira_core::{application::App, domain::data::Folder, services::list_files::list_files};
+    #[gpui::test]
+    fn recovery_board_survives_status_expiry_and_later_transfer_progress(cx: &mut TestAppContext) {
+        use ira_core::{
+            model::{STATUS_TTL, Status},
+            services::{
+                list_files::FEntry,
+                transfer::{Job, JobKind, JobStatus, OverwritePolicy},
+            },
+        };
+        let fixture =
+            std::env::temp_dir().join(format!("ira-native-recovery-{}", std::process::id()));
+        std::fs::create_dir_all(fixture.join("dest")).unwrap();
+        let source = fixture.join("source.txt");
+        std::fs::write(&source, vec![b'x'; 16384]).unwrap();
+        let recovery = format!(
+            "destination WAS published at /fixture/target; retained recovery paths: /fixture/{}; remaining batch items were not processed",
+            "nested/".repeat(100)
+        );
+        let expected = recovery.clone();
+        let mut app = App::default();
+        app.window_generation = 7;
+        app.copy_board = true;
+        app.split = true;
+        app.panes[0].folder = Some(Folder::new(
+            "Source".into(),
+            fixture.to_string_lossy().into_owned(),
+            '#',
+        ));
+        app.panes[1].folder = Some(Folder::new(
+            "Destination".into(),
+            fixture.join("dest").to_string_lossy().into_owned(),
+            'd',
+        ));
+        app.panes[0].files = vec![FEntry {
+            path: source.to_string_lossy().into_owned(),
+            label: "source.txt".into(),
+            is_dir: false,
+            size: 16384,
+            modified: None,
+        }];
+        app.panes[0].selected = vec![false];
+        app.panes[0].state.select(Some(0));
+        app.panes[0].listing_settled = true;
+        app.jobs.push(Job {
+            id: 40,
+            kind: JobKind::Move,
+            overwrite: OverwritePolicy::Overwrite,
+            paths: vec!["/fixture/prior-source".into()],
+            dest_dir: "/fixture/target".into(),
+            label: "Earlier committed recovery".into(),
+            total_bytes: Some(10),
+            copied_bytes: 10,
+            current: String::new(),
+            status: JobStatus::Failed(recovery),
+            started_at: std::time::Instant::now(),
+            control: JobControl::new(),
+        });
+        let runtime = Runtime::with_factory(7, move || {
+            app.status = Some(Status {
+                text: "Transient notice".into(),
+                is_error: false,
+                raised: std::time::Instant::now() - STATUS_TTL + Duration::from_millis(200),
+            });
+            app
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let publication = loop {
+            if let Some(p) = runtime.try_snapshot() {
+                break p;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            let mut view = Desktop::new(runtime, crate::platform::geometry::Writer::new(None), cx);
+            view.accessibility = accessibility::Host::headless();
+            view.snapshot = Some(publication.snapshot);
+            view
+        });
+        loop {
+            let expired = view.update_in(cx, |view, _, cx| {
+                view.poll(cx);
+                view.snapshot.as_ref().unwrap().status.is_none()
+            });
+            if expired {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        view.update_in(cx, |view, window, cx| {
+            window.focus(&view.focus);
+            view.dispatch(KeyCode::Char('c'), cx);
+        });
+        loop {
+            let confirming = view.update_in(cx, |view, _, cx| {
+                view.poll(cx);
+                view.snapshot.as_ref().unwrap().confirming.is_some()
+            });
+            if confirming {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        view.update_in(cx, |view, _, cx| view.dispatch(KeyCode::Enter, cx));
+        loop {
+            let done = view.update_in(cx, |view, _, cx| {
+                view.poll(cx);
+                view.snapshot.as_ref().unwrap().jobs.iter().any(|job| {
+                    job.id != 40 && job.status == JobStatus::Done && job.copied_bytes > 0
+                })
+            });
+            if done {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        view.update_in(cx, |view, _, _| {
+            let job = view
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .jobs
+                .iter()
+                .find(|j| j.id == 40)
+                .unwrap();
+            assert_eq!(job.status, JobStatus::Failed(expected.clone()));
+            let tree = view.accessibility.tree.as_ref().unwrap();
+            let node = tree
+                .nodes
+                .values()
+                .find(|n| n.target == Target::Job(40) && n.role == Role::Row)
+                .unwrap();
+            let geometry = node.geometry.unwrap();
+            assert!(
+                geometry.bounds.height > 90.,
+                "recovery error must wrap beyond one line"
+            );
+            assert!(geometry.visible.valid());
+            assert!(node.name.contains("retained recovery paths"));
+            view.runtime.stop(&view.controls);
+            view.close();
+        });
+        let footer = cx
+            .debug_bounds("ira-status-footer")
+            .expect("actual footer rendered even without transient Status semantic node");
+        let board = cx
+            .debug_bounds("ira-copy-board")
+            .expect("actual recovery board");
+        assert!(
+            board.size.height <= px(240.),
+            "recovery board must remain bounded and scrollable"
+        );
+        let window_height = view.update_in(cx, |_, window, _| window.bounds().size.height);
+        assert!(
+            footer.origin.y >= px(0.) && footer.bottom() <= window_height,
+            "footer must remain reachable below recovery board"
+        );
+        assert_eq!(
+            std::fs::read(fixture.join("dest/source.txt"))
+                .unwrap()
+                .len(),
+            16384
+        );
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+    #[gpui::test]
+    fn grid_viewport_mouse_and_mode_changes_keep_path_targets(cx: &mut TestAppContext) {
+        use ira_core::{model::PreviewMode, services::list_files::FEntry};
+        let mut app = App::default();
+        app.window_generation = 7;
+        app.panes[0].preview_mode = PreviewMode::Grid;
+        app.panes[0].folder = Some(Folder::new(
+            "Grid fixture".into(),
+            "/tmp/ira-grid-headless".into(),
+            '#',
+        ));
+        app.panes[0].files = (0..200)
+            .map(|i| FEntry {
+                path: format!("/tmp/ira-grid-headless/file-{i:03}.txt"),
+                label: format!("file-{i:03}.txt"),
+                is_dir: false,
+                size: 20,
+                modified: None,
+            })
+            .collect();
+        app.panes[0].selected = vec![false; 200];
+        app.panes[0].listing_settled = true;
+        app.panes[0].listing_generation = 3;
+        app.panes[0].state.select(Some(0));
+        let runtime = Runtime::with_factory(7, move || app);
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        let publication = loop {
+            if let Some(p) = runtime.try_snapshot() {
+                break p;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            let mut view = Desktop::new(runtime, crate::platform::geometry::Writer::new(None), cx);
+            view.accessibility = accessibility::Host::headless();
+            view.snapshot = Some(publication.snapshot);
+            view
+        });
+        let (id,point)=view.update_in(cx,|view,window,_|{
+            window.focus(&view.focus);
+            let tree=view.accessibility.tree.as_ref().unwrap();let rows:Vec<_>=tree.nodes.values().filter(|n|n.role==Role::Row).collect();assert_eq!(rows.len(),200);
+            assert!(rows.iter().filter(|n|n.geometry.is_some()).count()<200);
+            let first=rows.iter().find(|n|matches!(&n.target,Target::Entry{path,..} if path.ends_with("file-000.txt"))).unwrap();
+            let geometry=first.geometry.unwrap();assert_eq!(geometry.bounds.height,160.);assert!(view.grid_columns[0]>1);
+            (first.id,gpui::point(px((geometry.visible.x+geometry.visible.width/2.)as f32),px((geometry.visible.y+geometry.visible.height/2.)as f32)))
+        });
+        cx.simulate_click(
+            point,
+            gpui::Modifiers {
+                control: true,
+                ..Default::default()
+            },
+        );
+        loop {
+            let ready = view.update_in(cx, |view, _, cx| {
+                view.poll(cx);
+                view.snapshot.as_ref().unwrap().panes[0].rows[0].selected
+            });
+            if ready {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        cx.simulate_keystrokes("v");
+        loop {
+            let ready = view.update_in(cx, |view, _, cx| {
+                view.poll(cx);
+                view.snapshot.as_ref().unwrap().panes[0].preview_mode == PreviewMode::Off
+            });
+            if ready {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        view.update_in(cx, |view, _, _| {
+            let node = &view.accessibility.tree.as_ref().unwrap().nodes[&id];
+            assert_eq!(node.geometry.unwrap().bounds.height, 30.);
+            assert!(matches!(&node.target,Target::Entry{path,..}if path.ends_with("file-000.txt")));
+            assert!(view.snapshot.as_ref().unwrap().panes[0].rows[0].selected);
+        });
+        cx.simulate_keystrokes("v");
+        loop {
+            let ready = view.update_in(cx, |view, _, cx| {
+                view.poll(cx);
+                view.snapshot.as_ref().unwrap().panes[0].preview_mode == PreviewMode::Details
+            });
+            if ready {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        view.update_in(cx, |view, _, _| {
+            assert_eq!(
+                view.accessibility.tree.as_ref().unwrap().nodes[&id]
+                    .geometry
+                    .unwrap()
+                    .bounds
+                    .height,
+                30.
+            );
+            view.runtime.stop(&view.controls);
+            view.close();
+        });
+    }
     #[gpui::test]
     fn duplicate_place_focus_uses_real_handle_without_navigation(cx: &mut TestAppContext) {
         let mut app = App::default();
