@@ -1,0 +1,11 @@
+# Frozen lossless ledger-history maintenance reference
+
+This directory preserves the independently reviewed `ledger.py` source and its original developer maintenance tests without changing their logic. Source hashes and original local paths appear in `source-provenance.json`. This is a frozen reference, not a complete installable dev-team kit or a claim that tests ran in this published layout.
+
+The supported `archive-history` command retains exact source bytes and full chronological event history in a byte/hash-bound archive before atomically shortening the active gap. It preserves status, reopening count and required Links, and leaves the5000-byte active-file limit unchanged. Archive integrity is checked by show/doctor and reindex/transitions. Use an explicitly selected isolated ledger workspace; no real user configuration is involved.
+
+Independent R014 source review approved the exact ledger SHA25672c66437fc63db60dfdc4fa1fba70f4e4993a647a2d808286733627794c8d698 after9 isolated independent maintenance tests. Original developer tests are retained under `reference/`. They resolve the local engineering directory using `parents[2]`, expect `kit/scripts/ledger.py`, read `gaps/runtime/G-0008.md` and use an owned `evidence/R011/maintenance-synthetic` root. These paths do not exist in this published layout. The local G0008 fixture contains private diagnostic provenance and is deliberately excluded. Tests in this published layout are UNRUN and are not directly runnable; adapting them requires an independently reviewed relocatable runner and sanitized synthetic fixture. Do not infer reproduction from copying files alone.
+
+The standalone source also reads broader kit/roster files in its `init` workflow; those are not bundled. For maintenance on an existing isolated v2 ledger, select it explicitly with `--dir`, authenticate its expected source hash, and follow independent workspace review. Never use this reference to suppress doctor failures, erase chronology, rewrite existing evidence or infer an execution grant.
+
+Live archival outcome and remaining migration blockers are recorded separately in the checkpoint handoff. Numerical/isolated maintenance success does not establish runtime, native or feature parity.
