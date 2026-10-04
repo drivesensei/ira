@@ -179,4 +179,27 @@ fn info_measurement_saturates_and_clamps_tiny_or_overfull_viewports() {
         // Complete content cannot fit these viewports; only bounded geometry
         // is asserted, not an impossible guarantee of footer visibility.
     }
+
+    // 65,536 cells would become zero with a direct usize-to-u16 cast.
+    // Geometry only: no large terminal buffer is allocated.
+    let wide = vec![Line::raw("a".repeat(u16::MAX as usize + 1))];
+    assert_eq!(wide[0].width(), u16::MAX as usize + 1);
+    let area = chrome::wrapped_info_area(&wide, Rect::new(0, 0, 100, 30));
+    assert_eq!(area.width, 98, "wide content must saturate before clamping");
+
+    // Every blank logical line consumes one rendered row at nonzero width.
+    // 65,536 rows must saturate, then clamp to the 98 available rows; a
+    // direct cast would produce zero rows and only four cells of chrome.
+    let tall = vec![Line::raw(""); u16::MAX as usize + 1];
+    let area = chrome::wrapped_info_area(&tall, Rect::new(0, 0, 20, 100));
+    assert_eq!(area.height, 98, "row count must saturate before clamping");
+
+    // Plenty of vertical space makes a forced minimum wrap width observable.
+    // At zero content width Ratatui counts no rows, leaving only the chrome.
+    let nonempty = vec![Line::raw("zero-width-content")];
+    for width in 0..=4 {
+        let area = chrome::wrapped_info_area(&nonempty, Rect::new(0, 0, width, 40));
+        assert_eq!(area.width.saturating_sub(chrome::DIALOG_CHROME), 0);
+        assert_eq!(area.height, 4, "zero content width must stay zero");
+    }
 }
