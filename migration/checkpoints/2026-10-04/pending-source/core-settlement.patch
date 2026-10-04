@@ -1,0 +1,1881 @@
+From 4bc2fa95b8ecba10ec4719cd1dcc44a248a3ad5d Mon Sep 17 00:00:00 2001
+From: Vladimir Lopez <vladimir.lopez@lifelinksystems.com>
+Date: Sat, 3 Oct 2026 14:18:03 -0600
+Subject: [PATCH 1/4] fix(shutdown): await authenticated accepted-work
+ settlement before persistence
+
+---
+ crates/core/src/application.rs                | 272 ++++++++++++++++--
+ .../core/src/application_settlement_tests.rs  | 265 +++++++++++++++++
+ crates/core/src/services/transfer.rs          |  84 +++++-
+ desktop/src/platform/shutdown.rs              |   3 +-
+ desktop/src/runtime.rs                        | 240 ++++++++++++----
+ desktop/src/runtime_settlement_tests.rs       | 249 ++++++++++++++++
+ 6 files changed, 1032 insertions(+), 81 deletions(-)
+ create mode 100644 crates/core/src/application_settlement_tests.rs
+ create mode 100644 desktop/src/runtime_settlement_tests.rs
+
+diff --git a/crates/core/src/application.rs b/crates/core/src/application.rs
+index f4e5ba0..8ee0675 100644
+--- a/crates/core/src/application.rs
++++ b/crates/core/src/application.rs
+@@ -15,8 +15,9 @@ use crate::{
+         list_files::{list_files_bounded, list_files_chunked, FEntry, LISTING_CHUNK},
+         state::{load_state, load_state_from, SessionState, SizeEntry},
+         transfer::{
+-            spawn_delete_job, spawn_job, spawn_job_with_provider, Job, JobControl, JobEvent,
+-            JobKind, JobStatus, NoReplaceProvider, OverwritePolicy,
++            rename_no_replace, spawn_delete_job_with_settlement, spawn_job_with_settlement, Job,
++            JobControl, JobEvent, JobKind, JobStatus, NoReplaceProvider, OverwritePolicy,
++            WorkOutcome,
+         },
+     },
+     utils::{
+@@ -77,6 +78,7 @@ struct OperationState {
+     drives: Option<Vec<Folder>>,
+ }
+ struct OperationRequest {
++    settlement_sequence: u64,
+     epoch: u64,
+     navigation_ticket: Option<u64>,
+     operation: BlockingOperation,
+@@ -139,7 +141,56 @@ struct SearchProjection {
+     indices: Arc<Vec<usize>>,
+ }
+ 
++/// Opaque, nonreusable authority for one App's permanently sealed issued set.
++#[derive(Clone, Debug)]
++pub struct ShutdownWorkSeal {
++    identity: Arc<()>,
++    operation_cutoff: u64,
++}
++/// Authentic completion returned only by polling this App's sealed issued set.
++#[derive(Debug)]
++pub struct ShutdownWorkReceipt {
++    seal: ShutdownWorkSeal,
++}
++impl ShutdownWorkSeal {
++    pub fn accepts(&self, receipt: &ShutdownWorkReceipt) -> bool {
++        Arc::ptr_eq(&self.identity, &receipt.seal.identity)
++            && self.operation_cutoff == receipt.seal.operation_cutoff
++    }
++}
++#[derive(Debug)]
++pub enum WorkSettlement {
++    Pending,
++    Error(String),
++    Settled(ShutdownWorkReceipt),
++}
++struct ActiveWork {
++    receipt: mpsc::Receiver<WorkOutcome>,
++    control: Arc<JobControl>,
++}
++// Release publication follows each FIFO request's final business-I/O attempt.
++#[derive(Default)]
++struct OperationSettlement {
++    through: AtomicU64,
++    exited: AtomicBool,
++}
++struct OperationExit(Arc<OperationSettlement>);
++impl Drop for OperationExit {
++    fn drop(&mut self) {
++        self.0.exited.store(true, Ordering::Release);
++    }
++}
++
+ pub struct App {
++    work_identity: Arc<()>,
++    work_seal: Option<ShutdownWorkSeal>,
++    work_error: Option<String>,
++    work_diagnostic: Option<String>,
++    work_receipts: VecDeque<ActiveWork>,
++    operation_issued: u64,
++    operation_settlement: Arc<OperationSettlement>,
++    #[cfg(test)]
++    operation_test: Option<Arc<dyn Fn() + Send + Sync>>,
+     search_projection: std::cell::RefCell<Option<SearchProjection>>,
+     pub(crate) snapshot_cache: [std::cell::RefCell<Option<crate::observable::PaneProjection>>; 2],
+     pub(crate) deletion_generation: u64,
+@@ -298,6 +349,15 @@ impl Default for App {
+         let (file_list_tx, file_list_rx) = mpsc::channel();
+         let (info_tx, info_rx) = mpsc::channel();
+         Self {
++            work_identity: Arc::new(()),
++            work_seal: None,
++            work_error: None,
++            work_diagnostic: None,
++            work_receipts: VecDeque::new(),
++            operation_issued: 0,
++            operation_settlement: Arc::new(OperationSettlement::default()),
++            #[cfg(test)]
++            operation_test: None,
+             search_projection: std::cell::RefCell::new(None),
+             snapshot_cache: std::array::from_fn(|_| std::cell::RefCell::new(None)),
+             deletion_generation: 0,
+@@ -485,7 +545,11 @@ impl App {
+             ..Self::default()
+         };
+         app.host_requests.push(HostRequest::RefreshDrives);
+-        let tx = app.startup_tx.clone();
++        // Only the original load worker retains the real sender, so a lost
++        // startup payload is distinguishable from a still-pending load.
++        let (unused_tx, unused_rx) = mpsc::channel();
++        drop(unused_rx);
++        let tx = std::mem::replace(&mut app.startup_tx, unused_tx);
+         let state_path = app.state_path.clone();
+         let bookmarks_path = app.bookmarks_path.clone();
+         thread::spawn(move || {
+@@ -506,12 +570,7 @@ impl App {
+     }
+     fn drain_startup(&mut self) {
+         if let Ok((state, pairs)) = self.startup_rx.try_recv() {
+-            self.apply_bookmark_pairs(pairs);
+-            let preset = self.apply_session_state(state);
+-            if let Some(preset) = preset.and_then(|s| crate::theme::ThemePreset::parse(&s)) {
+-                self.theme_preset = preset;
+-            }
+-            self.initializing = false;
++            self.apply_startup_payload(state, pairs);
+             self.request_pane_listing(0);
+             self.request_pane_listing(1);
+             while let Some(input) = self.startup_inputs.pop_front() {
+@@ -520,6 +579,103 @@ impl App {
+         }
+     }
+ 
++    fn apply_startup_payload(&mut self, state: SessionState, pairs: Vec<(String, String)>) {
++        self.apply_bookmark_pairs(pairs);
++        let preset = self.apply_session_state(state);
++        if let Some(preset) = preset.and_then(|s| crate::theme::ThemePreset::parse(&s)) {
++            self.theme_preset = preset;
++        }
++        self.initializing = false;
++    }
++
++    /// Seal admission once; attachment cancellation does not create this seal.
++    pub fn begin_shutdown_settlement(&mut self) -> ShutdownWorkSeal {
++        if let Some(seal) = &self.work_seal {
++            return seal.clone();
++        }
++        let seal = ShutdownWorkSeal {
++            identity: self.work_identity.clone(),
++            operation_cutoff: self.operation_issued,
++        };
++        self.work_seal = Some(seal.clone());
++        self.cancel_pending_work();
++        self.host_requests.clear();
++        self.deferred_listings.clear();
++        for work in &self.work_receipts {
++            work.control.request_cancel();
++        }
++        // Let the FIFO consume/acknowledge stale queued operations and terminate.
++        self.operation_tx.take();
++        seal
++    }
++
++    fn poll_work_receipts(&mut self, budget: usize) {
++        // Rotate the outstanding deque so a blocked first worker cannot starve others.
++        for _ in 0..budget.max(1).min(self.work_receipts.len()) {
++            let Some(work) = self.work_receipts.pop_front() else {
++                break;
++            };
++            match work.receipt.try_recv() {
++                Ok(WorkOutcome::Failed(error)) => {
++                    self.work_diagnostic
++                        .get_or_insert_with(|| error.chars().take(512).collect());
++                }
++                Ok(WorkOutcome::Done | WorkOutcome::Cancelled) => {}
++                Err(mpsc::TryRecvError::Empty) => self.work_receipts.push_back(work),
++                Err(mpsc::TryRecvError::Disconnected) => {
++                    self.work_error
++                        .get_or_insert_with(|| "Work acknowledgement disconnected".into());
++                }
++            }
++        }
++    }
++
++    /// Completion-only polling. Never runs tick, applies ordinary results, or issues work.
++    pub fn poll_shutdown_settlement(
++        &mut self,
++        seal: &ShutdownWorkSeal,
++        budget: usize,
++    ) -> WorkSettlement {
++        if !Arc::ptr_eq(&seal.identity, &self.work_identity)
++            || self.work_seal.as_ref().map(|own| own.operation_cutoff)
++                != Some(seal.operation_cutoff)
++        {
++            return WorkSettlement::Error("Wrong shutdown work seal".into());
++        }
++        // Poll all lanes even while the original startup payload is pending.
++        self.poll_work_receipts(budget);
++        if self.initializing {
++            match self.startup_rx.try_recv() {
++                Ok((state, pairs)) => {
++                    self.apply_startup_payload(state, pairs);
++                    self.startup_inputs.clear();
++                }
++                Err(mpsc::TryRecvError::Empty) => {}
++                Err(mpsc::TryRecvError::Disconnected) => {
++                    self.work_error
++                        .get_or_insert_with(|| "Original startup payload disconnected".into());
++                }
++            }
++        }
++        let through = self.operation_settlement.through.load(Ordering::Acquire);
++        if through < seal.operation_cutoff
++            && self.operation_settlement.exited.load(Ordering::Acquire)
++            && self.operation_settlement.through.load(Ordering::Acquire) < seal.operation_cutoff
++        {
++            self.work_error.get_or_insert_with(|| {
++                "Operation worker exited before sealed acknowledgement".into()
++            });
++        }
++        if let Some(error) = &self.work_error {
++            return WorkSettlement::Error(error.clone());
++        }
++        if self.initializing || !self.work_receipts.is_empty() || through < seal.operation_cutoff {
++            WorkSettlement::Pending
++        } else {
++            WorkSettlement::Settled(ShutdownWorkReceipt { seal: seal.clone() })
++        }
++    }
++
+     fn semantic_changed(&mut self) {
+         self.revision = self.revision.wrapping_add(1);
+     }
+@@ -553,6 +709,10 @@ impl App {
+ 
+     /// Handles the tick event of the terminal.
+     pub fn tick(&mut self) {
++        if self.work_seal.is_some() {
++            return;
++        }
++        self.poll_work_receipts(64);
+         let before = self.tick_semantics();
+         let revision = self.revision;
+         let focus = self.focus_generation;
+@@ -1586,6 +1746,9 @@ impl App {
+ 
+     /// Applies the pending copy/move confirmation: spawns the jobs.
+     pub fn confirm_transfer(&mut self, kind: JobKind) {
++        if self.work_seal.is_some() || self.work_error.is_some() {
++            return;
++        }
+         let Some(confirm) = self.confirming.take() else {
+             return;
+         };
+@@ -2340,6 +2503,9 @@ impl App {
+         dest: String,
+         policy: OverwritePolicy,
+     ) {
++        if self.work_seal.is_some() || self.work_error.is_some() {
++            return;
++        }
+         let dest_path = std::path::Path::new(&dest);
+         // One batch job for the whole selection: a single worker thread
+         // processes the paths sequentially — never one thread per file.
+@@ -2385,10 +2551,19 @@ impl App {
+             control: JobControl::new(),
+         });
+         let job = self.jobs.last().unwrap();
+-        if let Some(provider) = &self.transfer_provider {
+-            spawn_job_with_provider(job, self.job_tx.clone(), Arc::clone(provider));
+-        } else {
+-            spawn_job(job, self.job_tx.clone());
++        let (settlement_tx, receipt) = mpsc::channel();
++        self.work_receipts.push_back(ActiveWork {
++            receipt,
++            control: job.control.clone(),
++        });
++        let provider = self
++            .transfer_provider
++            .clone()
++            .unwrap_or_else(|| Arc::new(rename_no_replace));
++        if let Err(error) =
++            spawn_job_with_settlement(job, self.job_tx.clone(), provider, Some(settlement_tx))
++        {
++            self.work_error = Some(format!("Transfer worker spawn failed: {error}"));
+         }
+ 
+         self.transfer_generation = self.transfer_generation.wrapping_add(1);
+@@ -2515,6 +2690,9 @@ impl App {
+     /// and returns immediately. Progress arrives on the job channel and is
+     /// shown in the (dismissable) progress dialog plus file-list spinners.
+     pub fn confirm_delete(&mut self) {
++        if self.work_seal.is_some() || self.work_error.is_some() {
++            return;
++        }
+         let Some(confirm) = self.confirming.take() else {
+             return;
+         };
+@@ -2524,7 +2702,20 @@ impl App {
+         self.deletion_generation = self.deletion_generation.wrapping_add(1);
+         self.deleting_paths = confirm.paths.iter().cloned().collect();
+         let tx = self.job_tx.clone();
+-        let control = spawn_delete_job(confirm.paths.clone(), tx);
++        let control = JobControl::new();
++        let (settlement_tx, receipt) = mpsc::channel();
++        self.work_receipts.push_back(ActiveWork {
++            receipt,
++            control: control.clone(),
++        });
++        if let Err(error) = spawn_delete_job_with_settlement(
++            confirm.paths.clone(),
++            tx,
++            control.clone(),
++            Some(settlement_tx),
++        ) {
++            self.work_error = Some(format!("Deletion worker spawn failed: {error}"));
++        }
+         self.deletion = Some(DeletionState {
+             total: confirm.paths.len(),
+             done: 0,
+@@ -3431,6 +3622,9 @@ impl App {
+         true
+     }
+     pub fn dispatch(&mut self, input: crate::input::Input) -> AppResult<()> {
++        if self.work_seal.is_some() {
++            return Err("Application work is sealed for shutdown".into());
++        }
+         if self.initializing && !matches!(input, crate::input::Input::Tick) {
+             let quit = matches!(
+                 input,
+@@ -3704,6 +3898,9 @@ impl App {
+         }
+     }
+     fn submit_operation(&mut self, operation: BlockingOperation) {
++        if self.work_seal.is_some() || self.work_error.is_some() {
++            return;
++        }
+         let pane = self.active_pane;
+         let relative = matches!(
+             operation,
+@@ -3729,13 +3926,27 @@ impl App {
+         } else {
+             None
+         };
++        let Some(sequence) = self.operation_issued.checked_add(1) else {
++            self.work_error = Some("Operation settlement sequence exhausted".into());
++            return;
++        };
++        // Register before the worker can receive or complete this request.
++        self.operation_issued = sequence;
+         self.pending_operations += 1;
+         if self.operation_tx.is_none() {
+             let (tx, rx) = mpsc::channel::<OperationRequest>();
+             let result_tx = self.operation_result_tx.clone();
+             let epoch = self.operation_epoch.clone();
+-            thread::spawn(move || {
++            let settlement = self.operation_settlement.clone();
++            #[cfg(test)]
++            let operation_test = self.operation_test.clone();
++            let spawned = thread::Builder::new().spawn(move || {
++                let _exit = OperationExit(settlement.clone());
++                let mut expected = 1u64;
+                 while let Ok(request) = rx.recv() {
++                    if request.settlement_sequence != expected {
++                        break;
++                    }
+                     let source = std::array::from_fn(|i| {
+                         (
+                             request.state.panes[i]
+@@ -3759,6 +3970,10 @@ impl App {
+                         ..App::default()
+                     };
+                     if request.epoch == epoch.load(Ordering::Acquire) {
++                        #[cfg(test)]
++                        if let Some(hook) = &operation_test {
++                            hook();
++                        }
+                         match request.operation {
+                             BlockingOperation::EnterFolder => worker.enter_folder_blocking(),
+                             BlockingOperation::ParentFolder => worker.out_of_folder_blocking(),
+@@ -3781,14 +3996,30 @@ impl App {
+                         listings: std::mem::take(&mut worker.deferred_listings),
+                         host_requests: std::mem::take(&mut worker.host_requests),
+                     };
++                    // All explicit operation filesystem attempts have returned;
++                    // result guards/admission are independent from this watermark.
++                    settlement
++                        .through
++                        .store(request.settlement_sequence, Ordering::Release);
+                     if result_tx.send(result).is_err() {
+                         break;
+                     }
++                    let Some(next) = expected.checked_add(1) else {
++                        break;
++                    };
++                    expected = next;
+                 }
+             });
+-            self.operation_tx = Some(tx);
++            match spawned {
++                Ok(_) => self.operation_tx = Some(tx),
++                Err(error) => {
++                    self.work_error = Some(format!("Operation worker spawn failed: {error}"));
++                    return;
++                }
++            }
+         }
+         let request = OperationRequest {
++            settlement_sequence: sequence,
+             epoch: self.operation_epoch.load(Ordering::Acquire),
+             navigation_ticket,
+             operation,
+@@ -3802,7 +4033,10 @@ impl App {
+             self.goto_prompt = None;
+         }
+         if let Some(tx) = &self.operation_tx {
+-            let _ = tx.send(request);
++            if tx.send(request).is_err() {
++                self.work_error = Some("Operation request channel disconnected".into());
++                self.operation_tx.take();
++            }
+         }
+     }
+     fn drain_operation_results(&mut self) {
+@@ -4108,3 +4342,7 @@ mod existing_path;
+ pub use existing_path::{
+     ExistingPathFocusStamp, ExistingPathKind, ExistingPathReceipt, ExistingPathScope,
+ };
++
++#[cfg(test)]
++#[path = "application_settlement_tests.rs"]
++mod settlement_tests;
+diff --git a/crates/core/src/application_settlement_tests.rs b/crates/core/src/application_settlement_tests.rs
+new file mode 100644
+index 0000000..25750b2
+--- /dev/null
++++ b/crates/core/src/application_settlement_tests.rs
+@@ -0,0 +1,265 @@
++use super::*;
++use std::sync::Condvar;
++#[derive(Default)]
++struct Gate {
++    entered: AtomicBool,
++    released: Mutex<bool>,
++    ready: Condvar,
++}
++impl Gate {
++    fn block(&self) {
++        self.entered.store(true, Ordering::Release);
++        let mut open = self.released.lock().unwrap();
++        while !*open {
++            open = self.ready.wait(open).unwrap();
++        }
++    }
++    fn release(&self) {
++        *self.released.lock().unwrap() = true;
++        self.ready.notify_all();
++    }
++    fn wait(&self) {
++        let until = Instant::now() + Duration::from_secs(5);
++        while !self.entered.load(Ordering::Acquire) {
++            assert!(Instant::now() < until);
++            thread::yield_now();
++        }
++    }
++}
++struct Release(Arc<Gate>);
++impl Drop for Release {
++    fn drop(&mut self) {
++        self.0.release();
++    }
++}
++fn owned_app() -> (App, PathBuf) {
++    static NEXT: AtomicU64 = AtomicU64::new(1);
++    let root = std::env::temp_dir().join(format!(
++        "ira-t061-core-{}-{}",
++        std::process::id(),
++        NEXT.fetch_add(1, Ordering::Relaxed)
++    ));
++    std::fs::create_dir(&root).unwrap();
++    let mut app = App::default();
++    app.state_path = Some(root.join("state"));
++    app.bookmarks_path = Some(root.join("bookmarks"));
++    (app, root) // Retain synthetic directory; never clean under physical workers.
++}
++fn await_settled(app: &mut App, seal: &ShutdownWorkSeal) {
++    let until = Instant::now() + Duration::from_secs(5);
++    loop {
++        match app.poll_shutdown_settlement(seal, 1) {
++            WorkSettlement::Settled(_) => break,
++            WorkSettlement::Error(e) => panic!("{e}"),
++            WorkSettlement::Pending => assert!(Instant::now() < until),
++        }
++        thread::yield_now();
++    }
++}
++#[test]
++fn operation_after_epoch_check_and_queued_stale_request_require_authentic_watermark() {
++    let (mut app, root) = owned_app();
++    let gate = Arc::new(Gate::default());
++    let hold = gate.clone();
++    let _release = Release(gate.clone());
++    app.operation_test = Some(Arc::new(move || hold.block()));
++    app.goto_prompt = Some(root.join("accepted").to_str().unwrap().into());
++    app.submit_operation(BlockingOperation::Goto);
++    gate.wait();
++    app.goto_prompt = Some(root.join("queued").to_str().unwrap().into());
++    app.submit_operation(BlockingOperation::Goto);
++    let seal = app.begin_shutdown_settlement();
++    assert_eq!(app.pending_operations, 0);
++    assert!(matches!(
++        app.poll_shutdown_settlement(&seal, 1),
++        WorkSettlement::Pending
++    ));
++    gate.release();
++    await_settled(&mut app, &seal);
++    assert!(root.join("accepted").is_dir());
++    assert!(!root.join("queued").exists());
++    assert!(
++        app.panes[0].folder.is_none(),
++        "stale operation business results must not apply"
++    );
++    app.goto_prompt = Some(root.join("after-seal").to_str().unwrap().into());
++    app.submit_operation(BlockingOperation::Goto);
++    assert_eq!(app.operation_issued, seal.operation_cutoff);
++}
++#[test]
++fn original_startup_payload_applies_without_listing_tick_or_deferred_input_replay() {
++    let (mut app, _root) = owned_app();
++    app.initializing = true;
++    app.startup_inputs.push_back(crate::input::Input::Action(
++        crate::input::Command::ToggleHidden,
++    ));
++    let seal = app.begin_shutdown_settlement();
++    assert!(matches!(
++        app.poll_shutdown_settlement(&seal, 1),
++        WorkSettlement::Pending
++    ));
++    app.startup_tx
++        .send((
++            SessionState {
++                show_hidden: true,
++                split: true,
++                ..SessionState::default()
++            },
++            vec![],
++        ))
++        .unwrap();
++    await_settled(&mut app, &seal);
++    assert!(app.show_hidden);
++    assert!(app.split);
++    assert!(app.startup_inputs.is_empty());
++    assert_eq!(app.panes[0].listing_generation, 1);
++    assert!(app.take_host_requests().is_empty());
++}
++#[test]
++fn different_app_seal_and_lost_receipt_never_settle() {
++    let (mut app, _) = owned_app();
++    let (mut other, _) = owned_app();
++    let foreign = other.begin_shutdown_settlement();
++    assert!(matches!(
++        app.poll_shutdown_settlement(&foreign, 1),
++        WorkSettlement::Error(_)
++    ));
++    let (tx, rx) = mpsc::channel();
++    app.work_receipts.push_back(ActiveWork {
++        receipt: rx,
++        control: JobControl::new(),
++    });
++    drop(tx);
++    let seal = app.begin_shutdown_settlement();
++    assert!(matches!(
++        app.poll_shutdown_settlement(&seal, 1),
++        WorkSettlement::Error(_)
++    ));
++}
++
++#[test]
++fn actual_delete_batch_survives_hidden_replaced_dialog_and_disconnected_business_results() {
++    let (mut app, root) = owned_app();
++    let a = root.join("a");
++    let b = root.join("b");
++    std::fs::write(&a, b"a").unwrap();
++    std::fs::write(&b, b"b").unwrap();
++    let (_unused_tx, disconnected_rx) = mpsc::channel();
++    drop(std::mem::replace(&mut app.job_rx, disconnected_rx));
++    for path in [&a, &b] {
++        app.confirming = Some(Confirm {
++            action: ConfirmAction::Delete,
++            policy: OverwritePolicy::AutoRename,
++            label: "owned".into(),
++            paths: vec![path.to_str().unwrap().into()],
++            dest_dir: None,
++        });
++        app.confirm_delete();
++        app.deletion = None;
++    }
++    let seal = app.begin_shutdown_settlement();
++    await_settled(&mut app, &seal);
++    assert_eq!(app.work_receipts.len(), 0);
++    // Cancellation may precede either deletion; settled means attempts have ended,
++    // not that cancelled business operations succeeded.
++}
++#[test]
++fn operation_sequence_overflow_is_error_without_issuing_a_mutation() {
++    let (mut app, root) = owned_app();
++    app.operation_issued = u64::MAX;
++    app.goto_prompt = Some(root.join("overflow").to_str().unwrap().into());
++    app.submit_operation(BlockingOperation::Goto);
++    let seal = app.begin_shutdown_settlement();
++    assert!(matches!(
++        app.poll_shutdown_settlement(&seal, 1),
++        WorkSettlement::Error(_)
++    ));
++    assert!(!root.join("overflow").exists());
++}
++#[test]
++fn fair_bounded_active_receipt_poll_does_not_wait_on_first_blocked_worker() {
++    let (mut app, _) = owned_app();
++    let (held, pending) = mpsc::channel();
++    let (done, ready) = mpsc::channel();
++    done.send(WorkOutcome::Done).unwrap();
++    app.work_receipts.push_back(ActiveWork {
++        receipt: pending,
++        control: JobControl::new(),
++    });
++    app.work_receipts.push_back(ActiveWork {
++        receipt: ready,
++        control: JobControl::new(),
++    });
++    let seal = app.begin_shutdown_settlement();
++    assert!(matches!(
++        app.poll_shutdown_settlement(&seal, 1),
++        WorkSettlement::Pending
++    ));
++    assert_eq!(app.work_receipts.len(), 2);
++    assert!(matches!(
++        app.poll_shutdown_settlement(&seal, 1),
++        WorkSettlement::Pending
++    ));
++    assert_eq!(app.work_receipts.len(), 1);
++    held.send(WorkOutcome::Cancelled).unwrap();
++    await_settled(&mut app, &seal);
++    // Accounting-only supplemental fixture; actual workers are primary above.
++}
++
++#[test]
++fn actual_transfer_provider_panic_loses_ack_and_never_settles() {
++    let (mut app, root) = owned_app();
++    let source = root.join("source");
++    let dest = root.join("dest");
++    std::fs::write(&source, b"owned").unwrap();
++    std::fs::create_dir(&dest).unwrap();
++    app.set_transfer_provider(Arc::new(|_, _| panic!("owned worker panic fixture")));
++    app.spawn_transfer_jobs(
++        JobKind::Move,
++        vec![source.to_str().unwrap().into()],
++        dest.to_str().unwrap().into(),
++        OverwritePolicy::AutoRename,
++    );
++    // Wait for sender loss through the real worker, avoiding a cancellation race
++    // that could skip the provider before it is entered.
++    let deadline = Instant::now() + Duration::from_secs(5);
++    while app.work_error.is_none() {
++        app.poll_work_receipts(1);
++        assert!(Instant::now() < deadline);
++        thread::yield_now();
++    }
++    let seal = app.begin_shutdown_settlement();
++    assert!(matches!(
++        app.poll_shutdown_settlement(&seal, 1),
++        WorkSettlement::Error(_)
++    ));
++    assert!(source.exists());
++}
++#[test]
++fn actual_failed_transfer_is_terminal_without_replaying_business_work() {
++    let (mut app, root) = owned_app();
++    let source = root.join("source");
++    let dest = root.join("dest");
++    std::fs::write(&source, b"owned").unwrap();
++    std::fs::create_dir(&dest).unwrap();
++    app.set_transfer_provider(Arc::new(|_, _| {
++        Err(std::io::Error::other("owned provider failure"))
++    }));
++    app.spawn_transfer_jobs(
++        JobKind::Move,
++        vec![source.to_str().unwrap().into()],
++        dest.to_str().unwrap().into(),
++        OverwritePolicy::AutoRename,
++    );
++    let deadline = Instant::now() + Duration::from_secs(5);
++    while !app.work_receipts.is_empty() {
++        app.poll_work_receipts(1);
++        assert!(Instant::now() < deadline);
++        thread::yield_now();
++    }
++    assert!(app.work_diagnostic.is_some());
++    let seal = app.begin_shutdown_settlement();
++    await_settled(&mut app, &seal);
++    assert!(source.exists());
++    assert!(!dest.join("source").exists());
++}
+diff --git a/crates/core/src/services/transfer.rs b/crates/core/src/services/transfer.rs
+index e6b5635..6207c98 100644
+--- a/crates/core/src/services/transfer.rs
++++ b/crates/core/src/services/transfer.rs
+@@ -183,6 +183,24 @@ pub fn spawn_job_with_provider(
+     tx: mpsc::Sender<JobEvent>,
+     provider: Arc<NoReplaceProvider>,
+ ) {
++    let _ = spawn_job_with_settlement(job, tx, provider, None);
++}
++
++/// A terminal business-I/O outcome, independent of progress/result delivery.
++#[derive(Clone, Debug)]
++pub enum WorkOutcome {
++    Done,
++    Cancelled,
++    Failed(String),
++}
++
++/// The optional one-shot acknowledgement follows run_batch and its cleanup suffix.
++pub fn spawn_job_with_settlement(
++    job: &Job,
++    tx: mpsc::Sender<JobEvent>,
++    provider: Arc<NoReplaceProvider>,
++    settlement: Option<mpsc::Sender<WorkOutcome>>,
++) -> std::io::Result<()> {
+     let id = job.id;
+     let kind = job.kind;
+     let control = job.control.clone();
+@@ -190,7 +208,8 @@ pub fn spawn_job_with_provider(
+     let dest_dir = job.dest_dir.clone();
+     let policy = job.overwrite;
+ 
+-    thread::spawn(move || {
++    let tracked = settlement.is_some();
++    let work = move || {
+         let result = run_batch_with_provider(
+             id,
+             kind,
+@@ -201,15 +220,28 @@ pub fn spawn_job_with_provider(
+             &tx,
+             provider.as_ref(),
+         );
+-        let event = match result {
+-            Ok(()) => JobEvent::Done { id },
+-            Err(JobError::Cancelled) => JobEvent::Cancelled { id },
+-            Err(JobError::Io(msg) | JobError::CommittedWithRecovery(msg)) => {
+-                JobEvent::Failed { id, error: msg }
+-            }
++        let (event, outcome) = match result {
++            Ok(()) => (JobEvent::Done { id }, WorkOutcome::Done),
++            Err(JobError::Cancelled) => (JobEvent::Cancelled { id }, WorkOutcome::Cancelled),
++            Err(JobError::Io(msg) | JobError::CommittedWithRecovery(msg)) => (
++                JobEvent::Failed {
++                    id,
++                    error: msg.clone(),
++                },
++                WorkOutcome::Failed(msg),
++            ),
+         };
+         let _ = tx.send(event);
+-    });
++        if let Some(settlement) = settlement {
++            let _ = settlement.send(outcome);
++        }
++    };
++    if tracked {
++        thread::Builder::new().spawn(work).map(|_| ())
++    } else {
++        thread::spawn(work);
++        Ok(())
++    }
+ }
+ 
+ /// Resolves the destination path under the overwrite policy. Returns the
+@@ -1097,8 +1129,20 @@ fn remove_tree(path: &Path) -> Result<(), JobError> {
+ /// granularity is per path).
+ pub fn spawn_delete_job(paths: Vec<String>, tx: mpsc::Sender<JobEvent>) -> Arc<JobControl> {
+     let control = JobControl::new();
+-    let c = control.clone();
+-    thread::spawn(move || {
++    let _ = spawn_delete_job_with_settlement(paths, tx, control.clone(), None);
++    control
++}
++
++/// Caller registers the control and one-shot owner before starting this worker.
++pub fn spawn_delete_job_with_settlement(
++    paths: Vec<String>,
++    tx: mpsc::Sender<JobEvent>,
++    control: Arc<JobControl>,
++    settlement: Option<mpsc::Sender<WorkOutcome>>,
++) -> std::io::Result<()> {
++    let c = control;
++    let tracked = settlement.is_some();
++    let work = move || {
+         let total = paths.len();
+         let mut failed: Vec<(String, String)> = Vec::new();
+         for (i, path) in paths.iter().enumerate() {
+@@ -1107,6 +1151,9 @@ pub fn spawn_delete_job(paths: Vec<String>, tx: mpsc::Sender<JobEvent>) -> Arc<J
+                     cancelled: true,
+                     failed,
+                 });
++                if let Some(settlement) = settlement {
++                    let _ = settlement.send(WorkOutcome::Cancelled);
++                }
+                 return;
+             }
+             let result = std::fs::symlink_metadata(path).ok().map(|meta| {
+@@ -1125,12 +1172,25 @@ pub fn spawn_delete_job(paths: Vec<String>, tx: mpsc::Sender<JobEvent>) -> Arc<J
+                 current: path.clone(),
+             });
+         }
++        let outcome = if failed.is_empty() {
++            WorkOutcome::Done
++        } else {
++            WorkOutcome::Failed(format!("{} deletion(s) failed", failed.len()))
++        };
+         let _ = tx.send(JobEvent::DeleteDone {
+             cancelled: false,
+             failed,
+         });
+-    });
+-    control
++        if let Some(settlement) = settlement {
++            let _ = settlement.send(outcome);
++        }
++    };
++    if tracked {
++        thread::Builder::new().spawn(work).map(|_| ())
++    } else {
++        thread::spawn(work);
++        Ok(())
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/desktop/src/platform/shutdown.rs b/desktop/src/platform/shutdown.rs
+index 43135df..bd47a2b 100644
+--- a/desktop/src/platform/shutdown.rs
++++ b/desktop/src/platform/shutdown.rs
+@@ -51,6 +51,7 @@ impl Coordinator {
+                     .collect::<Vec<_>>()
+                     .join("; ")
+             )),
++            Some(ShutdownState::WorkError(error)) => Status::PendingError(format!("Shutdown paused: {error}")),
+             Some(ShutdownState::Disconnected) => {
+                 Status::PendingError("Shutdown paused: persistence receipt disconnected".into())
+             }
+@@ -58,7 +59,7 @@ impl Coordinator {
+                 Status::Ready
+             }
+             _ if self.started.elapsed() >= Duration::from_secs(2) => Status::PendingError(
+-                "Shutdown paused: checked persistence or geometry receipt not confirmed".into(),
++                "Shutdown paused: accepted work, original startup, checked persistence or geometry not confirmed".into(),
+             ),
+             _ => Status::Waiting,
+         }
+diff --git a/desktop/src/runtime.rs b/desktop/src/runtime.rs
+index 517eeab..a925948 100644
+--- a/desktop/src/runtime.rs
++++ b/desktop/src/runtime.rs
+@@ -1,6 +1,6 @@
+ //! One background owner; foreground reads never wait for the actor.
+ use ira_core::{
+-    application::{App, PersistenceFailure},
++    application::{App, PersistenceFailure, WorkSettlement},
+     editor::{EditorDocument, EditorError, EditorSession, SaveCompletion},
+     input::{Input, KeyCode, KeyEvent, KeyModifiers},
+     model::{EntryTarget, HostRequest, OpenEditorRequest},
+@@ -44,6 +44,10 @@ enum ActorPhase {
+ type ActorHook = Arc<dyn Fn(ActorUnit, ActorPhase, &App) + Send + Sync>;
+ #[cfg(test)]
+ thread_local! { static ACTOR_HOOK: std::cell::RefCell<Option<ActorHook>> = const { std::cell::RefCell::new(None) }; }
++#[cfg(test)]
++type EditorHook = Arc<dyn Fn() + Send + Sync>;
++#[cfg(test)]
++thread_local! { static EDITOR_HOOK: std::cell::RefCell<Option<EditorHook>> = const { std::cell::RefCell::new(None) }; }
+ struct ActorAdmission {
+     stop: Arc<AtomicBool>,
+     #[cfg(test)]
+@@ -223,6 +227,7 @@ pub enum ShutdownState {
+     Success { epoch: u64 },
+     Failure(Arc<PersistenceFailure>),
+     Disconnected,
++    WorkError(String),
+ }
+ pub struct Runtime {
+     sender: SyncSender<Envelope>,
+@@ -339,6 +344,8 @@ impl Runtime {
+         let attached = attached_window.clone();
+         #[cfg(test)]
+         let hook = ACTOR_HOOK.with(|slot| slot.borrow().clone());
++        #[cfg(test)]
++        let editor_hook = EDITOR_HOOK.with(|slot| slot.borrow().clone());
+         thread::spawn(move || {
+             let admission = ActorAdmission {
+                 stop: stop.clone(),
+@@ -359,7 +366,18 @@ impl Runtime {
+                 app.attach_window(window_generation);
+                 admission.finish(&mut app, ActorUnit::Attachment);
+             }
+-            let (editor_tx, editor_rx) = mpsc::channel::<(u64, HostRequest)>();
++            let (editor_sender, editor_rx) = mpsc::channel::<(u64, u64, HostRequest)>();
++            let editor_settlement = Arc::new(EditorSettlement {
++                #[cfg(test)]
++                hook: editor_hook,
++                ..EditorSettlement::default()
++            });
++            let editor_tx = EditorDispatch {
++                sender: std::cell::RefCell::new(Some(editor_sender)),
++                issued: std::cell::Cell::new(0),
++                error: std::cell::RefCell::new(None),
++                settlement: editor_settlement.clone(),
++            };
+             let (editor_done, editor_results) = mpsc::channel();
+             let (drive_tx, drive_rx) = mpsc::channel::<u64>();
+             let drive_stop = stop.clone();
+@@ -395,46 +413,19 @@ impl Runtime {
+             let mut drive_generation = 0;
+             let editor_stop = stop.clone();
+             let editor_attached = attached.clone();
+-            thread::spawn(move || {
+-                let mut sessions = std::collections::HashMap::new();
+-                while let Ok((epoch, request)) = editor_rx.recv() {
+-                    if editor_stop.load(Ordering::Acquire) {
+-                        break;
+-                    }
+-                    if editor_attached.load(Ordering::Acquire) != epoch {
+-                        continue;
+-                    }
+-                    let result = match request {
+-                        HostRequest::OpenEditor(request) => {
+-                            let result = ira_core::editor::open_document(
+-                                request.document_id,
+-                                &request.target.path,
+-                            );
+-                            sessions.clear();
+-                            if let Ok(document) = &result {
+-                                sessions.insert(document.id, EditorSession::new(document.clone()));
+-                            }
+-                            EditorResult::Opened(epoch, request, result)
+-                        }
+-                        HostRequest::SaveEditor(snapshot) => {
+-                            let result = sessions
+-                                .get(&snapshot.document_id)
+-                                .ok_or_else(|| EditorError("Editor session closed".into()))
+-                                .and_then(|session| session.save(&snapshot));
+-                            EditorResult::Saved(
+-                                epoch,
+-                                snapshot.document_id,
+-                                snapshot.edit_revision,
+-                                result,
+-                            )
+-                        }
+-                        _ => continue,
+-                    };
+-                    if editor_done.send(result).is_err() {
+-                        break;
+-                    }
+-                }
+-            });
++            if let Err(error) = thread::Builder::new().spawn(move || {
++                editor_worker(
++                    editor_rx,
++                    editor_done,
++                    editor_stop,
++                    editor_attached,
++                    editor_settlement,
++                );
++            }) {
++                *editor_tx.error.borrow_mut() =
++                    Some(format!("Editor worker spawn failed: {error}"));
++                editor_tx.sender.borrow_mut().take();
++            }
+             let mut chooser = chooser_runtime::ActorChooser::default();
+             let (chooser_pending_tx, chooser_pending_rx) = mpsc::channel();
+             let mut last_tick = Instant::now();
+@@ -674,16 +665,40 @@ impl Runtime {
+                 "actor terminating: core running false"
+             });
+             stop.store(true, Ordering::Release);
+-            app.cancel_pending_work();
++            let core_seal = app.begin_shutdown_settlement();
+             cancel_all(&app);
++            let editor_cutoff = editor_tx.seal();
+             *actor_shutdown.lock().unwrap() = ShutdownState::Pending;
+-            // A stop during async startup must not publish uninitialized defaults
+-            // over the saved session. Original startup receipt stays owned offUI.
+-            while app.is_initializing() {
+-                app.tick();
++            // Original startup, active jobs and both serial lanes are independent.
++            // Poll all of them fairly; never tick, route hosts or apply stale results.
++            loop {
++                let core = app.poll_shutdown_settlement(&core_seal, 64);
++                let editor = editor_tx.poll(editor_cutoff);
++                let error = match (&core, &editor) {
++                    (WorkSettlement::Error(error), _) => Some(error.clone()),
++                    (_, Err(error)) => Some(error.clone()),
++                    _ => None,
++                };
++                if let Some(error) = error {
++                    *actor_shutdown.lock().unwrap() = ShutdownState::WorkError(error);
++                } else if matches!(&core, WorkSettlement::Settled(receipt) if core_seal.accepts(receipt))
++                    && matches!(editor, Ok(true))
++                {
++                    break;
++                } else {
++                    *actor_shutdown.lock().unwrap() = ShutdownState::Pending;
++                }
++                // Discard only bounded ordinary-result records; these confer no
++                // settlement authority and cannot resurrect business state/effects.
++                for _ in 0..64 {
++                    if editor_results.try_recv().is_err() {
++                        break;
++                    }
++                }
++                // A retry during work wait cannot manufacture an acknowledgement.
++                let _ = retry_requests.try_recv();
+                 thread::sleep(Duration::from_millis(20));
+             }
+-            app.cancel_pending_work();
+             app.persist_state();
+             // Keep this ORIGINAL receipt and owner after timeout; only a checked
+             // write success acknowledges the final accepted snapshot.
+@@ -1141,6 +1156,125 @@ pub fn apply(app: &mut App, envelope: Envelope) -> Result<(), String> {
+     Ok(())
+ }
+ 
++// One actor-owned FIFO issuer and independent worker publication. Epochs remain
++// business-result guards; they never identify acknowledgements.
++#[derive(Default)]
++struct EditorSettlement {
++    #[cfg(test)]
++    hook: Option<EditorHook>,
++    through: AtomicU64,
++    exited: AtomicBool,
++}
++struct EditorExit(Arc<EditorSettlement>);
++impl Drop for EditorExit {
++    fn drop(&mut self) {
++        self.0.exited.store(true, Ordering::Release);
++    }
++}
++struct EditorDispatch {
++    sender: std::cell::RefCell<Option<mpsc::Sender<(u64, u64, HostRequest)>>>,
++    issued: std::cell::Cell<u64>,
++    error: std::cell::RefCell<Option<String>>,
++    settlement: Arc<EditorSettlement>,
++}
++impl EditorDispatch {
++    fn submit(&self, epoch: u64, request: HostRequest) {
++        if self.error.borrow().is_some() {
++            return;
++        }
++        let Some(sequence) = self.issued.get().checked_add(1) else {
++            *self.error.borrow_mut() = Some("Editor settlement sequence exhausted".into());
++            self.sender.borrow_mut().take();
++            return;
++        };
++        // Accounting precedes send; a failed delivery never leaves a silent hole.
++        self.issued.set(sequence);
++        let delivered = self
++            .sender
++            .borrow()
++            .as_ref()
++            .is_some_and(|sender| sender.send((sequence, epoch, request)).is_ok());
++        if !delivered {
++            *self.error.borrow_mut() = Some("Editor request channel disconnected or sealed".into());
++            self.sender.borrow_mut().take();
++        }
++    }
++    fn seal(&self) -> u64 {
++        self.sender.borrow_mut().take();
++        self.issued.get()
++    }
++    fn poll(&self, cutoff: u64) -> Result<bool, String> {
++        if let Some(error) = &*self.error.borrow() {
++            return Err(error.clone());
++        }
++        if self.settlement.through.load(Ordering::Acquire) >= cutoff {
++            return Ok(true);
++        }
++        if self.settlement.exited.load(Ordering::Acquire)
++            && self.settlement.through.load(Ordering::Acquire) < cutoff
++        {
++            return Err("Editor worker exited before sealed acknowledgement".into());
++        }
++        Ok(false)
++    }
++}
++fn editor_worker(
++    requests: Receiver<(u64, u64, HostRequest)>,
++    results: mpsc::Sender<EditorResult>,
++    stop: Arc<AtomicBool>,
++    attached: Arc<AtomicU64>,
++    settlement: Arc<EditorSettlement>,
++) {
++    let _exit = EditorExit(settlement.clone());
++    let mut sessions = std::collections::HashMap::new();
++    let mut expected = 1u64;
++    while let Ok((sequence, epoch, request)) = requests.recv() {
++        if sequence != expected {
++            break;
++        }
++        let result = if stop.load(Ordering::Acquire) || attached.load(Ordering::Acquire) != epoch {
++            None // Queued stopped/stale work is skipped, then acknowledged in FIFO order.
++        } else {
++            Some(match request {
++                HostRequest::OpenEditor(request) => {
++                    let result =
++                        ira_core::editor::open_document(request.document_id, &request.target.path);
++                    sessions.clear();
++                    if let Ok(document) = &result {
++                        sessions.insert(document.id, EditorSession::new(document.clone()));
++                    }
++                    EditorResult::Opened(epoch, request, result)
++                }
++                HostRequest::SaveEditor(snapshot) => {
++                    let result = sessions
++                        .get(&snapshot.document_id)
++                        .ok_or_else(|| EditorError("Editor session closed".into()))
++                        .and_then(|session| {
++                            #[cfg(test)]
++                            if let Some(hook) = &settlement.hook {
++                                hook();
++                            }
++                            session.save(&snapshot)
++                        });
++                    EditorResult::Saved(epoch, snapshot.document_id, snapshot.edit_revision, result)
++                }
++                _ => break,
++            })
++        };
++        // Save returned after staging rename/cleanup and post-save metadata.
++        settlement.through.store(sequence, Ordering::Release);
++        if let Some(result) = result {
++            // Even a disconnected business-result consumer cannot strand queued
++            // stopped items; the receipt lane remains independent of this channel.
++            let _ = results.send(result);
++        }
++        let Some(next) = expected.checked_add(1) else {
++            break;
++        };
++        expected = next;
++    }
++}
++
+ enum EditorResult {
+     Drives(
+         u64,
+@@ -1154,7 +1288,7 @@ fn route_host(
+     app: &App,
+     request: HostRequest,
+     sequence: u64,
+-    editor: &mpsc::Sender<(u64, HostRequest)>,
++    editor: &EditorDispatch,
+     drives: &mpsc::Sender<u64>,
+     completed: &mpsc::Sender<Completion>,
+ ) {
+@@ -1164,7 +1298,7 @@ fn route_host(
+         request,
+         HostRequest::OpenEditor(_) | HostRequest::SaveEditor(_)
+     ) {
+-        let _ = editor.send((app.window_generation, request));
++        editor.submit(app.window_generation, request);
+     } else {
+         let input_generation = matches!(
+             request,
+@@ -1196,7 +1330,7 @@ impl EffectGuard {
+ fn synchronize_attachment(
+     app: &mut App,
+     epoch: u64,
+-    editor: &mpsc::Sender<(u64, HostRequest)>,
++    editor: &EditorDispatch,
+     drives: &mpsc::Sender<u64>,
+     completed: &mpsc::Sender<Completion>,
+     admission: &ActorAdmission,
+@@ -1259,3 +1393,7 @@ impl Runtime {
+ #[cfg(test)]
+ #[path = "runtime_stop_admission_tests.rs"]
+ mod stop_admission_tests;
++
++#[cfg(test)]
++#[path = "runtime_settlement_tests.rs"]
++mod settlement_tests;
+diff --git a/desktop/src/runtime_settlement_tests.rs b/desktop/src/runtime_settlement_tests.rs
+new file mode 100644
+index 0000000..ca17f57
+--- /dev/null
++++ b/desktop/src/runtime_settlement_tests.rs
+@@ -0,0 +1,249 @@
++use super::*;
++use ira_core::model::{Confirm, ConfirmAction};
++use ira_core::services::transfer::{OverwritePolicy, rename_no_replace};
++use std::sync::Condvar;
++#[derive(Default)]
++struct Gate {
++    entered: AtomicBool,
++    released: Mutex<bool>,
++    ready: Condvar,
++}
++impl Gate {
++    fn block(&self) {
++        self.entered.store(true, Ordering::Release);
++        let mut open = self.released.lock().unwrap();
++        while !*open {
++            open = self.ready.wait(open).unwrap();
++        }
++    }
++    fn release(&self) {
++        *self.released.lock().unwrap() = true;
++        self.ready.notify_all();
++    }
++    fn wait(&self) {
++        let deadline = Instant::now() + Duration::from_secs(5);
++        while !self.entered.load(Ordering::Acquire) {
++            assert!(Instant::now() < deadline);
++            thread::yield_now();
++        }
++    }
++}
++struct Release(Arc<Gate>);
++impl Drop for Release {
++    fn drop(&mut self) {
++        self.0.release();
++    }
++}
++fn finish(runtime: &Runtime) {
++    let deadline = Instant::now() + Duration::from_secs(5);
++    while !runtime.shutdown_complete() {
++        assert!(Instant::now() < deadline);
++        thread::yield_now();
++    }
++    assert!(matches!(
++        runtime.shutdown_state(),
++        Some(ShutdownState::Success { .. })
++    ));
++}
++#[test]
++fn runtime_waits_for_actual_accepted_transfer_provider_return_before_final_persistence() {
++    let _fixture = crate::test_support::enter();
++    let root = crate::test_support::current().unwrap().directory.clone();
++    let gate = Arc::new(Gate::default());
++    let hold = gate.clone();
++    let _release = Release(gate.clone());
++    std::fs::write(root.join("source"), b"owned source").unwrap();
++    std::fs::create_dir(root.join("destination")).unwrap();
++    let owned = root.clone();
++    let mut runtime = Runtime::with_factory(7, move || {
++        let mut app = App::default();
++        app.state_path = Some(owned.join("state"));
++        app.bookmarks_path = Some(owned.join("bookmarks"));
++        app.window_generation = 7;
++        app.set_transfer_provider(Arc::new(move |src, dst| {
++            hold.block();
++            rename_no_replace(src, dst)
++        }));
++        app.confirming = Some(Confirm {
++            action: ConfirmAction::Move,
++            policy: OverwritePolicy::AutoRename,
++            label: "owned".into(),
++            paths: vec![owned.join("source").to_str().unwrap().into()],
++            dest_dir: Some(owned.join("destination").to_str().unwrap().into()),
++        });
++        app
++    });
++    runtime.enqueue(
++        Command::Input(Input::Key(KeyEvent::new(
++            KeyCode::Enter,
++            KeyModifiers::NONE,
++        ))),
++        None,
++    );
++    runtime.flush();
++    gate.wait();
++    runtime.stop(&[]);
++    let until = Instant::now() + Duration::from_millis(2200);
++    while Instant::now() < until {
++        assert!(!runtime.shutdown_complete());
++        assert!(!matches!(
++            runtime.shutdown_state(),
++            Some(ShutdownState::Success { .. })
++        ));
++        assert!(!root.join("state").exists());
++        thread::yield_now();
++    }
++    gate.release();
++    finish(&runtime);
++    // This gates an actual provider continuation, not a genuinely blocked OS syscall.
++    assert!(root.join("state").exists());
++    assert_eq!(std::fs::read(root.join("source")).unwrap(), b"owned source");
++    assert!(!root.join("destination/source").exists());
++}
++
++struct EditorHookScope(Option<EditorHook>);
++impl Drop for EditorHookScope {
++    fn drop(&mut self) {
++        EDITOR_HOOK.with(|slot| slot.replace(self.0.take()));
++    }
++}
++#[test]
++fn runtime_real_editor_save_waits_then_skips_queued_save_after_stop() {
++    let _fixture = crate::test_support::enter();
++    let root = crate::test_support::current().unwrap().directory.clone();
++    let path = root.join("edit.txt");
++    std::fs::write(&path, b"old\r\n").unwrap();
++    let gate = Arc::new(Gate::default());
++    let hold = gate.clone();
++    let _release = Release(gate.clone());
++    let _hook = EditorHookScope(
++        EDITOR_HOOK.with(|slot| slot.replace(Some(Arc::new(move || hold.block())))),
++    );
++    let owned = root.clone();
++    let input = path.clone();
++    let mut runtime = Runtime::with_factory(7, move || {
++        let mut app = App::default();
++        app.state_path = Some(owned.join("state"));
++        app.bookmarks_path = Some(owned.join("bookmarks"));
++        app.window_generation = 7;
++        app.panes[0].files = vec![ira_core::services::list_files::FEntry {
++            path: input.to_str().unwrap().into(),
++            label: "edit.txt".into(),
++            is_dir: false,
++            size: 5,
++            modified: None,
++        }];
++        app.panes[0].selected = vec![false];
++        app.panes[0].state.select(Some(0));
++        app.panes[0].preview_mode = ira_core::model::PreviewMode::Column;
++        app.panes[0].listing_settled = true;
++        app
++    });
++    runtime.enqueue(
++        Command::Input(Input::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))),
++        None,
++    );
++    runtime.flush();
++    let deadline = Instant::now() + Duration::from_secs(5);
++    let id = loop {
++        if let Some(publication) = runtime.try_snapshot() {
++            if let Some(edit) = &publication.snapshot.edit {
++                break edit.document_id;
++            }
++        }
++        assert!(Instant::now() < deadline);
++        thread::yield_now();
++    };
++    runtime.enqueue(
++        Command::SaveDraft {
++            document_id: id,
++            revision: 1,
++            text: "first\n".into(),
++        },
++        None,
++    );
++    runtime.flush();
++    gate.wait();
++    let sequence = runtime.enqueue(
++        Command::SaveDraft {
++            document_id: id,
++            revision: 2,
++            text: "second\n".into(),
++        },
++        None,
++    );
++    runtime.flush();
++    let deadline = Instant::now() + Duration::from_secs(5);
++    loop {
++        if let Some(publication) = runtime.try_snapshot() {
++            if publication.snapshot.ack_sequence == sequence {
++                break;
++            }
++        }
++        assert!(Instant::now() < deadline);
++        thread::yield_now();
++    }
++    runtime.stop(&[]);
++    let until = Instant::now() + Duration::from_millis(2200);
++    while Instant::now() < until {
++        assert!(!runtime.shutdown_complete());
++        assert!(!root.join("state").exists());
++        thread::yield_now();
++    }
++    gate.release();
++    finish(&runtime);
++    assert_eq!(std::fs::read(&path).unwrap(), b"first\r\n");
++    // Actual actor dispatch, OpenEditor and EditorSession::save; gate models the
++    // already-entered worker continuation immediately before save, not blocked OS I/O.
++}
++#[test]
++fn actual_original_startup_is_applied_before_immediate_stop_publishes_state() {
++    let _fixture = crate::test_support::enter();
++    let root = crate::test_support::current().unwrap().directory.clone();
++    let state = root.join("state");
++    let bookmarks = root.join("bookmarks");
++    ira_core::services::state::save_state_to(
++        &state,
++        &ira_core::services::state::SessionState {
++            show_hidden: true,
++            split: true,
++            active_pane: 1,
++            preview: [1, 2],
++            theme: Some("light".into()),
++            ..Default::default()
++        },
++    );
++    std::fs::write(&bookmarks, b"").unwrap();
++    let path = state.clone();
++    let mut runtime =
++        Runtime::with_factory(7, move || App::new_with_paths(Some(path), Some(bookmarks)));
++    runtime.stop(&[]);
++    finish(&runtime);
++    let saved = ira_core::services::state::load_state_from(&state);
++    assert!(saved.show_hidden);
++    assert!(saved.split);
++    assert_eq!(saved.active_pane, 1);
++    assert_eq!(saved.preview, [1, 2]);
++}
++#[test]
++fn editor_sequence_overflow_and_missing_worker_cutoff_never_authorize_success() {
++    let (tx, _rx) = mpsc::channel();
++    let lane = EditorDispatch {
++        sender: std::cell::RefCell::new(Some(tx)),
++        issued: std::cell::Cell::new(u64::MAX),
++        error: std::cell::RefCell::new(None),
++        settlement: Arc::new(EditorSettlement::default()),
++    };
++    lane.submit(7, HostRequest::RefreshDrives);
++    assert!(lane.poll(lane.seal()).is_err());
++    let (tx, rx) = mpsc::channel();
++    drop(rx);
++    let lane = EditorDispatch {
++        sender: std::cell::RefCell::new(Some(tx)),
++        issued: std::cell::Cell::new(0),
++        error: std::cell::RefCell::new(None),
++        settlement: Arc::new(EditorSettlement::default()),
++    };
++    lane.submit(7, HostRequest::RefreshDrives);
++    assert!(lane.poll(lane.seal()).is_err());
++}
+-- 
+2.54.0 (Apple Git-157)
+
+
+From abe60c7c7e18f91c3f572e7a6ca2b84143699de1 Mon Sep 17 00:00:00 2001
+From: Vladimir Lopez <vladimir.lopez@lifelinksystems.com>
+Date: Sat, 3 Oct 2026 14:10:19 -0600
+Subject: [PATCH 2/4] fix(core): expose existing path drain to parent module
+
+---
+ crates/core/src/application_existing_path.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/crates/core/src/application_existing_path.rs b/crates/core/src/application_existing_path.rs
+index 6af7226..9206e84 100644
+--- a/crates/core/src/application_existing_path.rs
++++ b/crates/core/src/application_existing_path.rs
+@@ -245,7 +245,7 @@ impl App {
+         }
+         Ok(())
+     }
+-    fn drain_existing_paths(&mut self) {
++    pub(super) fn drain_existing_paths(&mut self) {
+         while let Ok(reply) = self.existing_paths.rx.try_recv() {
+             if self.existing_paths.pending.as_ref() != Some(&(reply.id, reply.scope.clone())) {
+                 continue;
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 5fc1a2c9f39677c2ad37d90a7c93791830010110 Mon Sep 17 00:00:00 2001
+From: Vladimir Lopez <vladimir.lopez@lifelinksystems.com>
+Date: Sat, 3 Oct 2026 14:38:24 -0600
+Subject: [PATCH 3/4] test(startup): inject empty drive source before actor
+ work
+
+---
+ desktop/src/runtime_settlement_tests.rs | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/desktop/src/runtime_settlement_tests.rs b/desktop/src/runtime_settlement_tests.rs
+index ca17f57..208b193 100644
+--- a/desktop/src/runtime_settlement_tests.rs
++++ b/desktop/src/runtime_settlement_tests.rs
+@@ -215,8 +215,11 @@ fn actual_original_startup_is_applied_before_immediate_stop_publishes_state() {
+     );
+     std::fs::write(&bookmarks, b"").unwrap();
+     let path = state.clone();
+-    let mut runtime =
+-        Runtime::with_factory(7, move || App::new_with_paths(Some(path), Some(bookmarks)));
++    let mut runtime = Runtime::with_drive_probe(
++        7,
++        move || App::new_with_paths(Some(path), Some(bookmarks)),
++        || Ok(Vec::new()),
++    );
+     runtime.stop(&[]);
+     finish(&runtime);
+     let saved = ira_core::services::state::load_state_from(&state);
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 1d8a4be1135afb47e9a98df94e2ac025321ab7e0 Mon Sep 17 00:00:00 2001
+From: Vladimir Lopez <vladimir.lopez@lifelinksystems.com>
+Date: Sat, 3 Oct 2026 14:43:28 -0600
+Subject: [PATCH 4/4] fix(cancel): synchronize cancellation with paused waiter
+ registration
+
+---
+ crates/core/src/services/transfer.rs          |  27 ++
+ .../services/transfer_cancel_wake_tests.rs    | 262 ++++++++++++++++++
+ desktop/src/runtime.rs                        |   3 +-
+ 3 files changed, 291 insertions(+), 1 deletion(-)
+ create mode 100644 crates/core/src/services/transfer_cancel_wake_tests.rs
+
+diff --git a/crates/core/src/services/transfer.rs b/crates/core/src/services/transfer.rs
+index 6207c98..17d8199 100644
+--- a/crates/core/src/services/transfer.rs
++++ b/crates/core/src/services/transfer.rs
+@@ -83,12 +83,21 @@ pub enum JobEvent {
+     },
+ }
+ 
++#[cfg(test)]
++#[derive(Debug)]
++struct GateWaitTest {
++    entered: mpsc::Sender<()>,
++    released: mpsc::Receiver<()>,
++}
++
+ /// Shared cancellation + pause state between the UI and the worker thread.
+ #[derive(Debug)]
+ pub struct JobControl {
+     cancel: AtomicBool,
+     pause: Mutex<bool>,
+     resume: Condvar,
++    #[cfg(test)]
++    before_wait: Mutex<Option<GateWaitTest>>,
+ }
+ 
+ impl JobControl {
+@@ -97,10 +106,15 @@ impl JobControl {
+             cancel: AtomicBool::new(false),
+             pause: Mutex::new(false),
+             resume: Condvar::new(),
++            #[cfg(test)]
++            before_wait: Mutex::new(None),
+         })
+     }
+ 
+     pub fn request_cancel(&self) {
++        // Serialize publication with the paused predicate's check/registration.
++        // The named guard covers both store and notification; no business I/O.
++        let _paused = self.pause.lock();
+         self.cancel.store(true, Ordering::Relaxed);
+         self.resume.notify_all();
+     }
+@@ -126,6 +140,15 @@ impl JobControl {
+             if self.cancel.load(Ordering::Relaxed) {
+                 return Err(JobError::Cancelled);
+             }
++            #[cfg(test)]
++            if let Some(hook) = self.before_wait.lock().take() {
++                let _ = hook.entered.send(());
++                // Bounded, test-only observation of the real check/wait gap.
++                // Disconnection/timeout merely releases the hook, never cancels.
++                let _ = hook
++                    .released
++                    .recv_timeout(std::time::Duration::from_secs(5));
++            }
+             self.resume.wait(&mut paused);
+         }
+         Ok(())
+@@ -1200,3 +1223,7 @@ mod batch_tests;
+ #[cfg(test)]
+ #[path = "transfer_safety_tests.rs"]
+ mod safety_tests;
++
++#[cfg(test)]
++#[path = "transfer_cancel_wake_tests.rs"]
++mod cancel_wake_tests;
+diff --git a/crates/core/src/services/transfer_cancel_wake_tests.rs b/crates/core/src/services/transfer_cancel_wake_tests.rs
+new file mode 100644
+index 0000000..0ae9586
+--- /dev/null
++++ b/crates/core/src/services/transfer_cancel_wake_tests.rs
+@@ -0,0 +1,262 @@
++use super::*;
++use std::time::Duration;
++
++const READY: Duration = Duration::from_secs(5);
++const EARLY: Duration = Duration::from_millis(100);
++const PROGRESS: Duration = Duration::from_secs(1);
++
++struct Owner {
++    control: Arc<JobControl>,
++    release: Option<mpsc::Sender<()>>,
++    threads: Vec<thread::JoinHandle<()>>,
++    worker_receipt: Option<mpsc::Receiver<WorkOutcome>>,
++    worker_acknowledged: bool,
++}
++impl Owner {
++    fn paused() -> (Self, mpsc::Receiver<()>) {
++        let control = JobControl::new();
++        control.set_paused(true);
++        let (entered, observed) = mpsc::channel();
++        let (release, released) = mpsc::channel();
++        *control.before_wait.lock() = Some(GateWaitTest { entered, released });
++        (
++            Self {
++                control,
++                release: Some(release),
++                threads: Vec::new(),
++                worker_receipt: None,
++                worker_acknowledged: false,
++            },
++            observed,
++        )
++    }
++    fn release_hook(&mut self) {
++        if let Some(release) = self.release.take() {
++            let _ = release.send(());
++        }
++    }
++    fn cancel_thread(&mut self) -> (mpsc::Receiver<()>, mpsc::Receiver<()>) {
++        let (enter, entered) = mpsc::channel();
++        let (done, returned) = mpsc::channel();
++        let control = self.control.clone();
++        self.threads.push(thread::spawn(move || {
++            let _ = enter.send(());
++            control.request_cancel();
++            let _ = done.send(());
++        }));
++        (entered, returned)
++    }
++    fn cleanup(&mut self) {
++        self.release_hook();
++        // Cleanup-only notification AFTER the tested progress result was captured.
++        // Never count this unpause as a successful cancellation wake.
++        self.control.set_paused(false);
++        for worker in self.threads.drain(..) {
++            let _ = worker.join();
++        }
++        if !self.worker_acknowledged {
++            if let Some(receipt) = &self.worker_receipt {
++                // Cleanup-only outcome, never counted as normal cancellation success.
++                self.worker_acknowledged = receipt.recv_timeout(READY).is_ok();
++            }
++        }
++    }
++}
++impl Drop for Owner {
++    fn drop(&mut self) {
++        self.cleanup();
++    }
++}
++
++#[test]
++fn cancel_cannot_return_in_actual_gate_check_registration_gap_and_wakes_without_second_notify() {
++    let (mut owner, observed) = Owner::paused();
++    let (done, result) = mpsc::channel();
++    let control = owner.control.clone();
++    owner.threads.push(thread::spawn(move || {
++        let _ = done.send(matches!(control.gate(), Err(JobError::Cancelled)));
++    }));
++    observed.recv_timeout(READY).unwrap(); // actual inner cancel=false, pause mutex HELD
++    let (entered, returned) = owner.cancel_thread();
++    entered.recv_timeout(READY).unwrap();
++    let early = returned.recv_timeout(EARLY).is_ok();
++    owner.release_hook(); // registration happens before the predicate mutex unlocks
++    let cancel_returned = early || returned.recv_timeout(READY).is_ok();
++    let actual_result = result.recv_timeout(PROGRESS).ok();
++    let pause_preserved = *owner.control.pause.lock();
++    owner.cleanup(); // records remain distinct from cancellation progress witness
++    assert!(
++        !early,
++        "request_cancel returned while real gate still held predicate lock; lost-wake window"
++    );
++    assert!(
++        cancel_returned,
++        "cancel did not complete after actual wait registration"
++    );
++    assert_eq!(
++        actual_result,
++        Some(true),
++        "real gate must yield Cancelled without unpause or second notify"
++    );
++    assert!(pause_preserved);
++}
++
++fn actual_terminal_event(events: &mpsc::Receiver<JobEvent>) -> Option<JobEvent> {
++    let deadline = Instant::now() + PROGRESS;
++    loop {
++        let remaining = deadline.checked_duration_since(Instant::now())?;
++        let event = events.recv_timeout(remaining).ok()?;
++        if matches!(
++            event,
++            JobEvent::Done { .. }
++                | JobEvent::Cancelled { .. }
++                | JobEvent::Failed { .. }
++                | JobEvent::DeleteDone { .. }
++        ) {
++            return Some(event);
++        }
++        // Real transfer pre-scan emits Started before its first paused gate.
++        // A progress event is neither a terminal event nor a settlement proof.
++    }
++}
++
++fn actual_worker_race(delete: bool) {
++    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
++    let root = std::env::temp_dir().join(format!(
++        "ira-t073-cancel-{}-{}",
++        std::process::id(),
++        NEXT.fetch_add(1, Ordering::Relaxed)
++    ));
++    std::fs::create_dir(&root).unwrap();
++    let source = root.join("source");
++    let dest = root.join("destination");
++    std::fs::write(&source, b"owned cancelled bytes").unwrap();
++    std::fs::create_dir(&dest).unwrap();
++    let (mut owner, observed) = Owner::paused();
++    let (events, outcomes) = mpsc::channel();
++    let (settlement, receipt) = mpsc::channel();
++    owner.worker_receipt = Some(receipt);
++    if delete {
++        spawn_delete_job_with_settlement(
++            vec![source.to_str().unwrap().into()],
++            events,
++            owner.control.clone(),
++            Some(settlement),
++        )
++        .unwrap();
++    } else {
++        let job = Job {
++            id: 99,
++            kind: JobKind::Move,
++            overwrite: OverwritePolicy::AutoRename,
++            paths: vec![source.to_str().unwrap().into()],
++            dest_dir: dest.to_str().unwrap().into(),
++            label: "owned".into(),
++            total_bytes: None,
++            copied_bytes: 0,
++            current: String::new(),
++            status: JobStatus::Running,
++            started_at: Instant::now(),
++            control: owner.control.clone(),
++        };
++        spawn_job_with_settlement(&job, events, Arc::new(rename_no_replace), Some(settlement))
++            .unwrap();
++    }
++    observed.recv_timeout(READY).unwrap();
++    let (entered, returned) = owner.cancel_thread();
++    entered.recv_timeout(READY).unwrap();
++    let early = returned.recv_timeout(EARLY).is_ok();
++    owner.release_hook();
++    let cancel_returned = early || returned.recv_timeout(READY).is_ok();
++    let authentic = owner
++        .worker_receipt
++        .as_ref()
++        .unwrap()
++        .recv_timeout(PROGRESS)
++        .ok();
++    owner.worker_acknowledged = authentic.is_some();
++    let terminal = actual_terminal_event(&outcomes);
++    let pause_preserved = *owner.control.pause.lock();
++    owner.cleanup();
++    assert!(
++        !early,
++        "actual worker predicate gap allowed early cancel return"
++    );
++    assert!(cancel_returned);
++    assert!(
++        matches!(authentic, Some(WorkOutcome::Cancelled)),
++        "actual worker must acknowledge cancellation before cleanup-only release"
++    );
++    if delete {
++        assert!(matches!(
++            terminal,
++            Some(JobEvent::DeleteDone {
++                cancelled: true,
++                ..
++            })
++        ));
++    } else {
++        assert!(matches!(terminal, Some(JobEvent::Cancelled { id: 99 })));
++    }
++    assert!(pause_preserved);
++    assert_eq!(std::fs::read(&source).unwrap(), b"owned cancelled bytes");
++    assert!(!dest.join("source").exists());
++    // All fixture paths retained; receipts do not claim physical thread exit.
++}
++#[test]
++fn actual_paused_transfer_cancel_wakes_and_sends_terminal_ack_without_unpause() {
++    actual_worker_race(false);
++}
++#[test]
++fn actual_paused_delete_cancel_wakes_and_sends_terminal_ack_without_unpause() {
++    actual_worker_race(true);
++}
++
++#[test]
++fn cancel_before_gate_is_irreversible_idempotent_and_preserves_pause_true() {
++    let control = JobControl::new();
++    control.set_paused(true);
++    control.request_cancel();
++    control.request_cancel();
++    assert!(*control.pause.lock());
++    assert!(control.cancel.load(Ordering::Relaxed));
++    assert!(matches!(control.gate(), Err(JobError::Cancelled)));
++    control.set_paused(false);
++    assert!(matches!(control.gate(), Err(JobError::Cancelled)));
++}
++#[test]
++fn already_registered_paused_gate_is_cancelled_without_changing_pause_flag() {
++    let (mut owner, observed) = Owner::paused();
++    let (done, result) = mpsc::channel();
++    let control = owner.control.clone();
++    owner.threads.push(thread::spawn(move || {
++        let _ = done.send(matches!(control.gate(), Err(JobError::Cancelled)));
++    }));
++    observed.recv_timeout(READY).unwrap();
++    owner.release_hook();
++    // This acquisition is possible only after actual wait registered/unlocked.
++    drop(owner.control.pause.lock());
++    owner.control.request_cancel();
++    let actual = result.recv_timeout(PROGRESS).ok();
++    let preserved = *owner.control.pause.lock();
++    owner.cleanup();
++    assert_eq!(actual, Some(true));
++    assert!(preserved);
++}
++#[test]
++fn set_paused_false_still_releases_actual_registered_gate_without_cancellation() {
++    let (mut owner, observed) = Owner::paused();
++    let (done, result) = mpsc::channel();
++    let control = owner.control.clone();
++    owner.threads.push(thread::spawn(move || {
++        let _ = done.send(control.gate().is_ok());
++    }));
++    observed.recv_timeout(READY).unwrap();
++    owner.release_hook();
++    drop(owner.control.pause.lock());
++    owner.control.set_paused(false);
++    let actual = result.recv_timeout(PROGRESS).ok();
++    owner.cleanup();
++    assert_eq!(actual, Some(true));
++    assert!(!owner.control.cancel.load(Ordering::Relaxed));
++}
+diff --git a/desktop/src/runtime.rs b/desktop/src/runtime.rs
+index a925948..ec2a077 100644
+--- a/desktop/src/runtime.rs
++++ b/desktop/src/runtime.rs
+@@ -873,7 +873,8 @@ impl Runtime {
+     pub fn shutdown_complete(&self) -> bool {
+         self.shutdown_complete.load(Ordering::Acquire)
+     }
+-    /// Does not enqueue, lock or join. Known worker controls are canceled immediately.
++    /// Does not enqueue business work, wait on App/session locks, do I/O or join workers.
++    /// Cancelling known controls briefly synchronizes each pause predicate; it may contend.
+     pub fn stop(&self, controls: &[Arc<JobControl>]) {
+         self.stopping.store(true, Ordering::Release);
+         for control in controls {
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,3 +1,5 @@
+> Current continuation checkpoint: [2026-10-04 handoff](checkpoints/2026-10-04/HANDOFF.md). Migration remains incomplete; R0117builds/7inventories/5bodies are UNRUN. The152-row parity snapshot and source provenance are linked there. The state below is preserved historical baseline documentation (151 rows), not current source/build/verification status. In particular the core is now populated; old commands below are not authorization to run tests with real user configuration.
+
 # Migration state
 
 Updated: 2026-10-01 | Branch: main | HEAD: df91471 (F-002 reviewer transitions reconciled in feature branch)
