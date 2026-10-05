@@ -83,12 +83,21 @@ pub enum JobEvent {
     },
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+struct GateWaitTest {
+    entered: mpsc::Sender<()>,
+    released: mpsc::Receiver<()>,
+}
+
 /// Shared cancellation + pause state between the UI and the worker thread.
 #[derive(Debug)]
 pub struct JobControl {
     cancel: AtomicBool,
     pause: Mutex<bool>,
     resume: Condvar,
+    #[cfg(test)]
+    before_wait: Mutex<Option<GateWaitTest>>,
 }
 
 impl JobControl {
@@ -97,10 +106,15 @@ impl JobControl {
             cancel: AtomicBool::new(false),
             pause: Mutex::new(false),
             resume: Condvar::new(),
+            #[cfg(test)]
+            before_wait: Mutex::new(None),
         })
     }
 
     pub fn request_cancel(&self) {
+        // Serialize publication with the paused predicate's check/registration.
+        // The named guard covers both store and notification; no business I/O.
+        let _paused = self.pause.lock();
         self.cancel.store(true, Ordering::Relaxed);
         self.resume.notify_all();
     }
@@ -125,6 +139,15 @@ impl JobControl {
         while *paused {
             if self.cancel.load(Ordering::Relaxed) {
                 return Err(JobError::Cancelled);
+            }
+            #[cfg(test)]
+            if let Some(hook) = self.before_wait.lock().take() {
+                let _ = hook.entered.send(());
+                // Bounded, test-only observation of the real check/wait gap.
+                // Disconnection/timeout merely releases the hook, never cancels.
+                let _ = hook
+                    .released
+                    .recv_timeout(std::time::Duration::from_secs(5));
             }
             self.resume.wait(&mut paused);
         }
@@ -183,6 +206,24 @@ pub fn spawn_job_with_provider(
     tx: mpsc::Sender<JobEvent>,
     provider: Arc<NoReplaceProvider>,
 ) {
+    let _ = spawn_job_with_settlement(job, tx, provider, None);
+}
+
+/// A terminal business-I/O outcome, independent of progress/result delivery.
+#[derive(Clone, Debug)]
+pub enum WorkOutcome {
+    Done,
+    Cancelled,
+    Failed(String),
+}
+
+/// The optional one-shot acknowledgement follows run_batch and its cleanup suffix.
+pub fn spawn_job_with_settlement(
+    job: &Job,
+    tx: mpsc::Sender<JobEvent>,
+    provider: Arc<NoReplaceProvider>,
+    settlement: Option<mpsc::Sender<WorkOutcome>>,
+) -> std::io::Result<()> {
     let id = job.id;
     let kind = job.kind;
     let control = job.control.clone();
@@ -190,7 +231,8 @@ pub fn spawn_job_with_provider(
     let dest_dir = job.dest_dir.clone();
     let policy = job.overwrite;
 
-    thread::spawn(move || {
+    let tracked = settlement.is_some();
+    let work = move || {
         let result = run_batch_with_provider(
             id,
             kind,
@@ -201,15 +243,28 @@ pub fn spawn_job_with_provider(
             &tx,
             provider.as_ref(),
         );
-        let event = match result {
-            Ok(()) => JobEvent::Done { id },
-            Err(JobError::Cancelled) => JobEvent::Cancelled { id },
-            Err(JobError::Io(msg) | JobError::CommittedWithRecovery(msg)) => {
-                JobEvent::Failed { id, error: msg }
-            }
+        let (event, outcome) = match result {
+            Ok(()) => (JobEvent::Done { id }, WorkOutcome::Done),
+            Err(JobError::Cancelled) => (JobEvent::Cancelled { id }, WorkOutcome::Cancelled),
+            Err(JobError::Io(msg) | JobError::CommittedWithRecovery(msg)) => (
+                JobEvent::Failed {
+                    id,
+                    error: msg.clone(),
+                },
+                WorkOutcome::Failed(msg),
+            ),
         };
         let _ = tx.send(event);
-    });
+        if let Some(settlement) = settlement {
+            let _ = settlement.send(outcome);
+        }
+    };
+    if tracked {
+        thread::Builder::new().spawn(work).map(|_| ())
+    } else {
+        thread::spawn(work);
+        Ok(())
+    }
 }
 
 /// Resolves the destination path under the overwrite policy. Returns the
@@ -1097,8 +1152,20 @@ fn remove_tree(path: &Path) -> Result<(), JobError> {
 /// granularity is per path).
 pub fn spawn_delete_job(paths: Vec<String>, tx: mpsc::Sender<JobEvent>) -> Arc<JobControl> {
     let control = JobControl::new();
-    let c = control.clone();
-    thread::spawn(move || {
+    let _ = spawn_delete_job_with_settlement(paths, tx, control.clone(), None);
+    control
+}
+
+/// Caller registers the control and one-shot owner before starting this worker.
+pub fn spawn_delete_job_with_settlement(
+    paths: Vec<String>,
+    tx: mpsc::Sender<JobEvent>,
+    control: Arc<JobControl>,
+    settlement: Option<mpsc::Sender<WorkOutcome>>,
+) -> std::io::Result<()> {
+    let c = control;
+    let tracked = settlement.is_some();
+    let work = move || {
         let total = paths.len();
         let mut failed: Vec<(String, String)> = Vec::new();
         for (i, path) in paths.iter().enumerate() {
@@ -1107,6 +1174,9 @@ pub fn spawn_delete_job(paths: Vec<String>, tx: mpsc::Sender<JobEvent>) -> Arc<J
                     cancelled: true,
                     failed,
                 });
+                if let Some(settlement) = settlement {
+                    let _ = settlement.send(WorkOutcome::Cancelled);
+                }
                 return;
             }
             let result = std::fs::symlink_metadata(path).ok().map(|meta| {
@@ -1125,12 +1195,25 @@ pub fn spawn_delete_job(paths: Vec<String>, tx: mpsc::Sender<JobEvent>) -> Arc<J
                 current: path.clone(),
             });
         }
+        let outcome = if failed.is_empty() {
+            WorkOutcome::Done
+        } else {
+            WorkOutcome::Failed(format!("{} deletion(s) failed", failed.len()))
+        };
         let _ = tx.send(JobEvent::DeleteDone {
             cancelled: false,
             failed,
         });
-    });
-    control
+        if let Some(settlement) = settlement {
+            let _ = settlement.send(outcome);
+        }
+    };
+    if tracked {
+        thread::Builder::new().spawn(work).map(|_| ())
+    } else {
+        thread::spawn(work);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1140,3 +1223,7 @@ mod batch_tests;
 #[cfg(test)]
 #[path = "transfer_safety_tests.rs"]
 mod safety_tests;
+
+#[cfg(test)]
+#[path = "transfer_cancel_wake_tests.rs"]
+mod cancel_wake_tests;

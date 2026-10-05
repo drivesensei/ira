@@ -15,8 +15,9 @@ use crate::{
         list_files::{list_files_bounded, list_files_chunked, FEntry, LISTING_CHUNK},
         state::{load_state, load_state_from, SessionState, SizeEntry},
         transfer::{
-            spawn_delete_job, spawn_job, spawn_job_with_provider, Job, JobControl, JobEvent,
-            JobKind, JobStatus, NoReplaceProvider, OverwritePolicy,
+            rename_no_replace, spawn_delete_job_with_settlement, spawn_job_with_settlement, Job,
+            JobControl, JobEvent, JobKind, JobStatus, NoReplaceProvider, OverwritePolicy,
+            WorkOutcome,
         },
     },
     utils::{
@@ -77,6 +78,7 @@ struct OperationState {
     drives: Option<Vec<Folder>>,
 }
 struct OperationRequest {
+    settlement_sequence: u64,
     epoch: u64,
     navigation_ticket: Option<u64>,
     operation: BlockingOperation,
@@ -139,7 +141,56 @@ struct SearchProjection {
     indices: Arc<Vec<usize>>,
 }
 
+/// Opaque, nonreusable authority for one App's permanently sealed issued set.
+#[derive(Clone, Debug)]
+pub struct ShutdownWorkSeal {
+    identity: Arc<()>,
+    operation_cutoff: u64,
+}
+/// Authentic completion returned only by polling this App's sealed issued set.
+#[derive(Debug)]
+pub struct ShutdownWorkReceipt {
+    seal: ShutdownWorkSeal,
+}
+impl ShutdownWorkSeal {
+    pub fn accepts(&self, receipt: &ShutdownWorkReceipt) -> bool {
+        Arc::ptr_eq(&self.identity, &receipt.seal.identity)
+            && self.operation_cutoff == receipt.seal.operation_cutoff
+    }
+}
+#[derive(Debug)]
+pub enum WorkSettlement {
+    Pending,
+    Error(String),
+    Settled(ShutdownWorkReceipt),
+}
+struct ActiveWork {
+    receipt: mpsc::Receiver<WorkOutcome>,
+    control: Arc<JobControl>,
+}
+// Release publication follows each FIFO request's final business-I/O attempt.
+#[derive(Default)]
+struct OperationSettlement {
+    through: AtomicU64,
+    exited: AtomicBool,
+}
+struct OperationExit(Arc<OperationSettlement>);
+impl Drop for OperationExit {
+    fn drop(&mut self) {
+        self.0.exited.store(true, Ordering::Release);
+    }
+}
+
 pub struct App {
+    work_identity: Arc<()>,
+    work_seal: Option<ShutdownWorkSeal>,
+    work_error: Option<String>,
+    work_diagnostic: Option<String>,
+    work_receipts: VecDeque<ActiveWork>,
+    operation_issued: u64,
+    operation_settlement: Arc<OperationSettlement>,
+    #[cfg(test)]
+    operation_test: Option<Arc<dyn Fn() + Send + Sync>>,
     search_projection: std::cell::RefCell<Option<SearchProjection>>,
     pub(crate) snapshot_cache: [std::cell::RefCell<Option<crate::observable::PaneProjection>>; 2],
     pub(crate) deletion_generation: u64,
@@ -298,6 +349,15 @@ impl Default for App {
         let (file_list_tx, file_list_rx) = mpsc::channel();
         let (info_tx, info_rx) = mpsc::channel();
         Self {
+            work_identity: Arc::new(()),
+            work_seal: None,
+            work_error: None,
+            work_diagnostic: None,
+            work_receipts: VecDeque::new(),
+            operation_issued: 0,
+            operation_settlement: Arc::new(OperationSettlement::default()),
+            #[cfg(test)]
+            operation_test: None,
             search_projection: std::cell::RefCell::new(None),
             snapshot_cache: std::array::from_fn(|_| std::cell::RefCell::new(None)),
             deletion_generation: 0,
@@ -485,7 +545,11 @@ impl App {
             ..Self::default()
         };
         app.host_requests.push(HostRequest::RefreshDrives);
-        let tx = app.startup_tx.clone();
+        // Only the original load worker retains the real sender, so a lost
+        // startup payload is distinguishable from a still-pending load.
+        let (unused_tx, unused_rx) = mpsc::channel();
+        drop(unused_rx);
+        let tx = std::mem::replace(&mut app.startup_tx, unused_tx);
         let state_path = app.state_path.clone();
         let bookmarks_path = app.bookmarks_path.clone();
         thread::spawn(move || {
@@ -506,17 +570,109 @@ impl App {
     }
     fn drain_startup(&mut self) {
         if let Ok((state, pairs)) = self.startup_rx.try_recv() {
-            self.apply_bookmark_pairs(pairs);
-            let preset = self.apply_session_state(state);
-            if let Some(preset) = preset.and_then(|s| crate::theme::ThemePreset::parse(&s)) {
-                self.theme_preset = preset;
-            }
-            self.initializing = false;
+            self.apply_startup_payload(state, pairs);
             self.request_pane_listing(0);
             self.request_pane_listing(1);
             while let Some(input) = self.startup_inputs.pop_front() {
                 let _ = self.dispatch(input);
             }
+        }
+    }
+
+    fn apply_startup_payload(&mut self, state: SessionState, pairs: Vec<(String, String)>) {
+        self.apply_bookmark_pairs(pairs);
+        let preset = self.apply_session_state(state);
+        if let Some(preset) = preset.and_then(|s| crate::theme::ThemePreset::parse(&s)) {
+            self.theme_preset = preset;
+        }
+        self.initializing = false;
+    }
+
+    /// Seal admission once; attachment cancellation does not create this seal.
+    pub fn begin_shutdown_settlement(&mut self) -> ShutdownWorkSeal {
+        if let Some(seal) = &self.work_seal {
+            return seal.clone();
+        }
+        let seal = ShutdownWorkSeal {
+            identity: self.work_identity.clone(),
+            operation_cutoff: self.operation_issued,
+        };
+        self.work_seal = Some(seal.clone());
+        self.cancel_pending_work();
+        self.host_requests.clear();
+        self.deferred_listings.clear();
+        for work in &self.work_receipts {
+            work.control.request_cancel();
+        }
+        // Let the FIFO consume/acknowledge stale queued operations and terminate.
+        self.operation_tx.take();
+        seal
+    }
+
+    fn poll_work_receipts(&mut self, budget: usize) {
+        // Rotate the outstanding deque so a blocked first worker cannot starve others.
+        for _ in 0..budget.max(1).min(self.work_receipts.len()) {
+            let Some(work) = self.work_receipts.pop_front() else {
+                break;
+            };
+            match work.receipt.try_recv() {
+                Ok(WorkOutcome::Failed(error)) => {
+                    self.work_diagnostic
+                        .get_or_insert_with(|| error.chars().take(512).collect());
+                }
+                Ok(WorkOutcome::Done | WorkOutcome::Cancelled) => {}
+                Err(mpsc::TryRecvError::Empty) => self.work_receipts.push_back(work),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.work_error
+                        .get_or_insert_with(|| "Work acknowledgement disconnected".into());
+                }
+            }
+        }
+    }
+
+    /// Completion-only polling. Never runs tick, applies ordinary results, or issues work.
+    pub fn poll_shutdown_settlement(
+        &mut self,
+        seal: &ShutdownWorkSeal,
+        budget: usize,
+    ) -> WorkSettlement {
+        if !Arc::ptr_eq(&seal.identity, &self.work_identity)
+            || self.work_seal.as_ref().map(|own| own.operation_cutoff)
+                != Some(seal.operation_cutoff)
+        {
+            return WorkSettlement::Error("Wrong shutdown work seal".into());
+        }
+        // Poll all lanes even while the original startup payload is pending.
+        self.poll_work_receipts(budget);
+        if self.initializing {
+            match self.startup_rx.try_recv() {
+                Ok((state, pairs)) => {
+                    self.apply_startup_payload(state, pairs);
+                    self.startup_inputs.clear();
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.work_error
+                        .get_or_insert_with(|| "Original startup payload disconnected".into());
+                }
+            }
+        }
+        let through = self.operation_settlement.through.load(Ordering::Acquire);
+        if through < seal.operation_cutoff
+            && self.operation_settlement.exited.load(Ordering::Acquire)
+            && self.operation_settlement.through.load(Ordering::Acquire) < seal.operation_cutoff
+        {
+            self.work_error.get_or_insert_with(|| {
+                "Operation worker exited before sealed acknowledgement".into()
+            });
+        }
+        if let Some(error) = &self.work_error {
+            return WorkSettlement::Error(error.clone());
+        }
+        if self.initializing || !self.work_receipts.is_empty() || through < seal.operation_cutoff {
+            WorkSettlement::Pending
+        } else {
+            WorkSettlement::Settled(ShutdownWorkReceipt { seal: seal.clone() })
         }
     }
 
@@ -553,6 +709,10 @@ impl App {
 
     /// Handles the tick event of the terminal.
     pub fn tick(&mut self) {
+        if self.work_seal.is_some() {
+            return;
+        }
+        self.poll_work_receipts(64);
         let before = self.tick_semantics();
         let revision = self.revision;
         let focus = self.focus_generation;
@@ -1586,6 +1746,9 @@ impl App {
 
     /// Applies the pending copy/move confirmation: spawns the jobs.
     pub fn confirm_transfer(&mut self, kind: JobKind) {
+        if self.work_seal.is_some() || self.work_error.is_some() {
+            return;
+        }
         let Some(confirm) = self.confirming.take() else {
             return;
         };
@@ -2340,6 +2503,9 @@ impl App {
         dest: String,
         policy: OverwritePolicy,
     ) {
+        if self.work_seal.is_some() || self.work_error.is_some() {
+            return;
+        }
         let dest_path = std::path::Path::new(&dest);
         // One batch job for the whole selection: a single worker thread
         // processes the paths sequentially — never one thread per file.
@@ -2385,10 +2551,19 @@ impl App {
             control: JobControl::new(),
         });
         let job = self.jobs.last().unwrap();
-        if let Some(provider) = &self.transfer_provider {
-            spawn_job_with_provider(job, self.job_tx.clone(), Arc::clone(provider));
-        } else {
-            spawn_job(job, self.job_tx.clone());
+        let (settlement_tx, receipt) = mpsc::channel();
+        self.work_receipts.push_back(ActiveWork {
+            receipt,
+            control: job.control.clone(),
+        });
+        let provider = self
+            .transfer_provider
+            .clone()
+            .unwrap_or_else(|| Arc::new(rename_no_replace));
+        if let Err(error) =
+            spawn_job_with_settlement(job, self.job_tx.clone(), provider, Some(settlement_tx))
+        {
+            self.work_error = Some(format!("Transfer worker spawn failed: {error}"));
         }
 
         self.transfer_generation = self.transfer_generation.wrapping_add(1);
@@ -2515,6 +2690,9 @@ impl App {
     /// and returns immediately. Progress arrives on the job channel and is
     /// shown in the (dismissable) progress dialog plus file-list spinners.
     pub fn confirm_delete(&mut self) {
+        if self.work_seal.is_some() || self.work_error.is_some() {
+            return;
+        }
         let Some(confirm) = self.confirming.take() else {
             return;
         };
@@ -2524,7 +2702,20 @@ impl App {
         self.deletion_generation = self.deletion_generation.wrapping_add(1);
         self.deleting_paths = confirm.paths.iter().cloned().collect();
         let tx = self.job_tx.clone();
-        let control = spawn_delete_job(confirm.paths.clone(), tx);
+        let control = JobControl::new();
+        let (settlement_tx, receipt) = mpsc::channel();
+        self.work_receipts.push_back(ActiveWork {
+            receipt,
+            control: control.clone(),
+        });
+        if let Err(error) = spawn_delete_job_with_settlement(
+            confirm.paths.clone(),
+            tx,
+            control.clone(),
+            Some(settlement_tx),
+        ) {
+            self.work_error = Some(format!("Deletion worker spawn failed: {error}"));
+        }
         self.deletion = Some(DeletionState {
             total: confirm.paths.len(),
             done: 0,
@@ -3431,6 +3622,9 @@ impl App {
         true
     }
     pub fn dispatch(&mut self, input: crate::input::Input) -> AppResult<()> {
+        if self.work_seal.is_some() {
+            return Err("Application work is sealed for shutdown".into());
+        }
         if self.initializing && !matches!(input, crate::input::Input::Tick) {
             let quit = matches!(
                 input,
@@ -3704,6 +3898,9 @@ impl App {
         }
     }
     fn submit_operation(&mut self, operation: BlockingOperation) {
+        if self.work_seal.is_some() || self.work_error.is_some() {
+            return;
+        }
         let pane = self.active_pane;
         let relative = matches!(
             operation,
@@ -3729,13 +3926,27 @@ impl App {
         } else {
             None
         };
+        let Some(sequence) = self.operation_issued.checked_add(1) else {
+            self.work_error = Some("Operation settlement sequence exhausted".into());
+            return;
+        };
+        // Register before the worker can receive or complete this request.
+        self.operation_issued = sequence;
         self.pending_operations += 1;
         if self.operation_tx.is_none() {
             let (tx, rx) = mpsc::channel::<OperationRequest>();
             let result_tx = self.operation_result_tx.clone();
             let epoch = self.operation_epoch.clone();
-            thread::spawn(move || {
+            let settlement = self.operation_settlement.clone();
+            #[cfg(test)]
+            let operation_test = self.operation_test.clone();
+            let spawned = thread::Builder::new().spawn(move || {
+                let _exit = OperationExit(settlement.clone());
+                let mut expected = 1u64;
                 while let Ok(request) = rx.recv() {
+                    if request.settlement_sequence != expected {
+                        break;
+                    }
                     let source = std::array::from_fn(|i| {
                         (
                             request.state.panes[i]
@@ -3759,6 +3970,10 @@ impl App {
                         ..App::default()
                     };
                     if request.epoch == epoch.load(Ordering::Acquire) {
+                        #[cfg(test)]
+                        if let Some(hook) = &operation_test {
+                            hook();
+                        }
                         match request.operation {
                             BlockingOperation::EnterFolder => worker.enter_folder_blocking(),
                             BlockingOperation::ParentFolder => worker.out_of_folder_blocking(),
@@ -3781,14 +3996,30 @@ impl App {
                         listings: std::mem::take(&mut worker.deferred_listings),
                         host_requests: std::mem::take(&mut worker.host_requests),
                     };
+                    // All explicit operation filesystem attempts have returned;
+                    // result guards/admission are independent from this watermark.
+                    settlement
+                        .through
+                        .store(request.settlement_sequence, Ordering::Release);
                     if result_tx.send(result).is_err() {
                         break;
                     }
+                    let Some(next) = expected.checked_add(1) else {
+                        break;
+                    };
+                    expected = next;
                 }
             });
-            self.operation_tx = Some(tx);
+            match spawned {
+                Ok(_) => self.operation_tx = Some(tx),
+                Err(error) => {
+                    self.work_error = Some(format!("Operation worker spawn failed: {error}"));
+                    return;
+                }
+            }
         }
         let request = OperationRequest {
+            settlement_sequence: sequence,
             epoch: self.operation_epoch.load(Ordering::Acquire),
             navigation_ticket,
             operation,
@@ -3802,7 +4033,10 @@ impl App {
             self.goto_prompt = None;
         }
         if let Some(tx) = &self.operation_tx {
-            let _ = tx.send(request);
+            if tx.send(request).is_err() {
+                self.work_error = Some("Operation request channel disconnected".into());
+                self.operation_tx.take();
+            }
         }
     }
     fn drain_operation_results(&mut self) {
@@ -4108,3 +4342,7 @@ mod existing_path;
 pub use existing_path::{
     ExistingPathFocusStamp, ExistingPathKind, ExistingPathReceipt, ExistingPathScope,
 };
+
+#[cfg(test)]
+#[path = "application_settlement_tests.rs"]
+mod settlement_tests;
