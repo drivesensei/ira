@@ -1,4 +1,4 @@
-> Current continuation checkpoint: [2026-10-04 handoff](checkpoints/2026-10-04/HANDOFF.md). Migration remains incomplete; R0117builds/7inventories/5bodies are UNRUN. The152-row parity snapshot and source provenance are linked there. The state below is preserved historical baseline documentation (151 rows), not current source/build/verification status. In particular the core is now populated; old commands below are not authorization to run tests with real user configuration.
+> Current continuation: [2026-10-05 regression checkpoint](checkpoints/2026-10-05/REGRESSION.md) and [single-worktree policy/source checkpoint](SINGLE_WORKTREE.md). Forty distinct focused bodies passed; migration remains incomplete and desktop/native/R011/aggregate/full-parity gates remain open. The historical state below (151 rows, empty-core-era commands) is preserved unchanged and is not current source or runtime status. The 152-row historical parity snapshot/source provenance remain linked from the prior 2026-10-04 handoff. Never run the historical commands against real user configuration.
 
 # Migration state
 
