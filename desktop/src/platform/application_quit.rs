@@ -8,6 +8,35 @@
 #[cfg(any(target_os = "macos", test))]
 use std::cell::Cell;
 
+// Runtime metadata only; fixed byte/output bounds and ASCII escaping keep each
+// rejection diagnostic one line. Never pass an object/pointer/address to this.
+#[cfg(any(target_os = "macos", test))]
+const STRUCTURE_BYTES: usize = 64;
+#[cfg(any(target_os = "macos", test))]
+fn bounded_structure(value: &[u8]) -> String {
+    let mut output: String = value
+        .iter()
+        .take(STRUCTURE_BYTES)
+        .flat_map(|byte| std::ascii::escape_default(*byte))
+        .map(char::from)
+        .collect();
+    if value.len() > STRUCTURE_BYTES {
+        output.push_str("...");
+    }
+    output
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn write_structure(output: &mut impl std::io::Write, arguments: std::fmt::Arguments<'_>) {
+    // Diagnostics cannot replace a safety rejection or unwind from gate Drop.
+    // A closed/broken stderr is deliberately ignored; guard results remain authoritative.
+    let _ = writeln!(output, "{arguments}");
+}
+#[cfg(target_os = "macos")]
+fn emit_structure(arguments: std::fmt::Arguments<'_>) {
+    write_structure(&mut std::io::stderr().lock(), arguments);
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct QuitRequest {
     gate: u64,
@@ -127,7 +156,7 @@ mod mac {
     use objc2::{
         ClassType, DefinedClass, Encode, MainThreadOnly, define_class, msg_send,
         rc::{Allocated, Retained},
-        runtime::{AnyClass, AnyObject, AnyProtocol, ClassBuilder, ProtocolObject, Sel},
+        runtime::{AnyClass, AnyObject, AnyProtocol, ClassBuilder, Ivar, ProtocolObject, Sel},
         sel,
     };
     use objc2_app_kit::{NSApplication, NSApplicationDelegate};
@@ -201,12 +230,124 @@ mod mac {
             .copied()
             .ok_or(QuitError::ClassRegistration)
     }
+    const APPLICATION_CLASS: &std::ffi::CStr = c"GPUIApplication";
+    const APPLICATION_COMPANION: &std::ffi::CStr = c"NSKVONotifying_GPUIApplication";
+
+    fn platform_layout(offset: isize, base_size: usize, actual_size: usize) -> bool {
+        usize::try_from(offset)
+            .ok()
+            .is_some_and(|offset| pointer_slot_fits(offset, base_size, actual_size))
+    }
+    fn pointer_slot_fits(offset: usize, base_size: usize, actual_size: usize) -> bool {
+        offset % std::mem::align_of::<*mut c_void>() == 0
+            && offset
+                .checked_add(std::mem::size_of::<*mut c_void>())
+                .is_some_and(|end| end <= base_size)
+            && actual_size >= base_size
+    }
+
+    // Metadata only: no object reads, messages, allocation or class mutation.
+    // The parameterized seam is private; production always supplies fixed names
+    // and the runtime's registered GPUI base identity.
+    fn application_slot<'a>(
+        actual: &AnyClass,
+        base: &'a AnyClass,
+        companion: &std::ffi::CStr,
+    ) -> Result<&'a Ivar, QuitError> {
+        let registered_base = std::ptr::eq(actual, base);
+        let permitted_name = actual.name() == companion;
+        let parent = actual.superclass();
+        let direct_base = parent.is_some_and(|parent| std::ptr::eq(parent, base));
+        let base_slot = base.instance_variable(c"platform");
+        let actual_slot = actual.instance_variable(c"platform");
+        let declared = base_slot.is_some_and(|slot| {
+            !base
+                .superclass()
+                .and_then(|parent| parent.instance_variable(c"platform"))
+                .is_some_and(|inherited| std::ptr::eq(slot, inherited))
+        });
+        let inherited_slot = base_slot
+            .zip(actual_slot)
+            .is_some_and(|(base, actual)| std::ptr::eq(base, actual));
+        let encoding_match = base_slot.is_some_and(|slot| {
+            slot.type_encoding().to_bytes() == <*mut c_void>::ENCODING.to_string().as_bytes()
+        });
+        let offset_match = base_slot
+            .zip(actual_slot)
+            .is_some_and(|(base, actual)| base.offset() == actual.offset());
+        let layout_ok = base_slot.is_some_and(|slot| {
+            platform_layout(slot.offset(), base.instance_size(), actual.instance_size())
+        });
+        let accepted = !actual.is_metaclass()
+            && !base.is_metaclass()
+            && (registered_base || (permitted_name && direct_base))
+            && declared
+            && inherited_slot
+            && encoding_match
+            && offset_match
+            && layout_ok;
+        emit_structure(format_args!(
+            "Native deferred quit structure: stage=application_layout actual={} direct_super={} registered_base={} permitted_name={} direct_base={} base_declared={} inherited_slot={} encoding_match={} offset_match={} layout_ok={} accepted={}",
+            bounded_structure(actual.name().to_bytes()),
+            parent
+                .map(|parent| bounded_structure(parent.name().to_bytes()))
+                .unwrap_or_else(|| "none".into()),
+            registered_base,
+            permitted_name,
+            direct_base,
+            declared,
+            inherited_slot,
+            encoding_match,
+            offset_match,
+            layout_ok,
+            accepted,
+        ));
+        if !accepted {
+            return Err(QuitError::UnsupportedDelegate);
+        }
+        base_slot.ok_or(QuitError::UnsupportedDelegate)
+    }
+
+    fn validated_application_slot(actual: &AnyClass) -> Result<&'static Ivar, QuitError> {
+        let Some(base) = AnyClass::get(APPLICATION_CLASS) else {
+            emit_structure(format_args!(
+                "Native deferred quit structure: stage=application_layout actual={} registered_base_present=false accepted=false",
+                bounded_structure(actual.name().to_bytes()),
+            ));
+            return Err(QuitError::UnsupportedDelegate);
+        };
+        application_slot(actual, base, APPLICATION_COMPANION)
+    }
+
+    fn application_platform(object: &AnyObject) -> Result<*mut c_void, QuitError> {
+        // AnyObject::class reads actual runtime isa, not Objective-C -class.
+        let slot = validated_application_slot(object.class())?;
+        // SAFETY: declaring-base metadata, exact encoding, non-shadowed ivar
+        // identity and complete pointer bounds/alignment were just validated.
+        // No native callback occurs between validation and this main-thread read.
+        Ok(unsafe { *slot.load_ptr::<*mut c_void>(object) })
+    }
+
+    #[cfg(test)]
+    mod class_tests {
+        include!("application_quit_class_tests.rs");
+    }
+
     pub(super) fn platform(object: &AnyObject) -> Result<*mut c_void, QuitError> {
-        let ivar = object
-            .class()
-            .instance_variable(c"platform")
-            .ok_or(QuitError::UnsupportedDelegate)?;
+        let Some(ivar) = object.class().instance_variable(c"platform") else {
+            emit_structure(format_args!(
+                "Native deferred quit structure: stage=platform_ivar class={} ivar_present=false",
+                bounded_structure(object.class().name().to_bytes()),
+            ));
+            return Err(QuitError::UnsupportedDelegate);
+        };
         if ivar.type_encoding().to_bytes() != <*mut c_void>::ENCODING.to_string().as_bytes() {
+            emit_structure(format_args!(
+                "Native deferred quit structure: stage=platform_encoding class={} ivar_present=true actual={} expected={}",
+                bounded_structure(object.class().name().to_bytes()),
+                bounded_structure(ivar.type_encoding().to_bytes()),
+                bounded_structure(<*mut c_void>::ENCODING.to_string().as_bytes()),
+            ));
             return Err(QuitError::UnsupportedDelegate);
         }
         // SAFETY: exact pinned class and encoding are checked by install;
@@ -243,13 +384,21 @@ mod mac {
         Ok(proxy)
     }
     // Only restore layouts whose pointers still match our source-pinned lease.
+    #[cfg(test)]
     pub(super) fn synchronize_platform_alias(
         app: &AnyObject,
         proxy: &AnyObject,
         original: &AnyObject,
         expected: *mut c_void,
     ) -> Result<(), QuitError> {
-        let app_pointer = platform(app)?;
+        synchronize_platform_pointers(platform(app)?, proxy, original, expected)
+    }
+    fn synchronize_platform_pointers(
+        app_pointer: *mut c_void,
+        proxy: &AnyObject,
+        original: &AnyObject,
+        expected: *mut c_void,
+    ) -> Result<(), QuitError> {
         let proxy_pointer = platform(proxy)?;
         let original_pointer = platform(original)?;
         if app_pointer == expected && proxy_pointer == expected && original_pointer == expected {
@@ -281,6 +430,13 @@ mod mac {
                 Self::Fixture(object) => object,
             }
         }
+        fn platform(&self) -> Result<*mut c_void, QuitError> {
+            match self {
+                Self::Application(app) => application_platform(app.as_ref()),
+                #[cfg(test)]
+                Self::Fixture(object) => platform(object),
+            }
+        }
         fn delegate(&self) -> Option<Retained<ProtocolObject<dyn NSApplicationDelegate>>> {
             // SAFETY: NSApplication and the initialized test fixture implement
             // this exact object-returning selector and weak-delegate contract.
@@ -305,18 +461,41 @@ mod mac {
         pub fn install() -> Result<Self, QuitError> {
             let mtm = MainThreadMarker::new().ok_or(QuitError::WrongThread)?;
             let app = NSApplication::sharedApplication(mtm);
-            if app.class().name() != c"GPUIApplication" {
-                return Err(QuitError::UnsupportedDelegate);
-            }
-            let original = app.delegate().ok_or(QuitError::MissingDelegate)?;
+            let application_object: &AnyObject = app.as_ref();
+            validated_application_slot(application_object.class())?;
+            let Some(original) = app.delegate() else {
+                emit_structure(format_args!(
+                    "Native deferred quit structure: stage=delegate_present app_class=GPUIApplication delegate_present=false"
+                ));
+                return Err(QuitError::MissingDelegate);
+            };
             if original.respondsToSelector(sel!(applicationShouldTerminate:)) {
+                emit_structure(format_args!(
+                    "Native deferred quit structure: stage=termination_hook delegate_class={} existing_hook=true",
+                    bounded_structure(original_object(&original).class().name().to_bytes()),
+                ));
                 return Err(QuitError::ExistingTerminationHook);
             }
             if original_object(&original).class().name() != c"GPUIApplicationDelegate" {
+                emit_structure(format_args!(
+                    "Native deferred quit structure: stage=delegate_class actual={} expected=GPUIApplicationDelegate",
+                    bounded_structure(original_object(&original).class().name().to_bytes()),
+                ));
                 return Err(QuitError::UnsupportedDelegate);
             }
             let original_platform = platform(original_object(&original))?;
-            if original_platform.is_null() || platform(app.as_ref())? != original_platform {
+            if original_platform.is_null() {
+                emit_structure(format_args!(
+                    "Native deferred quit structure: stage=platform_pointer delegate_class=GPUIApplicationDelegate delegate_platform_null=true app_platform_checked=false"
+                ));
+                return Err(QuitError::UnsupportedDelegate);
+            }
+            let app_platform = application_platform(app.as_ref())?;
+            if app_platform != original_platform {
+                emit_structure(format_args!(
+                    "Native deferred quit structure: stage=platform_pointer app_class=GPUIApplication delegate_class=GPUIApplicationDelegate delegate_platform_null=false app_platform_null={} platform_equal=false",
+                    app_platform.is_null(),
+                ));
                 return Err(QuitError::UnsupportedDelegate);
             }
             static NEXT_GATE: AtomicU64 = AtomicU64::new(1);
@@ -345,6 +524,11 @@ mod mac {
                 return Err(QuitError::DelegateChanged);
             }
             app.set_delegate(ProtocolObject::from_ref(&*proxy));
+            if matches!(&app, NativeHost::Application(_)) {
+                emit_structure(format_args!(
+                    "Native deferred quit structure: stage=proxy_attach retained_proxy=true delegate_replacement_sent=true"
+                ));
+            }
             Ok(Self {
                 app,
                 proxy,
@@ -392,8 +576,8 @@ mod mac {
             Ok(())
         }
         fn synchronize_returned_loop(&self) -> Result<(), QuitError> {
-            synchronize_platform_alias(
-                self.app.object(),
+            synchronize_platform_pointers(
+                self.app.platform()?,
                 self.proxy.as_ref(),
                 original_object(&self.proxy.ivars().original),
                 self.original_platform,
@@ -441,3 +625,7 @@ impl ApplicationQuitGate {
 #[cfg(test)]
 #[path = "application_quit_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "application_quit_diagnostic_tests.rs"]
+mod diagnostic_tests;
