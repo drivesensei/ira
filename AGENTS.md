@@ -1,3 +1,16 @@
+## User directive — single migration worktree (2026-10-05)
+
+The user requires one existing worktree throughout the rest of this migration. This directive takes precedence over earlier feature/reviewer worktree and per-worktree target guidance in this file and the skills.
+
+- All implementation, integration, reviews that write tests, and execution use this existing `ira-migration-checkpoints` worktree on `migrate/desktop-parity-checkpoints`. Do not create another worktree.
+- Keep every other IRA worktree, branch, unique commit and local source/evidence intact as read-only references. Only separately authorized generated build cleanup may touch their outputs.
+- Assign agents nonoverlapping file write-sets in this shared checkout; serialize shared-file integration and compiler execution.
+- Future Cargo output uses this checkout’s `target/` only after fresh physical-space, cumulative-output budget, source and execution gates. Do not create more targets/caches or run broad tests against real HOME/config/cache.
+- Use isolated synthetic app configuration/files for any separately authorized runtime verification. Preserve the unresolved real zero-byte state incident.
+- Review exact scope before commits. Publish focused checkpoints only to this migration branch; never push main, force push, rewrite history, or change global Git/auth configuration.
+
+Read `migration/SINGLE_WORKTREE.md` for the preserved source accounting, integration prerequisites and continuation gates. Historical instructions below remain provenance; they do not permit additional worktrees.
+
 # MANAGER CHARTER: Rust TUI file manager -> GPUI desktop app, 1:1 parity
 
 You are the **Migration Manager**. You run in goal mode. You do not stop, summarize-and-exit,

@@ -1,0 +1,68 @@
+# Single-worktree migration policy and source checkpoint
+
+This 2026-10-05 checkpoint is authoritative for the applied source and single-worktree policy below. The 2026-10-04 HANDOFF, SOURCE_BRANCH_MAP and pending-source patch/provenance files remain untouched historical snapshots; their pending/uncommitted labels describe that earlier checkpoint. The seven selected deltas are now applied in canonical as listed here; the preserved patch series is historical source provenance, not an instruction to apply them again.
+
+The existing ira-migration-checkpoints checkout on migrate/desktop-parity-checkpoints is the only writable implementation/integration/test worktree. Its starting HEAD is a2baedc490702e8cc21e758ff639fa2658c5ecc0. Do not create new worktrees. All 25 other registered worktrees remain read-only source/history references; keep their branches and unique commits. User instruction of 2026-10-05 overrides historical per-stream isolation guidance.
+
+Why 26 worktrees: wave-planning skill line89 prescribed one worktree/branch/CARGO_TARGET_DIR per developer; subagent-delegation line24 defaulted local worktrees and line118 prescribed separate tournament alternatives. The migration journal records feature and reviewer isolation. This is historical workflow provenance, not a continuing requirement. Separate output directories multiplied generated artifacts. Cleanup R025 is owned separately; this plan deletes no source, worktree, refs, cache or outputs.
+
+Read-only inventory observed 26 trees, canonical clean, main25ffceb165281baa382aea46616917e7b6aa2789 unchanged, repo-local author configuration verified privately; HTTPS origin unchanged. No tracked modifications or non-generated product-source untracked entries were found. Main has13 untracked .agents skills; parity has local untracked engineering metadata/evidence; both stay in place. Generated-path classification is informational, not deletion authorization. Full private inventory is read-only-git-inventory.json; source-status-summary.json excludes generated listings. These receipt locators refer to the local engineering workspace only and are not shipped. Counts and cached refs are snapshot observations.
+
+## Applied focused source reconciliation
+
+The seven original per-commit deltas below were applied after R027 source-plan approval and coordinator grant, preserving accepted terminal/Info source already in canonical. At this review checkpoint they were applied but not yet committed. Fourteen focused core bodies passed against these exact bytes; desktop compilation, native usability and aggregate/runtime checks remain UNRUN. Native chain:392a688b0d4c945c8aa1a64e41205f928382e7ef → ef687945c8f49bcd4ad54280422eaa68a16f6854 → dd8f7b380a7ca5756358851cfb0dd33339f7e4f0 → dbaf487c227d965b6127d0194bf959d8834a261f. Core chain:4bc2fa95b8ecba10ec4719cd1dcc44a248a3ad5d → 5fc1a2c9f39677c2ad37d90a7c93791830010110 → 1d8a4be1135afb47e9a98df94e2ac025321ab7e0. Omit abe60c7c7e18f91c3f572e7a6ca2b84143699de1 because its exact diff is identical to already reachable fc8e7d799e3c0f36a95ee17f8e28be021c63b267 (pub(super) drain_existing_paths).
+
+Native allowlist: desktop/src/main.rs; desktop/src/platform/application_quit.rs; desktop/src/platform/application_quit_diagnostic_tests.rs; desktop/src/platform/application_quit_class_tests.rs.
+Core allowlist: crates/core/src/application.rs; crates/core/src/application_settlement_tests.rs; crates/core/src/services/transfer.rs; crates/core/src/services/transfer_cancel_wake_tests.rs; desktop/src/platform/shutdown.rs; desktop/src/runtime.rs; desktop/src/runtime_settlement_tests.rs.
+
+Read-only git apply --check passed both exact concatenated delta series on canonical (native30,560/core69,151 patch bytes). This proves textual applicability only, not build/runtime acceptance. Branch-tip replacement would remove accepted terminal/Info work and is rejected. No other divergent tip is implicitly selected. Exhaustive SOURCE_BRANCH_MAP.json preserves77 refs/261 unique commits, including obsolete/equivalent/divergent alternatives; clean branch status is not acceptance. Parity2211 matrix is documentary152-row provenance, with disabled publication/executor work that must not be reintroduced wholesale.
+
+R027 independently verified the applied eleven source/test files byte-for-byte against the selected native/core blobs and confirmed accepted terminal/Info files outside the allowlist unchanged. The user-override section is now persisted in canonical AGENTS.md with a link to migration/SINGLE_WORKTREE.md: single existing canonical worktree only, no new trees, historical trees read-only, all future outputs canonical/target after resource gates, disjoint agent write-sets. Original AGENTS guidance remains below with this explicit user instruction taking precedence. Applied documentation allowlist: AGENTS.md and migration/SINGLE_WORKTREE.md; source allowlist remains the eleven paths above. Source-only reconciliation used the seven exact delta patches with the stated changed-file scope; preserve all original commits, skip duplicate explicitly, inspect combined diff and abort unsafe conflict rather than discard canonical work. Focused new commits require final exact review. The authorized core batch used canonical/target only after genuine disk/resource/source gates; future tests continue to require those gates; no new compiler target, no realHOME/config/cache broad tests. No app/restart until separate gates.
+
+## Continuation limits
+
+R021 bounded sampler:11 independent isolated tests pass; actual first2,726-byte path content/identity matched but flags/blocks/ctime drift produced strictSTOP after3.014s, childreaped; other5 paths UNRUN. This does not explain old180s cleanup timeout (originalguard did not check thosefields). Historical R013 recursive deletion remains unperformed; its original failed receipts remain intact. New R025 selective generated-output cleanup passed independently: 28,527 reviewed generated intermediates removed across parity (4,156), preview (17,258) and T017 (7,113), with proof-bound files preserved and no whole-folder deletion. Observed free space rose from 8,371,433,472 to 15,258,177,536 bytes; the 6,886,744,064-byte difference includes concurrent allocation and is not an exact deletion byte count. These three legacy outputs were outside the charged cap, so physical recovery does not clear the cumulative budget. The subsequent selective charged shared-cache cleanup also passed: 658 unbound rmeta files removed while 18 proof-bound rmeta files, 676 rlibs, 50 object files and 80 product/dylib entries remained intact. Its observed free-space difference was 764,489,728 bytes, with the same concurrency caveat. The owner’s fresh charged baseline was 9,835,825,520 bytes before the core batch. The two selective cleanup phases observed a combined free-space difference of 7,651,233,792 bytes (about7.13GiB), with concurrent allocation caveats. The final core batch receipt observed 16,828,952,576 bytes free; its new target footprint was151,838,720 bytes. R022 diagnostic:8 tests and once-only4 current reads pass, G8snapshot6473B/19events/12links/closed/rounds3; historical failures UNKNOWN. Expanded cleanup/archive drivers are SOURCE_ONLY_NOT_READY: cleanup freeze hit ENOSPC/error60 before unresolved counting/controller-grant fixes; archive latest861f fixes locked-witness defect but independent suite9/10 has timing-test failure, attempted test snapshot hit ENOSPC; separate30s probephase UNKNOWN. No expanded live deletion/archive CLI grant.
+
+R0117builds/7inventories/5 bodies remain UNRUN; controllers/source closure/resource witnesses and bodydrivers remain required. Historical CI/build PASS evidence does not authenticate newly combined source or fullparity. Native KVO/aggregate/resolver gaps remain;152matrix rows are unverified. Real zero-byte IRA state incident remains preserved. PR9 exists regular/emptybody; no API writes. Publication only reviewed focused commits to migration branch through existing authorized strict SSH identity; never main/force or persistent auth/config changes.
+
+Latest observed archive driver SHA861f0c031f50e996debca3c8b3193f771c594b7b87b7ac5fff0ac6d802a9a649 (23,050B), test SHA07c627e978f0511c13a86d37ac9fb96998f6bd256effe9fceab44b46fc7786eb (15,397B); source-only, QA pending. Exact local helper metadata resides in latest-helper-metadata.json; the original delete helper is historical, not the corrected candidate.
+
+
+## Focused verification on this combined source
+
+Direct installed formatter parse/format check passed all eleven selected Rust files with skip_children=true; it created no target output or source edits. After fresh physical and cumulative budget approval, one serial offline/locked core batch ran eight application settlement bodies and six transfer cancellation/wake bodies. All14 passed with zero failures and zero ignored. Cargo exited zero for both commands and owned children were reaped. Synthetic HOME/XDG/TMP/logs lived beneath the single canonical target; existing installed Homebrew toolchain/cache were reused offline. Command-scoped single compiler job, debug information disabled and incremental disabled left optimization, debug assertions and overflow semantics unchanged.
+
+The allowance was350MiB across BOTH commands from one immutable target baseline, with300MiB observed stop threshold and a separate500MiB reserve. Per-path charge was max(logical bytes, allocated blocks×512), with no hardlink discount; all fixtures/logs were included. Target began at0 and final/observedpeak charge was151,838,720 bytes. Commands took24.891 and0.684seconds. Source hashes for all eleven files were authenticated before and after each command and again finally. Polling was an observed budget guard, not a kernel allocation guarantee. Raw logs and bounded execution/profile/source/resource receipts are local-only under R026 engineering evidence; exact core logSHA256s:3fa71c224b4b1d4984293bf9b524b1296bd5502894e7ea951673d1bb91ec834a and8035af8fa4742f3c08df1b91a80bd963eb22f7a58f2a7bc6144fcdca362e216e.
+
+This is narrow core evidence. Desktop no-run compilation/class-test execution, native application behavior, R011 phases, aggregate and full parity remain UNRUN/unverified. No app was launched; no real configuration/state was changed. Further compiler work needs its own current budget/source scope and grant.
+
+## Preserved worktree accounting
+
+| Branch | HEAD | Commits not reachable from canonical | Source status |
+|---|---|---:|---|
+| main | 25ffceb165281baa382aea46616917e7b6aa2789 | 0 | clean product source; retained references |
+| codex/ira-application-quit | edc8b7eb56cac40d0176a068861dbbc41aae36af | 4 | clean product source; retained references |
+| codex/ira-boundary-reconciliation | 536f7bea65fa231fff57881ee0a4f154de79c779 | 4 | clean product source; retained references |
+| codex/ira-compile-repair | fc8e7d799e3c0f36a95ee17f8e28be021c63b267 | 0 | clean product source; retained references |
+| codex/ira-core-foundation | 5dacb49b46a7486492305cd447cd05d8ba310708 | 1 | clean product source; retained references |
+| codex/ira-desktop-parity | 2211ed8d69129c71ef9e7600aa8e2a2ca7d4da1a | 37 | clean product source; retained references |
+| codex/ira-fixture-repair | 641d0b8dc25ebd519ee144b458352e19f3ce8593 | 4 | clean product source; retained references |
+| codex/ira-gpui-runtime | d889ba18c8a46cd9ddf846f722c2d7944249b1a5 | 0 | clean product source; retained references |
+| codex/ira-harness-completion | bfaa5fc52bcc5c547e2f61f7c4068fe968f66498 | 27 | clean product source; retained references |
+| codex/ira-harness-safety | e7cc2507776bc5cd6609655fa152411defa780f3 | 29 | clean product source; retained references |
+| migrate/desktop-parity-checkpoints | a2baedc490702e8cc21e758ff639fa2658c5ecc0 | 0 | clean product source; retained references |
+| codex/ira-model-parity | cdbbe16bdead3e9bd8281e124b59aab99a910d64 | 6 | clean product source; retained references |
+| codex/ira-native-accessibility | 4996d6a0d0201d22add0424f093a8accae3766bb | 10 | clean product source; retained references |
+| codex/ira-native-chooser | 6233a1f43cdf72b65dc76104845cc5055c18f610 | 2 | clean product source; retained references |
+| codex/ira-native-gate-repair | ef687945c8f49bcd4ad54280422eaa68a16f6854 | 2 | clean product source; retained references |
+| codex/ira-native-input | b868a431c5533fcbd2877304f86cb9e9017cf744 | 7 | clean product source; retained references |
+| codex/ira-native-kvo-repair | dbaf487c227d965b6127d0194bf959d8834a261f | 4 | clean product source; retained references |
+| codex/ira-native-validation | dd8f7b380a7ca5756358851cfb0dd33339f7e4f0 | 3 | clean product source; retained references |
+| codex/ira-overwrite-safety | 7191d9d0314cc0f652ca104ae2002a757301ff55 | 8 | clean product source; retained references |
+| codex/ira-persistence-safe | 6684f31e63a49f30518c496640fd805fd82efd93 | 45 | clean product source; retained references |
+| codex/ira-preview-editor | 8970234952df11cb2eec213e7395a1ec48252f81 | 5 | clean product source; retained references |
+| codex/ira-shutdown-surface-repair | 738407a9dee7d82d4b34e40bd2c98e16005180cc | 1 | clean product source; retained references |
+| codex/ira-terminal-fixture-repair | cb9741569a60a9629da25134efc4a034662b2e52 | 0 | clean product source; retained references |
+| codex/ira-terminal-settlement | 66e9550460ca760a547473495880ce06d587c3e8 | 0 | clean product source; retained references |
+| codex/ira-transfer-refresh | 51b1f88115de8da72c41936419952ffa5b2a106a | 37 | clean product source; retained references |
+| codex/ira-work-settlement | 1d8a4be1135afb47e9a98df94e2ac025321ab7e0 | 4 | clean product source; retained references |
