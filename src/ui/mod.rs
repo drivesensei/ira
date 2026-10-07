@@ -434,11 +434,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
                 &theme,
             ));
         }
-        let mut max_w: u16 = 10;
-        for l in &lines {
-            max_w = max_w.max(l.width() as u16);
-        }
-        let area = dialog_area(max_w, lines.len() as u16, frame.area());
+        let area = chrome::wrapped_info_area(&lines, frame.area());
         render_dialog(frame, "Info", lines, DialogKind::Info, &theme, area);
     }
 
@@ -506,6 +502,9 @@ fn is_partial_size(value: &str) -> bool {
     const SPINNER: &str = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
     value.chars().any(|c| SPINNER.contains(c)) || value.contains("calculating")
 }
+
+#[cfg(test)]
+mod info_dialog_tests;
 
 #[cfg(test)]
 mod tests {

@@ -788,7 +788,7 @@ fn readiness_uses_output_polling_and_absolute_deadline() {
 #[ignore = "GAP G-F002-ADV-32"]
 fn readiness_timeout_sends_no_input() {
     let trace = trace_file("initial_screen.toml").with_events(vec![InputEvent::Key {
-        code: KeyCode::Character('q'),
+        code: KeyCode::Character { character: 'q' },
         modifiers: BTreeSet::new(),
         phase: KeyPhase::Press,
     }]);

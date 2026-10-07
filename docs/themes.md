@@ -38,6 +38,23 @@ So `theme.toml` sets the theme for a fresh profile; `\` overrides it from then o
 To pin a theme permanently, delete the `theme=` line from the state file (or simply cycle
 back to the one you want, since the last press is what gets saved).
 
+### Desktop system appearance
+
+The desktop keeps the same configured preset by default. To follow the operating
+system's light or dark appearance, add this top-level key to `theme.toml`:
+
+```toml
+desktop_appearance = "system"
+```
+
+This desktop-only option does not change the terminal theme, preset IDs or saved
+state. Missing or unknown values keep the configured preset. In system mode,
+light appearance uses a light counterpart of the selected preset; dark appearance
+uses its original palette. Backslash still cycles and saves the same presets.
+Per-key color overrides apply last in either appearance, including intentionally
+low-contrast custom colors. Changes to the file take effect on the next launch;
+operating-system appearance changes update an existing desktop window.
+
 ### Per-key overrides
 
 `~/.config/ira/theme.toml` can also override individual colors. Overrides are applied

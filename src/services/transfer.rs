@@ -32,7 +32,7 @@ pub enum OverwritePolicy {
     AutoRename,
     /// Never overwrite: colliding destinations are skipped and reported.
     SkipExisting,
-    /// Replace existing destination files outright (folders merge).
+    /// Replace files; on Unix a directory Move may replace an empty directory.
     Overwrite,
 }
 
@@ -83,12 +83,21 @@ pub enum JobEvent {
     },
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+struct GateWaitTest {
+    entered: mpsc::Sender<()>,
+    released: mpsc::Receiver<()>,
+}
+
 /// Shared cancellation + pause state between the UI and the worker thread.
 #[derive(Debug)]
 pub struct JobControl {
     cancel: AtomicBool,
     pause: Mutex<bool>,
     resume: Condvar,
+    #[cfg(test)]
+    before_wait: Mutex<Option<GateWaitTest>>,
 }
 
 impl JobControl {
@@ -97,10 +106,16 @@ impl JobControl {
             cancel: AtomicBool::new(false),
             pause: Mutex::new(false),
             resume: Condvar::new(),
+            #[cfg(test)]
+            before_wait: Mutex::new(None),
         })
     }
 
     pub fn request_cancel(&self) {
+        // Synchronize with the pause wait to avoid a lost wakeup between its
+        // cancellation check and Condvar::wait. Preserve the original gate
+        // algorithm; cancellation wakes the paused worker to return Cancelled.
+        let _paused = self.pause.lock();
         self.cancel.store(true, Ordering::Relaxed);
         self.resume.notify_all();
     }
@@ -126,6 +141,14 @@ impl JobControl {
             if self.cancel.load(Ordering::Relaxed) {
                 return Err(JobError::Cancelled);
             }
+            #[cfg(test)]
+            if let Some(hook) = self.before_wait.lock().take() {
+                let _ = hook.entered.send(());
+                // Bounded observation only; timeout/disconnect never cancels.
+                let _ = hook
+                    .released
+                    .recv_timeout(std::time::Duration::from_secs(5));
+            }
             self.resume.wait(&mut paused);
         }
         Ok(())
@@ -136,6 +159,7 @@ impl JobControl {
 enum JobError {
     Cancelled,
     Io(String),
+    CommittedWithRecovery(String),
 }
 
 impl From<std::io::Error> for JobError {
@@ -167,7 +191,90 @@ const MAX_ENTRIES: u64 = 200_000; // pre-scan cap; above this show indeterminate
 
 /// Spawns ONE worker thread for the whole batch; it processes `job.paths`
 /// sequentially and reports progress on `tx`. Returns immediately.
+/// Host-supplied atomic entry rename: must refuse every existing destination,
+/// preserve source and destination on failure, and never follow entry symlinks.
+/// It must support files and directories without copying across volumes.
+pub type NoReplaceProvider = dyn Fn(&Path, &Path) -> std::io::Result<()> + Send + Sync;
+
+/// A dedicated one-shot terminal capability. Only the worker sends it after
+/// its last business I/O; dropping it never authenticates completion.
+pub(crate) struct TerminalReceipt {
+    identity: u64,
+    sender: mpsc::Sender<u64>,
+}
+impl TerminalReceipt {
+    pub(crate) fn acknowledge(self) {
+        let _ = self.sender.send(self.identity);
+    }
+}
+pub(crate) fn terminal_receipt(identity: u64) -> (TerminalReceipt, mpsc::Receiver<u64>) {
+    let (sender, receiver) = mpsc::channel();
+    (TerminalReceipt { identity, sender }, receiver)
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct WorkerTestHooks {
+    pub provider: Option<Arc<NoReplaceProvider>>,
+    /// Observe/block after the real owned remove attempt, before its return
+    /// is processed. This is not a physically blocked OS syscall witness.
+    pub after_remove: Option<Arc<dyn Fn(&Path) + Send + Sync>>,
+    pub lose_receipt: bool,
+}
+
+#[cfg(test)]
+pub(crate) fn test_real_no_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
+    rename_no_replace(src, dst)
+}
+
+pub(crate) fn spawn_job_tracked(
+    job: &Job,
+    tx: mpsc::Sender<JobEvent>,
+    receipt: TerminalReceipt,
+    #[cfg(test)] hooks: Option<WorkerTestHooks>,
+) {
+    spawn_job_internal(
+        job,
+        tx,
+        Arc::new(rename_no_replace),
+        Some(receipt),
+        #[cfg(test)]
+        hooks,
+    );
+}
+
 pub fn spawn_job(job: &Job, tx: mpsc::Sender<JobEvent>) {
+    spawn_job_with_provider(job, tx, Arc::new(rename_no_replace));
+}
+
+/// Additive host hook for platforms needing a native no-replace primitive.
+pub fn spawn_job_with_provider(
+    job: &Job,
+    tx: mpsc::Sender<JobEvent>,
+    provider: Arc<NoReplaceProvider>,
+) {
+    spawn_job_internal(
+        job,
+        tx,
+        provider,
+        None,
+        #[cfg(test)]
+        None,
+    );
+}
+
+fn spawn_job_internal(
+    job: &Job,
+    tx: mpsc::Sender<JobEvent>,
+    provider: Arc<NoReplaceProvider>,
+    receipt: Option<TerminalReceipt>,
+    #[cfg(test)] hooks: Option<WorkerTestHooks>,
+) {
+    #[cfg(test)]
+    let provider = hooks
+        .as_ref()
+        .and_then(|h| h.provider.clone())
+        .unwrap_or(provider);
     let id = job.id;
     let kind = job.kind;
     let control = job.control.clone();
@@ -176,7 +283,7 @@ pub fn spawn_job(job: &Job, tx: mpsc::Sender<JobEvent>) {
     let policy = job.overwrite;
 
     thread::spawn(move || {
-        let result = run_batch(
+        let result = run_batch_with_provider(
             id,
             kind,
             &paths,
@@ -184,13 +291,23 @@ pub fn spawn_job(job: &Job, tx: mpsc::Sender<JobEvent>) {
             policy,
             &control,
             &tx,
+            provider.as_ref(),
         );
         let event = match result {
             Ok(()) => JobEvent::Done { id },
             Err(JobError::Cancelled) => JobEvent::Cancelled { id },
-            Err(JobError::Io(msg)) => JobEvent::Failed { id, error: msg },
+            Err(JobError::Io(msg) | JobError::CommittedWithRecovery(msg)) => {
+                JobEvent::Failed { id, error: msg }
+            }
         };
         let _ = tx.send(event);
+        #[cfg(test)]
+        if hooks.as_ref().is_some_and(|h| h.lose_receipt) {
+            return;
+        }
+        if let Some(receipt) = receipt {
+            receipt.acknowledge();
+        }
     });
 }
 
@@ -236,6 +353,7 @@ fn resolve_destination(
 /// order with one shared byte counter. Per-item I/O failures are counted
 /// and skipped (the rest still transfers); the job ends Failed with a
 /// summary if any item failed.
+#[cfg(test)]
 fn run_batch(
     id: u64,
     kind: JobKind,
@@ -244,6 +362,45 @@ fn run_batch(
     policy: OverwritePolicy,
     control: &JobControl,
     tx: &mpsc::Sender<JobEvent>,
+) -> Result<(), JobError> {
+    run_batch_with_provider(
+        id,
+        kind,
+        paths,
+        dest_dir,
+        policy,
+        control,
+        tx,
+        &rename_no_replace,
+    )
+}
+fn preserve_batch_recovery(error: JobError, previous_failures: &[String]) -> JobError {
+    if previous_failures.is_empty() {
+        return error;
+    }
+    let previous = previous_failures.join("; ");
+    match error {
+        JobError::Cancelled => JobError::Io(format!(
+            "batch cancelled; prior failed items and recovery locations: {previous}"
+        )),
+        JobError::CommittedWithRecovery(message) => JobError::CommittedWithRecovery(format!(
+            "{message}; prior failed items and recovery locations: {previous}"
+        )),
+        JobError::Io(message) => JobError::Io(format!(
+            "{message}; prior failed items and recovery locations: {previous}"
+        )),
+    }
+}
+#[allow(clippy::too_many_arguments)]
+fn run_batch_with_provider(
+    id: u64,
+    kind: JobKind,
+    paths: &[String],
+    dest_dir: &Path,
+    policy: OverwritePolicy,
+    control: &JobControl,
+    tx: &mpsc::Sender<JobEvent>,
+    provider: &NoReplaceProvider,
 ) -> Result<(), JobError> {
     // Pre-scan totals (capped): any oversized/unreadable tree -> indeterminate.
     let mut total = 0u64;
@@ -261,8 +418,11 @@ fn run_batch(
 
     let mut bytes = 0u64;
     let mut failed = 0usize;
+    let mut failure_details = Vec::new();
     for p in paths {
-        control.gate()?;
+        if let Err(error) = control.gate() {
+            return Err(preserve_batch_recovery(error, &failure_details));
+        }
         let src = Path::new(p);
         let Some(dst) = resolve_destination(src, dest_dir, policy) else {
             failed += 1;
@@ -273,38 +433,35 @@ fn run_batch(
             });
             continue;
         };
-        // Overwrite policy: replace the existing destination file before
-        // copying (create_new would otherwise refuse). Folders merge.
-        if policy == OverwritePolicy::Overwrite
-            && fs::symlink_metadata(&dst).is_ok_and(|m| !m.is_dir())
-        {
-            fs::remove_file(&dst)?;
-        }
-        let result = match kind {
-            JobKind::Copy => copy_entry(src, &dst, control, id, tx, &mut bytes),
-            JobKind::Move => match fs::rename(src, &dst) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == ErrorKind::CrossesDevices => {
-                    copy_entry(src, &dst, control, id, tx, &mut bytes)?;
-                    remove_tree(src)
-                }
-                Err(e) => Err(JobError::Io(e.to_string())),
-            },
+        let mut context = TransferContext {
+            control,
+            id,
+            tx,
+            bytes: &mut bytes,
+            provider,
         };
+        let result = transfer_entry(src, &dst, kind, policy, &mut context);
         match result {
             Ok(()) => {}
             Err(JobError::Cancelled) => {
-                // Cancelled mid-item: remove the partial destination we
-                // created so neither a truncated copy nor a half-moved tree
-                // is left behind. The source is untouched.
-                let _ = remove_tree(&dst);
-                return Err(JobError::Cancelled);
+                // Staged copies clean only their private working directory.
+                return Err(preserve_batch_recovery(
+                    JobError::Cancelled,
+                    &failure_details,
+                ));
+            }
+            Err(JobError::CommittedWithRecovery(msg)) => {
+                return Err(preserve_batch_recovery(
+                    JobError::CommittedWithRecovery(format!(
+                        "{msg}; remaining batch items were not processed"
+                    )),
+                    &failure_details,
+                ));
             }
             Err(JobError::Io(msg)) => {
                 failed += 1;
-                // Item failed: remove our partial destination (never the
-                // source) so no truncated file is mistaken for a copy.
-                let _ = remove_tree(&dst);
+                failure_details.push(format!("{p}: {msg}"));
+                // A failed item never authorizes deleting the public path.
                 let _ = tx.send(JobEvent::Progress {
                     id,
                     copied_bytes: bytes,
@@ -321,13 +478,516 @@ fn run_batch(
     }
 
     if failed > 0 {
-        return Err(JobError::Io(format!(
-            "{} of {} items failed",
-            failed,
-            paths.len()
+        let mut summary = format!("{} of {} items failed", failed, paths.len());
+        if !failure_details.is_empty() {
+            summary.push_str("; ");
+            summary.push_str(&failure_details.join("; "));
+        }
+        return Err(JobError::Io(summary));
+    }
+    Ok(())
+}
+
+/// Atomically moves an entry without replacing a destination created by another actor.
+/// The safe Unix backend is the already pinned rustix publication primitive.
+fn rename_no_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
+    #[cfg(not(windows))]
+    {
+        ira_core::services::transfer::rename_no_replace(src, dst)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        fn wide(path: &Path) -> std::io::Result<Vec<u16>> {
+            let mut value: Vec<u16> = path.as_os_str().encode_wide().collect();
+            if value.contains(&0) {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "path contains embedded NUL",
+                ));
+            }
+            value.push(0);
+            Ok(value)
+        }
+        let from = wide(src)?;
+        let to = wide(dst)?;
+        // SAFETY: both buffers are live NUL-terminated UTF-16 strings. Flags 0
+        // forbids replacement and cross-volume copy; the OS moves entries.
+        let moved = unsafe { winapi::um::winbase::MoveFileExW(from.as_ptr(), to.as_ptr(), 0) };
+        if moved == 0 {
+            // SAFETY: capture this thread's error immediately after the failed call.
+            let error = unsafe { winapi::um::errhandlingapi::GetLastError() };
+            return Err(std::io::Error::from_raw_os_error(error as i32));
+        }
+        Ok(())
+    }
+}
+
+static NEXT_STAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+fn create_stage(parent: &Path) -> Result<std::path::PathBuf, JobError> {
+    loop {
+        let sequence = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
+        let stage = parent.join(format!(".ira-transfer-{}-{sequence}", std::process::id()));
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&stage) {
+            Ok(()) => return Ok(stage),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+struct TransferContext<'a> {
+    control: &'a JobControl,
+    id: u64,
+    tx: &'a mpsc::Sender<JobEvent>,
+    bytes: &'a mut u64,
+    provider: &'a NoReplaceProvider,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PayloadOwnership {
+    Generated,
+    CapturedSource,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StagePoint {
+    BeforeSourceCapture,
+    SourceCaptured,
+    PayloadReady,
+    BackupCaptured,
+    BeforePublication,
+    Published,
+}
+fn same_entry(expected: &fs::Metadata, actual: &fs::Metadata) -> bool {
+    if expected.file_type() != actual.file_type() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        expected.dev() == actual.dev() && expected.ino() == actual.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    } // Native Windows identity proof remains a documented gap.
+}
+fn entry_present(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+fn cleanup_generated_container(stage: &Path) -> std::io::Result<()> {
+    for entry in fs::read_dir(stage)? {
+        if entry?.file_name() != "recovery.txt" {
+            return Err(std::io::Error::new(
+                ErrorKind::DirectoryNotEmpty,
+                "captured or incomplete data remains",
+            ));
+        }
+    }
+    match fs::remove_file(stage.join("recovery.txt")) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    fs::remove_dir(stage) // Never recursive: captured entries make cleanup fail safely.
+}
+fn encoded_path(path: &Path) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let mut value = String::from("unix-bytes-hex:");
+        for byte in path.as_os_str().as_bytes() {
+            use std::fmt::Write;
+            write!(value, "{byte:02x}").expect("String write");
+        }
+        value
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let mut value = String::from("windows-utf16-hex:");
+        for unit in path.as_os_str().encode_wide() {
+            use std::fmt::Write;
+            write!(value, "{unit:04x}").expect("String write");
+        }
+        value
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        format!("unsupported-path-encoding:{path:?}")
+    }
+}
+fn write_recovery(
+    stage: &Path,
+    src: &Path,
+    dst: &Path,
+    source_stage: Option<&Path>,
+    destination_stage: &Path,
+    phase: &str,
+) -> std::io::Result<()> {
+    fs::write(stage.join("recovery.txt"),format!(
+        "IRA transfer recovery v1\nphase={phase:?}\nsource={src:?}\ndestination={dst:?}\nsource_raw={}\ndestination_raw={}\nsource_stage_raw={}\ndestination_stage_raw={}\nNo automatic disposal of retained captures.\n",
+        encoded_path(src),encoded_path(dst),source_stage.map(encoded_path).unwrap_or_else(||"none".into()),encoded_path(destination_stage)))
+}
+#[cfg(test)]
+fn copy_staged(
+    src: &Path,
+    dst: &Path,
+    replace: bool,
+    context: &mut TransferContext<'_>,
+    mut before_publish: impl FnMut(&Path),
+) -> Result<(), JobError> {
+    transfer_staged(
+        src,
+        dst,
+        JobKind::Copy,
+        replace,
+        context,
+        false,
+        |point, payload| {
+            if point == StagePoint::PayloadReady {
+                before_publish(payload);
+            }
+            Ok(())
+        },
+    )
+}
+fn transfer_staged(
+    src: &Path,
+    dst: &Path,
+    kind: JobKind,
+    replace: bool,
+    context: &mut TransferContext<'_>,
+    force_copy_move: bool,
+    mut hook: impl FnMut(StagePoint, &Path) -> Result<(), JobError>,
+) -> Result<(), JobError> {
+    context.control.gate()?;
+    let expected_source = fs::symlink_metadata(src)?;
+    let expected_destination = if replace {
+        Some(fs::symlink_metadata(dst)?)
+    } else {
+        None
+    };
+    let source_stage = if kind == JobKind::Move {
+        Some(create_stage(src.parent().ok_or_else(|| {
+            JobError::Io("source has no parent".into())
+        })?)?)
+    } else {
+        None
+    };
+    let stage = match create_stage(
+        dst.parent()
+            .ok_or_else(|| JobError::Io("destination has no parent".into()))?,
+    ) {
+        Ok(stage) => stage,
+        Err(error) => {
+            if let Some(s) = &source_stage {
+                let _ = fs::remove_dir(s);
+            }
+            return Err(error);
+        }
+    };
+    let payload = stage.join("payload");
+    let backup = stage.join("backup");
+    let captured = source_stage.as_ref().map(|s| s.join("captured"));
+    let mut source_location = captured.clone();
+    let mut ownership = PayloadOwnership::Generated;
+    let mut published = false;
+    let result = (|| {
+        write_recovery(
+            &stage,
+            src,
+            dst,
+            source_stage.as_deref(),
+            &stage,
+            "before capture",
+        )?;
+        if let Some(s) = &source_stage {
+            write_recovery(
+                s,
+                src,
+                dst,
+                source_stage.as_deref(),
+                &stage,
+                "before source capture",
+            )?;
+        }
+        hook(StagePoint::BeforeSourceCapture, &payload)?;
+        if let Some(captured) = &captured {
+            (context.provider)(src, captured)?;
+            if !same_entry(&expected_source, &fs::symlink_metadata(captured)?) {
+                return Err(JobError::Io("captured source identity/type changed".into()));
+            }
+            hook(StagePoint::SourceCaptured, captured)?;
+            context.control.gate()?;
+            let moved = if force_copy_move {
+                false
+            } else {
+                match (context.provider)(captured, &payload) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        if entry_present(&payload) && !entry_present(captured) {
+                            ownership = PayloadOwnership::CapturedSource;
+                            source_location = Some(payload.clone());
+                            return Err(e.into());
+                        }
+                        if e.kind() == ErrorKind::CrossesDevices {
+                            false
+                        } else {
+                            return Err(e.into());
+                        }
+                    }
+                }
+            };
+            if moved {
+                ownership = PayloadOwnership::CapturedSource;
+                source_location = Some(payload.clone());
+            } else {
+                #[cfg(not(unix))]
+                if fs::symlink_metadata(captured)?.file_type().is_symlink()
+                    || expected_source.is_dir()
+                {
+                    return Err(JobError::Io("Windows captured-tree/symlink fallback requires original-parent resolution; unsupported without native proof".into()));
+                }
+                let before_copy = fs::symlink_metadata(captured)?;
+                copy_entry(
+                    captured,
+                    &payload,
+                    context.control,
+                    context.id,
+                    context.tx,
+                    context.bytes,
+                )?;
+                let after_copy = fs::symlink_metadata(captured)?;
+                if !same_entry(&before_copy, &after_copy)
+                    || before_copy.len() != after_copy.len()
+                    || before_copy.modified().ok() != after_copy.modified().ok()
+                {
+                    return Err(JobError::Io(
+                        "captured source changed while copying; publication refused".into(),
+                    ));
+                }
+                // Metadata stability does not exclude open-handle/hard-link
+                // writes, so the copied source remains retained after commit.
+            }
+        } else {
+            copy_entry(
+                src,
+                &payload,
+                context.control,
+                context.id,
+                context.tx,
+                context.bytes,
+            )?;
+        }
+        hook(StagePoint::PayloadReady, &payload)?;
+        context.control.gate()?;
+        if let Some(expected) = &expected_destination {
+            (context.provider)(dst, &backup)?;
+            let actual = fs::symlink_metadata(&backup)?;
+            if !same_entry(expected, &actual) {
+                return Err(JobError::Io(
+                    "captured destination identity/type changed".into(),
+                ));
+            }
+            if actual.is_dir()
+                && (kind != JobKind::Move
+                    || !expected_source.is_dir()
+                    || fs::read_dir(&backup)?.next().transpose()?.is_some())
+            {
+                return Err(JobError::Io(
+                    "captured destination directory is not an eligible empty Move target".into(),
+                ));
+            }
+            hook(StagePoint::BackupCaptured, &payload)?;
+        }
+        hook(StagePoint::BeforePublication, &payload)?;
+        context.control.gate()?;
+        if let Err(error) = (context.provider)(&payload, dst) {
+            if !entry_present(&payload) {
+                published = true;
+            }
+            return Err(error.into());
+        }
+        published = true;
+        hook(StagePoint::Published, &payload)?;
+        context.control.gate()?;
+        Ok(())
+    })();
+    if !published {
+        let primary = result
+            .err()
+            .unwrap_or_else(|| JobError::Io("publication did not commit".into()));
+        let mut errors = Vec::new();
+        if entry_present(&backup) {
+            if let Err(e) = (context.provider)(&backup, dst) {
+                errors.push(format!("destination restore failed: {e}"));
+            }
+        }
+        if let Some(location) = &source_location {
+            if entry_present(location) {
+                if let Err(e) = (context.provider)(location, src) {
+                    errors.push(format!("source restore failed: {e}"));
+                }
+            }
+        }
+        // A provider may report failure after moving into a private path.
+        // Discover and restore/retain that capture rather than recursively deleting it.
+        if let Some(captured) = &captured {
+            if entry_present(captured) && source_location.as_ref() != Some(captured) {
+                if let Err(e) = (context.provider)(captured, src) {
+                    errors.push(format!("uncertain source restore failed: {e}"));
+                }
+            }
+        }
+        if ownership == PayloadOwnership::Generated && entry_present(&payload) {
+            if let Err(e) = remove_tree(&payload) {
+                errors.push(format!("generated payload cleanup failed: {e:?}"));
+            }
+        }
+        let mut retained = Vec::new();
+        if let Err(e) = cleanup_generated_container(&stage) {
+            errors.push(format!("destination stage retained: {e}"));
+            retained.push(stage.clone());
+        }
+        if let Some(s) = &source_stage {
+            if let Err(e) = cleanup_generated_container(s) {
+                errors.push(format!("source stage retained: {e}"));
+                retained.push(s.clone());
+            }
+        }
+        if !retained.is_empty() {
+            for s in &retained {
+                let _ = write_recovery(
+                    s,
+                    src,
+                    dst,
+                    source_stage.as_deref(),
+                    &stage,
+                    &format!(
+                        "failed before publication; restore incomplete; {primary:?}; {}",
+                        errors.join("; ")
+                    ),
+                );
+            }
+        }
+        return if errors.is_empty() {
+            Err(primary)
+        } else {
+            Err(JobError::Io(format!(
+                "{primary:?}; {}; recoverable transfer data retained at {}",
+                errors.join("; "),
+                retained
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )))
+        };
+    }
+    // Successful no-replace publication commits this item. Never touch the
+    // public destination again, including after cancellation or actor replacement.
+    let mut errors = Vec::new();
+    if let Err(e) = result {
+        errors.push(format!("after publication: {e:?}"));
+    }
+    if errors.is_empty() && entry_present(&backup) {
+        let cleanup = match fs::symlink_metadata(&backup) {
+            Ok(meta) if meta.is_dir() => fs::remove_dir(&backup), // Atomic empty-only disposal.
+            Ok(_) => fs::remove_file(&backup), // Policy-authorized captured file overwrite.
+            Err(e) => Err(e),
+        };
+        if let Err(e) = cleanup {
+            errors.push(format!("captured destination retained: {e}"));
+        }
+    }
+    let mut retained = Vec::new();
+    if let Err(e) = cleanup_generated_container(&stage) {
+        errors.push(format!("destination stage retained: {e}"));
+        retained.push(stage.clone());
+    }
+    if let Some(s) = &source_stage {
+        if let Err(e) = cleanup_generated_container(s) {
+            errors.push(format!("captured source retained: {e}"));
+            retained.push(s.clone());
+        }
+    }
+    if !errors.is_empty() || !retained.is_empty() {
+        for s in &retained {
+            let _ = write_recovery(
+                s,
+                src,
+                dst,
+                source_stage.as_deref(),
+                &stage,
+                &format!(
+                    "destination WAS published; recovery retained; {}",
+                    errors.join("; ")
+                ),
+            );
+        }
+        return Err(JobError::CommittedWithRecovery(format!(
+            "destination WAS published at {}; {}; retained recovery paths: {}",
+            dst.display(),
+            errors.join("; "),
+            retained
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         )));
     }
     Ok(())
+}
+#[cfg(unix)]
+fn move_directory_over_directory(
+    src: &Path,
+    dst: &Path,
+    context: &mut TransferContext<'_>,
+    before_capture: impl FnOnce(),
+) -> Result<(), JobError> {
+    let mut before_capture = Some(before_capture);
+    transfer_staged(src, dst, JobKind::Move, true, context, false, |point, _| {
+        if point == StagePoint::BeforeSourceCapture {
+            before_capture.take().unwrap()();
+        }
+        Ok(())
+    })
+}
+fn transfer_entry(
+    src: &Path,
+    dst: &Path,
+    kind: JobKind,
+    policy: OverwritePolicy,
+    context: &mut TransferContext<'_>,
+) -> Result<(), JobError> {
+    let destination = match fs::symlink_metadata(dst) {
+        Ok(meta) => Some(meta),
+        Err(e) if e.kind() == ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    if policy == OverwritePolicy::Overwrite
+        && destination.as_ref().is_some_and(fs::Metadata::is_dir)
+    {
+        #[cfg(unix)]
+        if kind == JobKind::Move && fs::symlink_metadata(src)?.is_dir() {
+            return move_directory_over_directory(src, dst, context, || {});
+        }
+        return Err(JobError::Io("destination directory already exists".into()));
+    }
+    transfer_staged(
+        src,
+        dst,
+        kind,
+        policy == OverwritePolicy::Overwrite && destination.is_some(),
+        context,
+        false,
+        |_, _| Ok(()),
+    )
 }
 
 /// Windows fallback for symlink sources: creating symlinks needs
@@ -528,7 +1188,41 @@ fn remove_tree(path: &Path) -> Result<(), JobError> {
 /// granularity is per path).
 pub fn spawn_delete_job(paths: Vec<String>, tx: mpsc::Sender<JobEvent>) -> Arc<JobControl> {
     let control = JobControl::new();
-    let c = control.clone();
+    spawn_delete_internal(
+        paths,
+        tx,
+        control.clone(),
+        None,
+        #[cfg(test)]
+        None,
+    );
+    control
+}
+
+pub(crate) fn spawn_delete_tracked(
+    paths: Vec<String>,
+    tx: mpsc::Sender<JobEvent>,
+    control: Arc<JobControl>,
+    receipt: TerminalReceipt,
+    #[cfg(test)] hooks: Option<WorkerTestHooks>,
+) {
+    spawn_delete_internal(
+        paths,
+        tx,
+        control,
+        Some(receipt),
+        #[cfg(test)]
+        hooks,
+    );
+}
+
+fn spawn_delete_internal(
+    paths: Vec<String>,
+    tx: mpsc::Sender<JobEvent>,
+    c: Arc<JobControl>,
+    receipt: Option<TerminalReceipt>,
+    #[cfg(test)] hooks: Option<WorkerTestHooks>,
+) {
     thread::spawn(move || {
         let total = paths.len();
         let mut failed: Vec<(String, String)> = Vec::new();
@@ -538,6 +1232,13 @@ pub fn spawn_delete_job(paths: Vec<String>, tx: mpsc::Sender<JobEvent>) -> Arc<J
                     cancelled: true,
                     failed,
                 });
+                #[cfg(test)]
+                if hooks.as_ref().is_some_and(|h| h.lose_receipt) {
+                    return;
+                }
+                if let Some(receipt) = receipt {
+                    receipt.acknowledge();
+                }
                 return;
             }
             let result = std::fs::symlink_metadata(path).ok().map(|meta| {
@@ -547,6 +1248,10 @@ pub fn spawn_delete_job(paths: Vec<String>, tx: mpsc::Sender<JobEvent>) -> Arc<J
                     std::fs::remove_file(path)
                 }
             });
+            #[cfg(test)]
+            if let Some(hook) = hooks.as_ref().and_then(|h| h.after_remove.as_ref()) {
+                hook(Path::new(path));
+            }
             if let Some(Err(e)) = result {
                 failed.push((path.clone(), e.to_string()));
             }
@@ -560,8 +1265,14 @@ pub fn spawn_delete_job(paths: Vec<String>, tx: mpsc::Sender<JobEvent>) -> Arc<J
             cancelled: false,
             failed,
         });
+        #[cfg(test)]
+        if hooks.as_ref().is_some_and(|h| h.lose_receipt) {
+            return;
+        }
+        if let Some(receipt) = receipt {
+            receipt.acknowledge();
+        }
     });
-    control
 }
 
 #[cfg(test)]
@@ -617,7 +1328,7 @@ mod batch_tests {
         let mut paths = Vec::new();
         for i in 0..30 {
             let p = base.join("src").join(format!("f{i}.txt"));
-            std::fs::write(&p, vec![b'x'; 100]);
+            std::fs::write(&p, vec![b'x'; 100]).unwrap();
             paths.push(p.to_string_lossy().into_owned());
         }
 
@@ -699,7 +1410,7 @@ mod batch_tests {
         let mut paths = Vec::new();
         for i in 0..5 {
             let p = base.join("src").join(format!("m{i}"));
-            std::fs::write(&p, "data");
+            std::fs::write(&p, "data").unwrap();
             paths.push(p.to_string_lossy().into_owned());
         }
 
@@ -909,18 +1620,28 @@ mod batch_tests {
         let control = job.control.clone();
         spawn_job(&job, tx);
 
-        // Pause as soon as the partial dst appears: the worker parks at its
+        // Pause as soon as the private staged payload appears: the worker parks at its
         // next 256KB gate with the partial file still on disk.
         let mut partial_seen = false;
         for _ in 0..1000 {
-            if std::fs::symlink_metadata(base.join("dst").join("big.bin")).is_ok() {
+            if std::fs::read_dir(base.join("dst"))
+                .unwrap()
+                .flatten()
+                .any(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".ira-transfer-")
+                        && entry.path().join("payload").exists()
+                })
+            {
                 control.set_paused(true);
                 partial_seen = true;
                 break;
             }
             std::thread::sleep(Duration::from_millis(2));
         }
-        assert!(partial_seen, "partial destination must exist mid-copy");
+        assert!(partial_seen, "private staged payload must exist mid-copy");
         std::thread::sleep(Duration::from_millis(50)); // let the worker park
         control.request_cancel();
 
@@ -930,6 +1651,8 @@ mod batch_tests {
             std::fs::symlink_metadata(base.join("dst").join("big.bin")).is_err(),
             "partial destination must be removed on cancel"
         );
+        assert_eq!(std::fs::metadata(&src).unwrap().len(), 64 * 1024 * 1024);
+        assert_eq!(std::fs::read_dir(base.join("dst")).unwrap().count(), 0);
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -953,3 +1676,15 @@ mod batch_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 }
+
+#[cfg(test)]
+#[path = "transfer_safety_tests.rs"]
+mod safety_tests;
+
+#[cfg(test)]
+#[path = "transfer_settlement_tests.rs"]
+mod settlement_tests;
+
+#[cfg(test)]
+#[path = "transfer_cancel_wake_tests.rs"]
+mod cancel_wake_tests;

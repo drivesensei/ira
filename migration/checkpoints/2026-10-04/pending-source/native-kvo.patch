@@ -1,0 +1,769 @@
+From 392a688b0d4c945c8aa1a64e41205f928382e7ef Mon Sep 17 00:00:00 2001
+From: Vladimir Lopez <vladimir.lopez@lifelinksystems.com>
+Date: Sat, 3 Oct 2026 15:14:15 -0600
+Subject: [PATCH 1/4] diagnose(native): identify quit gate structural rejection
+ stage
+
+---
+ desktop/src/platform/application_quit.rs      | 71 +++++++++++++++++--
+ .../application_quit_diagnostic_tests.rs      | 28 ++++++++
+ 2 files changed, 93 insertions(+), 6 deletions(-)
+ create mode 100644 desktop/src/platform/application_quit_diagnostic_tests.rs
+
+diff --git a/desktop/src/platform/application_quit.rs b/desktop/src/platform/application_quit.rs
+index 89ddc57..6f9ea9f 100644
+--- a/desktop/src/platform/application_quit.rs
++++ b/desktop/src/platform/application_quit.rs
+@@ -8,6 +8,24 @@
+ #[cfg(any(target_os = "macos", test))]
+ use std::cell::Cell;
+ 
++// Runtime metadata only; fixed byte/output bounds and ASCII escaping keep each
++// rejection diagnostic one line. Never pass an object/pointer/address to this.
++#[cfg(any(target_os = "macos", test))]
++const STRUCTURE_BYTES: usize = 64;
++#[cfg(any(target_os = "macos", test))]
++fn bounded_structure(value: &[u8]) -> String {
++    let mut output: String = value
++        .iter()
++        .take(STRUCTURE_BYTES)
++        .flat_map(|byte| std::ascii::escape_default(*byte))
++        .map(char::from)
++        .collect();
++    if value.len() > STRUCTURE_BYTES {
++        output.push_str("...");
++    }
++    output
++}
++
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub struct QuitRequest {
+     gate: u64,
+@@ -202,11 +220,20 @@ mod mac {
+             .ok_or(QuitError::ClassRegistration)
+     }
+     pub(super) fn platform(object: &AnyObject) -> Result<*mut c_void, QuitError> {
+-        let ivar = object
+-            .class()
+-            .instance_variable(c"platform")
+-            .ok_or(QuitError::UnsupportedDelegate)?;
++        let Some(ivar) = object.class().instance_variable(c"platform") else {
++            eprintln!(
++                "Native deferred quit structure: stage=platform_ivar class={} ivar_present=false",
++                bounded_structure(object.class().name().to_bytes()),
++            );
++            return Err(QuitError::UnsupportedDelegate);
++        };
+         if ivar.type_encoding().to_bytes() != <*mut c_void>::ENCODING.to_string().as_bytes() {
++            eprintln!(
++                "Native deferred quit structure: stage=platform_encoding class={} ivar_present=true actual={} expected={}",
++                bounded_structure(object.class().name().to_bytes()),
++                bounded_structure(ivar.type_encoding().to_bytes()),
++                bounded_structure(<*mut c_void>::ENCODING.to_string().as_bytes()),
++            );
+             return Err(QuitError::UnsupportedDelegate);
+         }
+         // SAFETY: exact pinned class and encoding are checked by install;
+@@ -306,17 +333,45 @@ mod mac {
+             let mtm = MainThreadMarker::new().ok_or(QuitError::WrongThread)?;
+             let app = NSApplication::sharedApplication(mtm);
+             if app.class().name() != c"GPUIApplication" {
++                eprintln!(
++                    "Native deferred quit structure: stage=application_class actual={} expected=GPUIApplication",
++                    bounded_structure(app.class().name().to_bytes()),
++                );
+                 return Err(QuitError::UnsupportedDelegate);
+             }
+-            let original = app.delegate().ok_or(QuitError::MissingDelegate)?;
++            let Some(original) = app.delegate() else {
++                eprintln!(
++                    "Native deferred quit structure: stage=delegate_present app_class=GPUIApplication delegate_present=false"
++                );
++                return Err(QuitError::MissingDelegate);
++            };
+             if original.respondsToSelector(sel!(applicationShouldTerminate:)) {
++                eprintln!(
++                    "Native deferred quit structure: stage=termination_hook delegate_class={} existing_hook=true",
++                    bounded_structure(original_object(&original).class().name().to_bytes()),
++                );
+                 return Err(QuitError::ExistingTerminationHook);
+             }
+             if original_object(&original).class().name() != c"GPUIApplicationDelegate" {
++                eprintln!(
++                    "Native deferred quit structure: stage=delegate_class actual={} expected=GPUIApplicationDelegate",
++                    bounded_structure(original_object(&original).class().name().to_bytes()),
++                );
+                 return Err(QuitError::UnsupportedDelegate);
+             }
+             let original_platform = platform(original_object(&original))?;
+-            if original_platform.is_null() || platform(app.as_ref())? != original_platform {
++            if original_platform.is_null() {
++                eprintln!(
++                    "Native deferred quit structure: stage=platform_pointer delegate_class=GPUIApplicationDelegate delegate_platform_null=true app_platform_checked=false"
++                );
++                return Err(QuitError::UnsupportedDelegate);
++            }
++            let app_platform = platform(app.as_ref())?;
++            if app_platform != original_platform {
++                eprintln!(
++                    "Native deferred quit structure: stage=platform_pointer app_class=GPUIApplication delegate_class=GPUIApplicationDelegate delegate_platform_null=false app_platform_null={} platform_equal=false",
++                    app_platform.is_null(),
++                );
+                 return Err(QuitError::UnsupportedDelegate);
+             }
+             static NEXT_GATE: AtomicU64 = AtomicU64::new(1);
+@@ -441,3 +496,7 @@ impl ApplicationQuitGate {
+ #[cfg(test)]
+ #[path = "application_quit_tests.rs"]
+ pub(crate) mod tests;
++
++#[cfg(test)]
++#[path = "application_quit_diagnostic_tests.rs"]
++mod diagnostic_tests;
+diff --git a/desktop/src/platform/application_quit_diagnostic_tests.rs b/desktop/src/platform/application_quit_diagnostic_tests.rs
+new file mode 100644
+index 0000000..eac11cb
+--- /dev/null
++++ b/desktop/src/platform/application_quit_diagnostic_tests.rs
+@@ -0,0 +1,28 @@
++use super::*;
++
++#[test]
++fn structural_metadata_escapes_control_characters_without_multiline_output() {
++    assert_eq!(
++        bounded_structure(b"GPUI\nDelegate\r\t\0"),
++        "GPUI\\nDelegate\\r\\t\\x00"
++    );
++    assert!(!bounded_structure(b"\n\r").contains('\n'));
++}
++#[test]
++fn structural_metadata_has_fixed_output_bound_even_for_invalid_utf8() {
++    let bytes = vec![0xff; 1024];
++    let output = bounded_structure(&bytes);
++    assert!(output.len() <= STRUCTURE_BYTES * 4 + 3);
++    assert!(output.ends_with("..."));
++    assert_eq!(bounded_structure(&[0xff]), "\\xff");
++}
++#[test]
++fn pinned_class_names_and_void_pointer_encoding_remain_exact_in_diagnostics() {
++    assert_eq!(bounded_structure(b"GPUIApplication"), "GPUIApplication");
++    assert_eq!(
++        bounded_structure(b"GPUIApplicationDelegate"),
++        "GPUIApplicationDelegate"
++    );
++    assert_eq!(bounded_structure(b"^v"), "^v");
++    assert_eq!(bounded_structure(&[]), "");
++}
+-- 
+2.54.0 (Apple Git-157)
+
+
+From ef687945c8f49bcd4ad54280422eaa68a16f6854 Mon Sep 17 00:00:00 2001
+From: Vladimir Lopez <vladimir.lopez@lifelinksystems.com>
+Date: Sat, 3 Oct 2026 15:17:56 -0600
+Subject: [PATCH 2/4] fix(native): ignore structural diagnostic write failures
+
+---
+ desktop/src/platform/application_quit.rs      | 43 ++++++++++++-------
+ .../application_quit_diagnostic_tests.rs      | 25 +++++++++++
+ 2 files changed, 52 insertions(+), 16 deletions(-)
+
+diff --git a/desktop/src/platform/application_quit.rs b/desktop/src/platform/application_quit.rs
+index 6f9ea9f..dfc48fb 100644
+--- a/desktop/src/platform/application_quit.rs
++++ b/desktop/src/platform/application_quit.rs
+@@ -26,6 +26,17 @@ fn bounded_structure(value: &[u8]) -> String {
+     output
+ }
+ 
++#[cfg(any(target_os = "macos", test))]
++fn write_structure(output: &mut impl std::io::Write, arguments: std::fmt::Arguments<'_>) {
++    // Diagnostics cannot replace a safety rejection or unwind from gate Drop.
++    // A closed/broken stderr is deliberately ignored; guard results remain authoritative.
++    let _ = writeln!(output, "{arguments}");
++}
++#[cfg(target_os = "macos")]
++fn emit_structure(arguments: std::fmt::Arguments<'_>) {
++    write_structure(&mut std::io::stderr().lock(), arguments);
++}
++
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub struct QuitRequest {
+     gate: u64,
+@@ -221,19 +232,19 @@ mod mac {
+     }
+     pub(super) fn platform(object: &AnyObject) -> Result<*mut c_void, QuitError> {
+         let Some(ivar) = object.class().instance_variable(c"platform") else {
+-            eprintln!(
++            emit_structure(format_args!(
+                 "Native deferred quit structure: stage=platform_ivar class={} ivar_present=false",
+                 bounded_structure(object.class().name().to_bytes()),
+-            );
++            ));
+             return Err(QuitError::UnsupportedDelegate);
+         };
+         if ivar.type_encoding().to_bytes() != <*mut c_void>::ENCODING.to_string().as_bytes() {
+-            eprintln!(
++            emit_structure(format_args!(
+                 "Native deferred quit structure: stage=platform_encoding class={} ivar_present=true actual={} expected={}",
+                 bounded_structure(object.class().name().to_bytes()),
+                 bounded_structure(ivar.type_encoding().to_bytes()),
+                 bounded_structure(<*mut c_void>::ENCODING.to_string().as_bytes()),
+-            );
++            ));
+             return Err(QuitError::UnsupportedDelegate);
+         }
+         // SAFETY: exact pinned class and encoding are checked by install;
+@@ -333,45 +344,45 @@ mod mac {
+             let mtm = MainThreadMarker::new().ok_or(QuitError::WrongThread)?;
+             let app = NSApplication::sharedApplication(mtm);
+             if app.class().name() != c"GPUIApplication" {
+-                eprintln!(
++                emit_structure(format_args!(
+                     "Native deferred quit structure: stage=application_class actual={} expected=GPUIApplication",
+                     bounded_structure(app.class().name().to_bytes()),
+-                );
++                ));
+                 return Err(QuitError::UnsupportedDelegate);
+             }
+             let Some(original) = app.delegate() else {
+-                eprintln!(
++                emit_structure(format_args!(
+                     "Native deferred quit structure: stage=delegate_present app_class=GPUIApplication delegate_present=false"
+-                );
++                ));
+                 return Err(QuitError::MissingDelegate);
+             };
+             if original.respondsToSelector(sel!(applicationShouldTerminate:)) {
+-                eprintln!(
++                emit_structure(format_args!(
+                     "Native deferred quit structure: stage=termination_hook delegate_class={} existing_hook=true",
+                     bounded_structure(original_object(&original).class().name().to_bytes()),
+-                );
++                ));
+                 return Err(QuitError::ExistingTerminationHook);
+             }
+             if original_object(&original).class().name() != c"GPUIApplicationDelegate" {
+-                eprintln!(
++                emit_structure(format_args!(
+                     "Native deferred quit structure: stage=delegate_class actual={} expected=GPUIApplicationDelegate",
+                     bounded_structure(original_object(&original).class().name().to_bytes()),
+-                );
++                ));
+                 return Err(QuitError::UnsupportedDelegate);
+             }
+             let original_platform = platform(original_object(&original))?;
+             if original_platform.is_null() {
+-                eprintln!(
++                emit_structure(format_args!(
+                     "Native deferred quit structure: stage=platform_pointer delegate_class=GPUIApplicationDelegate delegate_platform_null=true app_platform_checked=false"
+-                );
++                ));
+                 return Err(QuitError::UnsupportedDelegate);
+             }
+             let app_platform = platform(app.as_ref())?;
+             if app_platform != original_platform {
+-                eprintln!(
++                emit_structure(format_args!(
+                     "Native deferred quit structure: stage=platform_pointer app_class=GPUIApplication delegate_class=GPUIApplicationDelegate delegate_platform_null=false app_platform_null={} platform_equal=false",
+                     app_platform.is_null(),
+-                );
++                ));
+                 return Err(QuitError::UnsupportedDelegate);
+             }
+             static NEXT_GATE: AtomicU64 = AtomicU64::new(1);
+diff --git a/desktop/src/platform/application_quit_diagnostic_tests.rs b/desktop/src/platform/application_quit_diagnostic_tests.rs
+index eac11cb..b071a88 100644
+--- a/desktop/src/platform/application_quit_diagnostic_tests.rs
++++ b/desktop/src/platform/application_quit_diagnostic_tests.rs
+@@ -26,3 +26,28 @@ fn pinned_class_names_and_void_pointer_encoding_remain_exact_in_diagnostics() {
+     assert_eq!(bounded_structure(b"^v"), "^v");
+     assert_eq!(bounded_structure(&[]), "");
+ }
++
++#[test]
++fn diagnostic_write_failure_is_ignored_without_panicking() {
++    struct FailedWriter {
++        calls: usize,
++    }
++    impl std::io::Write for FailedWriter {
++        fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
++            self.calls += 1;
++            Err(std::io::Error::new(
++                std::io::ErrorKind::BrokenPipe,
++                "owned diagnostic fixture",
++            ))
++        }
++        fn flush(&mut self) -> std::io::Result<()> {
++            Ok(())
++        }
++    }
++    let mut writer = FailedWriter { calls: 0 };
++    write_structure(
++        &mut writer,
++        format_args!("Native deferred quit structure: stage=platform_ivar"),
++    );
++    assert_eq!(writer.calls, 1);
++}
+-- 
+2.54.0 (Apple Git-157)
+
+
+From dd8f7b380a7ca5756358851cfb0dd33339f7e4f0 Mon Sep 17 00:00:00 2001
+From: Vladimir Lopez <vladimir.lopez@lifelinksystems.com>
+Date: Sat, 3 Oct 2026 15:15:23 -0600
+Subject: [PATCH 3/4] fix(desktop): give shutdown recovery status explicit
+ readable styling
+
+---
+ desktop/src/main.rs | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/desktop/src/main.rs b/desktop/src/main.rs
+index f0e93c5..f89adf1 100644
+--- a/desktop/src/main.rs
++++ b/desktop/src/main.rs
+@@ -36,8 +36,14 @@ struct ShutdownStatus {
+ }
+ impl Render for ShutdownStatus {
+     fn render(&mut self, _: &mut gpui::Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
++        use ira_desktop::views::native_color;
++        // Built-in recovery colors require no theme/config filesystem initialization.
++        let theme = ira_core::theme::ThemePreset::default().theme();
+         div()
+             .size_full()
++            .bg(native_color(theme.bg))
++            .text_color(native_color(theme.text))
++            .text_size(px(14.))
+             .p_4()
+             .flex()
+             .flex_col()
+@@ -46,6 +52,14 @@ impl Render for ShutdownStatus {
+             .child(
+                 div()
+                     .id("retry-shutdown")
++                    .flex_none()
++                    .p_2()
++                    .rounded_md()
++                    .border_1()
++                    .border_color(native_color(theme.accent))
++                    .bg(native_color(theme.surface))
++                    .text_color(native_color(theme.text))
++                    .cursor_pointer()
+                     .child("Retry shutdown saves")
+                     .on_click(|_, window, cx| {
+                         window.dispatch_action(Box::new(actions::RetryShutdown), cx)
+-- 
+2.54.0 (Apple Git-157)
+
+
+From dbaf487c227d965b6127d0194bf959d8834a261f Mon Sep 17 00:00:00 2001
+From: Vladimir Lopez <vladimir.lopez@lifelinksystems.com>
+Date: Sat, 3 Oct 2026 15:57:14 -0600
+Subject: [PATCH 4/4] fix(desktop): validate exact GPUI KVO application
+ platform layout
+
+---
+ desktop/src/platform/application_quit.rs      | 142 ++++++++++++--
+ .../platform/application_quit_class_tests.rs  | 181 ++++++++++++++++++
+ 2 files changed, 311 insertions(+), 12 deletions(-)
+ create mode 100644 desktop/src/platform/application_quit_class_tests.rs
+
+diff --git a/desktop/src/platform/application_quit.rs b/desktop/src/platform/application_quit.rs
+index dfc48fb..0883985 100644
+--- a/desktop/src/platform/application_quit.rs
++++ b/desktop/src/platform/application_quit.rs
+@@ -156,7 +156,7 @@ mod mac {
+     use objc2::{
+         ClassType, DefinedClass, Encode, MainThreadOnly, define_class, msg_send,
+         rc::{Allocated, Retained},
+-        runtime::{AnyClass, AnyObject, AnyProtocol, ClassBuilder, ProtocolObject, Sel},
++        runtime::{AnyClass, AnyObject, AnyProtocol, ClassBuilder, Ivar, ProtocolObject, Sel},
+         sel,
+     };
+     use objc2_app_kit::{NSApplication, NSApplicationDelegate};
+@@ -230,6 +230,109 @@ mod mac {
+             .copied()
+             .ok_or(QuitError::ClassRegistration)
+     }
++    const APPLICATION_CLASS: &std::ffi::CStr = c"GPUIApplication";
++    const APPLICATION_COMPANION: &std::ffi::CStr = c"NSKVONotifying_GPUIApplication";
++
++    fn platform_layout(offset: isize, base_size: usize, actual_size: usize) -> bool {
++        usize::try_from(offset)
++            .ok()
++            .is_some_and(|offset| pointer_slot_fits(offset, base_size, actual_size))
++    }
++    fn pointer_slot_fits(offset: usize, base_size: usize, actual_size: usize) -> bool {
++        offset % std::mem::align_of::<*mut c_void>() == 0
++            && offset
++                .checked_add(std::mem::size_of::<*mut c_void>())
++                .is_some_and(|end| end <= base_size)
++            && actual_size >= base_size
++    }
++
++    // Metadata only: no object reads, messages, allocation or class mutation.
++    // The parameterized seam is private; production always supplies fixed names
++    // and the runtime's registered GPUI base identity.
++    fn application_slot<'a>(
++        actual: &AnyClass,
++        base: &'a AnyClass,
++        companion: &std::ffi::CStr,
++    ) -> Result<&'a Ivar, QuitError> {
++        let registered_base = std::ptr::eq(actual, base);
++        let permitted_name = actual.name() == companion;
++        let parent = actual.superclass();
++        let direct_base = parent.is_some_and(|parent| std::ptr::eq(parent, base));
++        let base_slot = base.instance_variable(c"platform");
++        let actual_slot = actual.instance_variable(c"platform");
++        let declared = base_slot.is_some_and(|slot| {
++            !base
++                .superclass()
++                .and_then(|parent| parent.instance_variable(c"platform"))
++                .is_some_and(|inherited| std::ptr::eq(slot, inherited))
++        });
++        let inherited_slot = base_slot
++            .zip(actual_slot)
++            .is_some_and(|(base, actual)| std::ptr::eq(base, actual));
++        let encoding_match = base_slot.is_some_and(|slot| {
++            slot.type_encoding().to_bytes() == <*mut c_void>::ENCODING.to_string().as_bytes()
++        });
++        let offset_match = base_slot
++            .zip(actual_slot)
++            .is_some_and(|(base, actual)| base.offset() == actual.offset());
++        let layout_ok = base_slot.is_some_and(|slot| {
++            platform_layout(slot.offset(), base.instance_size(), actual.instance_size())
++        });
++        let accepted = !actual.is_metaclass()
++            && !base.is_metaclass()
++            && (registered_base || (permitted_name && direct_base))
++            && declared
++            && inherited_slot
++            && encoding_match
++            && offset_match
++            && layout_ok;
++        emit_structure(format_args!(
++            "Native deferred quit structure: stage=application_layout actual={} direct_super={} registered_base={} permitted_name={} direct_base={} base_declared={} inherited_slot={} encoding_match={} offset_match={} layout_ok={} accepted={}",
++            bounded_structure(actual.name().to_bytes()),
++            parent
++                .map(|parent| bounded_structure(parent.name().to_bytes()))
++                .unwrap_or_else(|| "none".into()),
++            registered_base,
++            permitted_name,
++            direct_base,
++            declared,
++            inherited_slot,
++            encoding_match,
++            offset_match,
++            layout_ok,
++            accepted,
++        ));
++        if !accepted {
++            return Err(QuitError::UnsupportedDelegate);
++        }
++        base_slot.ok_or(QuitError::UnsupportedDelegate)
++    }
++
++    fn validated_application_slot(actual: &AnyClass) -> Result<&'static Ivar, QuitError> {
++        let Some(base) = AnyClass::get(APPLICATION_CLASS) else {
++            emit_structure(format_args!(
++                "Native deferred quit structure: stage=application_layout actual={} registered_base_present=false accepted=false",
++                bounded_structure(actual.name().to_bytes()),
++            ));
++            return Err(QuitError::UnsupportedDelegate);
++        };
++        application_slot(actual, base, APPLICATION_COMPANION)
++    }
++
++    fn application_platform(object: &AnyObject) -> Result<*mut c_void, QuitError> {
++        // AnyObject::class reads actual runtime isa, not Objective-C -class.
++        let slot = validated_application_slot(object.class())?;
++        // SAFETY: declaring-base metadata, exact encoding, non-shadowed ivar
++        // identity and complete pointer bounds/alignment were just validated.
++        // No native callback occurs between validation and this main-thread read.
++        Ok(unsafe { *slot.load_ptr::<*mut c_void>(object) })
++    }
++
++    #[cfg(test)]
++    mod class_tests {
++        include!("application_quit_class_tests.rs");
++    }
++
+     pub(super) fn platform(object: &AnyObject) -> Result<*mut c_void, QuitError> {
+         let Some(ivar) = object.class().instance_variable(c"platform") else {
+             emit_structure(format_args!(
+@@ -281,13 +384,21 @@ mod mac {
+         Ok(proxy)
+     }
+     // Only restore layouts whose pointers still match our source-pinned lease.
++    #[cfg(test)]
+     pub(super) fn synchronize_platform_alias(
+         app: &AnyObject,
+         proxy: &AnyObject,
+         original: &AnyObject,
+         expected: *mut c_void,
+     ) -> Result<(), QuitError> {
+-        let app_pointer = platform(app)?;
++        synchronize_platform_pointers(platform(app)?, proxy, original, expected)
++    }
++    fn synchronize_platform_pointers(
++        app_pointer: *mut c_void,
++        proxy: &AnyObject,
++        original: &AnyObject,
++        expected: *mut c_void,
++    ) -> Result<(), QuitError> {
+         let proxy_pointer = platform(proxy)?;
+         let original_pointer = platform(original)?;
+         if app_pointer == expected && proxy_pointer == expected && original_pointer == expected {
+@@ -319,6 +430,13 @@ mod mac {
+                 Self::Fixture(object) => object,
+             }
+         }
++        fn platform(&self) -> Result<*mut c_void, QuitError> {
++            match self {
++                Self::Application(app) => application_platform(app.as_ref()),
++                #[cfg(test)]
++                Self::Fixture(object) => platform(object),
++            }
++        }
+         fn delegate(&self) -> Option<Retained<ProtocolObject<dyn NSApplicationDelegate>>> {
+             // SAFETY: NSApplication and the initialized test fixture implement
+             // this exact object-returning selector and weak-delegate contract.
+@@ -343,13 +461,8 @@ mod mac {
+         pub fn install() -> Result<Self, QuitError> {
+             let mtm = MainThreadMarker::new().ok_or(QuitError::WrongThread)?;
+             let app = NSApplication::sharedApplication(mtm);
+-            if app.class().name() != c"GPUIApplication" {
+-                emit_structure(format_args!(
+-                    "Native deferred quit structure: stage=application_class actual={} expected=GPUIApplication",
+-                    bounded_structure(app.class().name().to_bytes()),
+-                ));
+-                return Err(QuitError::UnsupportedDelegate);
+-            }
++            let application_object: &AnyObject = app.as_ref();
++            validated_application_slot(application_object.class())?;
+             let Some(original) = app.delegate() else {
+                 emit_structure(format_args!(
+                     "Native deferred quit structure: stage=delegate_present app_class=GPUIApplication delegate_present=false"
+@@ -377,7 +490,7 @@ mod mac {
+                 ));
+                 return Err(QuitError::UnsupportedDelegate);
+             }
+-            let app_platform = platform(app.as_ref())?;
++            let app_platform = application_platform(app.as_ref())?;
+             if app_platform != original_platform {
+                 emit_structure(format_args!(
+                     "Native deferred quit structure: stage=platform_pointer app_class=GPUIApplication delegate_class=GPUIApplicationDelegate delegate_platform_null=false app_platform_null={} platform_equal=false",
+@@ -411,6 +524,11 @@ mod mac {
+                 return Err(QuitError::DelegateChanged);
+             }
+             app.set_delegate(ProtocolObject::from_ref(&*proxy));
++            if matches!(&app, NativeHost::Application(_)) {
++                emit_structure(format_args!(
++                    "Native deferred quit structure: stage=proxy_attach retained_proxy=true delegate_replacement_sent=true"
++                ));
++            }
+             Ok(Self {
+                 app,
+                 proxy,
+@@ -458,8 +576,8 @@ mod mac {
+             Ok(())
+         }
+         fn synchronize_returned_loop(&self) -> Result<(), QuitError> {
+-            synchronize_platform_alias(
+-                self.app.object(),
++            synchronize_platform_pointers(
++                self.app.platform()?,
+                 self.proxy.as_ref(),
+                 original_object(&self.proxy.ivars().original),
+                 self.original_platform,
+diff --git a/desktop/src/platform/application_quit_class_tests.rs b/desktop/src/platform/application_quit_class_tests.rs
+new file mode 100644
+index 0000000..2897d64
+--- /dev/null
++++ b/desktop/src/platform/application_quit_class_tests.rs
+@@ -0,0 +1,181 @@
++use super::*;
++use std::ffi::CStr;
++
++// Registered metadata lives for the process lifetime. No instances are allocated
++// or initialized, and no selectors/global NSApplication are invoked by fixtures.
++struct Classes {
++    base: &'static AnyClass,
++    companion: &'static AnyClass,
++    wrong_parent: &'static AnyClass,
++    unexpected: &'static AnyClass,
++    grandchild: &'static AnyClass,
++    missing: &'static AnyClass,
++    inherited: &'static AnyClass,
++    wrong_encoding: &'static AnyClass,
++    shadow: &'static AnyClass,
++    extra: &'static AnyClass,
++}
++fn register(name: &CStr, parent: &AnyClass, platform_kind: u8, extra: bool) -> &'static AnyClass {
++    let mut builder = ClassBuilder::new(name, parent).expect("unique T101 fixture name");
++    match platform_kind {
++        0 => {}
++        1 => builder.add_ivar::<*mut c_void>(c"platform"),
++        2 => builder.add_ivar::<u64>(c"platform"),
++        _ => unreachable!(),
++    }
++    if extra {
++        builder.add_ivar::<u64>(c"t101_extra");
++    }
++    builder.register()
++}
++fn classes() -> &'static Classes {
++    static CLASSES: OnceLock<Classes> = OnceLock::new();
++    CLASSES.get_or_init(|| {
++        let root = NSObject::class();
++        let base = register(c"IRAT101MetadataBase", root, 1, false);
++        let companion = register(c"IRAT101MetadataCompanion", base, 0, false);
++        Classes {
++            base,
++            companion,
++            wrong_parent: register(c"IRAT101MetadataWrongParent", companion, 0, false),
++            unexpected: register(c"IRAT101MetadataUnexpected", base, 0, false),
++            grandchild: register(c"IRAT101MetadataGrandchild", companion, 0, false),
++            missing: register(c"IRAT101MetadataMissing", root, 0, false),
++            inherited: register(c"IRAT101MetadataInheritedBase", base, 0, false),
++            wrong_encoding: register(c"IRAT101MetadataWrongEncoding", root, 2, false),
++            shadow: register(c"IRAT101MetadataShadow", base, 1, false),
++            extra: register(c"IRAT101MetadataExtra", base, 0, true),
++        }
++    })
++}
++fn accepted(actual: &AnyClass, base: &AnyClass, companion: &CStr) -> bool {
++    application_slot(actual, base, companion).is_ok()
++}
++#[test]
++fn exact_base_returns_declaring_slot() {
++    let c = classes();
++    let slot = application_slot(c.base, c.base, c"IRAT101MetadataCompanion").unwrap();
++    assert!(std::ptr::eq(
++        slot,
++        c.base.instance_variable(c"platform").unwrap()
++    ));
++}
++#[test]
++fn exact_direct_companion_returns_inherited_slot() {
++    let c = classes();
++    let slot = application_slot(c.companion, c.base, c"IRAT101MetadataCompanion").unwrap();
++    assert!(std::ptr::eq(
++        slot,
++        c.base.instance_variable(c"platform").unwrap()
++    ));
++}
++#[test]
++fn exact_name_with_wrong_direct_parent_is_rejected() {
++    let c = classes();
++    // Has a usable platform slot, isolating the direct-parent guard.
++    assert!(!accepted(
++        c.wrong_parent,
++        c.base,
++        c"IRAT101MetadataWrongParent"
++    ));
++}
++#[test]
++fn unexpected_name_direct_child_is_rejected() {
++    let c = classes();
++    assert!(!accepted(c.unexpected, c.base, c"IRAT101MetadataCompanion"));
++}
++#[test]
++fn allowed_name_grandchild_is_rejected() {
++    let c = classes();
++    assert!(!accepted(
++        c.grandchild,
++        c.base,
++        c"IRAT101MetadataGrandchild"
++    ));
++}
++#[test]
++fn unrelated_root_is_rejected() {
++    let c = classes();
++    assert!(!accepted(
++        NSObject::class(),
++        c.base,
++        c"IRAT101MetadataCompanion"
++    ));
++}
++#[test]
++fn missing_base_slot_is_rejected() {
++    let c = classes();
++    assert!(!accepted(c.missing, c.missing, c"IRAT101MetadataUnused"));
++}
++#[test]
++fn inherited_base_slot_is_rejected() {
++    let c = classes();
++    assert!(!accepted(
++        c.inherited,
++        c.inherited,
++        c"IRAT101MetadataUnused"
++    ));
++}
++#[test]
++fn wrong_base_encoding_is_rejected() {
++    let c = classes();
++    assert!(!accepted(
++        c.wrong_encoding,
++        c.wrong_encoding,
++        c"IRAT101MetadataUnused"
++    ));
++}
++#[test]
++fn same_encoding_shadow_is_rejected() {
++    let c = classes();
++    assert_eq!(
++        c.shadow
++            .instance_variable(c"platform")
++            .unwrap()
++            .type_encoding(),
++        c.base
++            .instance_variable(c"platform")
++            .unwrap()
++            .type_encoding()
++    );
++    assert!(!std::ptr::eq(
++        c.shadow.instance_variable(c"platform").unwrap(),
++        c.base.instance_variable(c"platform").unwrap()
++    ));
++    assert!(!accepted(c.shadow, c.base, c"IRAT101MetadataShadow"));
++}
++#[test]
++fn extra_nonshadowing_field_is_accepted() {
++    let c = classes();
++    assert!(c.extra.instance_size() > c.base.instance_size());
++    assert!(accepted(c.extra, c.base, c"IRAT101MetadataExtra"));
++}
++#[test]
++fn metaclass_is_rejected() {
++    let c = classes();
++    assert!(!accepted(
++        c.base.metaclass(),
++        c.base,
++        c"IRAT101MetadataUnused"
++    ));
++}
++#[test]
++fn malformed_layout_is_rejected_without_ffi_metadata() {
++    let size = std::mem::size_of::<*mut c_void>();
++    assert!(platform_layout(0, size, size));
++    assert!(platform_layout(size as isize, size * 2, size * 3));
++    assert!(!platform_layout(-1, size, size));
++    assert!(!platform_layout(1, size * 2, size * 2));
++    assert!(!platform_layout(0, size - 1, size));
++    assert!(!platform_layout(0, size, size - 1));
++    assert!(!platform_layout(isize::MAX, usize::MAX, usize::MAX));
++    // Checked arithmetic itself rejects overflow; the signed metadata offset
++    // cannot represent a usize overflow on these pointer-width platforms.
++    let aligned_overflow = usize::MAX - (std::mem::align_of::<*mut c_void>() - 1);
++    assert!(!pointer_slot_fits(aligned_overflow, usize::MAX, usize::MAX));
++}
++#[test]
++fn production_names_are_exact_literals() {
++    assert_eq!(APPLICATION_CLASS, c"GPUIApplication");
++    assert_eq!(APPLICATION_COMPANION, c"NSKVONotifying_GPUIApplication");
++}
+-- 
+2.54.0 (Apple Git-157)
+

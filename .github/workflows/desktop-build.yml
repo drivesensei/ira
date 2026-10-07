@@ -1,10 +1,28 @@
-name: Desktop test binaries
+name: Desktop builds and focused regressions
 
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/desktop-build.yml"
+      - "scripts/ci_regressions.py"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "crates/core/**"
+      - "tools/ira-parity/**"
+      - "migration/oracle/traces/harness/**"
+      - "desktop/**"
   push:
     paths:
       - ".github/workflows/desktop-build.yml"
+      - "scripts/ci_regressions.py"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "crates/core/**"
+      - "tools/ira-parity/**"
+      - "migration/oracle/traces/harness/**"
       - "desktop/**"
 
 permissions:
@@ -12,33 +30,61 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+  CARGO_BUILD_JOBS: "2"
+  CARGO_INCREMENTAL: "0"
 
 jobs:
-  macos:
-    name: macOS desktop binary
-    runs-on: macos-14
+  headless:
+    name: Focused regressions (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - uses: Swatinem/rust-cache@v2
+      - name: Core persistence and terminal worker settlement
+        run: python scripts/ci_regressions.py headless
+      - name: Scripted capture and staging contracts
+        # Windows omits Unix symlink/staging bodies. No oracle builds, PTY
+        # lifecycle helpers, real configuration, or native UI are executed.
+        run: python scripts/ci_regressions.py harness
 
+  macos:
+    name: macOS desktop binary and model regressions
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: desktop -> target
-
+          workspaces: desktop -> ../target
+      - name: Desktop values and geometry regressions
+        # Explicit pure model bodies only. Native quit/retry remains a
+        # separately coordinated validation obligation.
+        run: python scripts/ci_regressions.py desktop
       - name: Build production binary
         run: cargo build --manifest-path desktop/Cargo.toml --release --locked
-
       - name: Package macOS app
         run: |
           mkdir -p dist/IRA.app/Contents/MacOS
-          cp desktop/target/release/ira-desktop dist/IRA.app/Contents/MacOS/ira-desktop
+          cp target/release/ira-desktop dist/IRA.app/Contents/MacOS/ira-desktop
           cp desktop/macos/Info.plist dist/IRA.app/Contents/Info.plist
           chmod +x dist/IRA.app/Contents/MacOS/ira-desktop
           codesign --force --deep --sign - dist/IRA.app
           codesign --verify --deep --strict --verbose=2 dist/IRA.app
           tar -czf ira-desktop-macos-arm64.tar.gz -C dist IRA.app
-
       - uses: actions/upload-artifact@v4
         with:
           name: ira-desktop-macos-arm64
@@ -47,26 +93,27 @@ jobs:
           retention-days: 14
 
   windows:
-    name: Windows desktop binary
+    name: Windows desktop binary and model regressions
     runs-on: windows-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
-
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: desktop -> target
-
+          workspaces: desktop -> ../target
+      - name: Desktop values and geometry regressions
+        run: python scripts/ci_regressions.py desktop
       - name: Build production binary
         run: cargo build --manifest-path desktop/Cargo.toml --release --locked
         env:
           RUSTFLAGS: -C target-feature=+crt-static
-
       - name: Stage binary
         shell: pwsh
-        run: Copy-Item desktop/target/release/ira-desktop.exe ira-desktop-windows-x86_64.exe
-
+        run: Copy-Item target/release/ira-desktop.exe ira-desktop-windows-x86_64.exe
       - uses: actions/upload-artifact@v4
         with:
           name: ira-desktop-windows-x86_64

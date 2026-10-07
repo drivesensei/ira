@@ -16,7 +16,7 @@ use ratatui_image::picker::Picker;
 use crate::{
     domain::data::Folder,
     services::{
-        bookmarks::{next_free_shortcut, read_bookmarks, write_bookmarks},
+        bookmarks::{next_free_shortcut, read_bookmarks, try_write_bookmarks},
         drives::{eject_drive, list_drives, mount_drive},
         file_info::{
             build_info_fast, build_info_full, dir_size, on_disk_bytes, size_line_final, DirSize,
@@ -25,14 +25,16 @@ use crate::{
         folders::list_common_folders,
         list_files::{list_files_bounded, list_files_chunked, FEntry, LISTING_CHUNK},
         overlay::{self, Overlay},
-        state::{load_state, load_state_from, save_state, save_state_to, SessionState, SizeEntry},
+        state::{
+            load_state, load_state_from, try_save_state, try_save_state_to, SessionState, SizeEntry,
+        },
         thumbnails::{
             preview_kind, prune_cache, spawn_workers, PreviewKind, PreviewSurface, Rendered,
             ThumbEvent, ThumbRequest, WorkerQueues, JOB_QUEUE_HI_CAP, JOB_QUEUE_LO_CAP,
         },
         transfer::{
-            spawn_delete_job, spawn_job, Job, JobControl, JobEvent, JobKind, JobStatus,
-            OverwritePolicy,
+            spawn_delete_tracked, spawn_job_tracked, terminal_receipt, Job, JobControl, JobEvent,
+            JobKind, JobStatus, OverwritePolicy, TerminalReceipt,
         },
     },
     utils::{
@@ -40,6 +42,24 @@ use crate::{
         is_dir::{get_directory, get_parent_directory},
     },
 };
+type TransferProbeResult = (u64, TransferDestSync, [u64; 2], bool);
+
+// Process-wide admission survives App/window destruction. Root and neutral core
+// each have one finite lane; a mixed process therefore has at most two lanes.
+static TRANSFER_PROBE_BUSY: AtomicBool = AtomicBool::new(false);
+struct TransferProbeOccupancy(Arc<AtomicBool>);
+impl Drop for TransferProbeOccupancy {
+    fn drop(&mut self) {
+        // A reply, if any, was sent before this completion signal. A panic or
+        // failed spawn also completes physical work without inventing a reply.
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+        TRANSFER_PROBE_BUSY.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+type TransferProbeTest = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 /// Application result type.
 pub type AppResult<T> = std::result::Result<T, Box<dyn error::Error>>;
 
@@ -300,6 +320,35 @@ struct WalkSlot {
     started: Instant,
 }
 
+/// Opaque, instance-bound authority for the finite set of accepted root workers.
+pub struct ExitWorkSeal(Arc<()>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkSettlementError {
+    ForeignSeal,
+    Sealed,
+    IdentityExhausted,
+    ReceiptLost { identity: u64 },
+    InvalidReceipt { identity: u64 },
+}
+impl std::fmt::Display for WorkSettlementError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Terminal work settlement failed: {self:?}")
+    }
+}
+impl error::Error for WorkSettlementError {}
+
+pub enum ExitWorkPoll {
+    Pending,
+    Settled,
+    Error(WorkSettlementError),
+}
+struct ExitWork {
+    identity: u64,
+    control: Arc<JobControl>,
+    receiver: mpsc::Receiver<u64>,
+}
+
 /// Application.
 pub struct App {
     /// Is the application running?
@@ -349,6 +398,16 @@ pub struct App {
     pub goto_prompt: Option<String>,
     /// Live destination sync while a transfer writes into a folder.
     pub transfer_dest: Option<TransferDestSync>,
+    transfer_probe_tx: mpsc::Sender<TransferProbeResult>,
+    transfer_probe_rx: mpsc::Receiver<TransferProbeResult>,
+    transfer_generation: u64,
+    transfer_probe_pending: Option<u64>,
+    transfer_probe_finished: Option<Arc<AtomicBool>>,
+    transfer_probe_last_attempt: Option<Instant>,
+    #[cfg(test)]
+    transfer_probe_test: Option<TransferProbeTest>,
+    #[cfg(test)]
+    transfer_probe_spawn_error: bool,
     /// Keybindings help dialog (`*`); closed by any key.
     pub keybindings_visible: bool,
     /// Marquee scroll offset (chars) for the contextual hint bar; advanced
@@ -383,6 +442,13 @@ pub struct App {
     /// Active background walks keyed by path (one per folder, cancellable).
     size_walks: HashMap<String, WalkSlot>,
     next_job_id: u64,
+    exit_work_identity: Arc<()>,
+    exit_work_sealed: bool,
+    next_exit_work_id: u64,
+    exit_work: VecDeque<ExitWork>,
+    exit_work_error: Option<WorkSettlementError>,
+    #[cfg(test)]
+    pub(crate) exit_worker_test: Option<crate::services::transfer::WorkerTestHooks>,
 
     /// Latest drive list produced by the background poller.
     drive_cache: Arc<Mutex<Vec<Folder>>>,
@@ -615,6 +681,7 @@ impl Default for App {
     fn default() -> Self {
         let (job_tx, job_rx) = mpsc::channel();
         let (file_list_tx, file_list_rx) = mpsc::channel();
+        let (transfer_probe_tx, transfer_probe_rx) = mpsc::channel();
         let (info_tx, info_rx) = mpsc::channel();
         let (thumb_tx, thumb_rx) = mpsc::channel();
         let (thumb_jobs_hi, thumb_jobs_hi_rx) = mpsc::sync_channel(JOB_QUEUE_HI_CAP);
@@ -640,6 +707,16 @@ impl Default for App {
             new_entry: None,
             goto_prompt: None,
             transfer_dest: None,
+            transfer_probe_tx,
+            transfer_probe_rx,
+            transfer_generation: 0,
+            transfer_probe_pending: None,
+            transfer_probe_finished: None,
+            transfer_probe_last_attempt: None,
+            #[cfg(test)]
+            transfer_probe_test: None,
+            #[cfg(test)]
+            transfer_probe_spawn_error: false,
             info: None,
             multi_info: None,
             status: None,
@@ -656,6 +733,13 @@ impl Default for App {
             size_cache: HashMap::new(),
             size_walks: HashMap::new(),
             next_job_id: 0,
+            exit_work_identity: Arc::new(()),
+            exit_work_sealed: false,
+            next_exit_work_id: 0,
+            exit_work: VecDeque::new(),
+            exit_work_error: None,
+            #[cfg(test)]
+            exit_worker_test: None,
             drive_cache: Arc::new(Mutex::new(Vec::new())),
             drive_generation: Arc::new(Mutex::new(0)),
             seen_drive_generation: 0,
@@ -782,8 +866,85 @@ impl App {
         default
     }
 
+    #[cfg(test)]
+    pub(crate) fn exit_test_event(&mut self) -> Option<JobEvent> {
+        self.job_rx.try_recv().ok()
+    }
+
+    /// Permanently closes transfer/delete admission and wakes paused workers.
+    /// The terminal dispatcher is serial; this introduces no global stop domain.
+    pub fn begin_exit_settlement(&mut self) -> ExitWorkSeal {
+        self.exit_work_sealed = true;
+        for work in &self.exit_work {
+            work.control.request_cancel();
+        }
+        ExitWorkSeal(self.exit_work_identity.clone())
+    }
+
+    /// Fair, bounded receipt-only bookkeeping. Never drains JobEvents or ticks.
+    pub fn poll_exit_settlement(&mut self, seal: &ExitWorkSeal, budget: usize) -> ExitWorkPoll {
+        if !self.exit_work_sealed || !Arc::ptr_eq(&seal.0, &self.exit_work_identity) {
+            return ExitWorkPoll::Error(WorkSettlementError::ForeignSeal);
+        }
+        self.poll_exit_receipts(budget);
+        if !self.exit_work.is_empty() {
+            return ExitWorkPoll::Pending;
+        }
+        match &self.exit_work_error {
+            Some(error) => ExitWorkPoll::Error(error.clone()),
+            None => ExitWorkPoll::Settled,
+        }
+    }
+
+    fn poll_exit_receipts(&mut self, budget: usize) {
+        for _ in 0..budget.min(self.exit_work.len()) {
+            let Some(work) = self.exit_work.pop_front() else {
+                break;
+            };
+            let error = match work.receiver.try_recv() {
+                Ok(identity) if identity == work.identity => None,
+                Ok(_) => Some(WorkSettlementError::InvalidReceipt {
+                    identity: work.identity,
+                }),
+                Err(mpsc::TryRecvError::Disconnected) => Some(WorkSettlementError::ReceiptLost {
+                    identity: work.identity,
+                }),
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.exit_work.push_back(work);
+                    continue;
+                }
+            };
+            if self.exit_work_error.is_none() {
+                self.exit_work_error = error;
+            }
+        }
+    }
+
+    fn register_exit_work(
+        &mut self,
+        control: Arc<JobControl>,
+    ) -> Result<TerminalReceipt, WorkSettlementError> {
+        if self.exit_work_sealed {
+            return Err(WorkSettlementError::Sealed);
+        }
+        let next = self
+            .next_exit_work_id
+            .checked_add(1)
+            .ok_or(WorkSettlementError::IdentityExhausted)?;
+        let identity = self.next_exit_work_id;
+        let (receipt, receiver) = terminal_receipt(identity);
+        self.next_exit_work_id = next;
+        self.exit_work.push_back(ExitWork {
+            identity,
+            control,
+            receiver,
+        });
+        Ok(receipt)
+    }
+
     /// Handles the tick event of the terminal.
     pub fn tick(&mut self) {
+        self.poll_exit_receipts(64);
         self.hint_offset = self.hint_offset.wrapping_add(2);
         self.drain_jobs();
         self.drain_info_results();
@@ -1403,14 +1564,7 @@ impl App {
         let permissions = edit.permissions.clone();
         let pane_index = edit.pane_index;
         let list_path = edit.path.clone();
-        let tmp = std::path::PathBuf::from(format!("{}.ira-tmp", fs_path.display()));
-        let write = || -> std::io::Result<()> {
-            std::fs::write(&tmp, content.as_bytes())?;
-            std::fs::set_permissions(&tmp, permissions)?;
-            std::fs::rename(&tmp, &fs_path)
-        };
-        if let Err(e) = write() {
-            let _ = std::fs::remove_file(&tmp);
+        if let Err(e) = editor_staging::save(&fs_path, content.as_bytes(), permissions) {
             self.set_status(format!("save failed: {e}"), true);
             return;
         }
@@ -2288,7 +2442,7 @@ impl App {
         self.theme_preset = self.theme_preset.next();
         self.theme = self.theme_loader.theme_for(self.theme_preset);
         self.set_status(format!("Switched to {}", self.theme_preset.label()), false);
-        self.persist_state();
+        self.persist_state_with_feedback();
     }
 
     /// Cycles the active pane's sort mode (Name → Size → Modified → Kind),
@@ -2978,7 +3132,7 @@ impl App {
         self.show_hidden = !self.show_hidden;
         self.list_files_for_pane(0);
         self.list_files_for_pane(1);
-        self.persist_state();
+        self.persist_state_with_feedback();
     }
 
     // ---- Rename (modal text editor) ----
@@ -3287,7 +3441,7 @@ impl App {
                     );
                     // A completed measurement is worth keeping across
                     // restarts; save immediately so a crash keeps it too.
-                    self.persist_state();
+                    self.persist_state_with_feedback();
                 }
                 InfoEvent::Meta { path, lines } => {
                     if let Some(dialog) = self.info.as_mut() {
@@ -3401,8 +3555,20 @@ impl App {
             format!("{} items", paths.len())
         };
 
+        let Some(next_job_id) = self.next_job_id.checked_add(1) else {
+            self.set_status(WorkSettlementError::IdentityExhausted.to_string(), true);
+            return;
+        };
+        let control = JobControl::new();
+        let receipt = match self.register_exit_work(control.clone()) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.set_status(error.to_string(), true);
+                return;
+            }
+        };
         let id = self.next_job_id;
-        self.next_job_id += 1;
+        self.next_job_id = next_job_id;
         let reveal = std::path::Path::new(&dest).join(
             std::path::Path::new(&paths[0])
                 .file_name()
@@ -3420,11 +3586,18 @@ impl App {
             current: String::new(),
             status: JobStatus::Running,
             started_at: Instant::now(),
-            control: JobControl::new(),
+            control,
         });
         let job = self.jobs.last().unwrap();
-        spawn_job(job, self.job_tx.clone());
+        spawn_job_tracked(
+            job,
+            self.job_tx.clone(),
+            receipt,
+            #[cfg(test)]
+            self.exit_worker_test.clone(),
+        );
 
+        self.invalidate_transfer_probe();
         self.transfer_dest = Some(TransferDestSync {
             dest_dir: dest.clone(),
             reveal_path: reveal.to_string_lossy().into_owned(),
@@ -3551,9 +3724,24 @@ impl App {
         if confirm.paths.is_empty() {
             return;
         }
+        let control = JobControl::new();
+        let receipt = match self.register_exit_work(control.clone()) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.set_status(error.to_string(), true);
+                return;
+            }
+        };
         self.deleting_paths = confirm.paths.iter().cloned().collect();
         let tx = self.job_tx.clone();
-        let control = spawn_delete_job(confirm.paths.clone(), tx);
+        spawn_delete_tracked(
+            confirm.paths.clone(),
+            tx,
+            control.clone(),
+            receipt,
+            #[cfg(test)]
+            self.exit_worker_test.clone(),
+        );
         self.deletion = Some(DeletionState {
             total: confirm.paths.len(),
             done: 0,
@@ -3601,6 +3789,7 @@ impl App {
                     }
                 }
                 JobEvent::Done { id } => {
+                    self.invalidate_transfer_probe();
                     if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id) {
                         j.status = JobStatus::Done;
                         self.transfer_dest = None;
@@ -3634,12 +3823,14 @@ impl App {
                     self.refresh_after_job();
                 }
                 JobEvent::Cancelled { id } => {
+                    self.invalidate_transfer_probe();
                     if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id) {
                         j.status = JobStatus::Cancelled;
                     }
                     self.refresh_after_job();
                 }
                 JobEvent::Failed { id, error } => {
+                    self.invalidate_transfer_probe();
                     if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id) {
                         j.status = JobStatus::Failed(error);
                     }
@@ -3687,29 +3878,129 @@ impl App {
         self.list_files_for_pane(1);
     }
 
-    /// While a transfer writes into a folder, re-lists panes that show that
-    /// folder (or are inside it) once per second, so copied items appear
-    /// live. Never blocks the UI: listings run on background workers.
+    fn invalidate_transfer_probe(&mut self) {
+        self.transfer_generation = self.transfer_generation.wrapping_add(1);
+        self.transfer_probe_pending = None;
+        self.transfer_probe_last_attempt = None;
+    }
+
+    /// Probe transfer destination existence on a worker, at most once per second.
+    /// Current results retain the source reveal and navigation-preservation rules.
     fn refresh_transfer_destinations(&mut self) {
-        let Some(sync) = self.transfer_dest.clone() else {
-            return;
-        };
+        let finished = self
+            .transfer_probe_finished
+            .as_ref()
+            .is_some_and(|finished| finished.load(std::sync::atomic::Ordering::Acquire));
+        // Terminal events are drained first by tick. Also reject results when
+        // no transfer is live, even if a caller changed job state directly.
         if !self
             .jobs
             .iter()
             .any(|j| matches!(j.status, JobStatus::Running | JobStatus::Paused))
         {
-            self.transfer_dest = None;
+            if self.transfer_dest.take().is_some() || self.transfer_probe_pending.is_some() {
+                self.invalidate_transfer_probe();
+            }
+            while self.transfer_probe_rx.try_recv().is_ok() {}
+            if finished {
+                self.transfer_probe_finished = None;
+            }
             return;
         }
-        // The destination folder appears once the first item starts copying.
-        if std::fs::metadata(&sync.dest_dir).is_err() {
+        while let Ok((generation, sync, listing_generations, exists)) =
+            self.transfer_probe_rx.try_recv()
+        {
+            if generation != self.transfer_generation {
+                continue;
+            }
+            self.transfer_probe_pending = None;
+            let current = self.transfer_dest.as_ref().is_some_and(|current| {
+                current.dest_dir == sync.dest_dir
+                    && current.reveal_path == sync.reveal_path
+                    && current.last_refresh == sync.last_refresh
+            });
+            if exists && current {
+                self.apply_transfer_destination_refresh(sync, listing_generations);
+            }
+        }
+        if finished {
+            // The worker can unwind or fail to spawn without delivering a
+            // result. Such completion must not wedge semantic pending forever.
+            self.transfer_probe_finished = None;
+            self.transfer_probe_pending = None;
+        }
+        let Some(sync) = self.transfer_dest.clone() else {
+            return;
+        };
+        let now = Instant::now();
+        if self.transfer_probe_pending.is_some()
+            || now.saturating_duration_since(sync.last_refresh) < Duration::from_secs(1)
+            || self
+                .transfer_probe_last_attempt
+                .is_some_and(|last| now.saturating_duration_since(last) < Duration::from_secs(1))
+        {
             return;
         }
-        if sync.last_refresh.elapsed() < Duration::from_secs(1) {
+        if TRANSFER_PROBE_BUSY
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            // Do not consume the attempt or pending slot on denied admission.
             return;
         }
-        for i in 0..self.panes.len() {
+        let completed = Arc::new(AtomicBool::new(false));
+        let occupancy = TransferProbeOccupancy(Arc::clone(&completed));
+        self.transfer_probe_finished = Some(completed);
+        let generation = self.transfer_generation;
+        let listing_generations = self.panes.each_ref().map(|pane| pane.listing_generation);
+        self.transfer_probe_pending = Some(generation);
+        self.transfer_probe_last_attempt = Some(now);
+        let tx = self.transfer_probe_tx.clone();
+        #[cfg(test)]
+        let probe = self.transfer_probe_test.clone();
+        let worker = move || {
+            let _occupancy = occupancy;
+            #[cfg(test)]
+            let exists = probe.as_ref().map_or_else(
+                || std::fs::metadata(&sync.dest_dir).is_ok(),
+                |probe| probe(&sync.dest_dir),
+            );
+            #[cfg(not(test))]
+            let exists = std::fs::metadata(&sync.dest_dir).is_ok();
+            let _ = tx.send((generation, sync, listing_generations, exists));
+        };
+        #[cfg(test)]
+        let spawn_result = if self.transfer_probe_spawn_error {
+            drop(worker);
+            Err(std::io::Error::other(
+                "fixture metadata worker spawn failure",
+            ))
+        } else {
+            thread::Builder::new().spawn(worker)
+        };
+        #[cfg(not(test))]
+        let spawn_result = thread::Builder::new().spawn(worker);
+        if spawn_result.is_err() {
+            self.transfer_probe_pending = None;
+        }
+    }
+
+    fn apply_transfer_destination_refresh(
+        &mut self,
+        sync: TransferDestSync,
+        listing_generations: [u64; 2],
+    ) {
+        for (i, listing_generation) in listing_generations.iter().enumerate() {
+            // An asynchronous existence result must not refresh a newer listing
+            // requested while the probe was in flight (including away-and-back).
+            if self.panes[i].listing_generation != *listing_generation {
+                continue;
+            }
             let viewing = self.panes[i].folder.as_ref().is_some_and(|f| {
                 f.path == sync.dest_dir || f.path.starts_with(&format!("{}/", sync.dest_dir))
             });
@@ -3897,9 +4188,11 @@ impl App {
         self.bookmarks = Some(loaded);
     }
 
-    fn persist_bookmarks(&self) {
+    fn persist_bookmarks(&mut self) {
         if let Some(bookmarks) = &self.bookmarks {
-            write_bookmarks(bookmarks);
+            if let Err(error) = try_write_bookmarks(bookmarks) {
+                self.set_status(error.to_string(), true);
+            }
         }
     }
 
@@ -4006,6 +4299,16 @@ impl App {
     /// Persists the current session state (split layout, pane folders and
     /// folder sizes) as `key=value` lines.
     pub fn persist_state(&self) {
+        if let Err(error) = self.try_persist_state() {
+            eprintln!("{error}");
+        }
+    }
+    fn persist_state_with_feedback(&mut self) {
+        if let Err(error) = self.try_persist_state() {
+            self.set_status(error.to_string(), true);
+        }
+    }
+    pub fn try_persist_state(&self) -> Result<(), crate::services::persistence::PersistenceError> {
         let state = SessionState {
             split: self.split,
             active_pane: self.active_pane,
@@ -4020,8 +4323,8 @@ impl App {
             sizes: self.size_entries(),
         };
         match &self.state_path {
-            Some(p) => save_state_to(p, &state),
-            None => save_state(&state),
+            Some(p) => try_save_state_to(p, &state),
+            None => try_save_state(&state),
         }
     }
     pub fn recalculate_dialog_size(&mut self) {
@@ -6274,3 +6577,22 @@ mod preview_tests {
         );
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "editor_safety_tests.rs"]
+mod editor_safety_tests;
+
+#[path = "services/editor.rs"]
+mod editor_staging;
+
+#[cfg(test)]
+#[path = "app_persistence_tests.rs"]
+mod persistence_tests;
+
+#[cfg(test)]
+#[path = "app_transfer_probe_tests.rs"]
+mod transfer_probe_tests;
+
+#[cfg(test)]
+#[path = "app_exit_settlement_tests.rs"]
+mod exit_settlement_tests;
