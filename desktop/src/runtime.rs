@@ -187,6 +187,8 @@ pub struct Publication {
     pub snapshot: Arc<Snapshot>,
     pub cancellation: Vec<Arc<JobControl>>,
     pub theme: Theme,
+    /// Worker-computed light counterpart; None preserves configured preset behavior.
+    pub light_theme: Option<Theme>,
     pub font_family: Option<String>,
 }
 pub enum Completion {
@@ -902,6 +904,7 @@ fn publish(app: &App, latest: &Latest<Publication>, loader: &Loader, font_family
         snapshot,
         cancellation,
         theme: loader.theme_for(app.theme_preset),
+        light_theme: loader.desktop_light_theme_for(app.theme_preset),
         font_family: font_family.clone(),
     });
 }

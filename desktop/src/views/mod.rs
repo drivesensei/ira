@@ -3,6 +3,7 @@ pub mod accessibility_bridge;
 pub mod accessibility_prepared;
 pub mod accessibility_retirement;
 pub mod accessibility_worker;
+mod appearance;
 pub mod preview;
 pub mod rows;
 use crate::platform::accessibility::{
@@ -56,6 +57,8 @@ pub struct Desktop {
     polling: Option<Task<()>>,
     feedback: Option<String>,
     theme: ira_core::theme::Theme,
+    palette: appearance::Palette,
+    appearance_subscription: Option<Subscription>,
     font_family: Option<String>,
     geometry: crate::platform::geometry::Writer,
     geometry_subscription: Option<Subscription>,
@@ -105,6 +108,8 @@ impl Desktop {
             polling: Some(polling),
             feedback: None,
             theme: ira_core::theme::ThemePreset::default().theme(),
+            palette: appearance::Palette::default(),
+            appearance_subscription: None,
             font_family: None,
             geometry,
             geometry_subscription: None,
@@ -120,6 +125,14 @@ impl Desktop {
     }
     pub fn focus_main(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus);
+        self.palette.appearance = window.appearance();
+        self.theme = self.palette.selected();
+        self.appearance_subscription =
+            Some(cx.observe_window_appearance(window, |this, window, cx| {
+                this.palette.appearance = window.appearance();
+                this.theme = this.palette.selected();
+                cx.notify();
+            }));
         self.geometry_subscription = Some(cx.observe_window_bounds(window, |this, window, _| {
             if this.runtime.is_stopping() {
                 return;
@@ -145,6 +158,7 @@ impl Desktop {
         self.runtime.detach();
         self.runtime.cancel_jobs(&self.controls);
         self.polling.take();
+        self.appearance_subscription.take();
     }
     pub fn shutdown_feedback(&mut self, message: String, cx: &mut Context<Self>) {
         self.runtime.stop(&self.controls);
@@ -193,7 +207,9 @@ impl Desktop {
                     );
                 }
             }
-            self.theme = publication.theme;
+            self.palette.configured = publication.theme;
+            self.palette.light = publication.light_theme;
+            self.theme = self.palette.selected();
             self.font_family = publication.font_family;
             if let Some(old) = self.snapshot.replace(publication.snapshot) {
                 self.accessibility.retire_snapshot(old);

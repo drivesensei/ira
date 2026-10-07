@@ -320,3 +320,109 @@ fn caller_owned_theme_file_uses_toml_fallback_without_changing_config() {
     );
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn desktop_appearance_default_invalid_and_terminal_palette_remain_unchanged() {
+    for setting in [
+        "",
+        "desktop_appearance = \"preset\"",
+        "desktop_appearance = \"unknown\"",
+    ] {
+        let loader = Loader::from_toml(setting, caps(false));
+        assert!(!loader.desktop_follows_system());
+        for preset in ThemePreset::ALL {
+            assert_eq!(loader.theme_for(*preset), preset.theme());
+            assert_eq!(loader.desktop_light_theme_for(*preset), None);
+        }
+    }
+    let loader = Loader::from_toml("desktop_appearance = \"system\"", caps(false));
+    for preset in ThemePreset::ALL {
+        assert_eq!(loader.theme_for(*preset), preset.theme());
+    }
+}
+
+#[test]
+fn desktop_appearance_preserves_preset_precedence_and_exact_overrides() {
+    let loader = Loader::from_toml(
+        r##"desktop_appearance = "system"
+preset = "nord"
+bg = "#010203"
+text = "#040506"
+key_fg = "#070809"
+[files]
+image = "red"
+"##,
+        caps(false),
+    );
+    assert_eq!(
+        loader.resolve_preset(None),
+        (ThemePreset::Nord, PresetSource::Toml)
+    );
+    assert_eq!(
+        loader.resolve_preset(Some("dracula")),
+        (ThemePreset::Dracula, PresetSource::State)
+    );
+    let light = loader
+        .desktop_light_theme_for(ThemePreset::Dracula)
+        .unwrap();
+    let dark = loader.theme_for(ThemePreset::Dracula);
+    for theme in [light, dark] {
+        assert_eq!(theme.bg, Color::Rgb(1, 2, 3));
+        assert_eq!(theme.text, Color::Rgb(4, 5, 6));
+        assert_eq!(theme.key_fg, Color::Rgb(7, 8, 9));
+        assert_eq!(theme.image, Color::Red);
+    }
+}
+
+#[test]
+fn desktop_appearance_all_six_light_presets_have_readable_default_roles() {
+    let loader = Loader::from_toml("desktop_appearance = \"system\"", caps(false));
+    let mut backgrounds = Vec::new();
+    for preset in ThemePreset::ALL {
+        let light = loader.desktop_light_theme_for(*preset).unwrap();
+        assert_ne!(light.bg, preset.theme().bg);
+        assert!(super::palette::luminance(light.bg) > 0.5, "{preset:?}");
+        backgrounds.push(light.bg);
+        let foregrounds = [
+            light.text,
+            light.text_muted,
+            light.success,
+            light.warning,
+            light.error,
+            light.info,
+            light.dir,
+            light.hidden,
+            light.image,
+            light.video,
+            light.audio,
+            light.archive,
+            light.code,
+            light.document,
+            light.executable,
+            light.data,
+        ];
+        for foreground in foregrounds {
+            for background in [light.bg, light.surface, light.surface_alt, light.selection] {
+                assert!(
+                    super::palette::contrast(foreground, background) >= 4.5,
+                    "{preset:?}: {foreground:?} vs {background:?}"
+                );
+            }
+        }
+        assert!(
+            super::palette::contrast(light.key_fg, light.key_bg) >= 4.5,
+            "{preset:?} key"
+        );
+        assert!(
+            super::palette::contrast(light.cursor_fg, light.cursor_bg) >= 4.5,
+            "{preset:?} cursor"
+        );
+    }
+    backgrounds.sort_by_key(|color| format!("{color:?}"));
+    backgrounds.dedup();
+    assert_eq!(
+        backgrounds.len(),
+        ThemePreset::ALL.len(),
+        "preset cycle retains distinct light backgrounds"
+    );
+}

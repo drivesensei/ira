@@ -28,6 +28,8 @@ pub(super) struct ThemeFile {
     /// Built-in palette name (`mocha`, `cyberpunk2077`). Color keys below
     /// still override individual slots.
     pub(super) preset: Option<String>,
+    /// Desktop-only opt-in. The terminal always uses the configured preset.
+    pub(super) desktop_appearance: Option<String>,
     pub(super) icons: Option<String>,
     /// `"outline"` | `"rounded"` | `"square"`; default follows the icon set.
     pub(super) chips: Option<String>,
@@ -165,6 +167,29 @@ impl Loader {
         theme.chips = self.chip_style();
         theme.nerd_glyphs = self.nerd_glyphs;
         theme
+    }
+
+    /// Desktop system appearance is opt-in; absent/unknown values keep oracle defaults.
+    pub fn desktop_follows_system(&self) -> bool {
+        self.overrides
+            .desktop_appearance
+            .as_deref()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("system"))
+    }
+
+    /// Light counterpart for desktop system appearance. Explicit colors remain last.
+    /// This never changes the configured/persisted preset or terminal palette.
+    pub fn desktop_light_theme_for(&self, preset: ThemePreset) -> Option<Theme> {
+        if !self.desktop_follows_system() {
+            return None;
+        }
+        let mut theme = preset.theme();
+        theme.adapt_desktop_light();
+        theme.apply_overrides(&self.overrides);
+        theme.adapt(&self.caps);
+        theme.chips = self.chip_style();
+        theme.nerd_glyphs = self.nerd_glyphs;
+        Some(theme)
     }
 
     /// Startup preset: persisted session state > `theme.toml` > default.

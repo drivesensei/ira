@@ -456,6 +456,91 @@ impl Theme {
         }
     }
 
+    /// Derive a light presentation without introducing a new persisted preset.
+    /// Reflect HSL lightness while preserving hue/chroma, then darken foreground
+    /// roles for readable defaults. User overrides are applied by Loader afterward.
+    pub(super) fn adapt_desktop_light(&mut self) {
+        for color in self.all_colors_mut() {
+            if let Color::Rgb(r, g, b) = *color {
+                let shift = 255i16 - i16::from(r.max(g).max(b)) - i16::from(r.min(g).min(b));
+                *color = rgb(
+                    (i16::from(r) + shift) as u8,
+                    (i16::from(g) + shift) as u8,
+                    (i16::from(b) + shift) as u8,
+                );
+            }
+        }
+        // Keep non-cursor selected rows on a light background. This ensures
+        // black is an available contrast fallback for every ordinary text role.
+        for _ in 0..32 {
+            if luminance(self.selection) >= 0.3 {
+                break;
+            }
+            let Color::Rgb(r, g, b) = self.selection else {
+                break;
+            };
+            self.selection = rgb(
+                r.saturating_add(8),
+                g.saturating_add(8),
+                b.saturating_add(8),
+            );
+        }
+        let backgrounds = [self.bg, self.surface, self.surface_alt, self.selection];
+        for foreground in [
+            &mut self.text,
+            &mut self.text_muted,
+            &mut self.success,
+            &mut self.warning,
+            &mut self.error,
+            &mut self.info,
+            &mut self.dir,
+            &mut self.hidden,
+            &mut self.image,
+            &mut self.video,
+            &mut self.audio,
+            &mut self.archive,
+            &mut self.code,
+            &mut self.document,
+            &mut self.executable,
+            &mut self.data,
+        ] {
+            for _ in 0..32 {
+                if backgrounds
+                    .iter()
+                    .all(|background| contrast(*foreground, *background) >= 4.5)
+                {
+                    break;
+                }
+                let Color::Rgb(r, g, b) = *foreground else {
+                    break;
+                };
+                *foreground = rgb(
+                    (u16::from(r) * 4 / 5) as u8,
+                    (u16::from(g) * 4 / 5) as u8,
+                    (u16::from(b) * 4 / 5) as u8,
+                );
+            }
+            if backgrounds
+                .iter()
+                .any(|background| contrast(*foreground, *background) < 4.5)
+            {
+                *foreground = rgb(0, 0, 0);
+            }
+        }
+        for (foreground, background) in [
+            (&mut self.key_fg, self.key_bg),
+            (&mut self.cursor_fg, self.cursor_bg),
+        ] {
+            if contrast(*foreground, background) < 4.5 {
+                *foreground = if luminance(background) > 0.179 {
+                    rgb(0, 0, 0)
+                } else {
+                    rgb(255, 255, 255)
+                };
+            }
+        }
+    }
+
     /// Applies a (possibly partial) TOML override. Invalid colors are skipped.
     pub(super) fn apply_overrides(&mut self, file: &ThemeFile) {
         apply(&mut self.bg, file.bg.as_deref());
@@ -572,6 +657,29 @@ impl Theme {
             Other => self.text,
         }
     }
+}
+
+pub(super) fn luminance(color: Color) -> f64 {
+    let rgba = color.rgba(Rgba {
+        r: 0,
+        g: 0,
+        b: 0,
+        a: 255,
+    });
+    let linear = |channel: u8| {
+        let value = f64::from(channel) / 255.;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * linear(rgba.r) + 0.7152 * linear(rgba.g) + 0.0722 * linear(rgba.b)
+}
+
+pub(super) fn contrast(a: Color, b: Color) -> f64 {
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
 }
 
 fn apply(slot: &mut Color, raw: Option<&str>) {
