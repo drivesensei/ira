@@ -17,7 +17,7 @@ use crate::{
     domain::data::Folder,
     services::{
         bookmarks::{next_free_shortcut, read_bookmarks, write_bookmarks},
-        drives::{eject_drive, list_drives, mount_drive},
+        drives::{eject_drive, fill_space, list_drives, mount_drive},
         file_info::{
             build_info_fast, build_info_full, dir_size, on_disk_bytes, size_line_final, DirSize,
             InfoEvent, SizeInfo, WalkHandle,
@@ -870,7 +870,10 @@ impl App {
         let generation = self.drive_generation.clone();
 
         thread::spawn(move || loop {
-            if let Ok(drives) = list_drives() {
+            if let Ok(mut drives) = list_drives() {
+                // statvfs can block on stale network mounts: only ever done
+                // here on the worker, never on the UI thread.
+                fill_space(&mut drives);
                 let mut guard = cache.lock().unwrap();
                 if *guard != drives {
                     *guard = drives;
@@ -2104,6 +2107,18 @@ impl App {
             drive.path.clone()
         };
 
+        // `list_drives` does no blocking space queries; keep the free-space
+        // figures the background poller already published.
+        if let Some(prev) = &self.drives {
+            for d in drives.iter_mut() {
+                if let Some(p) = prev
+                    .iter()
+                    .find(|p| p.device == d.device && p.label == d.label)
+                {
+                    d.space = p.space;
+                }
+            }
+        }
         self.drives = Some(drives);
         let pane = self.pane_mut();
         pane.filter_query = None;
@@ -2113,6 +2128,7 @@ impl App {
             path: mount_point,
             shortcut: '#',
             device: drive.device,
+            space: drive.space,
         });
         self.search_query = None;
         self.list_files_from_selected_folder();
@@ -3611,9 +3627,11 @@ impl App {
                             let dest_item = std::path::Path::new(&j.dest_dir)
                                 .join(std::path::Path::new(last).file_name().unwrap_or_default());
                             let dest_item = dest_item.to_string_lossy().into_owned();
-                            if let Some(pane) = self.panes.iter_mut().find(|p| {
-                                p.folder.as_ref().is_some_and(|f| f.path == j.dest_dir)
-                            }) {
+                            if let Some(pane) = self
+                                .panes
+                                .iter_mut()
+                                .find(|p| p.folder.as_ref().is_some_and(|f| f.path == j.dest_dir))
+                            {
                                 // Land on the finished item — unless the user
                                 // took the cursor over while it streamed, in
                                 // which case leave it where they put it.
@@ -4747,6 +4765,7 @@ fn matching_drive_picks_longest_mount_prefix() {
         label: "x".to_string(),
         shortcut: '1',
         device: Some("/dev/x".to_string()),
+        space: None,
     }];
     assert!(matching_drive(&none, "/anything").is_none());
 }
@@ -4897,7 +4916,11 @@ mod preview_tests {
             modified: None,
         };
         let paths = |app: &App, pane: usize| -> Vec<String> {
-            app.panes[pane].files.iter().map(|e| e.path.clone()).collect()
+            app.panes[pane]
+                .files
+                .iter()
+                .map(|e| e.path.clone())
+                .collect()
         };
         let mut app = App::default();
         app.panes[0].folder = Some(Folder::new("home".into(), "/tmp/ira-home".into(), '#'));

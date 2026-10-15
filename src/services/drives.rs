@@ -1,6 +1,72 @@
 use std::io::Result as IOResult;
 
+#[cfg(unix)]
+use crate::domain::data::DiskSpace;
 use crate::domain::data::Folder;
+
+/// Turns raw block counts into a `DiskSpace`. A zero block size (some FUSE
+/// filesystems) falls back to `bsize`; a zero total means "unknown" (`None`).
+/// Callers pass `u64` counts so the multiply never wraps on 32-bit fields.
+#[cfg(unix)]
+fn space_from_counts(blocks: u64, bavail: u64, frsize: u64, bsize: u64) -> Option<DiskSpace> {
+    let unit = if frsize == 0 { bsize } else { frsize };
+    let total = blocks.saturating_mul(unit);
+    if total == 0 {
+        return None;
+    }
+    Some(DiskSpace {
+        total,
+        available: Some(bavail.saturating_mul(unit).min(total)),
+    })
+}
+
+/// Filesystem totals via `statvfs` (O(1) syscall; no directory walk).
+/// `f_bavail` is the space usable by a non-root user, matching `df`.
+/// May block on hung network mounts, so only call it from worker threads.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn disk_space(path: &str) -> Option<DiskSpace> {
+    let c_path = std::ffi::CString::new(path).ok()?;
+    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut s) } != 0 {
+        return None;
+    }
+    space_from_counts(
+        s.f_blocks as u64,
+        s.f_bavail as u64,
+        s.f_frsize as u64,
+        s.f_bsize as u64,
+    )
+}
+
+/// macOS: `statvfs` block counts are 32-bit and wrap on volumes over 16 TB,
+/// so use `statfs`, whose counts are 64-bit.
+#[cfg(target_os = "macos")]
+fn disk_space(path: &str) -> Option<DiskSpace> {
+    let c_path = std::ffi::CString::new(path).ok()?;
+    let mut s: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c_path.as_ptr(), &mut s) } != 0 {
+        return None;
+    }
+    space_from_counts(s.f_blocks, s.f_bavail, 0, s.f_bsize as u64)
+}
+
+/// Fills in free/total space for mounted drives. This issues `statvfs`-style
+/// calls that can block on stale network mounts, so it must only run on a
+/// background thread (the drive poller), never on the UI thread. Drives whose
+/// space cannot be read keep whatever `list_drives` reported.
+pub fn fill_space(drives: &mut [Folder]) {
+    for d in drives.iter_mut() {
+        if d.path.is_empty() {
+            continue;
+        }
+        if let Some(space) = disk_space(&d.path) {
+            d.space = Some(space);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+use crate::services::windows_drives_labels::disk_space;
 
 #[cfg(target_os = "macos")]
 use std::fs::read_dir;
@@ -19,6 +85,7 @@ pub fn list_drives() -> IOResult<Vec<Folder>> {
                         label: file_name,
                         shortcut: (i + 1) as u8 as char,
                         device: None,
+                        space: None,
                     });
                 }
             }
@@ -43,6 +110,7 @@ pub fn list_drives() -> IOResult<Vec<Folder>> {
                 if let Ok(label) = get_volume_label(&maybe_drive) {
                     i += 1;
                     Some(Folder {
+                        space: None,
                         path: maybe_drive.clone(),
                         label: {
                             if label.len() > 1 {
@@ -118,11 +186,22 @@ fn parse_lsblk_pairs(line: &str) -> Vec<(String, String)> {
             break;
         }
         i += 1; // skip opening quote
-        let mut value = String::new();
+        let mut raw: Vec<u8> = Vec::new();
         while i < bytes.len() {
             match bytes[i] {
+                b'\\'
+                    if i + 3 < bytes.len()
+                        && bytes[i + 1] == b'x'
+                        && bytes[i + 2].is_ascii_hexdigit()
+                        && bytes[i + 3].is_ascii_hexdigit() =>
+                {
+                    // lsblk escapes unsafe bytes as \xNN (e.g. space = \x20).
+                    let hex = &line[i + 2..i + 4];
+                    raw.push(u8::from_str_radix(hex, 16).unwrap_or(b'?'));
+                    i += 4;
+                }
                 b'\\' if i + 1 < bytes.len() => {
-                    value.push(bytes[i + 1] as char);
+                    raw.push(bytes[i + 1]);
                     i += 2;
                 }
                 b'"' => {
@@ -130,12 +209,12 @@ fn parse_lsblk_pairs(line: &str) -> Vec<(String, String)> {
                     break;
                 }
                 b => {
-                    value.push(b as char);
+                    raw.push(b);
                     i += 1;
                 }
             }
         }
-        pairs.push((key, value));
+        pairs.push((key, String::from_utf8_lossy(&raw).into_owned()));
     }
     pairs
 }
@@ -170,6 +249,7 @@ fn drives_from_lsblk(output: &str) -> Vec<Folder> {
         let label = lsblk_field(&pairs, "LABEL");
         let parttype = lsblk_field(&pairs, "PARTTYPE");
         let mountpoint = lsblk_field(&pairs, "MOUNTPOINT");
+        let size: Option<u64> = lsblk_field(&pairs, "SIZE").parse().ok();
 
         if !DISK_FS.contains(&fstype) {
             continue;
@@ -191,12 +271,20 @@ fn drives_from_lsblk(output: &str) -> Vec<Folder> {
             label.to_string()
         };
         let i = drives.len() + 1;
+        // No syscalls here (this runs on the UI thread too): report the
+        // partition size; `fill_space` upgrades mounted drives with free space
+        // from the filesystem on the background poller.
+        let space = size.map(|total| DiskSpace {
+            total,
+            available: None,
+        });
 
         drives.push(Folder {
             label: display_name,
             path: mountpoint.to_string(),
             shortcut: i as u8 as char,
             device: Some(device),
+            space,
         });
     }
 
@@ -209,8 +297,9 @@ pub fn list_drives() -> IOResult<Vec<Folder>> {
         .args([
             "-P",
             "-n",
+            "-b",
             "-o",
-            "KNAME,TYPE,FSTYPE,LABEL,PARTTYPE,MOUNTPOINT",
+            "KNAME,TYPE,FSTYPE,LABEL,PARTTYPE,MOUNTPOINT,SIZE",
         ])
         .output()?;
 
@@ -335,6 +424,102 @@ KNAME="sdc1" TYPE="part" FSTYPE="exfat" LABEL="USB STICK" PARTTYPE="0x7" MOUNTPO
             labels,
             vec!["SEAGATE SATA HDD", "ADATA NVME SSD", "USB STICK"]
         );
+    }
+
+    #[test]
+    fn unmounted_drive_reports_partition_size_only() {
+        let fixture = r#"KNAME="sdb1" TYPE="part" FSTYPE="ntfs" LABEL="X" PARTTYPE="0x7" MOUNTPOINT="" SIZE="2000398934016""#;
+        let drives = drives_from_lsblk(fixture);
+        assert_eq!(
+            drives[0].space,
+            Some(DiskSpace {
+                total: 2000398934016,
+                available: None
+            })
+        );
+    }
+
+    /// Parses `df -B1 -P <path>` into (total, available) bytes.
+    fn df_bytes(path: &str) -> (u64, u64) {
+        let out = std::process::Command::new("df")
+            .args(["-B1", "-P", path])
+            .output()
+            .expect("run df");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let cols: Vec<&str> = text
+            .lines()
+            .nth(1)
+            .expect("df row")
+            .split_whitespace()
+            .collect();
+        (cols[1].parse().unwrap(), cols[3].parse().unwrap())
+    }
+
+    #[test]
+    fn statvfs_matches_df_for_root() {
+        let s = disk_space("/").expect("statvfs(/)");
+        let (df_total, df_avail) = df_bytes("/");
+        let avail = s.available.unwrap();
+        assert!(avail <= s.total);
+        // df and statvfs are separate syscalls; allow drift from concurrent writes.
+        let tol = 64 * 1024 * 1024;
+        assert!(
+            s.total.abs_diff(df_total) <= tol,
+            "{} vs {}",
+            s.total,
+            df_total
+        );
+        assert!(avail.abs_diff(df_avail) <= tol, "{avail} vs {df_avail}");
+    }
+
+    #[test]
+    fn space_from_counts_handles_edge_cases() {
+        // f_frsize == 0 falls back to f_bsize.
+        let s = space_from_counts(10, 4, 0, 4096).unwrap();
+        assert_eq!((s.total, s.available), (40960, Some(16384)));
+        // Zero total is unknown, not "0B free / 0B".
+        assert_eq!(space_from_counts(0, 0, 4096, 4096), None);
+        assert_eq!(space_from_counts(10, 4, 0, 0), None);
+        // Counts beyond u32 multiply in u64 without wrapping (>16 TB volume).
+        let blocks = u32::MAX as u64 + 10;
+        let s = space_from_counts(blocks, blocks, 4096, 4096).unwrap();
+        assert_eq!(s.total, blocks * 4096);
+        // Available never exceeds total.
+        assert_eq!(space_from_counts(1, 5, 10, 10).unwrap().available, Some(10));
+    }
+
+    #[test]
+    fn list_step_does_no_statvfs_but_fill_space_does() {
+        let fixture = r#"KNAME="sdc1" TYPE="part" FSTYPE="ext4" LABEL="R" PARTTYPE="" MOUNTPOINT="/mnt" SIZE="123""#;
+        let mut drives = drives_from_lsblk(fixture);
+        assert_eq!(
+            drives[0].space,
+            Some(DiskSpace {
+                total: 123,
+                available: None
+            })
+        );
+        drives[0].path = "/".to_string();
+        fill_space(&mut drives);
+        let s = drives[0].space.unwrap();
+        assert!(s.available.is_some() && s.total > 123);
+        // Unmounted drives keep the partition size.
+        let mut unmounted = drives_from_lsblk(&fixture.replace("/mnt", ""));
+        fill_space(&mut unmounted);
+        assert_eq!(unmounted[0].space.unwrap().total, 123);
+    }
+
+    #[test]
+    fn lsblk_hex_escapes_are_decoded() {
+        let pairs = parse_lsblk_pairs(
+            r#"LABEL="USB\x20STICK" MOUNTPOINT="/run/media/v/USB\x20STICK" X="a\"b""#,
+        );
+        assert_eq!(pairs[0].1, "USB STICK");
+        assert_eq!(pairs[1].1, "/run/media/v/USB STICK");
+        assert_eq!(pairs[2].1, "a\"b");
+        // Multi-byte UTF-8 survives (\xC3\xA9 = e-acute).
+        let pairs = parse_lsblk_pairs(r#"LABEL="caf\xc3\xa9""#);
+        assert_eq!(pairs[0].1, "café");
     }
 
     #[test]
