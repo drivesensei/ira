@@ -484,9 +484,6 @@ impl OverlaySlot {
 
     /// Transient hide: order out, keep the bitmap so a later show is `move_to`.
     fn suspend(&mut self) {
-        if !self.visible && self.shown_fp.is_none() {
-            return;
-        }
         self.shown_fp = None;
         #[cfg(any(target_os = "macos", windows))]
         self.inner.order_out();
@@ -494,9 +491,6 @@ impl OverlaySlot {
     }
 
     fn hide(&mut self) {
-        if !self.visible && self.shown_fp.is_none() && self.content_fp.is_none() {
-            return;
-        }
         self.shown_fp = None;
         self.content_fp = None;
         #[cfg(any(target_os = "macos", windows))]

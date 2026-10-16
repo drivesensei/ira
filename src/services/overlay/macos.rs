@@ -168,23 +168,33 @@ impl MacOverlay {
 
     /// Hide the panel without dropping the image (modal / wrong-window).
     pub fn order_out(&mut self) {
-        if !self.visible {
-            return;
-        }
         if let Some(panel) = &self.panel {
             panel.orderOut(None);
+            panel.setFrame_display(
+                NSRect::new(NSPoint::new(-10000.0, -10000.0), NSSize::new(1.0, 1.0)),
+                false,
+            );
         }
         self.visible = false;
+        self.pump();
     }
 
     pub fn hide(&mut self) {
-        self.order_out();
+        if let Some(panel) = &self.panel {
+            panel.orderOut(None);
+            panel.setFrame_display(
+                NSRect::new(NSPoint::new(-10000.0, -10000.0), NSSize::new(1.0, 1.0)),
+                false,
+            );
+        }
         if let Some(view) = &self.image_view {
             view.setImage(None);
         }
         // The bytes are gone with the view; the decoded image would only
         // pin memory.
         self.image = None;
+        self.visible = false;
+        self.pump();
     }
 
     pub fn close(&mut self) {
@@ -193,6 +203,7 @@ impl MacOverlay {
             panel.close();
         }
         self.image_view = None;
+        self.pump();
     }
 
     pub fn pump(&mut self) {
@@ -200,9 +211,10 @@ impl MacOverlay {
             return;
         };
         let app = NSApplication::sharedApplication(mtm);
+        app.updateWindows();
         // Non-blocking drain: nil untilDate can wait forever. Bound the
         // loop so a busy queue cannot stall the render thread.
-        const MAX_EVENTS: usize = 8;
+        const MAX_EVENTS: usize = 16;
         let until = NSDate::distantPast();
         for _ in 0..MAX_EVENTS {
             let event = unsafe {

@@ -1552,6 +1552,17 @@ impl App {
             self.overlay_protect.clear();
             return;
         }
+
+        // Always hide any slots that do not have an active overlay job this frame.
+        // This ensures that switching folder modes (e.g. thumbnail grid to table/list)
+        // or moving to a non-image file immediately hides the overlay without
+        // waiting for window geometry or dialog checks.
+        for slot in 0..overlay::OVERLAY_SLOTS {
+            if self.overlay_jobs[slot].is_none() {
+                self.overlay.hide_slot(slot);
+            }
+        }
+
         if self.overlay_covers_preview() {
             // Leave polling off while a dialog is open (no osascript
             // while help sits). Closing it sets wanted true, which
@@ -1591,11 +1602,9 @@ impl App {
         let cell = overlay::resolve_cell_px(window, cols, rows);
         let origin = overlay::content_origin(window, cols, rows, cell);
         for slot in 0..overlay::OVERLAY_SLOTS {
-            if self.overlay_jobs[slot].is_none() {
-                self.overlay.hide_slot(slot);
-                continue;
+            if self.overlay_jobs[slot].is_some() {
+                self.present_overlay_job(slot, window, origin, cell, (cols, rows));
             }
-            self.present_overlay_job(slot, window, origin, cell, (cols, rows));
         }
         self.rebuild_overlay_protect();
     }
