@@ -2384,3 +2384,104 @@ fn transient_banner_does_not_swallow_the_next_preview_cycle() {
         "the dismissing press must not also act"
     );
 }
+
+#[test]
+fn grid_mode_key_events_navigate_2d_and_open_or_rename() {
+    use ira::app::PreviewMode;
+    use ira::handler::handle_key_events;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let mut app = App::default();
+    let key = |code| KeyEvent::new(code, KeyModifiers::empty());
+
+    // Populate files in pane 0
+    app.panes[0].files = (0..9).map(|i| entry(&format!("/dir/file_{i}.txt"))).collect();
+    app.panes[0].grid_cols = 3;
+    app.panes[0].state.select(Some(0));
+
+    // In List mode: Right enters folder, Left leaves folder, Enter renames
+    handle_key_events(key(KeyCode::Enter), &mut app).unwrap();
+    assert!(app.renaming.is_some(), "Enter in list mode starts rename");
+    app.renaming = None;
+
+    // F2 in list mode also starts rename (G-0008)
+    handle_key_events(key(KeyCode::F(2)), &mut app).unwrap();
+    assert!(app.renaming.is_some(), "F2 in list mode starts rename");
+    app.renaming = None;
+
+    // Switch to Grid mode
+    app.panes[0].preview_mode = PreviewMode::Grid;
+
+    // Enter in grid mode does NOT start rename (it calls enter_folder)
+    handle_key_events(key(KeyCode::Enter), &mut app).unwrap();
+    assert!(app.renaming.is_none(), "Enter in grid mode does not start rename");
+
+    // F2 in grid mode starts rename
+    handle_key_events(key(KeyCode::F(2)), &mut app).unwrap();
+    assert!(app.renaming.is_some(), "F2 in grid mode starts rename");
+    app.renaming = None;
+
+    // Arrow navigation in Grid mode:
+    // Right moves right by 1
+    handle_key_events(key(KeyCode::Right), &mut app).unwrap();
+    assert_eq!(app.panes[0].state.selected(), Some(1));
+
+    // Up on top row stays in same column (G-0007)
+    handle_key_events(key(KeyCode::Up), &mut app).unwrap();
+    assert_eq!(app.panes[0].state.selected(), Some(1), "Up on top row preserves column");
+
+    // Down moves down by cols (3) -> 1 + 3 = 4
+    handle_key_events(key(KeyCode::Down), &mut app).unwrap();
+    assert_eq!(app.panes[0].state.selected(), Some(4));
+
+    // Left moves left by 1 -> 4 - 1 = 3
+    handle_key_events(key(KeyCode::Left), &mut app).unwrap();
+    assert_eq!(app.panes[0].state.selected(), Some(3));
+
+    // Up moves up by cols (3) -> 3 - 3 = 0
+    handle_key_events(key(KeyCode::Up), &mut app).unwrap();
+    assert_eq!(app.panes[0].state.selected(), Some(0));
+
+    // Alt+Down moves to bottom
+    handle_key_events(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT), &mut app).unwrap();
+    assert_eq!(app.panes[0].state.selected(), Some(8));
+
+    // Alt+Up moves to top
+    handle_key_events(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT), &mut app).unwrap();
+    assert_eq!(app.panes[0].state.selected(), Some(0));
+
+    // Grid mode leave directory (G-0006):
+    let base = std::env::temp_dir().join(format!("ira_grid_nav_{}", std::process::id()));
+    let child = base.join("child");
+    let _ = std::fs::create_dir_all(&child);
+    app.panes[0].folder = Some(ira::domain::data::Folder::new(
+        "child".into(),
+        child.to_str().unwrap().into(),
+        '#',
+    ));
+
+    // Left at index 0 leaves folder
+    app.panes[0].state.select(Some(0));
+    handle_key_events(key(KeyCode::Left), &mut app).unwrap();
+    assert_eq!(
+        app.panes[0].folder.as_ref().unwrap().path,
+        base.to_str().unwrap(),
+        "Left at index 0 leaves directory in grid mode"
+    );
+
+    // Reset folder to child, select non-zero index, Alt+Left leaves folder
+    app.panes[0].folder = Some(ira::domain::data::Folder::new(
+        "child".into(),
+        child.to_str().unwrap().into(),
+        '#',
+    ));
+    app.panes[0].state.select(Some(3));
+    handle_key_events(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT), &mut app).unwrap();
+    assert_eq!(
+        app.panes[0].folder.as_ref().unwrap().path,
+        base.to_str().unwrap(),
+        "Alt+Left leaves directory in grid mode"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+

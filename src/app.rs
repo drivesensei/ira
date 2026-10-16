@@ -44,7 +44,7 @@ use crate::{
 pub type AppResult<T> = std::result::Result<T, Box<dyn error::Error>>;
 
 /// A single file-browser pane (one side of a vertical split).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Pane {
     pub folder: Option<Folder>,
     pub state: ListState,
@@ -56,6 +56,8 @@ pub struct Pane {
     pub render_scroll: usize,
     /// First visible index of the grid-mode window (thumbnail grid).
     pub grid_top: usize,
+    /// Number of columns in the thumbnail grid.
+    pub grid_cols: usize,
     /// Image preview presentation of THIS pane (`v` cycles it); modes are
     /// per pane and persist across restarts.
     pub preview_mode: PreviewMode,
@@ -87,6 +89,29 @@ pub struct Pane {
     /// Active sort mode of the listing, cycled with `,`
     /// (0=Name, 1=Size, 2=Modified, 3=Kind).
     pub sort_mode: usize,
+}
+
+impl Default for Pane {
+    fn default() -> Self {
+        Self {
+            folder: None,
+            state: ListState::default(),
+            files: Vec::new(),
+            selected: Vec::new(),
+            render_scroll: 0,
+            grid_top: 0,
+            grid_cols: 1,
+            preview_mode: PreviewMode::default(),
+            preview_area: (0, 0),
+            listing_settled: false,
+            filter_query: None,
+            filter_indices: Vec::new(),
+            pending_select: None,
+            user_navigated: false,
+            listing_generation: 0,
+            sort_mode: 0,
+        }
+    }
 }
 
 /// Image preview presentation, cycled with `v`.
@@ -925,6 +950,21 @@ impl App {
         if self.hint_bar_blocked() || self.status.is_some() {
             return Vec::new();
         }
+        if self.panes[self.active_pane].preview_mode == PreviewMode::Grid {
+            return vec![
+                ("arrows", "navigate"),
+                ("Enter", "open"),
+                ("F2", "rename"),
+                ("c", "copy"),
+                ("m", "move"),
+                (".", "hidden"),
+                (",", "sort"),
+                ("v", "preview"),
+                ("b", "bookmark"),
+                ("n", "new"),
+                ("/", "search"),
+            ];
+        }
         vec![
             ("↑/↓", "move"),
             ("←/→", "open/leave"),
@@ -948,11 +988,11 @@ impl App {
     }
 
     /// The pane that currently receives input.
-    fn pane(&self) -> &Pane {
+    pub(crate) fn pane(&self) -> &Pane {
         &self.panes[self.active_pane]
     }
 
-    fn pane_mut(&mut self) -> &mut Pane {
+    pub(crate) fn pane_mut(&mut self) -> &mut Pane {
         &mut self.panes[self.active_pane]
     }
 
@@ -2308,6 +2348,67 @@ impl App {
                 }
             }
         }
+    }
+
+    pub fn grid_move_left(&mut self) {
+        self.pane_mut().user_navigated = true;
+        let count = self.visible_count();
+        if count == 0 {
+            self.pane_mut().state.select(None);
+            return;
+        }
+        let next = match self.pane().state.selected() {
+            Some(sel) => sel.saturating_sub(1),
+            None => 0,
+        };
+        self.pane_mut().state.select(Some(next));
+    }
+
+    pub fn grid_move_right(&mut self) {
+        self.pane_mut().user_navigated = true;
+        let count = self.visible_count();
+        if count == 0 {
+            self.pane_mut().state.select(None);
+            return;
+        }
+        let total = count;
+        let next = match self.pane().state.selected() {
+            Some(sel) => (sel + 1).min(total.saturating_sub(1)),
+            None => 0,
+        };
+        self.pane_mut().state.select(Some(next));
+    }
+
+    pub fn grid_move_up(&mut self) {
+        self.pane_mut().user_navigated = true;
+        let count = self.visible_count();
+        if count == 0 {
+            self.pane_mut().state.select(None);
+            return;
+        }
+        let cols = self.pane().grid_cols.max(1);
+        let next = match self.pane().state.selected() {
+            Some(sel) if sel >= cols => sel - cols,
+            Some(sel) => sel, // Top row: stay in same column, do not jump to 0
+            None => 0,
+        };
+        self.pane_mut().state.select(Some(next));
+    }
+
+    pub fn grid_move_down(&mut self) {
+        self.pane_mut().user_navigated = true;
+        let count = self.visible_count();
+        if count == 0 {
+            self.pane_mut().state.select(None);
+            return;
+        }
+        let cols = self.pane().grid_cols.max(1);
+        let total = count;
+        let next = match self.pane().state.selected() {
+            Some(sel) => (sel + cols).min(total.saturating_sub(1)),
+            None => 0,
+        };
+        self.pane_mut().state.select(Some(next));
     }
 
     /// Switches to the next built-in theme preset (`\`), announces it in
@@ -6308,5 +6409,94 @@ mod preview_tests {
             app.overlay_protect.is_empty(),
             "protect must not accumulate where the overlay never shows"
         );
+    }
+
+    #[test]
+    fn grid_navigation_tests() {
+        let mut app = App::default();
+        let entry = |path: &str| FEntry {
+            path: path.to_string(),
+            label: path.rsplit('/').next().unwrap_or(path).to_string(),
+            is_dir: false,
+            size: 0,
+            modified: None,
+        };
+
+        // 1. Empty pane
+        app.grid_move_left();
+        assert_eq!(app.panes[0].state.selected(), None);
+        app.grid_move_right();
+        assert_eq!(app.panes[0].state.selected(), None);
+        app.grid_move_up();
+        assert_eq!(app.panes[0].state.selected(), None);
+        app.grid_move_down();
+        assert_eq!(app.panes[0].state.selected(), None);
+
+        // 2. Populate pane with 10 files (indices 0..9)
+        app.panes[0].files = (0..10).map(|i| entry(&format!("/file_{i}"))).collect();
+        app.panes[0].grid_cols = 3;
+
+        // None selected defaults to 0 on any move
+        app.grid_move_left();
+        assert_eq!(app.panes[0].state.selected(), Some(0));
+
+        // Left from 0 saturates at 0
+        app.grid_move_left();
+        assert_eq!(app.panes[0].state.selected(), Some(0));
+
+        // Up from 0 (first row) saturates at 0
+        app.grid_move_up();
+        assert_eq!(app.panes[0].state.selected(), Some(0));
+
+        // Right moves by 1
+        app.grid_move_right();
+        assert_eq!(app.panes[0].state.selected(), Some(1));
+        app.grid_move_right();
+        assert_eq!(app.panes[0].state.selected(), Some(2));
+
+        // Up from index 2 stays at 2 (top row: stay in same column, do not jump to 0)
+        app.grid_move_up();
+        assert_eq!(app.panes[0].state.selected(), Some(2));
+
+        // Down moves by cols (3) from index 2
+        app.grid_move_down();
+        assert_eq!(app.panes[0].state.selected(), Some(5));
+        // Up moves back to 2
+        app.grid_move_up();
+        assert_eq!(app.panes[0].state.selected(), Some(2));
+
+        app.panes[0].state.select(Some(0));
+        // Down moves by cols (3)
+        app.grid_move_down();
+        assert_eq!(app.panes[0].state.selected(), Some(3));
+        app.grid_move_down();
+        assert_eq!(app.panes[0].state.selected(), Some(6));
+        app.grid_move_down();
+        assert_eq!(app.panes[0].state.selected(), Some(9));
+
+        // Down from last row (index 9, total 10) clamps to 9
+        app.grid_move_down();
+        assert_eq!(app.panes[0].state.selected(), Some(9));
+
+        // Right from last item (9) clamps to 9
+        app.grid_move_right();
+        assert_eq!(app.panes[0].state.selected(), Some(9));
+
+        // Down from index 8 (8 + 3 = 11 > 9) clamps to 9
+        app.panes[0].state.select(Some(8));
+        app.grid_move_down();
+        assert_eq!(app.panes[0].state.selected(), Some(9));
+
+        // Left moves left
+        app.grid_move_left();
+        assert_eq!(app.panes[0].state.selected(), Some(8));
+
+        // 3. Single column grid (cols = 1)
+        app.panes[0].grid_cols = 1;
+        app.panes[0].state.select(Some(0));
+        app.grid_move_down();
+        assert_eq!(app.panes[0].state.selected(), Some(1));
+        app.grid_move_up();
+        assert_eq!(app.panes[0].state.selected(), Some(0));
     }
 }

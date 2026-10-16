@@ -343,23 +343,69 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         }
 
         // Files navigation handlers
-        KeyCode::Right => app.enter_folder(),
-        KeyCode::Left => app.out_of_folder(),
+        KeyCode::Left => {
+            let in_grid = app.panes[app.active_pane].preview_mode == crate::app::PreviewMode::Grid;
+            if in_grid {
+                if key_event.modifiers == KeyModifiers::ALT {
+                    app.out_of_folder();
+                } else if key_event.modifiers.is_empty() && app.pane().state.selected() == Some(0) {
+                    app.out_of_folder();
+                } else {
+                    app.grid_move_left();
+                }
+            } else {
+                app.out_of_folder();
+            }
+        }
+        KeyCode::Right => {
+            let in_grid = app.panes[app.active_pane].preview_mode == crate::app::PreviewMode::Grid;
+            if in_grid {
+                app.grid_move_right();
+            } else {
+                app.enter_folder();
+            }
+        }
 
-        // Enter renames the selected entry (macOS-style).
-        KeyCode::Enter => app.start_rename(),
+        // Enter renames the selected entry (macOS-style) in list mode, opens folder in grid mode.
+        KeyCode::Enter => {
+            let in_grid = app.panes[app.active_pane].preview_mode == crate::app::PreviewMode::Grid;
+            if in_grid {
+                app.enter_folder();
+            } else {
+                app.start_rename();
+            }
+        }
+        KeyCode::F(2) => app.start_rename(),
 
         KeyCode::Up => {
-            if key_event.modifiers == KeyModifiers::ALT {
-                app.goto_top();
+            let in_grid = app.panes[app.active_pane].preview_mode == crate::app::PreviewMode::Grid;
+            if in_grid {
+                if key_event.modifiers == KeyModifiers::ALT {
+                    app.goto_top();
+                } else {
+                    app.grid_move_up();
+                }
+            } else {
+                if key_event.modifiers == KeyModifiers::ALT {
+                    app.goto_top();
+                }
+                app.prev_item();
             }
-            app.prev_item();
         }
         KeyCode::Down => {
-            if key_event.modifiers == KeyModifiers::ALT {
-                app.goto_bottom();
+            let in_grid = app.panes[app.active_pane].preview_mode == crate::app::PreviewMode::Grid;
+            if in_grid {
+                if key_event.modifiers == KeyModifiers::ALT {
+                    app.goto_bottom();
+                } else {
+                    app.grid_move_down();
+                }
+            } else {
+                if key_event.modifiers == KeyModifiers::ALT {
+                    app.goto_bottom();
+                }
+                app.next_item();
             }
-            app.next_item();
         }
 
         _ => {}

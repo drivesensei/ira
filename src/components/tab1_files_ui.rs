@@ -431,7 +431,7 @@ fn render_grid(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, acti
         let rows = app.pane_visible_rows(pane_index);
         let total = rows.len();
         let selected = pane.state.selected();
-        let top = grid_window(total, selected, pane.grid_top, per_screen);
+        let top = grid_window(total, selected, pane.grid_top, per_screen, cols);
         let end = (top + per_screen).min(total);
         let window: Vec<(usize, crate::services::list_files::FEntry)> = rows[top..end]
             .iter()
@@ -450,6 +450,7 @@ fn render_grid(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, acti
         (title, top, window, prefetch)
     };
     app.panes[pane_index].grid_top = top;
+    app.panes[pane_index].grid_cols = cols;
 
     let block = panel_block(title, active, &theme);
     let inner = block.inner(area);
@@ -592,18 +593,28 @@ fn render_grid(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, acti
 
 /// Computes the first visible index of a grid window of `per_screen` cells,
 /// keeping the cursor inside, seeded from the previous window start.
-fn grid_window(total: usize, selected: Option<usize>, scroll: usize, per_screen: usize) -> usize {
+/// Quantizes `top` to a multiple of `cols` so grid columns remain aligned.
+fn grid_window(
+    total: usize,
+    selected: Option<usize>,
+    scroll: usize,
+    per_screen: usize,
+    cols: usize,
+) -> usize {
+    let cols = cols.max(1);
     if total == 0 || per_screen == 0 {
         return 0;
     }
-    let max_top = total.saturating_sub(per_screen);
-    let mut top = scroll.min(max_top);
+    let per_screen = (per_screen / cols).max(1) * cols;
+    let max_top = (total.saturating_sub(per_screen) / cols) * cols;
+    let mut top = ((scroll.min(max_top)) / cols) * cols;
     if let Some(sel) = selected {
         let sel = sel.min(total - 1);
-        if sel < top {
-            top = sel;
+        let sel_row_start = (sel / cols) * cols;
+        if sel_row_start < top {
+            top = sel_row_start;
         } else if sel >= top + per_screen {
-            top = sel + 1 - per_screen;
+            top = sel_row_start + cols - per_screen;
         }
     }
     top
@@ -1098,15 +1109,23 @@ mod tests {
     #[test]
     fn grid_window_keeps_cursor_inside_viewport() {
         // Fewer cells than the viewport: window stays at 0.
-        assert_eq!(grid_window(10, Some(9), 0, 20), 0);
+        assert_eq!(grid_window(10, Some(9), 0, 20, 1), 0);
         // Cursor walks past the window: window follows.
-        assert_eq!(grid_window(100, Some(25), 0, 20), 6);
+        assert_eq!(grid_window(100, Some(25), 0, 20, 1), 6);
         // Cursor walks back above it: window follows.
-        assert_eq!(grid_window(100, Some(5), 6, 20), 5);
+        assert_eq!(grid_window(100, Some(5), 6, 20, 1), 5);
         // Stale scroll beyond the last full page clamps.
-        assert_eq!(grid_window(30, None, 25, 20), 10);
+        assert_eq!(grid_window(30, None, 25, 20, 1), 10);
         // Empty list / zero viewport.
-        assert_eq!(grid_window(0, Some(0), 0, 20), 0);
-        assert_eq!(grid_window(10, Some(0), 0, 0), 0);
+        assert_eq!(grid_window(0, Some(0), 0, 20, 1), 0);
+        assert_eq!(grid_window(10, Some(0), 0, 0, 1), 0);
+
+        // Multi-column grid quantizes top to multiple of cols:
+        // 3 cols, 12 per_screen (4 rows of 3).
+        // Item 14 is in row index 4 (14/3 = 4, sel_row_start = 12).
+        // sel >= top(0) + per_screen(12) => top = 12 + 3 - 12 = 3.
+        assert_eq!(grid_window(30, Some(14), 0, 12, 3), 3);
+        // Item 2 is in row 0, scrolling back up sets top to 0.
+        assert_eq!(grid_window(30, Some(2), 3, 12, 3), 0);
     }
 }

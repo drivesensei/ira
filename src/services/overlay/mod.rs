@@ -91,7 +91,9 @@ pub fn content_origin(window: WindowGeom, cols: u16, rows: u16, cell: CellPx) ->
     let text_h = rows as u32 * cell.height as u32;
     let ox = window.width.saturating_sub(text_w) / 2;
     // Chrome (title, tabs) sits above the text grid.
-    let oy = window.height.saturating_sub(text_h);
+    // Clamp to MAX_CHROME to avoid dumping bottom remainder space into top chrome.
+    let leftover = window.height.saturating_sub(text_h);
+    let oy = leftover.min(MAX_CHROME);
     (ox, oy)
 }
 
@@ -306,8 +308,7 @@ pub fn composite_grid(
         };
         let dx = i64::from(tile.x.saturating_sub(area.x)) * i64::from(cell.width)
             + i64::from((tw - fw) / 2);
-        let dy = i64::from(tile.y.saturating_sub(area.y)) * i64::from(cell.height)
-            + i64::from((th - fh) / 2);
+        let dy = i64::from(tile.y.saturating_sub(area.y)) * i64::from(cell.height);
         image::imageops::overlay(&mut canvas, fitted, dx, dy);
     }
     Some(DynamicImage::ImageRgba8(canvas))
@@ -889,10 +890,9 @@ pub fn resolve_cell_px(window: WindowGeom, cols: u16, rows: u16) -> CellPx {
 }
 
 /// Cell size from `TIOCGWINSZ` when the kernel fills pixel fields.
-/// Unused on macOS: those fields are device pixels while AppleScript
-/// bounds are points, and mixing them doubles every overlay offset on Retina.
+/// On macOS, divide device pixels by `backing_scale()` to yield dimensions in points.
 pub fn ioctl_cell_px() -> Option<CellPx> {
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     {
         let mut ws = libc::winsize {
             ws_row: 0,
@@ -902,14 +902,18 @@ pub fn ioctl_cell_px() -> Option<CellPx> {
         };
         let ok = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0;
         if ok && ws.ws_col > 0 && ws.ws_row > 0 && ws.ws_xpixel > 0 && ws.ws_ypixel > 0 {
+            #[cfg(target_os = "macos")]
+            let scale = backing_scale().max(1);
+            #[cfg(not(target_os = "macos"))]
+            let scale = 1;
             return Some(CellPx {
-                width: ws.ws_xpixel / ws.ws_col,
-                height: ws.ws_ypixel / ws.ws_row,
+                width: (ws.ws_xpixel / ws.ws_col) / scale,
+                height: (ws.ws_ypixel / ws.ws_row) / scale,
             });
         }
-        return None;
+        None
     }
-    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    #[cfg(not(unix))]
     None
 }
 
@@ -923,15 +927,15 @@ mod tests {
             x: 100,
             y: 50,
             width: 800,
-            height: 600,
+            height: 540,
         };
         let cell = CellPx {
             width: 10,
             height: 20,
         };
-        // 80×25 cells = 800×500; 100 px leftover is the title/tab bar.
+        // 80×25 cells = 800×500; 40 px leftover is the title/tab bar (<= MAX_CHROME).
         let (ox, oy) = content_origin(window, 80, 25, cell);
-        assert_eq!((ox, oy), (0, 100));
+        assert_eq!((ox, oy), (0, 40));
     }
 
     #[test]
@@ -940,7 +944,7 @@ mod tests {
             x: 100,
             y: 50,
             width: 800,
-            height: 600,
+            height: 540,
         };
         let cell = CellPx {
             width: 10,
@@ -955,7 +959,7 @@ mod tests {
         };
         let r = preview_screen_rect(window, origin, cell, area);
         assert_eq!(r.x, 100 + 0 + 40 * 10);
-        assert_eq!(r.y, 50 + 100 + 3 * 20);
+        assert_eq!(r.y, 50 + 40 + 3 * 20);
         assert_eq!(r.width, 38 * 10);
         assert_eq!(r.height, 20 * 20);
     }

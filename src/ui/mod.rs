@@ -188,7 +188,13 @@ pub fn render(app: &mut App, frame: &mut Frame) {
                 "copy to other pane",
                 &theme,
             ),
-            chrome::bind_pair("m", "move to other pane", "Enter", "rename entry", &theme),
+            chrome::bind_pair(
+                "m",
+                "move to other pane",
+                "Enter / F2",
+                "rename entry (open/rename in grid)",
+                &theme,
+            ),
             chrome::bind_pair(
                 "Del",
                 "delete (with confirm)",
