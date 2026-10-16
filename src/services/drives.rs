@@ -72,25 +72,62 @@ use crate::services::windows_drives_labels::disk_space;
 use std::fs::read_dir;
 
 #[cfg(target_os = "macos")]
+const ICLOUD_REL_PATH: &str = "Library/Mobile Documents/com~apple~CloudDocs";
+
+#[cfg(target_os = "macos")]
+const ICLOUD_SHORTCUT: char = '9';
+
+/// Checks whether the macOS iCloud Drive folder exists. A `PermissionDenied`
+/// result from `metadata` means TCC blocked inspecting inside `Mobile Documents`,
+/// which only happens when the folder exists on disk.
+#[cfg(target_os = "macos")]
+fn icloud_dir_exists(path: &std::path::Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(m) => m.is_dir(),
+        Err(e) => e.kind() == std::io::ErrorKind::PermissionDenied,
+    }
+}
+
+#[cfg(target_os = "macos")]
 pub fn list_drives() -> IOResult<Vec<Folder>> {
     const VOLUMES: &str = "/Volumes";
     let mut drives: Vec<Folder> = Vec::new();
 
     if let Ok(entries) = read_dir(VOLUMES) {
-        for (i, entry) in entries.enumerate() {
-            if let Ok(entry) = entry {
-                if let Ok(file_name) = entry.file_name().into_string() {
-                    drives.push(Folder {
-                        path: format!("{}/{}", VOLUMES, file_name),
-                        label: file_name,
-                        shortcut: (i + 1) as u8 as char,
-                        device: None,
-                        space: None,
-                    });
-                }
+        for entry in entries.flatten() {
+            if let Ok(file_name) = entry.file_name().into_string() {
+                let n = drives.len() + 1;
+                // Reserve '9' for iCloud Drive.
+                let shortcut = if n < 9 {
+                    char::from_digit(n as u32, 10).unwrap_or('#')
+                } else {
+                    '#'
+                };
+                drives.push(Folder {
+                    path: format!("{}/{}", VOLUMES, file_name),
+                    label: file_name,
+                    shortcut,
+                    device: None,
+                    space: None,
+                });
             }
         }
     }
+
+    if let Some(icloud) = dirs_next::home_dir().map(|h| h.join(ICLOUD_REL_PATH)) {
+        if icloud_dir_exists(&icloud) {
+            if let Some(path_str) = icloud.to_str() {
+                drives.push(Folder {
+                    path: path_str.to_string(),
+                    label: "iCloud".to_string(),
+                    shortcut: ICLOUD_SHORTCUT,
+                    device: None,
+                    space: None,
+                });
+            }
+        }
+    }
+
     Ok(drives)
 }
 
@@ -119,7 +156,7 @@ pub fn list_drives() -> IOResult<Vec<Folder>> {
                                 maybe_drive.clone()
                             }
                         },
-                        shortcut: i as u8 as char,
+                        shortcut: char::from_digit(i as u32, 10).unwrap_or('#'),
                         device: None,
                     })
                 } else {
@@ -282,7 +319,7 @@ fn drives_from_lsblk(output: &str) -> Vec<Folder> {
         drives.push(Folder {
             label: display_name,
             path: mountpoint.to_string(),
-            shortcut: i as u8 as char,
+            shortcut: char::from_digit(i as u32, 10).unwrap_or('#'),
             device: Some(device),
             space,
         });

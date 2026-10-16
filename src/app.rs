@@ -2081,7 +2081,7 @@ impl App {
     }
 
     pub fn set_folder_from_drives(&mut self, initial_shortcut: usize) {
-        let Ok(mut drives) = list_drives() else {
+        let Some(mut drives) = self.drives.clone().or_else(|| list_drives().ok()) else {
             return;
         };
         let Some(drive) = drives.get(initial_shortcut).cloned() else {
@@ -2107,18 +2107,6 @@ impl App {
             drive.path.clone()
         };
 
-        // `list_drives` does no blocking space queries; keep the free-space
-        // figures the background poller already published.
-        if let Some(prev) = &self.drives {
-            for d in drives.iter_mut() {
-                if let Some(p) = prev
-                    .iter()
-                    .find(|p| p.device == d.device && p.label == d.label)
-                {
-                    d.space = p.space;
-                }
-            }
-        }
         self.drives = Some(drives);
         let pane = self.pane_mut();
         pane.filter_query = None;

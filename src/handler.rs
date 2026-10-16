@@ -235,10 +235,14 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
 
         // Any digit represents a shortcut to a Drive path
         KeyCode::Char(c) if c.is_digit(10) => {
-            let index = c.to_digit(10).unwrap() as usize;
             let shortcuts = app.get_drive_shortcuts();
-            if index > 0 && index <= shortcuts.len() {
-                app.set_folder_from_drives(index - 1);
+            if let Some(idx) = shortcuts.iter().position(|&sc| sc == c) {
+                app.set_folder_from_drives(idx);
+            } else {
+                let index = c.to_digit(10).unwrap() as usize;
+                if index > 0 && index <= shortcuts.len() && !shortcuts[index - 1].is_ascii_digit() {
+                    app.set_folder_from_drives(index - 1);
+                }
             }
         }
 
