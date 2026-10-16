@@ -261,8 +261,8 @@ pub fn fit_pixels(img: &DynamicImage, w: u32, h: u32) -> DynamicImage {
     DynamicImage::ImageRgba8(canvas)
 }
 
-/// Grid overlay fill: leave a margin so names stay visible under the panel.
-pub const GRID_FILL_PERCENT: u32 = 80;
+/// Grid overlay fill: cover almost the entire space available for each tile.
+pub const GRID_FILL_PERCENT: u32 = 95;
 
 /// Composite tiles (cell-rect + image) onto one bitmap covering `area`.
 /// `fill_percent` shrinks each tile (centered) so 80 leaves a gap above the name.
@@ -1034,7 +1034,7 @@ mod tests {
             width: 5,
             height: 5,
         };
-        let out = composite_grid(area, cell, &[(tile, &red)], GRID_FILL_PERCENT).unwrap();
+        let out = composite_grid(area, cell, &[(tile, &red)], 80).unwrap();
         let rgba = out.to_rgba8();
         // 10×10 tile at 80% is 8×8 centered → 1 px margin.
         assert_eq!(rgba.get_pixel(0, 0), &image::Rgba([0, 0, 0, 0]));
