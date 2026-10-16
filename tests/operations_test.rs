@@ -2485,3 +2485,75 @@ fn grid_mode_key_events_navigate_2d_and_open_or_rename() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+#[test]
+fn mouse_scroll_and_page_navigation_in_list_and_grid_modes() {
+    use ira::app::PreviewMode;
+    use ira::handler::{handle_key_events, handle_mouse_events};
+    use ratatui::crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
+    };
+
+    let mut app = App::default();
+    let key = |code| KeyEvent::new(code, KeyModifiers::empty());
+    let scroll_down = MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: 10,
+        row: 10,
+        modifiers: KeyModifiers::empty(),
+    };
+    let scroll_up = MouseEvent {
+        kind: MouseEventKind::ScrollUp,
+        column: 10,
+        row: 10,
+        modifiers: KeyModifiers::empty(),
+    };
+
+    // Populate pane with 30 files
+    app.panes[0].files = (0..30).map(|i| entry(&format!("/dir/file_{i}.txt"))).collect();
+    app.panes[0].state.select(Some(0));
+
+    // 1. In List Mode:
+    // Scroll down moves to next item (0 -> 1)
+    handle_mouse_events(scroll_down, &mut app).unwrap();
+    assert_eq!(app.panes[0].state.selected(), Some(1));
+
+    // Scroll up moves to prev item (1 -> 0)
+    handle_mouse_events(scroll_up, &mut app).unwrap();
+    assert_eq!(app.panes[0].state.selected(), Some(0));
+
+    // PageDown moves by 10 (0 -> 10)
+    handle_key_events(key(KeyCode::PageDown), &mut app).unwrap();
+    assert_eq!(app.panes[0].state.selected(), Some(10));
+
+    // PageUp moves by 10 (10 -> 0)
+    handle_key_events(key(KeyCode::PageUp), &mut app).unwrap();
+    assert_eq!(app.panes[0].state.selected(), Some(0));
+
+    // 2. In Grid Mode:
+    app.panes[0].preview_mode = PreviewMode::Grid;
+    app.panes[0].grid_cols = 3;
+    app.panes[0].grid_rows = 4; // Page size = 3 * 4 = 12
+
+    // Scroll down in grid mode moves by cols (3) -> 0 -> 3
+    handle_mouse_events(scroll_down, &mut app).unwrap();
+    assert_eq!(app.panes[0].state.selected(), Some(3));
+
+    // Scroll up in grid mode moves by cols (3) -> 3 -> 0
+    handle_mouse_events(scroll_up, &mut app).unwrap();
+    assert_eq!(app.panes[0].state.selected(), Some(0));
+
+    // PageDown in grid mode moves by cols * rows (12) -> 0 -> 12
+    handle_key_events(key(KeyCode::PageDown), &mut app).unwrap();
+    assert_eq!(app.panes[0].state.selected(), Some(12));
+
+    handle_key_events(key(KeyCode::PageDown), &mut app).unwrap();
+    assert_eq!(app.panes[0].state.selected(), Some(24));
+
+    // PageUp moves up by 12 -> 24 -> 12
+    handle_key_events(key(KeyCode::PageUp), &mut app).unwrap();
+    assert_eq!(app.panes[0].state.selected(), Some(12));
+
+    handle_key_events(key(KeyCode::PageUp), &mut app).unwrap();
+    assert_eq!(app.panes[0].state.selected(), Some(0));
+}
+

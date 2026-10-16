@@ -1,5 +1,5 @@
 use crate::app::{App, AppResult};
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 /// vlad lopez
 /// Keys that trigger the delete flow in normal mode. Windows/Linux have a
 /// dedicated Del key; on macOS the key labeled "delete" is Backspace (Del
@@ -203,6 +203,8 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
                     app.next_item();
                 }
             }
+            KeyCode::PageDown => app.page_down(),
+            KeyCode::PageUp => app.page_up(),
             _ => {}
         }
         return Ok(());
@@ -408,6 +410,47 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
             }
         }
 
+        KeyCode::PageDown => app.page_down(),
+        KeyCode::PageUp => app.page_up(),
+
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Handles mouse events and updates the state of [`App`].
+pub fn handle_mouse_events(mouse_event: MouseEvent, app: &mut App) -> AppResult<()> {
+    // Suppress mouse scrolling when a modal dialog is active
+    if app.keybindings_visible
+        || app.status.as_ref().is_some_and(|s| s.is_error)
+        || app.confirming.is_some()
+        || app.renaming.is_some()
+        || app.goto_prompt.is_some()
+        || app.new_entry.is_some()
+        || app.multi_info.is_some()
+        || app.info.is_some()
+        || app.deletion_box_visible()
+    {
+        return Ok(());
+    }
+
+    match mouse_event.kind {
+        MouseEventKind::ScrollDown => {
+            let in_grid = app.panes[app.active_pane].preview_mode == crate::app::PreviewMode::Grid;
+            if in_grid {
+                app.grid_move_down();
+            } else {
+                app.next_item();
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            let in_grid = app.panes[app.active_pane].preview_mode == crate::app::PreviewMode::Grid;
+            if in_grid {
+                app.grid_move_up();
+            } else {
+                app.prev_item();
+            }
+        }
         _ => {}
     }
     Ok(())

@@ -39,7 +39,7 @@ pub const MAX_DECODE_THREADS: usize = 6;
 /// Capacity of the high-priority queue (on-screen cells). `try_send` into a
 /// full queue is dropped (retried on a later frame), so scrolling cannot
 /// build an unbounded backlog.
-pub const JOB_QUEUE_HI_CAP: usize = 32;
+pub const JOB_QUEUE_HI_CAP: usize = 128;
 
 /// Capacity of the prefetch queue (screens adjacent to the viewport). Kept
 /// separate from the visible queue so a big prefetch backlog — e.g. the

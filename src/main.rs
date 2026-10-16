@@ -1,6 +1,6 @@
 use ira::app::{App, AppResult};
 use ira::event::{Event, EventHandler};
-use ira::handler::handle_key_events;
+use ira::handler::{handle_key_events, handle_mouse_events};
 use ira::services::picker_probe;
 use ira::tui::Tui;
 use ratatui::backend::CrosstermBackend;
@@ -63,7 +63,7 @@ fn main() -> AppResult<()> {
         match tui.events.next()? {
             Event::Tick => app.tick(),
             Event::Key(key_event) => handle_key_events(key_event, &mut app)?,
-            Event::Mouse(_) => {}
+            Event::Mouse(mouse_event) => handle_mouse_events(mouse_event, &mut app)?,
             Event::Paste(text) => app.handle_paste(&text),
             Event::Resize(_, _) => {}
         }

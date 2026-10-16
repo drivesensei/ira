@@ -91,9 +91,15 @@ pub fn content_origin(window: WindowGeom, cols: u16, rows: u16, cell: CellPx) ->
     let text_h = rows as u32 * cell.height as u32;
     let ox = window.width.saturating_sub(text_w) / 2;
     // Chrome (title, tabs) sits above the text grid.
-    // Clamp to MAX_CHROME to avoid dumping bottom remainder space into top chrome.
+    // Any fractional remainder sits at the bottom of the window, not the top.
     let leftover = window.height.saturating_sub(text_h);
-    let oy = leftover.min(MAX_CHROME);
+    let rem = if rows > 0 && cell.height > 0 {
+        leftover % u32::from(cell.height)
+    } else {
+        0
+    };
+    let top_chrome = leftover.saturating_sub(rem);
+    let oy = top_chrome.min(MAX_CHROME);
     (ox, oy)
 }
 
@@ -190,13 +196,18 @@ fn snap_cell(
 /// `pub`, so it cannot assume its caller clamped.
 pub fn grid_tile_px(tile: Rect, cell: CellPx, fill_percent: u32) -> (u32, u32) {
     let fill = u64::from(fill_percent.clamp(1, 100));
-    let scaled = |cells: u16, px: u16| {
-        let v = u64::from(cells) * u64::from(px) * fill / 100;
+    let fill_h = if fill_percent == GRID_FILL_PERCENT || fill_percent == GRID_FILL_W_PERCENT {
+        u64::from(GRID_FILL_H_PERCENT)
+    } else {
+        fill.min(u64::from(GRID_FILL_H_PERCENT))
+    };
+    let scaled = |cells: u16, px: u16, pct: u64| {
+        let v = u64::from(cells) * u64::from(px) * pct / 100;
         v.min(u64::from(u32::MAX)) as u32
     };
     (
-        scaled(tile.width, cell.width).max(1),
-        scaled(tile.height, cell.height).max(1),
+        scaled(tile.width, cell.width, fill).max(1),
+        scaled(tile.height, cell.height, fill_h).max(1),
     )
 }
 
@@ -265,6 +276,8 @@ pub fn fit_pixels(img: &DynamicImage, w: u32, h: u32) -> DynamicImage {
 
 /// Grid overlay fill: cover almost the entire space available for each tile.
 pub const GRID_FILL_PERCENT: u32 = 95;
+pub const GRID_FILL_W_PERCENT: u32 = 95;
+pub const GRID_FILL_H_PERCENT: u32 = 78;
 
 /// Composite tiles (cell-rect + image) onto one bitmap covering `area`.
 /// `fill_percent` shrinks each tile (centered) so 80 leaves a gap above the name.
@@ -287,6 +300,16 @@ pub fn composite_grid(
         return None;
     }
     let fill = fill_percent.clamp(1, 100);
+    let fill_w = if fill_percent == GRID_FILL_PERCENT || fill_percent == 0 {
+        GRID_FILL_W_PERCENT
+    } else {
+        fill
+    };
+    let fill_h = if fill_percent == GRID_FILL_PERCENT || fill_percent == 0 {
+        GRID_FILL_H_PERCENT
+    } else {
+        fill.min(GRID_FILL_H_PERCENT)
+    };
     let mut canvas = image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 0]));
     for (tile, img) in tiles {
         let tw = u32::from(tile.width) * u32::from(cell.width);
@@ -294,8 +317,8 @@ pub fn composite_grid(
         if tw == 0 || th == 0 {
             continue;
         }
-        let fw = (tw * fill / 100).max(1);
-        let fh = (th * fill / 100).max(1);
+        let fw = (u64::from(tw) * u64::from(fill_w) / 100).max(1) as u32;
+        let fh = (u64::from(th) * u64::from(fill_h) / 100).max(1) as u32;
         // Already-fitted tiles (cached at dest size) are a memcpy onto the
         // canvas: borrow the pixels instead of cloning the tile per frame.
         let owned: image::RgbaImage;
@@ -308,7 +331,8 @@ pub fn composite_grid(
         };
         let dx = i64::from(tile.x.saturating_sub(area.x)) * i64::from(cell.width)
             + i64::from((tw - fw) / 2);
-        let dy = i64::from(tile.y.saturating_sub(area.y)) * i64::from(cell.height);
+        let dy = i64::from(tile.y.saturating_sub(area.y)) * i64::from(cell.height)
+            + i64::from((th.saturating_sub(fh)) / 4);
         image::imageops::overlay(&mut canvas, fitted, dx, dy);
     }
     Some(DynamicImage::ImageRgba8(canvas))
@@ -907,8 +931,12 @@ pub fn ioctl_cell_px() -> Option<CellPx> {
             #[cfg(not(target_os = "macos"))]
             let scale = 1;
             return Some(CellPx {
-                width: (ws.ws_xpixel / ws.ws_col) / scale,
-                height: (ws.ws_ypixel / ws.ws_row) / scale,
+                width: ((ws.ws_xpixel as f64 / ws.ws_col as f64) / scale as f64)
+                    .round()
+                    .max(1.0) as u16,
+                height: ((ws.ws_ypixel as f64 / ws.ws_row as f64) / scale as f64)
+                    .round()
+                    .max(1.0) as u16,
             });
         }
         None
@@ -1458,7 +1486,7 @@ mod tests {
         };
         let (w, h) = grid_tile_px(tile, cell, 100);
         assert_eq!(w, 4_294_836_225, "no wrap");
-        assert_eq!(h, 64);
+        assert_eq!(h, 49);
     }
 
     #[test]
@@ -1543,5 +1571,87 @@ mod tests {
         let composed = composite_grid(area, cell, &[(tile, &fitted)], GRID_FILL_PERCENT).unwrap();
         assert_eq!(composed.width(), 20);
         assert_eq!(composed.height(), 20);
+    }
+
+    #[test]
+    fn portrait_vs_landscape_grid_tile_compositing_leaves_gap_above_name() {
+        // Tile is 20 cells wide by 8 cells high (matching GRID_CELL_W and GRID_IMG_H).
+        // Cell is 10px wide by 20px high.
+        let tile = ratatui::layout::Rect::new(0, 0, 20, 8);
+        let area = tile;
+        let cell = CellPx {
+            width: 10,
+            height: 20,
+        };
+        // Total tile pixel dimensions:
+        // tw = 20 * 10 = 200px.
+        // th = 8 * 20 = 160px.
+        // Portrait image: 100 wide x 200 high (aspect 1:2).
+        let portrait = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            100,
+            200,
+            image::Rgba([255, 0, 0, 255]),
+        ));
+        let out_portrait =
+            composite_grid(area, cell, &[(tile, &portrait)], GRID_FILL_PERCENT).unwrap();
+        let rgba_p = out_portrait.to_rgba8();
+
+        // Check that bottom row of cells (at least 20px) above tile.height (y = 160) is transparent:
+        for y in (160 - 20)..160 {
+            for x in 0..200 {
+                assert_eq!(
+                    rgba_p.get_pixel(x, y),
+                    &image::Rgba([0, 0, 0, 0]),
+                    "pixel at ({x}, {y}) must be transparent gap above name area for portrait"
+                );
+            }
+        }
+
+        // Square image: 200 x 200
+        let square = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            200,
+            200,
+            image::Rgba([0, 255, 0, 255]),
+        ));
+        let out_square =
+            composite_grid(area, cell, &[(tile, &square)], GRID_FILL_PERCENT).unwrap();
+        let rgba_sq = out_square.to_rgba8();
+        // At least 1 full row (>= 20px) above tile.height is transparent:
+        for y in (160 - 20)..160 {
+            for x in 0..200 {
+                assert_eq!(
+                    rgba_sq.get_pixel(x, y),
+                    &image::Rgba([0, 0, 0, 0]),
+                    "pixel at ({x}, {y}) must be transparent gap above name area for square"
+                );
+            }
+        }
+
+        // Landscape image: 400 wide x 200 high (aspect 2:1).
+        let landscape = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            400,
+            200,
+            image::Rgba([0, 0, 255, 255]),
+        ));
+        let out_landscape =
+            composite_grid(area, cell, &[(tile, &landscape)], GRID_FILL_PERCENT).unwrap();
+        let rgba_l = out_landscape.to_rgba8();
+        // Landscape stays wide (~95% = 190px of 200px width):
+        let mut min_x = u32::MAX;
+        let mut max_x = 0;
+        for y in 0..160 {
+            for x in 0..200 {
+                if rgba_l.get_pixel(x, y)[3] > 0 {
+                    min_x = min_x.min(x);
+                    max_x = max_x.max(x);
+                }
+            }
+        }
+        let drawn_w = max_x.saturating_sub(min_x) + 1;
+        assert!(drawn_w >= 180, "landscape stays wide (~95%), got {drawn_w}");
+        // And bottom of tile (y = 159) also stays above name area:
+        for x in 0..200 {
+            assert_eq!(rgba_l.get_pixel(x, 159), &image::Rgba([0, 0, 0, 0]));
+        }
     }
 }

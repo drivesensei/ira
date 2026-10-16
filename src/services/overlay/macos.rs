@@ -81,7 +81,6 @@ impl MacOverlay {
             let view = NSImageView::initWithFrame(NSImageView::alloc(mtm), frame);
             view.setImageScaling(NSImageScaling::ScaleAxesIndependently);
             view.setImageFrameStyle(NSImageFrameStyle::None);
-            view.setWantsLayer(true);
             panel.setContentView(Some(&view));
 
             self.image_view = Some(view);
@@ -128,11 +127,17 @@ impl MacOverlay {
             self.order_out();
             return false;
         };
-        if let Some(view) = &self.image_view {
-            view.setImage(Some(&nsimg));
-        }
         let cocoa = to_cocoa_rect(rect);
         panel.setFrame_display(cocoa, true);
+        if let Some(view) = &self.image_view {
+            view.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), cocoa.size));
+            view.setImage(Some(&nsimg));
+            #[allow(deprecated)]
+            view.setNeedsDisplay();
+        }
+        panel.display();
+        #[allow(deprecated)]
+        panel.flushWindow();
         panel.orderFront(None);
         self.pump();
         self.visible = true;

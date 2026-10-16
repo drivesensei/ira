@@ -442,15 +442,16 @@ fn render_grid(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, acti
         // O(window) per frame, not O(folder).
         let pf_from = top.saturating_sub(per_screen);
         let pf_to = (end + per_screen).min(total);
-        let prefetch: Vec<crate::services::list_files::FEntry> = rows[pf_from..top]
+        let prefetch: Vec<crate::services::list_files::FEntry> = rows[end..pf_to]
             .iter()
-            .chain(rows[end..pf_to].iter())
+            .chain(rows[pf_from..top].iter())
             .map(|(_, e)| (*e).clone())
             .collect();
         (title, top, window, prefetch)
     };
     app.panes[pane_index].grid_top = top;
     app.panes[pane_index].grid_cols = cols;
+    app.panes[pane_index].grid_rows = grid_rows;
 
     let block = panel_block(title, active, &theme);
     let inner = block.inner(area);

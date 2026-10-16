@@ -58,6 +58,8 @@ pub struct Pane {
     pub grid_top: usize,
     /// Number of columns in the thumbnail grid.
     pub grid_cols: usize,
+    /// Number of rows in the thumbnail grid.
+    pub grid_rows: usize,
     /// Image preview presentation of THIS pane (`v` cycles it); modes are
     /// per pane and persist across restarts.
     pub preview_mode: PreviewMode,
@@ -101,6 +103,7 @@ impl Default for Pane {
             render_scroll: 0,
             grid_top: 0,
             grid_cols: 1,
+            grid_rows: 1,
             preview_mode: PreviewMode::default(),
             preview_area: (0, 0),
             listing_settled: false,
@@ -452,6 +455,8 @@ pub struct App {
     thumb_failed: HashSet<String>,
     /// Requests already dispatched to a worker (dedup guard).
     thumb_pending: HashSet<String>,
+    /// Prefetch requests already dispatched to the low-priority worker queue.
+    thumb_pending_lo: HashSet<String>,
     /// Whether the optional `ffmpeg` runtime dependency is usable (probed
     /// once in the background); gates video and HEIC previews.
     ffmpeg_available: Arc<AtomicBool>,
@@ -696,6 +701,7 @@ impl Default for App {
             thumb_jobs_lo,
             thumb_jobs_lo_rx: Some(thumb_jobs_lo_rx),
             thumb_pending: HashSet::new(),
+            thumb_pending_lo: HashSet::new(),
             thumb_workers_started: false,
             thumb_cache: HashMap::new(),
             thumb_cache_cap: THUMB_CACHE_CAP_MIN,
@@ -1518,19 +1524,20 @@ impl App {
     }
 
     /// Enqueues a prefetch request on the low-priority queue (deduped by
-    /// `thumb_pending`; dropped when the queue is full, retried on a later
+    /// `thumb_pending_lo`; dropped when the queue is full, retried on a later
     /// frame). Never blocks the caller.
     fn try_send_prefetch(&mut self, req: &ThumbRequest) {
         let key = req.mem_key();
         if self.picker.is_none()
             || self.thumb_failed.contains(&key)
             || self.thumb_pending.contains(&key)
+            || self.thumb_pending_lo.contains(&key)
             || self.thumb_cache.contains_key(&key)
         {
             return;
         }
         if self.thumb_jobs_lo.try_send(req.clone()).is_ok() {
-            self.thumb_pending.insert(key);
+            self.thumb_pending_lo.insert(key);
         }
     }
 
@@ -1880,7 +1887,7 @@ impl App {
                 rows,
                 surface: PreviewSurface::Grid,
             };
-            let _ = self.preview_image(&req);
+            self.try_send_prefetch(&req);
         }
     }
 
@@ -2050,8 +2057,11 @@ impl App {
         // Bounded queues: a full queue drops the request (retried on a
         // later frame via `preview_request`), so scrolling never builds an
         // unbounded backlog.
+        // If it was in thumb_pending_lo, sending to thumb_jobs_hi promotes it
+        // to high priority!
         if self.thumb_jobs_hi.try_send(req.clone()).is_ok() {
-            self.thumb_pending.insert(key);
+            self.thumb_pending.insert(key.clone());
+            self.thumb_pending_lo.remove(&key);
         }
         None
     }
@@ -2069,10 +2079,12 @@ impl App {
             match event {
                 ThumbEvent::Ready(req, rendered) => {
                     self.thumb_pending.remove(&req.mem_key());
+                    self.thumb_pending_lo.remove(&req.mem_key());
                     self.insert_thumb(req.mem_key(), rendered);
                 }
                 ThumbEvent::Failed(req) => {
                     self.thumb_pending.remove(&req.mem_key());
+                    self.thumb_pending_lo.remove(&req.mem_key());
                     self.thumb_failed.insert(req.mem_key());
                 }
                 ThumbEvent::Text {
@@ -2082,6 +2094,7 @@ impl App {
                     truncated,
                 } => {
                     self.thumb_pending.remove(&req.mem_key());
+                    self.thumb_pending_lo.remove(&req.mem_key());
                     self.text_cache.insert(
                         req.mem_key(),
                         TextPreview {
@@ -2406,6 +2419,50 @@ impl App {
         let total = count;
         let next = match self.pane().state.selected() {
             Some(sel) => (sel + cols).min(total.saturating_sub(1)),
+            None => 0,
+        };
+        self.pane_mut().state.select(Some(next));
+    }
+
+    pub fn page_down(&mut self) {
+        self.pane_mut().user_navigated = true;
+        let count = self.visible_count();
+        if count == 0 {
+            self.pane_mut().state.select(None);
+            return;
+        }
+        let in_grid = self.pane().preview_mode == PreviewMode::Grid;
+        let delta = if in_grid {
+            let cols = self.pane().grid_cols.max(1);
+            let rows = self.pane().grid_rows.max(1);
+            cols * rows
+        } else {
+            10
+        };
+        let next = match self.pane().state.selected() {
+            Some(i) => (i + delta).min(count.saturating_sub(1)),
+            None => 0,
+        };
+        self.pane_mut().state.select(Some(next));
+    }
+
+    pub fn page_up(&mut self) {
+        self.pane_mut().user_navigated = true;
+        let count = self.visible_count();
+        if count == 0 {
+            self.pane_mut().state.select(None);
+            return;
+        }
+        let in_grid = self.pane().preview_mode == PreviewMode::Grid;
+        let delta = if in_grid {
+            let cols = self.pane().grid_cols.max(1);
+            let rows = self.pane().grid_rows.max(1);
+            cols * rows
+        } else {
+            10
+        };
+        let next = match self.pane().state.selected() {
+            Some(i) => i.saturating_sub(delta),
             None => 0,
         };
         self.pane_mut().state.select(Some(next));
@@ -5861,7 +5918,7 @@ mod preview_tests {
         let mut written = String::new();
         for _ in 0..200 {
             if let Ok(text) = std::fs::read_to_string(&log) {
-                if !text.is_empty() {
+                if text.lines().count() >= 2 {
                     written = text;
                     break;
                 }
@@ -6498,5 +6555,125 @@ mod preview_tests {
         assert_eq!(app.panes[0].state.selected(), Some(1));
         app.grid_move_up();
         assert_eq!(app.panes[0].state.selected(), Some(0));
+    }
+
+    #[test]
+    fn prefetch_grid_cells_uses_lo_queue_and_promotes_on_preview_image() {
+        let mut app = App::default();
+        app.picker = Some(ratatui_image::picker::Picker::halfblocks());
+        app.panes[0].preview_mode = PreviewMode::Grid;
+
+        let entry = FEntry {
+            path: "/test/sample.png".to_string(),
+            label: "sample.png".to_string(),
+            is_dir: false,
+            size: 1024,
+            modified: None,
+        };
+
+        // 1. Prefetch grid cells: enqueues into thumb_jobs_lo, NOT thumb_jobs_hi
+        app.prefetch_grid_cells(0, &[entry.clone()], 20, 8);
+
+        let req = ThumbRequest {
+            path: entry.path.clone(),
+            mtime: entry.modified,
+            size: entry.size,
+            cols: 20,
+            rows: 8,
+            surface: PreviewSurface::Grid,
+        };
+        let key = req.mem_key();
+
+        // Must be in thumb_pending_lo, NOT in thumb_pending (hi)
+        assert!(
+            app.thumb_pending_lo.contains(&key),
+            "prefetched item must be in thumb_pending_lo"
+        );
+        assert!(
+            !app.thumb_pending.contains(&key),
+            "prefetched item must NOT consume high-priority thumb_pending"
+        );
+
+        // lo queue got the request
+        let lo_rx = app.thumb_jobs_lo_rx.take().unwrap();
+        let lo_job = lo_rx.try_recv().expect("must receive from lo queue");
+        assert_eq!(lo_job.path, entry.path);
+
+        // hi queue remains empty
+        let hi_rx = app.thumb_jobs_hi_rx.take().unwrap();
+        assert!(hi_rx.try_recv().is_err(), "hi queue must be empty");
+
+        // 2. Promotion: preview_image called on the same item while in thumb_pending_lo
+        let res = app.preview_image(&req);
+        assert!(res.is_none(), "not yet ready");
+
+        // Now promoted to thumb_pending (hi) and removed from thumb_pending_lo!
+        assert!(
+            app.thumb_pending.contains(&key),
+            "promoted item must be in high-priority thumb_pending"
+        );
+        assert!(
+            !app.thumb_pending_lo.contains(&key),
+            "promoted item must be removed from thumb_pending_lo"
+        );
+
+        // hi queue received the promoted request
+        let hi_job = hi_rx
+            .try_recv()
+            .expect("hi queue must receive promoted request");
+        assert_eq!(hi_job.path, entry.path);
+
+        // 3. Pickup cleans both pending sets
+        app.thumb_tx.send(ThumbEvent::Failed(req.clone())).unwrap();
+        app.pick_up_thumbnails();
+        assert!(!app.thumb_pending.contains(&key));
+        assert!(!app.thumb_pending_lo.contains(&key));
+        assert!(app.thumb_failed.contains(&key));
+    }
+
+    #[test]
+    fn page_down_and_page_up_navigation() {
+        let mut app = App::default();
+        let entry = |path: &str| FEntry {
+            path: path.to_string(),
+            label: path.to_string(),
+            is_dir: false,
+            size: 0,
+            modified: None,
+        };
+
+        // 1. List mode (default delta = 10)
+        app.panes[0].files = (0..25).map(|i| entry(&format!("/file_{i}"))).collect();
+        app.panes[0].state.select(Some(0));
+
+        app.page_down();
+        assert_eq!(app.panes[0].state.selected(), Some(10));
+        app.page_down();
+        assert_eq!(app.panes[0].state.selected(), Some(20));
+        app.page_down();
+        assert_eq!(app.panes[0].state.selected(), Some(24), "clamps to end");
+
+        app.page_up();
+        assert_eq!(app.panes[0].state.selected(), Some(14));
+        app.page_up();
+        assert_eq!(app.panes[0].state.selected(), Some(4));
+        app.page_up();
+        assert_eq!(app.panes[0].state.selected(), Some(0), "saturates at 0");
+
+        // 2. Grid mode (delta = cols * rows)
+        app.panes[0].preview_mode = PreviewMode::Grid;
+        app.panes[0].grid_cols = 4;
+        app.panes[0].grid_rows = 3; // 4 * 3 = 12 items per page
+
+        app.panes[0].state.select(Some(2));
+        app.page_down();
+        assert_eq!(app.panes[0].state.selected(), Some(14)); // 2 + 12 = 14
+        app.page_down();
+        assert_eq!(app.panes[0].state.selected(), Some(24), "clamps to end"); // 14 + 12 = 26 > 24 -> 24
+
+        app.page_up();
+        assert_eq!(app.panes[0].state.selected(), Some(12)); // 24 - 12 = 12
+        app.page_up();
+        assert_eq!(app.panes[0].state.selected(), Some(0)); // 12 - 12 = 0
     }
 }
