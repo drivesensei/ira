@@ -108,6 +108,18 @@ pub fn drive_icon(set: IconSet) -> &'static str {
     }
 }
 
+/// Drive glyph keyed by the drive's display label (`iCloud` gets an apple).
+pub fn drive_icon_for(label: &str, set: IconSet) -> &'static str {
+    if label.eq_ignore_ascii_case("icloud") {
+        return match set {
+            IconSet::Nerd => "\u{f179}", // nf-fa-apple
+            IconSet::Emoji => emoji::APPLE,
+            IconSet::Unicode => "\u{f8ff}",
+        };
+    }
+    drive_icon(set)
+}
+
 /// Bookmark glyph for the bookmarks panel.
 pub fn bookmark_icon(set: IconSet) -> &'static str {
     match set {
@@ -275,6 +287,7 @@ mod emoji {
 
     pub const FOLDER: &str = "📁"; // U+1F4C1
     pub const DRIVE: &str = "💾"; // U+1F4BE
+    pub const APPLE: &str = "🍎"; // U+1F34E
     pub const BOOKMARK: &str = "🔖"; // U+1F516
     pub const README: &str = "📖"; // U+1F4D6
 
@@ -373,7 +386,7 @@ mod emoji {
     /// Every glyph this module can emit (for the width test).
     #[cfg(test)]
     pub fn all() -> Vec<&'static str> {
-        let mut v = vec![FOLDER, DRIVE, BOOKMARK, README];
+        let mut v = vec![FOLDER, DRIVE, APPLE, BOOKMARK, README];
         for label in [
             "Home",
             "Desktop",
@@ -508,7 +521,8 @@ fn classify_ext(ext: &str) -> (FileCategory, &'static str) {
 #[cfg(test)]
 fn unicode_glyphs() -> &'static [&'static str] {
     &[
-        "□", "▣", "▶", "♪", "≡", "λ", "▦", "▤", "▥", "▸", "◈", "◉", "·", "⌂", "▢", "↓", "○",
+        "□", "▣", "\u{f8ff}", "▶", "♪", "≡", "λ", "▦", "▤", "▥", "▸", "◈", "◉", "·", "⌂", "▢",
+        "↓", "○",
     ]
 }
 
@@ -531,6 +545,17 @@ mod tests {
     fn unicode_glyphs_are_single_width() {
         for g in unicode_glyphs() {
             assert_eq!(UnicodeWidthStr::width(*g), 1, "glyph {g:?} must be width 1");
+        }
+    }
+
+    #[test]
+    fn icloud_drive_uses_apple_icon() {
+        assert_eq!(drive_icon_for("iCloud", IconSet::Emoji), "🍎");
+        assert_eq!(drive_icon_for("iCloud", IconSet::Nerd), "\u{f179}");
+        assert_eq!(drive_icon_for("iCloud", IconSet::Unicode), "\u{f8ff}");
+        for set in [IconSet::Emoji, IconSet::Nerd, IconSet::Unicode] {
+            assert_eq!(drive_icon_for("Macintosh HD", set), drive_icon(set));
+            assert_ne!(drive_icon_for("iCloud", set), drive_icon(set));
         }
     }
 

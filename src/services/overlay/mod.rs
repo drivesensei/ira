@@ -36,7 +36,9 @@ pub const MAX_OVERLAY_PX: u32 = 4096;
 
 /// How often the background tracker re-reads the terminal window while a
 /// preview overlay is needed.
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "macos")]
+const GEOM_POLL: Duration = Duration::from_millis(120);
+#[cfg(windows)]
 const GEOM_POLL: Duration = Duration::from_millis(300);
 /// Backoff while previews are off — no AppleScript / Win32 query at all
 /// between idle waits.
@@ -847,6 +849,19 @@ pub fn front_window() -> FrontWindow {
         };
         let classified = classify_geom_sample(g.state, sample_age(g.at, g.wall));
         pending_uses_last_ready(classified, g.last_ready)
+    }
+}
+
+/// Backing pixel scale factor for overlay bitmaps (`2` on Retina macOS, `1`
+/// where window/cell geometry is already in device pixels).
+pub fn backing_scale() -> u16 {
+    #[cfg(target_os = "macos")]
+    {
+        return macos::backing_scale();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        1
     }
 }
 

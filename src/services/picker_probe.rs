@@ -16,18 +16,45 @@ use ratatui_image::picker::{cap_parser::QueryStdioOptions, Picker, ProtocolType}
 pub struct ProbeEnv {
     pub wt_session: bool,
     pub is_windows: bool,
+    pub is_macos: bool,
     pub override_images: Option<String>,
     pub in_iterm2: bool,
+    pub in_kitty: bool,
+    pub in_tmux: bool,
 }
 
 impl ProbeEnv {
     pub fn from_os() -> Self {
+        let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+        let lc_terminal = std::env::var("LC_TERMINAL").unwrap_or_default();
+        let term = std::env::var("TERM").unwrap_or_default();
+        let in_tmux = term.starts_with("tmux")
+            || term.starts_with("screen")
+            || term_program == "tmux"
+            || std::env::var("TMUX").is_ok_and(|s| !s.is_empty());
+        let in_iterm2 = term_program.contains("iTerm")
+            || lc_terminal.contains("iTerm")
+            || term_program.contains("WezTerm")
+            || term_program.eq_ignore_ascii_case("rio")
+            || term_program.contains("Tabby")
+            || term_program.contains("Hyper")
+            || std::env::var("ITERM_SESSION_ID").is_ok_and(|s| !s.is_empty())
+            || std::env::var("WEZTERM_EXECUTABLE").is_ok_and(|s| !s.is_empty());
+        let in_kitty = !in_tmux
+            && (term.contains("kitty")
+                || term.contains("ghostty")
+                || term_program.eq_ignore_ascii_case("kitty")
+                || term_program.eq_ignore_ascii_case("ghostty")
+                || std::env::var("KITTY_WINDOW_ID").is_ok_and(|s| !s.is_empty())
+                || std::env::var("GHOSTTY_RESOURCES_DIR").is_ok_and(|s| !s.is_empty()));
         Self {
             wt_session: std::env::var("WT_SESSION").is_ok(),
             is_windows: cfg!(target_os = "windows"),
+            is_macos: cfg!(target_os = "macos"),
             override_images: std::env::var("IRA_IMAGES").ok(),
-            in_iterm2: std::env::var("TERM_PROGRAM").is_ok_and(|t| t.contains("iTerm"))
-                || std::env::var("LC_TERMINAL").is_ok_and(|t| t.contains("iTerm")),
+            in_iterm2,
+            in_kitty,
+            in_tmux,
         }
     }
 }
@@ -103,7 +130,23 @@ pub fn decide(query: Result<Picker, ()>, env: &ProbeEnv) -> Probed {
             source: PickerSource::Query,
         },
         query => {
-            if env.is_windows && env.wt_session {
+            if env.in_kitty && !env.in_tmux {
+                let mut picker = picker_or_halfblocks(query);
+                picker.set_protocol_type(ProtocolType::Kitty);
+                return Probed {
+                    picker,
+                    source: PickerSource::Query,
+                };
+            }
+            if env.in_iterm2 {
+                let mut picker = picker_or_halfblocks(query);
+                picker.set_protocol_type(ProtocolType::Iterm2);
+                return Probed {
+                    picker,
+                    source: PickerSource::Query,
+                };
+            }
+            if (env.is_windows && env.wt_session) || env.is_macos {
                 return Probed {
                     picker: picker_or_halfblocks(query),
                     source: PickerSource::NativeOverlay,
@@ -119,11 +162,13 @@ pub fn decide(query: Result<Picker, ()>, env: &ProbeEnv) -> Probed {
 
 fn run_query(env: &ProbeEnv) -> Result<Picker, ()> {
     let mut options = QueryStdioOptions::default();
-    // iTerm2 3.5+ answers the kitty query but does not draw unicode
-    // placeholders (U+10EEEE); every cell becomes "?". Skip kitty so the
-    // crate falls through to the iTerm2 protocol it actually implements.
+    // iTerm2 3.5+, WezTerm, and Warp answer the kitty/sixel queries but do not
+    // draw kitty unicode placeholders (U+10EEEE) and prefer native OSC 1337
+    // inline PNGs over palettized Sixel. Skip both so the crate falls through
+    // to the iTerm2 protocol they actually implement.
     if env.in_iterm2 {
         options.blacklist_protocols.push(ProtocolType::Kitty);
+        options.blacklist_protocols.push(ProtocolType::Sixel);
     }
     Picker::from_query_stdio_with_options(options).map_err(|_| ())
 }
@@ -220,8 +265,11 @@ mod tests {
         ProbeEnv {
             wt_session: wt,
             is_windows: windows,
+            is_macos: false,
             override_images: override_images.map(str::to_string),
             in_iterm2: false,
+            in_kitty: false,
+            in_tmux: false,
         }
     }
 
@@ -255,6 +303,43 @@ mod tests {
         let probed = decide(Ok(sixel), &env(true, true, None));
         assert_eq!(probed.source, PickerSource::Query);
         assert!(matches!(probed.picker.protocol_type(), ProtocolType::Sixel));
+    }
+
+    #[test]
+    fn silent_probe_on_macos_uses_native_overlay() {
+        let mut mac_env = env(false, false, None);
+        mac_env.is_macos = true;
+        let probed = decide(Ok(Picker::halfblocks()), &mac_env);
+        assert_eq!(probed.source, PickerSource::NativeOverlay);
+        assert!(matches!(
+            probed.picker.protocol_type(),
+            ProtocolType::Halfblocks
+        ));
+    }
+
+    #[test]
+    fn silent_probe_in_iterm2_or_kitty_promotes_protocol() {
+        let mut iterm_env = env(false, false, None);
+        iterm_env.is_macos = true;
+        iterm_env.in_iterm2 = true;
+        let probed = decide(Ok(Picker::halfblocks()), &iterm_env);
+        assert_eq!(probed.source, PickerSource::Query);
+        assert!(matches!(
+            probed.picker.protocol_type(),
+            ProtocolType::Iterm2
+        ));
+
+        let mut kitty_env = env(false, false, None);
+        kitty_env.is_macos = true;
+        kitty_env.in_kitty = true;
+        let probed = decide(Ok(Picker::halfblocks()), &kitty_env);
+        assert_eq!(probed.source, PickerSource::Query);
+        assert!(matches!(probed.picker.protocol_type(), ProtocolType::Kitty));
+
+        // Inside tmux, Kitty env vars must not blindly promote to Kitty protocol.
+        kitty_env.in_tmux = true;
+        let probed_tmux = decide(Ok(Picker::halfblocks()), &kitty_env);
+        assert_eq!(probed_tmux.source, PickerSource::NativeOverlay);
     }
 
     #[test]

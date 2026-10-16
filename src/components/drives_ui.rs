@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use crate::app::App;
-use crate::theme::icons::{drive_icon, pad_icon};
+use crate::theme::icons::{drive_icon_for, pad_icon};
 use crate::ui::chrome::{key_hint, panel_block};
 use crate::utils::bytes::format_bytes;
 
@@ -34,7 +34,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
             drive_spans.extend(key_hint(&keys[i], "", &theme));
             drive_spans.push(Span::raw(" "));
             drive_spans.push(Span::styled(
-                pad_icon(drive_icon(icons), icons),
+                pad_icon(drive_icon_for(&drive.label, icons), icons),
                 Style::default().fg(theme.dir),
             ));
             // Same icon/name gap as the file list; pad_icon alone only adds
@@ -109,6 +109,20 @@ mod tests {
         assert!(text.contains("120G free / 500G"), "{text}");
         assert!(text.contains("2.0T"), "{text}");
         assert!(text.contains("9") && text.contains("iCloud"), "{text}");
+        assert!(text.contains('\u{f8ff}'), "{text}");
+
+        app.icons = crate::theme::icons::IconSet::Emoji;
+        terminal
+            .draw(|f| super::render(f, &mut app, f.area()))
+            .unwrap();
+        let emoji_text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(emoji_text.contains("🍎"), "{emoji_text}");
     }
 
     #[test]

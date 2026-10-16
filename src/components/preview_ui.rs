@@ -157,8 +157,11 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect, pane_index: usize) {
         Some(req) => {
             let key = req.mem_key();
             app.protect_overlay_key(&key);
+            let native_overlay = app.needs_native_overlay();
             if let Some(rendered) = app.preview_image(&req) {
-                rendered.render(inner, frame.buffer_mut());
+                if !native_overlay {
+                    rendered.render(inner, frame.buffer_mut());
+                }
                 app.set_overlay_job(
                     pane_index,
                     crate::app::OverlayJob::Column { area: inner, key },

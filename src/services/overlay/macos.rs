@@ -55,7 +55,13 @@ impl MacOverlay {
                 false,
             );
             panel.setFloatingPanel(true);
-            panel.setHidesOnDeactivate(true);
+            // `ira` is a child CLI process inside the terminal with
+            // `ActivationPolicy::Accessory`, so `NSApp` is never the active
+            // application (the terminal is). `hidesOnDeactivate = true` would
+            // hide the panel immediately on every frame; visibility when the
+            // terminal loses focus is managed by `geom_tracker_loop` via
+            // `order_out`.
+            panel.setHidesOnDeactivate(false);
             panel.setOpaque(false);
             panel.setBackgroundColor(Some(&NSColor::clearColor()));
             panel.setIgnoresMouseEvents(true);
@@ -115,6 +121,9 @@ impl MacOverlay {
                 nsimg
             }
         };
+        // Express the NSImage logical size in Cocoa points while keeping the
+        // full-resolution (2x Retina) bitmap representation intact.
+        nsimg.setSize(NSSize::new(rect.width as f64, rect.height as f64));
         let Some(panel) = self.panel.as_ref() else {
             self.order_out();
             return false;
@@ -140,6 +149,9 @@ impl MacOverlay {
         if !self.ensure() {
             self.order_out();
             return false;
+        }
+        if let Some((_, nsimg)) = &self.image {
+            nsimg.setSize(NSSize::new(rect.width as f64, rect.height as f64));
         }
         let Some(panel) = self.panel.as_ref() else {
             self.order_out();
@@ -234,6 +246,19 @@ fn main_screen_height() -> f64 {
         .unwrap_or(1080.0)
 }
 
+/// Backing pixel scale factor of the main screen (`2` on Retina Macs, `1` on
+/// standard displays). Used to size overlay bitmaps at native Retina density
+/// while keeping window/panel placement in 1x Cocoa points.
+pub fn backing_scale() -> u16 {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return 2;
+    };
+    NSScreen::mainScreen(mtm)
+        .map(|s| s.backingScaleFactor().round() as u16)
+        .unwrap_or(2)
+        .clamp(1, 2)
+}
+
 fn stdin_tty() -> Option<String> {
     unsafe {
         let p = libc::ttyname(libc::STDIN_FILENO);
@@ -247,26 +272,76 @@ fn stdin_tty() -> Option<String> {
     }
 }
 
-pub fn query_front_window() -> Option<WindowGeom> {
-    let program = std::env::var("TERM_PROGRAM").unwrap_or_default();
-    let expected = if program.contains("iTerm") {
+fn classify_term_program(program: &str) -> &'static str {
+    if program.contains("iTerm") {
         "iTerm2"
-    } else if program.contains("ghostty") || program.contains("Ghostty") {
+    } else if program.eq_ignore_ascii_case("ghostty") {
         "Ghostty"
-    } else if program == "Apple_Terminal" || program.contains("Terminal") {
+    } else if program == "Apple_Terminal" || program == "Terminal" {
         "Terminal"
+    } else if program.contains("Warp") {
+        "Warp"
+    } else if program.contains("WezTerm") {
+        "WezTerm"
+    } else if program.eq_ignore_ascii_case("kitty") {
+        "kitty"
+    } else if program.eq_ignore_ascii_case("alacritty") {
+        "Alacritty"
+    } else if program.contains("vscode") {
+        "Code"
     } else {
         ""
-    };
+    }
+}
+
+pub fn query_front_window() -> Option<WindowGeom> {
+    let program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+    let expected = classify_term_program(&program);
+
+    // Primary path: in-process CoreGraphics window-server query. Requires
+    // zero TCC permissions (no System Events / Accessibility prompt) and
+    // works across every terminal emulator by matching ancestor PIDs or
+    // window owner name.
+    match cg::query_front_terminal_window(expected) {
+        cg::CgFrontResult::NotFrontmost => return None,
+        cg::CgFrontResult::Frontmost {
+            geom,
+            same_owner_windows,
+        } => {
+            // When multiple windows of Terminal.app or iTerm2 are open on
+            // screen at the same time, try tty-matching via AppleScript
+            // (talking directly to the terminal app, never System Events) so
+            // an inactive background terminal window does not paint over the
+            // active one. If osascript is unavailable or denied, keep the
+            // CoreGraphics front-window geometry.
+            if same_owner_windows > 1 && matches!(expected, "Terminal" | "iTerm2") {
+                let tty =
+                    stdin_tty().filter(|t| !t.is_empty() && !t.contains('"') && !t.contains('\\'));
+                if let Some(tty) = tty.as_deref() {
+                    if let Some(raw) = osascript(&bounds_script(expected, Some(tty))) {
+                        if raw.trim() == "HIDE" {
+                            return None;
+                        }
+                        if raw.trim() != "NOTFOUND" {
+                            if let Some(parsed) = parse_bounds(&Some(raw)) {
+                                return Some(parsed);
+                            }
+                        }
+                    }
+                }
+            }
+            return Some(geom);
+        }
+        cg::CgFrontResult::Unavailable => {}
+    }
+
+    // Fallback when the window server returned no layer-0 windows at all.
+    if !matches!(expected, "Terminal" | "iTerm2") {
+        return None;
+    }
     let tty = stdin_tty().filter(|t| !t.is_empty() && !t.contains('"') && !t.contains('\\'));
     let raw = osascript(&bounds_script(expected, tty.as_deref()))?;
     let raw = if raw.trim() == "NOTFOUND" {
-        // No window owns our tty. That is the multiplexer case (tmux / screen
-        // / an `ssh` wrapper): stdin is the *pane* pty while the emulator
-        // reports its session tty, so tty matching can never succeed. Fall
-        // back to the front window — the pre-tty behaviour — instead of
-        // hiding the overlay for the rest of the session. A terminal that is
-        // genuinely not frontmost still answers "HIDE".
         osascript(&bounds_script(expected, None))?
     } else {
         raw
@@ -277,53 +352,29 @@ pub fn query_front_window() -> Option<WindowGeom> {
     parse_bounds(&Some(raw))
 }
 
-/// AppleScript for `expected` (the `TERM_PROGRAM` class), tty-matched when our
-/// stdin tty is known. Returns "HIDE" when the app is not frontmost, and
-/// "NOTFOUND" when no window of it owns our tty.
+/// AppleScript for `Terminal` / `iTerm2`, tty-matched when our stdin tty is
+/// known. Uses the application's own `frontmost` property instead of
+/// `"System Events"` so no Accessibility/System Events TCC permission is
+/// required.
 fn bounds_script(expected: &str, tty: Option<&str>) -> String {
-    if expected.is_empty() {
-        return r#"tell application "System Events"
-            set n to name of first process whose frontmost is true
-            if n is not in {"Terminal", "iTerm2", "iTerm", "Ghostty", "kitty", "WezTerm", "Alacritty", "Warp"} then
-                return "HIDE"
-            end if
-            tell (first process whose frontmost is true)
-                set p to position of first window
-                set s to size of first window
-                return (item 1 of p as text) & "," & (item 2 of p as text) & "," & (item 1 of s as text) & "," & (item 2 of s as text)
-            end tell
-        end tell"#
-            .to_string();
-    }
     if expected == "iTerm2" {
         return iterm_bounds_script(tty);
-    }
-    if expected == "Ghostty" {
-        return r#"tell application "System Events" to set n to name of first process whose frontmost is true
-if n does not contain "Ghostty" and n is not "ghostty" then return "HIDE"
-tell application "System Events"
-    tell (first process whose frontmost is true)
-        set p to position of first window
-        set s to size of first window
-        return (item 1 of p as text) & "," & (item 2 of p as text) & "," & (item 1 of s as text) & "," & (item 2 of s as text)
-    end tell
-end tell"#
-            .to_string();
     }
     terminal_app_bounds_script(tty)
 }
 
 fn terminal_app_bounds_script(tty: Option<&str>) -> String {
     let Some(tty) = tty else {
-        return r#"tell application "System Events" to set n to name of first process whose frontmost is true
-if n is not "Terminal" then return "HIDE"
-tell application "Terminal" to get the bounds of the front window"#
+        return r#"tell application "Terminal"
+    if not frontmost then return "HIDE"
+    if (count of windows) is 0 then return "HIDE"
+    return bounds of front window
+end tell"#
             .to_string();
     };
     format!(
-        r#"tell application "System Events" to set n to name of first process whose frontmost is true
-if n is not "Terminal" then return "HIDE"
-tell application "Terminal"
+        r#"tell application "Terminal"
+    if not frontmost then return "HIDE"
     set targetTty to "{tty}"
     repeat with w in windows
         try
@@ -331,8 +382,6 @@ tell application "Terminal"
                 if w is front window then
                     return bounds of w
                 else
-                    -- Our tty lives in a window that is not in front: painting
-                    -- at its rectangle would land on the front window.
                     return "HIDE"
                 end if
             end if
@@ -345,15 +394,16 @@ end tell"#
 
 fn iterm_bounds_script(tty: Option<&str>) -> String {
     let Some(tty) = tty else {
-        return r#"tell application "System Events" to set n to name of first process whose frontmost is true
-if n does not contain "iTerm" then return "HIDE"
-tell application "iTerm" to get the bounds of the first window"#
+        return r#"tell application "iTerm"
+    if not frontmost then return "HIDE"
+    if (count of windows) is 0 then return "HIDE"
+    return bounds of current window
+end tell"#
             .to_string();
     };
     format!(
-        r#"tell application "System Events" to set n to name of first process whose frontmost is true
-if n does not contain "iTerm" then return "HIDE"
-tell application "iTerm"
+        r#"tell application "iTerm"
+    if not frontmost then return "HIDE"
     set targetTty to "{tty}"
     repeat with w in windows
         repeat with t in tabs of w
@@ -403,3 +453,312 @@ fn parse_bounds(raw: &Option<String>) -> Option<WindowGeom> {
         height: (b - t).max(0) as u32,
     })
 }
+
+mod cg {
+    use std::ffi::{c_char, c_void, CStr};
+
+    use super::WindowGeom;
+
+    pub enum CgFrontResult {
+        Frontmost {
+            geom: WindowGeom,
+            same_owner_windows: usize,
+        },
+        NotFrontmost,
+        Unavailable,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct CGPoint {
+        x: f64,
+        y: f64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct CGSize {
+        width: f64,
+        height: f64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct CGRect {
+        origin: CGPoint,
+        size: CGSize,
+    }
+
+    type CFTypeRef = *const c_void;
+    type CFArrayRef = *const c_void;
+    type CFDictionaryRef = *const c_void;
+    type CFStringRef = *const c_void;
+    type CFNumberRef = *const c_void;
+    type CFIndex = isize;
+
+    // kCGWindowListOptionOnScreenOnly (1 << 0) | kCGWindowListExcludeDesktopElements (1 << 4)
+    const WINDOW_LIST_OPTIONS: u32 = (1 << 0) | (1 << 4);
+    const K_CG_NULL_WINDOW_ID: u32 = 0;
+    const K_CF_NUMBER_SINT32_TYPE: i32 = 3;
+    const K_CF_NUMBER_FLOAT64_TYPE: i32 = 6;
+    const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32) -> CFArrayRef;
+        fn CGRectMakeWithDictionaryRepresentation(dict: CFDictionaryRef, rect: *mut CGRect) -> bool;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFArrayGetCount(the_array: CFArrayRef) -> CFIndex;
+        fn CFArrayGetValueAtIndex(the_array: CFArrayRef, idx: CFIndex) -> CFTypeRef;
+        fn CFDictionaryGetValue(the_dict: CFDictionaryRef, key: CFTypeRef) -> CFTypeRef;
+        fn CFNumberGetValue(
+            number: CFNumberRef,
+            the_type: i32,
+            value_ptr: *mut c_void,
+        ) -> bool;
+        fn CFStringCreateWithCString(
+            alloc: CFTypeRef,
+            c_str: *const c_char,
+            encoding: u32,
+        ) -> CFStringRef;
+        fn CFStringGetCString(
+            the_string: CFStringRef,
+            buffer: *mut c_char,
+            buffer_size: CFIndex,
+            encoding: u32,
+        ) -> bool;
+        fn CFRelease(cf: CFTypeRef);
+    }
+
+    struct CfKey(CFStringRef);
+
+    impl CfKey {
+        fn new(s: &CStr) -> Option<Self> {
+            let ptr = unsafe {
+                CFStringCreateWithCString(std::ptr::null(), s.as_ptr(), K_CF_STRING_ENCODING_UTF8)
+            };
+            if ptr.is_null() {
+                None
+            } else {
+                Some(Self(ptr))
+            }
+        }
+    }
+
+    impl Drop for CfKey {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { CFRelease(self.0) };
+            }
+        }
+    }
+
+    fn dict_i32(dict: CFDictionaryRef, key: &CfKey) -> Option<i32> {
+        let val = unsafe { CFDictionaryGetValue(dict, key.0) };
+        if val.is_null() {
+            return None;
+        }
+        let mut out: i32 = 0;
+        let ok = unsafe {
+            CFNumberGetValue(val, K_CF_NUMBER_SINT32_TYPE, (&mut out as *mut i32).cast())
+        };
+        ok.then_some(out)
+    }
+
+    fn dict_f64(dict: CFDictionaryRef, key: &CfKey) -> Option<f64> {
+        let val = unsafe { CFDictionaryGetValue(dict, key.0) };
+        if val.is_null() {
+            return None;
+        }
+        let mut out: f64 = 0.0;
+        let ok = unsafe {
+            CFNumberGetValue(val, K_CF_NUMBER_FLOAT64_TYPE, (&mut out as *mut f64).cast())
+        };
+        ok.then_some(out)
+    }
+
+    fn dict_string(dict: CFDictionaryRef, key: &CfKey) -> Option<String> {
+        let val = unsafe { CFDictionaryGetValue(dict, key.0) };
+        if val.is_null() {
+            return None;
+        }
+        let mut buf = [0 as c_char; 256];
+        let ok = unsafe {
+            CFStringGetCString(
+                val,
+                buf.as_mut_ptr(),
+                buf.len() as CFIndex,
+                K_CF_STRING_ENCODING_UTF8,
+            )
+        };
+        if !ok {
+            return None;
+        }
+        unsafe { CStr::from_ptr(buf.as_ptr()) }
+            .to_str()
+            .ok()
+            .map(str::to_string)
+    }
+
+    fn dict_rect(dict: CFDictionaryRef, key: &CfKey) -> Option<CGRect> {
+        let val = unsafe { CFDictionaryGetValue(dict, key.0) };
+        if val.is_null() {
+            return None;
+        }
+        let mut rect = CGRect::default();
+        let ok = unsafe { CGRectMakeWithDictionaryRepresentation(val, &mut rect) };
+        ok.then_some(rect)
+    }
+
+    /// Walks the process tree from `getppid()` up to PID 1 using `proc_pidinfo`
+    /// so we can identify the GUI terminal process that hosts `ira` without
+    /// guessing its display name.
+    fn ancestor_pids() -> Vec<i32> {
+        let mut pids = Vec::new();
+        let mut cur = unsafe { libc::getppid() };
+        for _ in 0..32 {
+            if cur <= 1 || pids.contains(&cur) {
+                break;
+            }
+            pids.push(cur);
+            let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+            let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+            let ret = unsafe {
+                libc::proc_pidinfo(
+                    cur,
+                    libc::PROC_PIDTBSDINFO,
+                    0,
+                    (&mut info as *mut libc::proc_bsdinfo).cast(),
+                    size,
+                )
+            };
+            if ret != size {
+                break;
+            }
+            cur = info.pbi_ppid as i32;
+        }
+        pids
+    }
+
+    fn owner_matches(owner_name: &str, expected: &str) -> bool {
+        if !expected.is_empty() && owner_name.to_ascii_lowercase().contains(&expected.to_ascii_lowercase()) {
+            return true;
+        }
+        const KNOWN_TERMINALS: &[&str] = &[
+            "terminal",
+            "iterm",
+            "ghostty",
+            "kitty",
+            "wezterm",
+            "alacritty",
+            "warp",
+            "stable",
+            "rio",
+            "hyper",
+            "tabby",
+            "code",
+            "cursor",
+            "windsurf",
+            "zed",
+        ];
+        let lower = owner_name.to_ascii_lowercase();
+        KNOWN_TERMINALS.iter().any(|t| lower.contains(t))
+    }
+
+    pub fn query_front_terminal_window(expected: &str) -> CgFrontResult {
+        let k_layer = match CfKey::new(c"kCGWindowLayer") {
+            Some(k) => k,
+            None => return CgFrontResult::Unavailable,
+        };
+        let k_pid = match CfKey::new(c"kCGWindowOwnerPID") {
+            Some(k) => k,
+            None => return CgFrontResult::Unavailable,
+        };
+        let k_owner = match CfKey::new(c"kCGWindowOwnerName") {
+            Some(k) => k,
+            None => return CgFrontResult::Unavailable,
+        };
+        let k_bounds = match CfKey::new(c"kCGWindowBounds") {
+            Some(k) => k,
+            None => return CgFrontResult::Unavailable,
+        };
+        let k_alpha = match CfKey::new(c"kCGWindowAlpha") {
+            Some(k) => k,
+            None => return CgFrontResult::Unavailable,
+        };
+
+        let list = unsafe { CGWindowListCopyWindowInfo(WINDOW_LIST_OPTIONS, K_CG_NULL_WINDOW_ID) };
+        if list.is_null() {
+            return CgFrontResult::Unavailable;
+        }
+        let count = unsafe { CFArrayGetCount(list) };
+        let self_pid = std::process::id() as i32;
+        let ancestors = ancestor_pids();
+
+        let mut front: Option<(i32, WindowGeom)> = None;
+        let mut same_owner_windows = 0usize;
+
+        for idx in 0..count {
+            let dict = unsafe { CFArrayGetValueAtIndex(list, idx) };
+            if dict.is_null() {
+                continue;
+            }
+            if dict_i32(dict, &k_layer) != Some(0) {
+                continue;
+            }
+            let Some(pid) = dict_i32(dict, &k_pid) else {
+                continue;
+            };
+            if pid == self_pid {
+                continue;
+            }
+            if dict_f64(dict, &k_alpha).unwrap_or(1.0) <= 0.01 {
+                continue;
+            }
+            let Some(rect) = dict_rect(dict, &k_bounds) else {
+                continue;
+            };
+            // Skip tiny helper/find/status windows that sit on layer 0.
+            if rect.size.width < 160.0 || rect.size.height < 100.0 {
+                continue;
+            }
+
+            if let Some((front_pid, _)) = front {
+                if pid == front_pid {
+                    same_owner_windows += 1;
+                }
+                continue;
+            }
+
+            let owner = dict_string(dict, &k_owner).unwrap_or_default();
+            let is_our_terminal = ancestors.contains(&pid) || owner_matches(&owner, expected);
+            if !is_our_terminal {
+                unsafe { CFRelease(list) };
+                return CgFrontResult::NotFrontmost;
+            }
+
+            let geom = WindowGeom {
+                x: rect.origin.x.round() as i32,
+                y: rect.origin.y.round() as i32,
+                width: rect.size.width.round().max(0.0) as u32,
+                height: rect.size.height.round().max(0.0) as u32,
+            };
+            front = Some((pid, geom));
+            same_owner_windows = 1;
+        }
+
+        unsafe { CFRelease(list) };
+
+        match front {
+            Some((_, geom)) => CgFrontResult::Frontmost {
+                geom,
+                same_owner_windows,
+            },
+            None => CgFrontResult::Unavailable,
+        }
+    }
+}
+

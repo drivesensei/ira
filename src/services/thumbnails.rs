@@ -770,7 +770,11 @@ pub fn build_rendered(
             return Rendered::Blocks(fallback);
         }
     }
-    match picker.new_protocol(img.clone(), Size::new(cols, rows), Resize::Fit(None)) {
+    match picker.new_protocol(
+        img.clone(),
+        Size::new(cols, rows),
+        Resize::Fit(Some(ratatui_image::FilterType::Triangle)),
+    ) {
         Ok(protocol) => Rendered::Protocol(protocol),
         // A protocol encode failure still has pixels; show them as blocks
         // rather than a failed placeholder.

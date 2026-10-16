@@ -1531,7 +1531,7 @@ impl App {
         }
     }
 
-    fn needs_native_overlay(&self) -> bool {
+    pub fn needs_native_overlay(&self) -> bool {
         (cfg!(target_os = "macos") || cfg!(windows))
             && self.picker.as_ref().is_some_and(|p| {
                 matches!(
@@ -1660,7 +1660,12 @@ impl App {
             self.overlay.hide_slot(slot);
             return;
         };
-        if overlay::area_exceeds_surface_cap(area, cell) {
+        let scale = overlay::backing_scale();
+        let bitmap_cell = overlay::clamp_cell(overlay::CellPx {
+            width: cell.width.saturating_mul(scale),
+            height: cell.height.saturating_mul(scale),
+        });
+        if overlay::area_exceeds_surface_cap(area, bitmap_cell) {
             // Wider or taller than one surface can cover: braille underlay.
             self.overlay.hide_slot(slot);
             return;
@@ -1689,10 +1694,18 @@ impl App {
                     key.clone()
                 };
                 {
+                    let bw = screen
+                        .width
+                        .saturating_mul(u32::from(scale))
+                        .min(overlay::MAX_OVERLAY_PX);
+                    let bh = screen
+                        .height
+                        .saturating_mul(u32::from(scale))
+                        .min(overlay::MAX_OVERLAY_PX);
                     let Some(fitted) = self
                         .thumb_cache
                         .get_mut(&key)
-                        .and_then(|r| r.ensure_fitted(screen.width, screen.height))
+                        .and_then(|r| r.ensure_fitted(bw, bh))
                     else {
                         self.overlay.hide_slot(slot);
                         return;
@@ -1705,7 +1718,7 @@ impl App {
                 }
             }
             OverlayJobKind::Grid => {
-                self.ensure_fitted_grid_tiles(slot, cell);
+                self.ensure_fitted_grid_tiles(slot, bitmap_cell);
                 let composed = {
                     let Some(OverlayJob::Grid { area, tiles }) = self.overlay_jobs[slot].as_ref()
                     else {
@@ -1715,15 +1728,18 @@ impl App {
                     let refs: Vec<(ratatui::layout::Rect, &DynamicImage)> = tiles
                         .iter()
                         .filter_map(|(tile, key)| {
-                            let (fw, fh) =
-                                overlay::grid_tile_px(*tile, cell, overlay::GRID_FILL_PERCENT);
+                            let (fw, fh) = overlay::grid_tile_px(
+                                *tile,
+                                bitmap_cell,
+                                overlay::GRID_FILL_PERCENT,
+                            );
                             self.thumb_cache
                                 .get(key)
                                 .and_then(|r| r.fitted_at(fw, fh))
                                 .map(|img| (*tile, img))
                         })
                         .collect();
-                    overlay::composite_grid(*area, cell, &refs, overlay::GRID_FILL_PERCENT)
+                    overlay::composite_grid(*area, bitmap_cell, &refs, overlay::GRID_FILL_PERCENT)
                 };
                 let Some(composed) = composed else {
                     self.overlay.hide_slot(slot);
