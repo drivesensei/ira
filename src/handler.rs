@@ -229,14 +229,14 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
 
     match key_event.code {
         // Exit application on `q`
-        KeyCode::Char(c) if c == 'q' => app.quit(),
+        KeyCode::Char('q') => app.quit(),
 
         // `0` spawns the user's terminal emulator in the active pane's
         // folder (drives shortcuts start at 1, so 0 is free).
         KeyCode::Char('0') => app.spawn_native_terminal(),
 
         // Any digit represents a shortcut to a Drive path
-        KeyCode::Char(c) if c.is_digit(10) => {
+        KeyCode::Char(c) if c.is_ascii_digit() => {
             let shortcuts = app.get_drive_shortcuts();
             if let Some(idx) = shortcuts.iter().position(|&sc| sc == c) {
                 app.set_folder_from_drives(idx);
@@ -332,7 +332,7 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         // `,` cycles the active pane's sort mode: Name → Size → Modified → Kind.
         KeyCode::Char(',') => app.cycle_sort(),
 
-        KeyCode::Char(c) if !c.is_digit(10) => {
+        KeyCode::Char(c) if !c.is_ascii_digit() => {
             let common = app.get_common_folders_shortcuts();
             if let Some(idx) = common.iter().position(|sc| *sc == c) {
                 app.set_folder_from_common_folders(idx);
@@ -348,9 +348,9 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         KeyCode::Left => {
             let in_grid = app.panes[app.active_pane].preview_mode == crate::app::PreviewMode::Grid;
             if in_grid {
-                if key_event.modifiers == KeyModifiers::ALT {
-                    app.out_of_folder();
-                } else if key_event.modifiers.is_empty() && app.pane().state.selected() == Some(0) {
+                if key_event.modifiers == KeyModifiers::ALT
+                    || (key_event.modifiers.is_empty() && app.pane().state.selected() == Some(0))
+                {
                     app.out_of_folder();
                 } else {
                     app.grid_move_left();
@@ -420,7 +420,7 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
 
 /// Handles mouse events and updates the state of [`App`].
 pub fn handle_mouse_events(mouse_event: MouseEvent, app: &mut App) -> AppResult<()> {
-    // Suppress mouse scrolling when a modal dialog is active
+    // Suppress mouse scrolling when a modal dialog, editor, or board has focus
     if app.keybindings_visible
         || app.status.as_ref().is_some_and(|s| s.is_error)
         || app.confirming.is_some()
@@ -430,6 +430,9 @@ pub fn handle_mouse_events(mouse_event: MouseEvent, app: &mut App) -> AppResult<
         || app.multi_info.is_some()
         || app.info.is_some()
         || app.deletion_box_visible()
+        || app.edit_focus
+        || app.board_has_focus()
+        || app.hint_bar_blocked()
     {
         return Ok(());
     }

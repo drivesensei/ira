@@ -91,15 +91,8 @@ pub fn content_origin(window: WindowGeom, cols: u16, rows: u16, cell: CellPx) ->
     let text_h = rows as u32 * cell.height as u32;
     let ox = window.width.saturating_sub(text_w) / 2;
     // Chrome (title, tabs) sits above the text grid.
-    // Any fractional remainder sits at the bottom of the window, not the top.
     let leftover = window.height.saturating_sub(text_h);
-    let rem = if rows > 0 && cell.height > 0 {
-        leftover % u32::from(cell.height)
-    } else {
-        0
-    };
-    let top_chrome = leftover.saturating_sub(rem);
-    let oy = top_chrome.min(MAX_CHROME);
+    let oy = leftover.min(MAX_CHROME);
     (ox, oy)
 }
 
@@ -857,7 +850,7 @@ fn query_front_window() -> Option<WindowGeom> {
 pub fn front_window() -> FrontWindow {
     #[cfg(not(any(target_os = "macos", windows)))]
     {
-        return FrontWindow::Hidden;
+        FrontWindow::Hidden
     }
     #[cfg(any(target_os = "macos", windows))]
     {
@@ -967,6 +960,24 @@ mod tests {
     }
 
     #[test]
+    fn content_origin_preserves_unquantized_chrome() {
+        let window = WindowGeom {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 538,
+        };
+        let cell = CellPx {
+            width: 10,
+            height: 20,
+        };
+        // 80x25 cells = 800x500; 38 px leftover (e.g. 38pt Terminal.app chrome).
+        // It must NOT be quantized to a multiple of cell.height (20).
+        let (ox, oy) = content_origin(window, 80, 25, cell);
+        assert_eq!((ox, oy), (0, 38));
+    }
+
+    #[test]
     fn preview_screen_rect_maps_cells_to_pixels() {
         let window = WindowGeom {
             x: 100,
@@ -986,7 +997,7 @@ mod tests {
             height: 20,
         };
         let r = preview_screen_rect(window, origin, cell, area);
-        assert_eq!(r.x, 100 + 0 + 40 * 10);
+        assert_eq!(r.x, 100 + 40 * 10);
         assert_eq!(r.y, 50 + 40 + 3 * 20);
         assert_eq!(r.width, 38 * 10);
         assert_eq!(r.height, 20 * 20);
@@ -1613,8 +1624,7 @@ mod tests {
             200,
             image::Rgba([0, 255, 0, 255]),
         ));
-        let out_square =
-            composite_grid(area, cell, &[(tile, &square)], GRID_FILL_PERCENT).unwrap();
+        let out_square = composite_grid(area, cell, &[(tile, &square)], GRID_FILL_PERCENT).unwrap();
         let rgba_sq = out_square.to_rgba8();
         // At least 1 full row (>= 20px) above tile.height is transparent:
         for y in (160 - 20)..160 {

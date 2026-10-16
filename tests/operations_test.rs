@@ -121,7 +121,7 @@ fn hidden_files_toggle() {
 
     // Listing is now async (chunked streaming + sorted final pass); wait
     // until the pane's settled (sorted) listing arrives before asserting.
-    let mut wait_settled = |app: &mut App| {
+    let wait_settled = |app: &mut App| {
         for _ in 0..250 {
             app.tick();
             if app.file_list_settled(0) {
@@ -362,7 +362,7 @@ fn delete_progress_dialog_is_dismissable() {
     assert!(app.deletion.is_none());
     assert!(!victim.exists());
     // After completion the box state resets.
-    assert!(app.deletion_box_visible() == false);
+    assert!(!app.deletion_box_visible());
 
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -507,6 +507,7 @@ fn info_dialog_shows_metadata() {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    assert!(ready, "info dialog finished pending");
 
     app.close_info();
     assert!(app.info.is_none());
@@ -586,7 +587,6 @@ fn delete_keys_depend_on_platform() {
 #[test]
 fn backspace_opens_delete_confirmation_on_macos() {
     use ira::app::App;
-    use ira::domain::data::Folder;
     use ira::handler::handle_key_events;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -756,7 +756,6 @@ fn filter_reapplies_after_listing_refresh_and_survives_deletion() {
         "select-all must operate on the filtered set"
     );
     app.request_delete();
-    let paths = app.confirming.as_ref().unwrap().paths.clone();
     app.confirm_delete();
     for _ in 0..250 {
         app.tick();
@@ -830,15 +829,12 @@ fn filter_reapplies_after_hidden_toggle() {
 fn new_entry_extension_decides_kind() {
     use ira::app::App;
     use ira::domain::data::Folder;
-    use ira::handler::handle_key_events;
-    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     let base = std::env::temp_dir().join(format!("ira_new_{}", std::process::id()));
     std::fs::create_dir_all(&base).unwrap();
 
     let mut app = App::default();
     app.panes[0].folder = Some(Folder::new("t".into(), base.to_str().unwrap().into(), '#'));
-    let key = |code| KeyEvent::new(code, KeyModifiers::empty());
     let type_text = |app: &mut App, text: &str| {
         for ch in text.chars() {
             app.new_entry_insert(ch);
@@ -2395,7 +2391,9 @@ fn grid_mode_key_events_navigate_2d_and_open_or_rename() {
     let key = |code| KeyEvent::new(code, KeyModifiers::empty());
 
     // Populate files in pane 0
-    app.panes[0].files = (0..9).map(|i| entry(&format!("/dir/file_{i}.txt"))).collect();
+    app.panes[0].files = (0..9)
+        .map(|i| entry(&format!("/dir/file_{i}.txt")))
+        .collect();
     app.panes[0].grid_cols = 3;
     app.panes[0].state.select(Some(0));
 
@@ -2414,7 +2412,10 @@ fn grid_mode_key_events_navigate_2d_and_open_or_rename() {
 
     // Enter in grid mode does NOT start rename (it calls enter_folder)
     handle_key_events(key(KeyCode::Enter), &mut app).unwrap();
-    assert!(app.renaming.is_none(), "Enter in grid mode does not start rename");
+    assert!(
+        app.renaming.is_none(),
+        "Enter in grid mode does not start rename"
+    );
 
     // F2 in grid mode starts rename
     handle_key_events(key(KeyCode::F(2)), &mut app).unwrap();
@@ -2428,7 +2429,11 @@ fn grid_mode_key_events_navigate_2d_and_open_or_rename() {
 
     // Up on top row stays in same column (G-0007)
     handle_key_events(key(KeyCode::Up), &mut app).unwrap();
-    assert_eq!(app.panes[0].state.selected(), Some(1), "Up on top row preserves column");
+    assert_eq!(
+        app.panes[0].state.selected(),
+        Some(1),
+        "Up on top row preserves column"
+    );
 
     // Down moves down by cols (3) -> 1 + 3 = 4
     handle_key_events(key(KeyCode::Down), &mut app).unwrap();
@@ -2489,9 +2494,7 @@ fn grid_mode_key_events_navigate_2d_and_open_or_rename() {
 fn mouse_scroll_and_page_navigation_in_list_and_grid_modes() {
     use ira::app::PreviewMode;
     use ira::handler::{handle_key_events, handle_mouse_events};
-    use ratatui::crossterm::event::{
-        KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
-    };
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
     let mut app = App::default();
     let key = |code| KeyEvent::new(code, KeyModifiers::empty());
@@ -2509,7 +2512,9 @@ fn mouse_scroll_and_page_navigation_in_list_and_grid_modes() {
     };
 
     // Populate pane with 30 files
-    app.panes[0].files = (0..30).map(|i| entry(&format!("/dir/file_{i}.txt"))).collect();
+    app.panes[0].files = (0..30)
+        .map(|i| entry(&format!("/dir/file_{i}.txt")))
+        .collect();
     app.panes[0].state.select(Some(0));
 
     // 1. In List Mode:
@@ -2556,4 +2561,3 @@ fn mouse_scroll_and_page_navigation_in_list_and_grid_modes() {
     handle_key_events(key(KeyCode::PageUp), &mut app).unwrap();
     assert_eq!(app.panes[0].state.selected(), Some(0));
 }
-

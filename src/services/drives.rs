@@ -375,14 +375,11 @@ pub fn mount_drive(device: &str) -> IOResult<String> {
         } else {
             msg
         };
-        return Err(std::io::Error::new(std::io::ErrorKind::Other, msg));
+        return Err(std::io::Error::other(msg));
     }
 
     parse_mount_point(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "could not determine mount point from udisksctl output",
-        )
+        std::io::Error::other("could not determine mount point from udisksctl output")
     })
 }
 

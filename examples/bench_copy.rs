@@ -40,15 +40,10 @@ fn main() {
     let t_prescan = t0;
     spawn_job(&job, tx);
     let mut events = 0usize;
-    loop {
-        match rx.recv_timeout(std::time::Duration::from_secs(60)) {
-            Ok(ev) => {
-                events += 1;
-                if matches!(ev, JobEvent::Done { .. } | JobEvent::Failed { .. }) {
-                    break;
-                }
-            }
-            Err(_) => break,
+    while let Ok(ev) = rx.recv_timeout(std::time::Duration::from_secs(60)) {
+        events += 1;
+        if matches!(ev, JobEvent::Done { .. } | JobEvent::Failed { .. }) {
+            break;
         }
     }
     println!(

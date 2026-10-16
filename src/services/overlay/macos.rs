@@ -324,8 +324,21 @@ fn owner_matches(owner_name: &str, expected: &str) -> bool {
         return true;
     }
     const KNOWN_TERMINALS: &[&str] = &[
-        "terminal", "iterm", "ghostty", "kitty", "wezterm", "alacritty", "warp", "stable",
-        "rio", "hyper", "tabby", "code", "cursor", "windsurf", "zed",
+        "terminal",
+        "iterm",
+        "ghostty",
+        "kitty",
+        "wezterm",
+        "alacritty",
+        "warp",
+        "stable",
+        "rio",
+        "hyper",
+        "tabby",
+        "code",
+        "cursor",
+        "windsurf",
+        "zed",
     ];
     let lower = owner_name.to_ascii_lowercase();
     KNOWN_TERMINALS.iter().any(|t| lower.contains(t))
@@ -574,7 +587,8 @@ mod cg {
     #[link(name = "CoreGraphics", kind = "framework")]
     extern "C" {
         fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32) -> CFArrayRef;
-        fn CGRectMakeWithDictionaryRepresentation(dict: CFDictionaryRef, rect: *mut CGRect) -> bool;
+        fn CGRectMakeWithDictionaryRepresentation(dict: CFDictionaryRef, rect: *mut CGRect)
+            -> bool;
     }
 
     #[link(name = "CoreFoundation", kind = "framework")]
@@ -582,11 +596,7 @@ mod cg {
         fn CFArrayGetCount(the_array: CFArrayRef) -> CFIndex;
         fn CFArrayGetValueAtIndex(the_array: CFArrayRef, idx: CFIndex) -> CFTypeRef;
         fn CFDictionaryGetValue(the_dict: CFDictionaryRef, key: CFTypeRef) -> CFTypeRef;
-        fn CFNumberGetValue(
-            number: CFNumberRef,
-            the_type: i32,
-            value_ptr: *mut c_void,
-        ) -> bool;
+        fn CFNumberGetValue(number: CFNumberRef, the_type: i32, value_ptr: *mut c_void) -> bool;
         fn CFStringCreateWithCString(
             alloc: CFTypeRef,
             c_str: *const c_char,
@@ -652,10 +662,7 @@ mod cg {
         ok.then_some(rect)
     }
 
-    pub fn query_front_terminal_window(
-        target_pid: Option<i32>,
-        _expected: &str,
-    ) -> CgFrontResult {
+    pub fn query_front_terminal_window(target_pid: Option<i32>, _expected: &str) -> CgFrontResult {
         let k_layer = match CfKey::new(c"kCGWindowLayer") {
             Some(k) => k,
             None => return CgFrontResult::Unavailable,
@@ -739,4 +746,3 @@ mod cg {
         }
     }
 }
-

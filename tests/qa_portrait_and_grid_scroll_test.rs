@@ -6,9 +6,7 @@ use ira::services::overlay::{
     composite_grid, grid_tile_px, CellPx, GRID_FILL_H_PERCENT, GRID_FILL_PERCENT,
     GRID_FILL_W_PERCENT,
 };
-use ratatui::crossterm::event::{
-    KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
-};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
 fn mock_entry(path: &str) -> FEntry {
@@ -131,7 +129,9 @@ fn qa_mouse_scroll_and_page_navigation_in_list_and_grid_with_modals() {
     };
 
     // Populate pane with 50 files
-    app.panes[0].files = (0..50).map(|i| mock_entry(&format!("/f_{i}.txt"))).collect();
+    app.panes[0].files = (0..50)
+        .map(|i| mock_entry(&format!("/f_{i}.txt")))
+        .collect();
     app.panes[0].state.select(Some(0));
 
     // --- LIST MODE ---
@@ -175,6 +175,39 @@ fn qa_mouse_scroll_and_page_navigation_in_list_and_grid_with_modals() {
         "ScrollDown suppressed while keybindings modal is open"
     );
     app.keybindings_visible = false;
+
+    // When edit_focus is active, mouse scroll must be suppressed (G-0010)
+    app.edit_focus = true;
+    handle_mouse_events(scroll_down, &mut app).unwrap();
+    assert_eq!(
+        app.panes[0].state.selected(),
+        Some(49),
+        "ScrollDown suppressed while edit_focus is true"
+    );
+    handle_mouse_events(scroll_up, &mut app).unwrap();
+    assert_eq!(
+        app.panes[0].state.selected(),
+        Some(49),
+        "ScrollUp suppressed while edit_focus is true"
+    );
+    app.edit_focus = false;
+
+    // When board_has_focus is active, mouse scroll must be suppressed (G-0010)
+    app.board_focused = true;
+    assert!(app.board_has_focus());
+    handle_mouse_events(scroll_down, &mut app).unwrap();
+    assert_eq!(
+        app.panes[0].state.selected(),
+        Some(49),
+        "ScrollDown suppressed while board_has_focus is true"
+    );
+    handle_mouse_events(scroll_up, &mut app).unwrap();
+    assert_eq!(
+        app.panes[0].state.selected(),
+        Some(49),
+        "ScrollUp suppressed while board_has_focus is true"
+    );
+    app.board_focused = false;
 
     // --- GRID MODE ---
     app.panes[0].preview_mode = PreviewMode::Grid;

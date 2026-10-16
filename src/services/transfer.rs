@@ -617,7 +617,7 @@ mod batch_tests {
         let mut paths = Vec::new();
         for i in 0..30 {
             let p = base.join("src").join(format!("f{i}.txt"));
-            std::fs::write(&p, vec![b'x'; 100]);
+            std::fs::write(&p, vec![b'x'; 100]).unwrap();
             paths.push(p.to_string_lossy().into_owned());
         }
 
@@ -699,7 +699,7 @@ mod batch_tests {
         let mut paths = Vec::new();
         for i in 0..5 {
             let p = base.join("src").join(format!("m{i}"));
-            std::fs::write(&p, "data");
+            std::fs::write(&p, "data").unwrap();
             paths.push(p.to_string_lossy().into_owned());
         }
 

@@ -617,9 +617,7 @@ fn overlay_job_fps(
 ) -> Option<(ratatui::layout::Rect, OverlayJobKind, u64, u64)> {
     match job {
         OverlayJob::Column { area, key } => {
-            if cache.get(key).and_then(Rendered::pixels).is_none() {
-                return None;
-            }
+            cache.get(key).and_then(Rendered::pixels)?;
             let tiles = [(*area, key.as_str())];
             let (place_fp, content_fp) =
                 overlay::overlay_fingerprints(window, cell, term, *area, &tiles);
@@ -4250,6 +4248,7 @@ impl App {
     }
 }
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use crate::services::file_info::DirSize;
@@ -4942,6 +4941,7 @@ fn matching_drive_picks_longest_mount_prefix() {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod preview_tests {
     use super::*;
     use crate::handler::handle_key_events;
@@ -5431,8 +5431,8 @@ mod preview_tests {
         )
         .unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "qsline\n");
-        let lines_after_save = app.edit.as_ref().unwrap().textarea.lines().clone();
-        assert_eq!(lines_after_save, vec!["qsline".to_string(), String::new()]);
+        let lines_after_save = app.edit.as_ref().unwrap().textarea.lines();
+        assert_eq!(lines_after_save, &["qsline".to_string(), String::new()]);
 
         // ...and Esc exits edit mode, leaving the file as saved.
         handle_key_events(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()), &mut app).unwrap();
@@ -5480,7 +5480,6 @@ mod preview_tests {
     #[test]
     fn preview_focus_is_only_offered_for_editable_text() {
         use std::fs;
-        let dir = std::env::temp_dir().join("ira_preview_tests");
         let png = png_at("nofocus.png");
         let mut app = App::default();
         app.set_picker(ratatui_image::picker::Picker::halfblocks(), true);
@@ -6572,7 +6571,7 @@ mod preview_tests {
         };
 
         // 1. Prefetch grid cells: enqueues into thumb_jobs_lo, NOT thumb_jobs_hi
-        app.prefetch_grid_cells(0, &[entry.clone()], 20, 8);
+        app.prefetch_grid_cells(0, std::slice::from_ref(&entry), 20, 8);
 
         let req = ThumbRequest {
             path: entry.path.clone(),
