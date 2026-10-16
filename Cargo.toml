@@ -1,6 +1,6 @@
 [package]
 name = "ira"
-version = "0.1.24"
+version = "0.1.25"
 
 description = "A terminal file manager built with Ratatui and crossterm"
 repository = "https://github.com/drivesensei/ira"
@@ -69,4 +69,6 @@ objc2-app-kit = { version = "0.3", features = [
     "NSCell",
     "NSEvent",
     "NSImageCell",
+    "NSWorkspace",
+    "NSRunningApplication",
 ] }

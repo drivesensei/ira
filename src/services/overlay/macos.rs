@@ -9,7 +9,7 @@ use objc2::{AnyThread, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor, NSEventMask,
     NSFloatingWindowLevel, NSImage, NSImageFrameStyle, NSImageScaling, NSImageView, NSPanel,
-    NSScreen, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSScreen, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{NSData, NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize};
 
@@ -229,7 +229,7 @@ pub(super) fn encode_png(img: &DynamicImage) -> Vec<u8> {
 
 /// AppleScript / our ScreenRect is top-left y-down; Cocoa is bottom-left y-up.
 fn to_cocoa_rect(rect: ScreenRect) -> NSRect {
-    let screen_h = main_screen_height();
+    let screen_h = primary_screen_height();
     let y = screen_h - rect.y as f64 - rect.height as f64;
     NSRect::new(
         NSPoint::new(rect.x as f64, y),
@@ -237,23 +237,27 @@ fn to_cocoa_rect(rect: ScreenRect) -> NSRect {
     )
 }
 
-fn main_screen_height() -> f64 {
+fn primary_screen_height() -> f64 {
     let Some(mtm) = MainThreadMarker::new() else {
         return 1080.0;
     };
-    NSScreen::mainScreen(mtm)
+    NSScreen::screens(mtm)
+        .iter()
+        .next()
         .map(|s| s.frame().size.height)
         .unwrap_or(1080.0)
 }
 
-/// Backing pixel scale factor of the main screen (`2` on Retina Macs, `1` on
+/// Backing pixel scale factor of the primary screen (`2` on Retina Macs, `1` on
 /// standard displays). Used to size overlay bitmaps at native Retina density
 /// while keeping window/panel placement in 1x Cocoa points.
 pub fn backing_scale() -> u16 {
     let Some(mtm) = MainThreadMarker::new() else {
         return 2;
     };
-    NSScreen::mainScreen(mtm)
+    NSScreen::screens(mtm)
+        .iter()
+        .next()
         .map(|s| s.backingScaleFactor().round() as u16)
         .unwrap_or(2)
         .clamp(1, 2)
@@ -294,26 +298,74 @@ fn classify_term_program(program: &str) -> &'static str {
     }
 }
 
+fn owner_matches(owner_name: &str, expected: &str) -> bool {
+    if !expected.is_empty()
+        && owner_name
+            .to_ascii_lowercase()
+            .contains(&expected.to_ascii_lowercase())
+    {
+        return true;
+    }
+    const KNOWN_TERMINALS: &[&str] = &[
+        "terminal", "iterm", "ghostty", "kitty", "wezterm", "alacritty", "warp", "stable",
+        "rio", "hyper", "tabby", "code", "cursor", "windsurf", "zed",
+    ];
+    let lower = owner_name.to_ascii_lowercase();
+    KNOWN_TERMINALS.iter().any(|t| lower.contains(t))
+}
+
+fn is_terminal_app(name: Option<&str>, bundle: Option<&str>, expected: &str) -> bool {
+    if let Some(b) = bundle {
+        let b_lower = b.to_ascii_lowercase();
+        if b_lower.contains("terminal")
+            || b_lower.contains("iterm")
+            || b_lower.contains("ghostty")
+            || b_lower.contains("kitty")
+            || b_lower.contains("wezterm")
+            || b_lower.contains("alacritty")
+            || b_lower.contains("warp")
+        {
+            return true;
+        }
+    }
+    if let Some(n) = name {
+        if owner_matches(n, expected) {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn query_front_window() -> Option<WindowGeom> {
     let program = std::env::var("TERM_PROGRAM").unwrap_or_default();
     let expected = classify_term_program(&program);
 
-    // Primary path: in-process CoreGraphics window-server query. Requires
-    // zero TCC permissions (no System Events / Accessibility prompt) and
-    // works across every terminal emulator by matching ancestor PIDs or
-    // window owner name.
-    match cg::query_front_terminal_window(expected) {
-        cg::CgFrontResult::NotFrontmost => return None,
+    let ws = NSWorkspace::sharedWorkspace();
+    let front_app = ws.frontmostApplication();
+    let front_pid = front_app.as_ref().map(|a| a.processIdentifier());
+    let name = front_app
+        .as_ref()
+        .and_then(|a| a.localizedName().map(|s| s.to_string()));
+    let bundle = front_app
+        .as_ref()
+        .and_then(|a| a.bundleIdentifier().map(|s| s.to_string()));
+
+    // When NSWorkspace reports a frontmost app that is NOT a terminal (e.g.
+    // the user switched to Safari or Finder), hide the overlay immediately.
+    if front_app.is_some() && !is_terminal_app(name.as_deref(), bundle.as_deref(), expected) {
+        return None;
+    }
+
+    // Primary path: in-process CoreGraphics window query.
+    // Matching by target_pid needs zero permissions and returns exact bounds.
+    match cg::query_front_terminal_window(front_pid, expected) {
         cg::CgFrontResult::Frontmost {
             geom,
             same_owner_windows,
         } => {
             // When multiple windows of Terminal.app or iTerm2 are open on
             // screen at the same time, try tty-matching via AppleScript
-            // (talking directly to the terminal app, never System Events) so
-            // an inactive background terminal window does not paint over the
-            // active one. If osascript is unavailable or denied, keep the
-            // CoreGraphics front-window geometry.
+            // (talking directly to the terminal app, never System Events).
             if same_owner_windows > 1 && matches!(expected, "Terminal" | "iTerm2") {
                 let tty =
                     stdin_tty().filter(|t| !t.is_empty() && !t.contains('"') && !t.contains('\\'));
@@ -335,7 +387,7 @@ pub fn query_front_window() -> Option<WindowGeom> {
         cg::CgFrontResult::Unavailable => {}
     }
 
-    // Fallback when the window server returned no layer-0 windows at all.
+    // Fallback: direct AppleScript query to Terminal / iTerm (no System Events).
     if !matches!(expected, "Terminal" | "iTerm2") {
         return None;
     }
@@ -464,7 +516,6 @@ mod cg {
             geom: WindowGeom,
             same_owner_windows: usize,
         },
-        NotFrontmost,
         Unavailable,
     }
 
@@ -524,12 +575,6 @@ mod cg {
             c_str: *const c_char,
             encoding: u32,
         ) -> CFStringRef;
-        fn CFStringGetCString(
-            the_string: CFStringRef,
-            buffer: *mut c_char,
-            buffer_size: CFIndex,
-            encoding: u32,
-        ) -> bool;
         fn CFRelease(cf: CFTypeRef);
     }
 
@@ -580,29 +625,6 @@ mod cg {
         ok.then_some(out)
     }
 
-    fn dict_string(dict: CFDictionaryRef, key: &CfKey) -> Option<String> {
-        let val = unsafe { CFDictionaryGetValue(dict, key.0) };
-        if val.is_null() {
-            return None;
-        }
-        let mut buf = [0 as c_char; 256];
-        let ok = unsafe {
-            CFStringGetCString(
-                val,
-                buf.as_mut_ptr(),
-                buf.len() as CFIndex,
-                K_CF_STRING_ENCODING_UTF8,
-            )
-        };
-        if !ok {
-            return None;
-        }
-        unsafe { CStr::from_ptr(buf.as_ptr()) }
-            .to_str()
-            .ok()
-            .map(str::to_string)
-    }
-
     fn dict_rect(dict: CFDictionaryRef, key: &CfKey) -> Option<CGRect> {
         let val = unsafe { CFDictionaryGetValue(dict, key.0) };
         if val.is_null() {
@@ -613,71 +635,15 @@ mod cg {
         ok.then_some(rect)
     }
 
-    /// Walks the process tree from `getppid()` up to PID 1 using `proc_pidinfo`
-    /// so we can identify the GUI terminal process that hosts `ira` without
-    /// guessing its display name.
-    fn ancestor_pids() -> Vec<i32> {
-        let mut pids = Vec::new();
-        let mut cur = unsafe { libc::getppid() };
-        for _ in 0..32 {
-            if cur <= 1 || pids.contains(&cur) {
-                break;
-            }
-            pids.push(cur);
-            let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-            let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-            let ret = unsafe {
-                libc::proc_pidinfo(
-                    cur,
-                    libc::PROC_PIDTBSDINFO,
-                    0,
-                    (&mut info as *mut libc::proc_bsdinfo).cast(),
-                    size,
-                )
-            };
-            if ret != size {
-                break;
-            }
-            cur = info.pbi_ppid as i32;
-        }
-        pids
-    }
-
-    fn owner_matches(owner_name: &str, expected: &str) -> bool {
-        if !expected.is_empty() && owner_name.to_ascii_lowercase().contains(&expected.to_ascii_lowercase()) {
-            return true;
-        }
-        const KNOWN_TERMINALS: &[&str] = &[
-            "terminal",
-            "iterm",
-            "ghostty",
-            "kitty",
-            "wezterm",
-            "alacritty",
-            "warp",
-            "stable",
-            "rio",
-            "hyper",
-            "tabby",
-            "code",
-            "cursor",
-            "windsurf",
-            "zed",
-        ];
-        let lower = owner_name.to_ascii_lowercase();
-        KNOWN_TERMINALS.iter().any(|t| lower.contains(t))
-    }
-
-    pub fn query_front_terminal_window(expected: &str) -> CgFrontResult {
+    pub fn query_front_terminal_window(
+        target_pid: Option<i32>,
+        _expected: &str,
+    ) -> CgFrontResult {
         let k_layer = match CfKey::new(c"kCGWindowLayer") {
             Some(k) => k,
             None => return CgFrontResult::Unavailable,
         };
         let k_pid = match CfKey::new(c"kCGWindowOwnerPID") {
-            Some(k) => k,
-            None => return CgFrontResult::Unavailable,
-        };
-        let k_owner = match CfKey::new(c"kCGWindowOwnerName") {
             Some(k) => k,
             None => return CgFrontResult::Unavailable,
         };
@@ -696,9 +662,8 @@ mod cg {
         }
         let count = unsafe { CFArrayGetCount(list) };
         let self_pid = std::process::id() as i32;
-        let ancestors = ancestor_pids();
 
-        let mut front: Option<(i32, WindowGeom)> = None;
+        let mut front: Option<WindowGeom> = None;
         let mut same_owner_windows = 0usize;
 
         for idx in 0..count {
@@ -715,6 +680,11 @@ mod cg {
             if pid == self_pid {
                 continue;
             }
+            if let Some(target) = target_pid {
+                if pid != target {
+                    continue;
+                }
+            }
             if dict_f64(dict, &k_alpha).unwrap_or(1.0) <= 0.01 {
                 continue;
             }
@@ -726,18 +696,9 @@ mod cg {
                 continue;
             }
 
-            if let Some((front_pid, _)) = front {
-                if pid == front_pid {
-                    same_owner_windows += 1;
-                }
+            if front.is_some() {
+                same_owner_windows += 1;
                 continue;
-            }
-
-            let owner = dict_string(dict, &k_owner).unwrap_or_default();
-            let is_our_terminal = ancestors.contains(&pid) || owner_matches(&owner, expected);
-            if !is_our_terminal {
-                unsafe { CFRelease(list) };
-                return CgFrontResult::NotFrontmost;
             }
 
             let geom = WindowGeom {
@@ -746,14 +707,14 @@ mod cg {
                 width: rect.size.width.round().max(0.0) as u32,
                 height: rect.size.height.round().max(0.0) as u32,
             };
-            front = Some((pid, geom));
+            front = Some(geom);
             same_owner_windows = 1;
         }
 
         unsafe { CFRelease(list) };
 
         match front {
-            Some((_, geom)) => CgFrontResult::Frontmost {
+            Some(geom) => CgFrontResult::Frontmost {
                 geom,
                 same_owner_windows,
             },

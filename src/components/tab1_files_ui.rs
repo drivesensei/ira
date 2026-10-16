@@ -531,12 +531,9 @@ fn render_grid(f: &mut Frame, app: &mut App, area: Rect, pane_index: usize, acti
                 // Read the failure flag before `preview_image` (its result
                 // borrows `app` for the whole match).
                 let failed = app.preview_failed(req);
-                let native_overlay = app.needs_native_overlay();
                 match app.preview_image(req) {
                     Some(rendered) => {
-                        if !native_overlay {
-                            rendered.render(img_area, f.buffer_mut());
-                        }
+                        rendered.render(img_area, f.buffer_mut());
                         if !skip_overlay_job {
                             overlay_tiles.push((img_area, key.clone()));
                         }
