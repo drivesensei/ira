@@ -26,3 +26,17 @@ pub mod domain;
 pub mod theme;
 
 pub mod utils;
+
+// Hooked exit fixtures use the natural library App/component type graph and
+// the same private helper source as production main.
+#[cfg(test)]
+mod terminal_exit;
+#[cfg(test)]
+use app::AppResult;
+#[cfg(test)]
+use std::io;
+#[cfg(test)]
+use terminal_exit::{finish_exit, ExitApp};
+#[cfg(test)]
+#[path = "main_exit_settlement_tests.rs"]
+mod main_exit_settlement_tests;

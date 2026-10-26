@@ -1,0 +1,26 @@
+{
+  "native-kvo": {
+    "head": "dbaf487c227d965b6127d0194bf959d8834a261f",
+    "commits": [
+      "392a688b0d4c945c8aa1a64e41205f928382e7ef",
+      "ef687945c8f49bcd4ad54280422eaa68a16f6854",
+      "dd8f7b380a7ca5756358851cfb0dd33339f7e4f0",
+      "dbaf487c227d965b6127d0194bf959d8834a261f"
+    ],
+    "patch_sha256": "933f0f6f49ed80106bf5c591d7b2071b44b96d2eb9f91c397d51271e7b70fb4c",
+    "bytes": 32498,
+    "integration": "PENDING; not applied, compiled or tested as this branch"
+  },
+  "core-settlement": {
+    "head": "1d8a4be1135afb47e9a98df94e2ac025321ab7e0",
+    "commits": [
+      "4bc2fa95b8ecba10ec4719cd1dcc44a248a3ad5d",
+      "abe60c7c7e18f91c3f572e7a6ca2b84143699de1",
+      "5fc1a2c9f39677c2ad37d90a7c93791830010110",
+      "1d8a4be1135afb47e9a98df94e2ac025321ab7e0"
+    ],
+    "patch_sha256": "9420603ba012eb247e483683852c5b0baaa7655cda93bb587181bcb388ef839a",
+    "bytes": 71985,
+    "integration": "PENDING; not applied, compiled or tested as this branch"
+  }
+}

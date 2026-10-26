@@ -11,3 +11,5 @@ pub mod state;
 pub mod thumbnails;
 pub mod transfer;
 mod windows_drives_labels;
+
+pub mod persistence;

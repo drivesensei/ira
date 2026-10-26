@@ -1,3 +1,5 @@
+> Current continuation: [2026-10-05 root acceptance checkpoint](checkpoints/2026-10-05/ROOT_ACCEPTANCE.md), [40-body regression checkpoint](checkpoints/2026-10-05/REGRESSION.md), and [single-worktree policy/source checkpoint](SINGLE_WORKTREE.md). Local root compilation stopped within its resource controls; zero new root bodies ran. The user published through 9634fbc and exact-head macOS/Windows production build checks passed; native/runtime/full parity remain unverified. Further compiler allocation requires an explicit resource decision; future agent publication is paused. The historical state below (151 rows, empty-core-era commands) is preserved unchanged and is not current source or runtime status. The 152-row historical parity snapshot/source provenance remain linked from the prior 2026-10-04 handoff. Never run historical commands against real user configuration.
+
 # Migration state
 
 Updated: 2026-10-01 | Branch: main | HEAD: df91471 (F-002 reviewer transitions reconciled in feature branch)

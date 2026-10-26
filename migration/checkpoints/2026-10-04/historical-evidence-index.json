@@ -1,0 +1,184 @@
+[
+  {
+    "proof": "R003",
+    "source_commits": [
+      "dbaf487c227d965b6127d0194bf959d8834a261f"
+    ],
+    "storage": "Local current task engineering .devteam",
+    "availability": "LOCAL ONLY; raw receipts not included in Git publication",
+    "files": [
+      {
+        "path": "reports/R-003-kvo-validation.md",
+        "bytes": 4371,
+        "sha256": "8b93e480356d5fa6ed7e3f78e41a31695ec86aa38bafb7a51ccc41f39a5b9076"
+      },
+      {
+        "path": "evidence/R-003/INDEX.md",
+        "bytes": 2140,
+        "sha256": "197ddcffb741ee19bba0a07712d9b891d1c1e31f000af0ae340743d49807c9ff"
+      },
+      {
+        "path": "evidence/R-003/outcomes.json",
+        "bytes": 5951,
+        "sha256": "d0a9066db3c7219e0c2f9e5dc37fca327d1fdec0e95b8a36f5832f146a0ec99d"
+      }
+    ]
+  },
+  {
+    "proof": "R009",
+    "source_commits": [
+      "dbaf487c227d965b6127d0194bf959d8834a261f"
+    ],
+    "storage": "Local current task engineering .devteam",
+    "availability": "LOCAL ONLY; raw receipts not included in Git publication",
+    "files": [
+      {
+        "path": "reports/R009-kvo-mutation-validation.md",
+        "bytes": 5969,
+        "sha256": "bc37ce47427df56687ab18e3f2e9a551965485e018390504e2f6c6696e96dcb4"
+      },
+      {
+        "path": "evidence/R-009/INDEX.md",
+        "bytes": 6355,
+        "sha256": "82e6b302642fbcbcb15b6682297eecc64cdc44b4fb17eac9b52ff0eb446f4abf"
+      }
+    ]
+  },
+  {
+    "proof": "R007",
+    "source_commits": [
+      "a976cb2dfa75b61bcd79f55bf7f57c332a73e2ed",
+      "26eac6b0f462e9013f34efe83e3eb0a1d1d8533a"
+    ],
+    "storage": "Local current task engineering .devteam",
+    "availability": "LOCAL ONLY; raw receipts not included in Git publication",
+    "files": [
+      {
+        "path": "reports/R-007-root-proof-validation.md",
+        "bytes": 8624,
+        "sha256": "b1c272f7f847f42694121c5afa27437407e5577c662e11d2775d60c627679cdd"
+      },
+      {
+        "path": "evidence/R-007/INDEX.md",
+        "availability": "NOTFOUND; report is primary source-bound locator"
+      }
+    ]
+  },
+  {
+    "proof": "R010",
+    "source_commits": [
+      "cb9741569a60a9629da25134efc4a034662b2e52",
+      "26eac6b0f462e9013f34efe83e3eb0a1d1d8533a"
+    ],
+    "storage": "Local current task engineering .devteam",
+    "availability": "LOCAL ONLY; raw receipts not included in Git publication",
+    "files": [
+      {
+        "path": "reports/R010-footer-validation.md",
+        "bytes": 3111,
+        "sha256": "ccddb644b95e7165017857ccca87d81ca66e491e472254e7de3f61044b908166"
+      },
+      {
+        "path": "evidence/R010/INDEX.md",
+        "bytes": 2996,
+        "sha256": "2fe1da46ac0bb6b0016b7f6f6dac1495b62d95b69e158a04a065991e848d78cc"
+      }
+    ]
+  },
+  {
+    "proof": "T103",
+    "source_commits": [
+      "26eac6b0f462e9013f34efe83e3eb0a1d1d8533a"
+    ],
+    "storage": "Local parity worktree .devteam",
+    "availability": "LOCAL ONLY; raw receipts not included in Git publication",
+    "files": [
+      {
+        "path": "reports/T103-qa-root-helper-settlement.md",
+        "bytes": 2953,
+        "sha256": "f2e59a590fc9c6c2bfd00a5dc867110c8597746379315c7d270a82155e732c0f"
+      },
+      {
+        "path": "evidence/T-103-continuation/INDEX.md",
+        "bytes": 1680,
+        "sha256": "81a037997362c1ebe524edac1630592c1fd8198131891394e2714150461d6aab"
+      }
+    ]
+  },
+  {
+    "proof": "T103-independent-audit",
+    "source_commits": [
+      "26eac6b0f462e9013f34efe83e3eb0a1d1d8533a"
+    ],
+    "storage": "Local current task engineering .devteam",
+    "availability": "LOCAL ONLY; raw receipts not included in Git publication",
+    "files": [
+      {
+        "path": "reports/R-002-terminal-audit.md",
+        "bytes": 7520,
+        "sha256": "d4f4ba91c2e25cbcfcdb1af7a6582ec7037b975f54b3e28149c62487f15e19ba"
+      }
+    ]
+  },
+  {
+    "proof": "R011 historical source review and current retained authentication blockers",
+    "source_binding": "Controller v5 runner SHA8d1dcad225f3231edb4b2a4850aab8c79cc925ceccbb4c29f8edcc7fe5d47c46; historical183artifact/22anchor/8tree authentication and5inert checks PASS. Fresh full authentication failed/cancelled INCONCLUSIVE; actual regression7/7/5UNRUN. Source graph bindings reside local frozen manifest index.",
+    "storage": "Local current task engineering .devteam",
+    "availability": "LOCAL ONLY; raw receipts not included in Git publication",
+    "files": [
+      {
+        "path": "reports/R011-controller-v5-independent-review.md",
+        "bytes": 7611,
+        "sha256": "212fda7e28dd5ab742c63aaeb04985f35e38043f0e361bdb11788eaf7a8b7a91"
+      },
+      {
+        "path": "evidence/R011/v5-ledger-submission.json",
+        "bytes": 572,
+        "sha256": "97904409ae347970ccd4583649313837cadcbbe8931dba6c80e743f16ca9da40"
+      },
+      {
+        "path": "reports/R011-runtime-qa-preflight.md",
+        "bytes": 2982,
+        "sha256": "241e63048a3e26151ffca84f00b1abcfcdac8986e28536f27a808b9a0e40ee52"
+      },
+      {
+        "path": "evidence/R011/runtime-qa-authentication-fault.json",
+        "bytes": 428,
+        "sha256": "157ae8b7f9290836d8ae8fdbbcc61b4cc11a10f4ce05353afc69ea4ad3290fc1"
+      },
+      {
+        "path": "reports/R011-runtime-safety-resumption-review.md",
+        "bytes": 9493,
+        "sha256": "9e3318b3ee064b271fb670c615e94a68a36095092a6705e7d4a77c5f10e763d4"
+      },
+      {
+        "path": "reports/R011-readonly-blocker-diagnosis.md",
+        "bytes": 7997,
+        "sha256": "95249cf13ecdeb593ecb3ccef85e4ff7e3010bf90cc7738f4b8ffe9e01561c09"
+      },
+      {
+        "path": "evidence/R011/diagnosis-lost7-metadata.json",
+        "bytes": 970,
+        "sha256": "c1ff2e2447cd404af6c51577dfdbf02e5e2d7fb6afd4564915d1f47f24cdf2d3"
+      }
+    ]
+  },
+  {
+    "proof": "R013/R014 current maintenance checkpoint",
+    "outcome": "Proof preservation PASS; deletion rejected before creation/no deletion. R014 exact source approved9isolatedtests/earlierfailingregression retained; livearchival unapplied and13gap changed-during-read refusal unresolved.",
+    "storage": "Local current task engineering .devteam",
+    "availability": "LOCAL ONLY; authorization transcript/scripts/privategapfixture excluded from publication",
+    "files": [
+      {
+        "path": "reports/R014-maintenance-review.md",
+        "bytes": 2916,
+        "sha256": "8937037269b0d25ed054ab3cd99cdcea7a8f6bf105208db1d257a3025b0a339c"
+      },
+      {
+        "path": "reports/R013-mainthread-execution-entry.md",
+        "bytes": 2727,
+        "sha256": "0cfeeed3254c313ccad2043bacdbf8ba9c0fe8fa7ebf36fd0040c71850dbdfd4"
+      }
+    ]
+  }
+]

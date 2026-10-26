@@ -8,6 +8,9 @@ use ratatui::Terminal;
 use ratatui_image::picker::ProtocolType;
 use std::io::{self, Write};
 
+mod terminal_exit;
+use terminal_exit::{finish_exit, ExitApp};
+
 fn main() -> AppResult<()> {
     // Package-manager entry point: `--version` / `-V` prints and exits before
     // the TUI initializes. Homebrew's `brew test` and other packagers rely on it.
@@ -68,26 +71,44 @@ fn main() -> AppResult<()> {
             Event::Resize(_, _) => {}
         }
     }
-    // Persist session state (split layout and pane folders) on exit.
-    app.persist_state();
-    app.close_overlay();
-    // Graphics-protocol cleanup: transmitted kitty images persist in the
-    // terminal beyond the program's lifetime unless explicitly deleted.
-    if matches!(
-        app.picker.as_ref().map(|p| p.protocol_type()),
-        Some(ProtocolType::Kitty)
-    ) {
-        let mut out: Box<dyn Write> = if use_stdout {
-            Box::new(io::stdout())
-        } else {
-            Box::new(io::stderr())
-        };
-        let _ = write!(out, "\x1b_Ga=d,d=e\x1b\\");
-        let _ = out.flush();
+    finish_exit(&mut app, |app| {
+        app.close_overlay();
+        // Graphics-protocol cleanup: transmitted kitty images persist in the
+        // terminal beyond the program's lifetime unless explicitly deleted.
+        if matches!(
+            app.picker.as_ref().map(|p| p.protocol_type()),
+            Some(ProtocolType::Kitty)
+        ) {
+            let mut out: Box<dyn Write> = if use_stdout {
+                Box::new(io::stdout())
+            } else {
+                Box::new(io::stderr())
+            };
+            let _ = write!(out, "\x1b_Ga=d,d=e\x1b\\");
+            let _ = out.flush();
+        }
+        // Exit the user interface.
+        tui.exit()?;
+        Ok(())
+    })
+}
+
+impl ExitApp for App {
+    type Seal = ira::app::ExitWorkSeal;
+    type SaveError = ira::services::persistence::PersistenceError;
+    fn begin_exit_work(&mut self) -> Self::Seal {
+        self.begin_exit_settlement()
     }
-    // Exit the user interface.
-    tui.exit()?;
-    Ok(())
+    fn poll_exit_work(&mut self, seal: &Self::Seal, budget: usize) -> AppResult<bool> {
+        match self.poll_exit_settlement(seal, budget) {
+            ira::app::ExitWorkPoll::Pending => Ok(false),
+            ira::app::ExitWorkPoll::Settled => Ok(true),
+            ira::app::ExitWorkPoll::Error(error) => Err(error.into()),
+        }
+    }
+    fn save_exit_state(&self) -> Result<(), ira::services::persistence::PersistenceError> {
+        self.try_persist_state()
+    }
 }
 
 /// Prints detected terminal capabilities and exits. Useful when icons
@@ -175,3 +196,7 @@ fn print_terminal_check() {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "main_exit_tests.rs"]
+mod main_exit_tests;
