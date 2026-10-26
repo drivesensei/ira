@@ -97,12 +97,18 @@ async fn registered_browse_actions_use_one_retained_receiver_and_shutdown_bypass
         old.update(cx, |_, window, _| window.remove_window())
             .unwrap();
         let _ = cx.global::<Session>().runtime.attach(8);
-        cx.open_window(WindowOptions::default(), |_, cx| {
-            cx.new(|_| ShutdownStatus {
-                message: "replacement synthetic owner".into(),
+        let replacement = cx
+            .open_window(WindowOptions::default(), |_, cx| {
+                cx.new(|_| ShutdownStatus {
+                    message: "replacement synthetic owner".into(),
+                })
             })
-        })
-        .unwrap();
+            .unwrap();
+        // TestPlatform retains the removed active window until explicitly activated.
+        replacement
+            .update(cx, |_, window, _| window.activate_window())
+            .unwrap();
+        assert!(cx.active_window() == Some(replacement.into()));
         cx.dispatch_action(&actions::BrowseFolder);
         tick_chooser(cx);
         assert!(cx.global::<Session>().chooser.active().is_some());
@@ -111,6 +117,9 @@ async fn registered_browse_actions_use_one_retained_receiver_and_shutdown_bypass
     // Actual global Quit still enters checked coordinator while the receiver is pending.
     cx.update(|cx| {
         cx.dispatch_action(&actions::Quit);
+    });
+    // The active-window action runs during the preceding update's effect flush.
+    cx.update(|cx| {
         assert!(cx.global::<Session>().shutdown.is_some());
         assert!(cx.global::<Session>().chooser.active().is_some());
     });

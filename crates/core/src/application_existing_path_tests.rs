@@ -79,7 +79,6 @@ fn directory_symlink_is_folder_and_non_utf8_is_rejected() {
     symlink(root.join("absent"), &dangling).unwrap();
     assert!(load(dangling, ExistingPathKind::Folder, true, 0).is_err());
     let raw = root.join(std::ffi::OsString::from_vec(vec![255]));
-    std::fs::write(&raw, b"v").unwrap();
     assert!(load(raw, ExistingPathKind::File, true, 0)
         .unwrap_err()
         .contains("non-UTF8"));
