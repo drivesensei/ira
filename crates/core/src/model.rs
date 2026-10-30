@@ -53,6 +53,10 @@ pub struct Pane {
     /// Active sort mode of the listing, cycled with `,`
     /// (0=Name, 1=Size, 2=Modified, 3=Kind).
     pub sort_mode: usize,
+    /// Number of columns in 2D thumbnail grid mode.
+    pub grid_cols: usize,
+    /// Number of rows in 2D thumbnail grid mode.
+    pub grid_rows: usize,
 }
 
 /// Image preview presentation, cycled with `v`.

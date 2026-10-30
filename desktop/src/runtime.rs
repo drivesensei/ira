@@ -403,7 +403,10 @@ impl Runtime {
                         continue;
                     }
                     generation = generation.wrapping_add(1);
-                    let result = drive_probe().map_err(|error| error.to_string());
+                    let mut result = drive_probe().map_err(|error| error.to_string());
+                    if let Ok(drives) = &mut result {
+                        ira_core::services::drives::fill_space(drives);
+                    }
                     if drive_done
                         .send(EditorResult::Drives(epoch, generation, result))
                         .is_err()

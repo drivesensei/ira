@@ -17,6 +17,7 @@ pub struct Row {
     pub entry: FEntry,
     pub selected: bool,
     pub deleting: bool,
+    pub size_walk_active: bool,
 }
 #[derive(Debug, Clone)]
 pub struct PaneSnapshot {
@@ -140,6 +141,9 @@ pub struct Snapshot {
     pub theme_preset: ThemePreset,
     pub icons: IconSet,
     pub sizes: Vec<(PathBuf, SizeInfo)>,
+    pub hint_offset: usize,
+    pub hint_bar_blocked: bool,
+    pub pane_shows_text_preview: [bool; 2],
 }
 #[derive(Clone, PartialEq, Eq)]
 struct ProjectionKey {
@@ -187,6 +191,7 @@ impl App {
                     entry: e.clone(),
                     selected: pane.selected.get(i).copied().unwrap_or(false),
                     deleting: self.deleting_started(&e.path).is_some(),
+                    size_walk_active: self.size_walk_started(&e.path).is_some(),
                 })
                 .collect();
             let selected_paths = pane
@@ -326,6 +331,12 @@ impl App {
             theme_preset: self.theme_preset,
             icons: self.icons,
             sizes: self.size_snapshot(),
+            hint_offset: self.hint_offset,
+            hint_bar_blocked: self.hint_bar_blocked(),
+            pane_shows_text_preview: [
+                self.pane_shows_text_preview(0),
+                self.pane_shows_text_preview(1),
+            ],
         }
     }
 }

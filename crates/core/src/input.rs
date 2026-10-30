@@ -15,6 +15,7 @@ pub enum KeyCode {
     End,
     PageUp,
     PageDown,
+    F(u8),
     Other,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -280,6 +281,8 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
                     app.next_item();
                 }
             }
+            KeyCode::PageDown => app.page_down(),
+            KeyCode::PageUp => app.page_up(),
             _ => {}
         }
         return Ok(());
@@ -312,10 +315,14 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
 
         // Any digit represents a shortcut to a Drive path
         KeyCode::Char(c) if c.is_ascii_digit() => {
-            let index = c.to_digit(10).unwrap() as usize;
             let shortcuts = app.get_drive_shortcuts();
-            if index > 0 && index <= shortcuts.len() {
-                app.set_folder_from_drives(index - 1);
+            if let Some(idx) = shortcuts.iter().position(|&sc| sc == c) {
+                app.set_folder_from_drives(idx);
+            } else {
+                let index = c.to_digit(10).unwrap() as usize;
+                if index > 0 && index <= shortcuts.len() && !shortcuts[index - 1].is_ascii_digit() {
+                    app.set_folder_from_drives(index - 1);
+                }
             }
         }
 
@@ -416,24 +423,73 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
         }
 
         // Files navigation handlers
-        KeyCode::Right => app.enter_folder(),
-        KeyCode::Left => app.out_of_folder(),
+        KeyCode::Left => {
+            let in_grid = app.panes[app.active_pane].preview_mode == crate::model::PreviewMode::Grid;
+            if in_grid {
+                if key_event.modifiers == KeyModifiers::ALT
+                    || (key_event.modifiers.is_empty() && app.pane().state.selected() == Some(0))
+                {
+                    app.out_of_folder();
+                } else {
+                    app.grid_move_left();
+                }
+            } else {
+                app.out_of_folder();
+            }
+        }
+        KeyCode::Right => {
+            let in_grid = app.panes[app.active_pane].preview_mode == crate::model::PreviewMode::Grid;
+            if in_grid {
+                app.grid_move_right();
+            } else {
+                app.enter_folder();
+            }
+        }
 
-        // Enter renames the selected entry (macOS-style).
-        KeyCode::Enter => app.start_rename(),
+        // Enter renames the selected entry (macOS-style) in list mode, opens folder in grid mode.
+        KeyCode::Enter => {
+            let in_grid = app.panes[app.active_pane].preview_mode == crate::model::PreviewMode::Grid;
+            if in_grid {
+                app.enter_folder();
+            } else {
+                app.start_rename();
+            }
+        }
+        KeyCode::F(2) => app.start_rename(),
 
         KeyCode::Up => {
-            if key_event.modifiers == KeyModifiers::ALT {
-                app.goto_top();
+            let in_grid = app.panes[app.active_pane].preview_mode == crate::model::PreviewMode::Grid;
+            if in_grid {
+                if key_event.modifiers == KeyModifiers::ALT {
+                    app.goto_top();
+                } else {
+                    app.grid_move_up();
+                }
+            } else {
+                if key_event.modifiers == KeyModifiers::ALT {
+                    app.goto_top();
+                }
+                app.prev_item();
             }
-            app.prev_item();
         }
         KeyCode::Down => {
-            if key_event.modifiers == KeyModifiers::ALT {
-                app.goto_bottom();
+            let in_grid = app.panes[app.active_pane].preview_mode == crate::model::PreviewMode::Grid;
+            if in_grid {
+                if key_event.modifiers == KeyModifiers::ALT {
+                    app.goto_bottom();
+                } else {
+                    app.grid_move_down();
+                }
+            } else {
+                if key_event.modifiers == KeyModifiers::ALT {
+                    app.goto_bottom();
+                }
+                app.next_item();
             }
-            app.next_item();
         }
+
+        KeyCode::PageDown => app.page_down(),
+        KeyCode::PageUp => app.page_up(),
 
         _ => {}
     }
@@ -448,6 +504,8 @@ pub enum Command {
     MovePrevious,
     MoveTop,
     MoveBottom,
+    PageUp,
+    PageDown,
     EnterFolder,
     ParentFolder,
     ToggleSplit,
@@ -508,6 +566,8 @@ impl Command {
             Self::MovePrevious => "pane.previous",
             Self::MoveTop => "pane.top",
             Self::MoveBottom => "pane.bottom",
+            Self::PageUp => "pane.page_up",
+            Self::PageDown => "pane.page_down",
             Self::EnterFolder => "pane.enter",
             Self::ParentFolder => "pane.parent",
             Self::ToggleSplit => "pane.split",

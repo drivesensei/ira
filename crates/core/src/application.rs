@@ -875,11 +875,11 @@ impl App {
     }
 
     /// The pane that currently receives input.
-    fn pane(&self) -> &Pane {
+    pub fn pane(&self) -> &Pane {
         &self.panes[self.active_pane]
     }
 
-    fn pane_mut(&mut self) -> &mut Pane {
+    pub fn pane_mut(&mut self) -> &mut Pane {
         &mut self.panes[self.active_pane]
     }
 
@@ -1230,6 +1230,7 @@ impl App {
             path: mount_point,
             shortcut: '#',
             device: drive.device,
+            space: drive.space,
         });
         self.search_query = None;
         self.list_files_from_selected_folder();
@@ -1398,6 +1399,111 @@ impl App {
                 }
             }
         }
+    }
+
+    pub fn grid_move_left(&mut self) {
+        self.pane_mut().user_navigated = true;
+        let count = self.visible_count();
+        if count == 0 {
+            self.pane_mut().state.select(None);
+            return;
+        }
+        let next = match self.pane().state.selected() {
+            Some(sel) => sel.saturating_sub(1),
+            None => 0,
+        };
+        self.pane_mut().state.select(Some(next));
+    }
+
+    pub fn grid_move_right(&mut self) {
+        self.pane_mut().user_navigated = true;
+        let count = self.visible_count();
+        if count == 0 {
+            self.pane_mut().state.select(None);
+            return;
+        }
+        let total = count;
+        let next = match self.pane().state.selected() {
+            Some(sel) => (sel + 1).min(total.saturating_sub(1)),
+            None => 0,
+        };
+        self.pane_mut().state.select(Some(next));
+    }
+
+    pub fn grid_move_up(&mut self) {
+        self.pane_mut().user_navigated = true;
+        let count = self.visible_count();
+        if count == 0 {
+            self.pane_mut().state.select(None);
+            return;
+        }
+        let cols = self.pane().grid_cols.max(1);
+        let next = match self.pane().state.selected() {
+            Some(sel) if sel >= cols => sel - cols,
+            Some(sel) => sel,
+            None => 0,
+        };
+        self.pane_mut().state.select(Some(next));
+    }
+
+    pub fn grid_move_down(&mut self) {
+        self.pane_mut().user_navigated = true;
+        let count = self.visible_count();
+        if count == 0 {
+            self.pane_mut().state.select(None);
+            return;
+        }
+        let cols = self.pane().grid_cols.max(1);
+        let total = count;
+        let next = match self.pane().state.selected() {
+            Some(sel) => (sel + cols).min(total.saturating_sub(1)),
+            None => 0,
+        };
+        self.pane_mut().state.select(Some(next));
+    }
+
+    pub fn page_down(&mut self) {
+        self.pane_mut().user_navigated = true;
+        let count = self.visible_count();
+        if count == 0 {
+            self.pane_mut().state.select(None);
+            return;
+        }
+        let in_grid = self.pane().preview_mode == crate::model::PreviewMode::Grid;
+        let delta = if in_grid {
+            let cols = self.pane().grid_cols.max(1);
+            let rows = self.pane().grid_rows.max(1);
+            cols * rows
+        } else {
+            10
+        };
+        let next = match self.pane().state.selected() {
+            Some(i) => (i + delta).min(count.saturating_sub(1)),
+            None => 0,
+        };
+        self.pane_mut().state.select(Some(next));
+    }
+
+    pub fn page_up(&mut self) {
+        self.pane_mut().user_navigated = true;
+        let count = self.visible_count();
+        if count == 0 {
+            self.pane_mut().state.select(None);
+            return;
+        }
+        let in_grid = self.pane().preview_mode == crate::model::PreviewMode::Grid;
+        let delta = if in_grid {
+            let cols = self.pane().grid_cols.max(1);
+            let rows = self.pane().grid_rows.max(1);
+            cols * rows
+        } else {
+            10
+        };
+        let next = match self.pane().state.selected() {
+            Some(i) => i.saturating_sub(delta),
+            None => 0,
+        };
+        self.pane_mut().state.select(Some(next));
     }
 
     /// Switches to the next built-in theme preset (`\`), announces it in
@@ -4181,6 +4287,8 @@ impl App {
             MovePrevious => self.prev_item(),
             MoveTop => self.goto_top(),
             MoveBottom => self.goto_bottom(),
+            PageUp => self.page_up(),
+            PageDown => self.page_down(),
             EnterFolder => self.enter_folder(),
             ParentFolder => self.out_of_folder(),
             ToggleSplit => self.toggle_split(),

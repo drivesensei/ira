@@ -4,6 +4,7 @@ pub mod accessibility_prepared;
 pub mod accessibility_retirement;
 pub mod accessibility_worker;
 mod appearance;
+pub mod chrome;
 pub mod preview;
 pub mod rows;
 use crate::platform::accessibility::{
@@ -785,22 +786,26 @@ impl Desktop {
             .id(label)
             .px_3()
             .py_1()
-            .rounded_md()
-            .bg(native_color(self.theme.surface))
+            .rounded(px(4.))
+            .border_1()
+            .border_color(chrome::to_gpui_color(self.theme.border))
+            .bg(native_color(self.theme.surface_alt))
+            .hover(|s| s.bg(chrome::to_gpui_color(self.theme.selection)))
+            .text_size(px(12.))
+            .text_color(chrome::to_gpui_color(self.theme.text))
             .cursor_pointer()
             .child(label)
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.dispatch(code, cx)));
-        if label == "Confirm" || label == "Cancel" {
-            self.accessibility.measured(
-                button,
-                AxTarget::Modal,
-                Some(AxRole::Button),
-                Some(if label == "Confirm" {
-                    AxCapability::Activate
-                } else {
-                    AxCapability::Dismiss
-                }),
-            )
+        let capability = if matches!(label, "Confirm" | "y: Yes") {
+            Some(AxCapability::Activate)
+        } else if matches!(label, "Cancel" | "n: No" | "Esc: Close") {
+            Some(AxCapability::Dismiss)
+        } else {
+            None
+        };
+        if capability.is_some() {
+            self.accessibility
+                .measured(button, AxTarget::Modal, Some(AxRole::Button), capability)
         } else {
             button.into_any_element()
         }
@@ -825,15 +830,27 @@ impl Desktop {
             listing_generation: pane.listing_generation,
         };
         let (glyph, category) = ira_core::theme::icons::icon_for(&row.entry, snapshot.icons);
-        let label = format!(
-            "{} {} {}",
-            if row.selected { "☑" } else { "☐" },
-            glyph,
-            row.entry.label
-        );
+        let icon_str = if row.deleting || row.size_walk_active {
+            chrome::spinner_char(std::time::Instant::now()).to_string()
+        } else {
+            glyph.to_string()
+        };
+        let dir_bytes = snapshot
+            .sizes
+            .iter()
+            .find(|(p, s)| s.complete && p == std::path::Path::new(&row.entry.path))
+            .map(|(_, s)| s.bytes)
+            .or_else(|| (row.entry.is_dir && row.entry.size > 0).then_some(row.entry.size));
+        let size_note = dir_bytes
+            .map(|b| format!(" ({})", ira_core::services::file_info::human(b)))
+            .unwrap_or_default();
         let current = pane.cursor == Some(row_index) && snapshot.active_pane == index;
         let foreground = if current {
             self.theme.cursor_fg
+        } else if row.entry.is_dir {
+            self.theme.dir
+        } else if row.entry.label.starts_with('.') {
+            self.theme.hidden
         } else {
             self.theme.color_for(category)
         };
@@ -855,20 +872,44 @@ impl Desktop {
                 .flex_col()
                 .w(px(172.))
                 .h(px(160.))
+                .rounded(px(4.))
                 .justify_between()
                 .py_2();
             let thumbnail = preview::Host::grid_key(snapshot, index, row_index)
                 .and_then(|key| self.preview.content(&key));
+            let thumb_border = chrome::to_gpui_color(if current {
+                self.theme.border_active
+            } else if row.selected {
+                self.theme.accent
+            } else {
+                self.theme.border
+            });
             element = match thumbnail {
                 Some(preview::Content::Image(image)) => element.child(
-                    gpui::img(image.clone())
+                    div()
                         .w_full()
                         .h(px(112.))
-                        .object_fit(gpui::ObjectFit::Contain),
+                        .rounded(px(3.))
+                        .border_1()
+                        .border_color(thumb_border)
+                        .bg(native_color(self.theme.surface_alt))
+                        .overflow_hidden()
+                        .child(
+                            gpui::img(image.clone())
+                                .w_full()
+                                .h(px(110.))
+                                .object_fit(gpui::ObjectFit::Contain),
+                        ),
                 ),
                 _ => element.child(
                     div()
+                        .w_full()
                         .h(px(112.))
+                        .rounded(px(3.))
+                        .border_1()
+                        .border_color(thumb_border)
+                        .bg(native_color(self.theme.surface_alt))
+                        .overflow_hidden()
                         .flex()
                         .items_center()
                         .justify_center()
@@ -876,13 +917,81 @@ impl Desktop {
                         .child(glyph),
                 ),
             };
-            element = element.child(div().w_full().truncate().text_sm().child(label));
+            let mut footer_row = div()
+                .w_full()
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .min_w_0();
+            if row.selected {
+                footer_row = footer_row.child(chrome::badge(
+                    "✓",
+                    chrome::to_gpui_color(self.theme.key_fg),
+                    chrome::to_gpui_color(self.theme.accent),
+                ));
+            }
+            footer_row = footer_row
+                .child(div().flex_shrink_0().text_size(px(12.)).child(icon_str))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(12.))
+                        .child(format!("{}{size_note}", row.entry.label)),
+                );
+            element = element.child(footer_row);
         } else {
             element = element
                 .h(px(30.))
                 .items_center()
-                .gap_3()
-                .child(div().flex_1().min_w_0().truncate().child(label));
+                .gap(px(6.))
+                .child(
+                    div()
+                        .w(px(2.))
+                        .h(px(18.))
+                        .rounded(px(1.))
+                        .bg(if current {
+                            chrome::to_gpui_color(self.theme.accent)
+                        } else {
+                            gpui::rgba(0x0000_0000)
+                        }),
+                )
+                .child(
+                    div()
+                        .w(px(22.))
+                        .flex_shrink_0()
+                        .text_size(px(11.))
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_color(chrome::to_gpui_color(if current {
+                            self.theme.cursor_fg
+                        } else if row.selected {
+                            self.theme.accent
+                        } else {
+                            self.theme.text_muted
+                        }))
+                        .child(if row.selected { "[*]" } else { "[ ]" }),
+                )
+                .child(
+                    div()
+                        .w(px(18.))
+                        .flex_shrink_0()
+                        .text_color(native_color(foreground))
+                        .child(icon_str),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(13.))
+                        .font_weight(if row.entry.is_dir {
+                            gpui::FontWeight::BOLD
+                        } else {
+                            gpui::FontWeight::NORMAL
+                        })
+                        .child(format!("{}{size_note}", row.entry.label)),
+                );
             if pane.preview_mode == ira_core::model::PreviewMode::Details {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -937,31 +1046,110 @@ impl Desktop {
             return div().flex_1().child("Loading…").into_any_element();
         };
         let pane = &snapshot.panes[index];
-        let title = pane
+        let folder_label = pane
+            .folder
+            .as_ref()
+            .map(|f| f.label.clone())
+            .unwrap_or_else(|| "No folder".into());
+        let folder_path = pane
             .folder
             .as_ref()
             .map(|f| f.path.clone())
-            .unwrap_or_else(|| "No folder open".into());
-        let header = div()
-            .px_3()
-            .py_2()
-            .bg(native_color(if snapshot.active_pane == index {
-                self.theme.border_active
-            } else {
-                self.theme.surface
-            }))
-            .child(title);
-        let mut body = div()
-            .flex_1()
-            .min_w_0()
-            .h_full()
+            .unwrap_or_default();
+
+        let (folder_glyph, _) = ira_core::theme::icons::icon_for(
+            &ira_core::services::list_files::FEntry {
+                path: folder_path.clone(),
+                label: folder_label.clone(),
+                is_dir: true,
+                size: 0,
+                modified: None,
+            },
+            snapshot.icons,
+        );
+        let mut title_elements = div()
             .flex()
-            .flex_col()
-            .border_1()
-            .border_color(native_color(self.theme.border))
-            .child(header);
+            .items_center()
+            .gap(px(6.))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(chrome::to_gpui_color(self.theme.dir))
+                    .child(folder_glyph),
+            )
+            .child(
+                div()
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_size(px(12.))
+                    .text_color(chrome::to_gpui_color(self.theme.text))
+                    .child(folder_label),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(chrome::to_gpui_color(self.theme.text_muted))
+                    .child(folder_path),
+            );
+
+        if pane.sort_mode > 0 || pane.preview_mode == ira_core::model::PreviewMode::Details {
+            title_elements = title_elements.child(chrome::badge(
+                format!("sort: {}", rows::sort_mode_label(pane.sort_mode)),
+                chrome::to_gpui_color(self.theme.text_muted),
+                chrome::to_gpui_color(self.theme.surface),
+            ));
+        }
+
+        if snapshot.show_hidden {
+            title_elements = title_elements.child(chrome::badge(
+                ". hidden",
+                chrome::to_gpui_color(self.theme.accent),
+                chrome::to_gpui_color(self.theme.surface),
+            ));
+        }
+
+        if let Some(filter) = &pane.filter_query {
+            title_elements = title_elements
+                .child(
+                    div()
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_size(px(11.))
+                        .text_color(chrome::to_gpui_color(self.theme.accent))
+                        .child(format!("/{filter}")),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(chrome::to_gpui_color(self.theme.text_muted))
+                        .child("(Esc clears)"),
+                );
+        }
+
+        if pane.preview_mode == ira_core::model::PreviewMode::Details {
+            title_elements = title_elements.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(chrome::to_gpui_color(self.theme.text_muted))
+                    .child("(details)"),
+            );
+        } else if pane.preview_mode == ira_core::model::PreviewMode::Grid {
+            title_elements = title_elements.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(chrome::to_gpui_color(self.theme.text_muted))
+                    .child("(grid)"),
+            );
+        }
+
+        let is_active = snapshot.active_pane == index && !snapshot.board_focused && !snapshot.edit_focus;
+        let border_color = if is_active {
+            chrome::to_gpui_color(self.theme.border_active)
+        } else {
+            chrome::to_gpui_color(self.theme.border)
+        };
+
+        let mut list_container = div().flex().flex_1().min_h_0().min_w_0();
         if pane.rows.is_empty() {
-            body = body.child(div().p_4().child(if !pane.listing_settled {
+            list_container = list_container.child(div().p_4().child(if !pane.listing_settled {
                 "Loading…"
             } else if pane.filter_query.is_some() {
                 "No matches"
@@ -970,7 +1158,7 @@ impl Desktop {
             }));
         } else if pane.preview_mode == ira_core::model::PreviewMode::Grid {
             let columns = self.grid_columns[index];
-            body = body.child(
+            list_container = list_container.child(
                 uniform_list(
                     ("grid-files", index),
                     pane.rows.len().div_ceil(columns),
@@ -1002,7 +1190,7 @@ impl Desktop {
                 .min_h_0(),
             );
         } else {
-            body = body.child(
+            list_container = list_container.child(
                 uniform_list(
                     ("files", index),
                     pane.rows.len(),
@@ -1017,6 +1205,223 @@ impl Desktop {
                 .min_h_0(),
             );
         }
+
+        let mut interior = div().flex().flex_1().min_h_0().min_w_0();
+        if pane.preview_mode == ira_core::model::PreviewMode::Column {
+            let is_text = snapshot.pane_shows_text_preview[index];
+            let list_flex = if is_text { 0.34 } else { 0.62 };
+            let preview_flex = if is_text { 0.66 } else { 0.38 };
+
+            interior = interior.child(
+                div()
+                    .flex_basis(gpui::relative(list_flex))
+                    .h_full()
+                    .min_w_0()
+                    .child(list_container),
+            );
+
+            let mut col = div()
+                .flex_basis(gpui::relative(preview_flex))
+                .h_full()
+                .min_w(px(220.))
+                .p_3()
+                .border_l_1()
+                .border_color(chrome::to_gpui_color(self.theme.border))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .bg(native_color(self.theme.surface_alt));
+
+            let is_editing = snapshot.edit_focus
+                && snapshot.active_pane == index
+                && self.input_mode == Some(InputMode::Editor)
+                && self.input.is_some();
+            let is_read_only = snapshot
+                .edit
+                .as_ref()
+                .is_some_and(|e| e.pane_index == index && e.read_only);
+            let is_dirty = snapshot
+                .edit
+                .as_ref()
+                .is_some_and(|e| e.pane_index == index && e.dirty);
+
+            let col_title = if is_editing {
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .w_full()
+                    .pb(px(4.))
+                    .border_b_1()
+                    .border_color(chrome::to_gpui_color(self.theme.border))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .child(
+                                div()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_size(px(11.))
+                                    .text_color(chrome::to_gpui_color(if is_dirty {
+                                        self.theme.warning
+                                    } else {
+                                        self.theme.accent
+                                    }))
+                                    .child(if is_dirty { "* Editing" } else { "Editing" }),
+                            ),
+                    )
+                    .child(chrome::hint_row(
+                        &[("Ctrl+S", "save"), ("Esc", "exit")],
+                        &self.theme,
+                    ))
+            } else if is_read_only {
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .w_full()
+                    .pb(px(4.))
+                    .border_b_1()
+                    .border_color(chrome::to_gpui_color(self.theme.border))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(chrome::to_gpui_color(self.theme.warning))
+                            .child("Preview (read-only)"),
+                    )
+                    .child(chrome::hint_pill("v", "mode", &self.theme))
+            } else {
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .w_full()
+                    .pb(px(4.))
+                    .border_b_1()
+                    .border_color(chrome::to_gpui_color(self.theme.border))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(chrome::to_gpui_color(self.theme.text_muted))
+                            .child("Preview"),
+                    )
+                    .child(chrome::hint_pill("v", "cycle", &self.theme))
+            };
+            col = col.child(col_title);
+
+            if is_editing && let Some(input) = &self.input {
+                col = col.child(
+                    div()
+                        .id(("preview-editor", index))
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .child(self.accessibility.measured(
+                            div().w_full().child(input.clone()),
+                            AxTarget::Text {
+                                document: snapshot.document_generation,
+                            },
+                            None,
+                            None,
+                        )),
+                );
+            } else if let Some(key) = preview::Host::key(snapshot, index) {
+                col = match self.preview.content(&key) {
+                    Some(preview::Content::Image(image)) => col.child(
+                        gpui::img(image.clone())
+                            .w_full()
+                            .max_h(px(500.))
+                            .object_fit(gpui::ObjectFit::Contain),
+                    ),
+                    Some(preview::Content::Text(text)) => col.child(
+                        div()
+                            .id(("preview-text", index))
+                            .overflow_y_scroll()
+                            .flex_1()
+                            .min_h_0()
+                            .child(text.clone()),
+                    ),
+                    Some(preview::Content::Error(error)) => col.child(
+                        div()
+                            .text_color(native_color(self.theme.text_muted))
+                            .child(error.clone()),
+                    ),
+                    None => col.child("Loading preview…"),
+                };
+            } else {
+                let selected_is_dir = pane
+                    .cursor
+                    .and_then(|c| pane.rows.get(c))
+                    .is_some_and(|r| r.entry.is_dir);
+                let placeholder = if selected_is_dir {
+                    "Folders have no image preview"
+                } else {
+                    "Select a file to preview"
+                };
+                col = col.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(chrome::to_gpui_color(self.theme.text_muted))
+                        .child(placeholder),
+                );
+            }
+            interior = interior.child(col);
+        } else {
+            interior = interior.child(list_container);
+        }
+
+        let mut body = div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .flex_col()
+            .rounded(px(4.))
+            .border_1()
+            .border_color(border_color)
+            .bg(native_color(self.theme.surface));
+
+        let header = div()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(border_color)
+            .bg(native_color(self.theme.surface_alt))
+            .child(title_elements);
+
+        if index == snapshot.active_pane
+            && self.input_mode == Some(InputMode::Search)
+            && let Some(input) = &self.input
+        {
+            body = body.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .px_3()
+                    .py_1()
+                    .bg(native_color(self.theme.surface_alt))
+                    .border_b_1()
+                    .border_color(border_color)
+                    .child(chrome::key_pill("/", &self.theme))
+                    .child(self.accessibility.measured(
+                        div().flex_1().child(input.clone()),
+                        AxTarget::Text {
+                            document: snapshot.document_generation,
+                        },
+                        None,
+                        None,
+                    ))
+                    .child(chrome::hint_pill("Esc", "cancel", &self.theme)),
+            );
+        } else {
+            body = body.child(header);
+        }
+        body = body.child(interior);
+
         body = body.on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, _, cx| {
             let delta = event.delta.pixel_delta(px(30.)).y;
             if delta == px(0.) {
@@ -1035,110 +1440,576 @@ impl Desktop {
                 cx.notify();
             }
         }));
+
         self.accessibility
             .measured(body, AxTarget::Pane(index), Some(AxRole::List), None)
     }
-    fn places(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let mut list = div()
-            .w(px(190.))
-            .flex_shrink_0()
+
+    fn render_drives_row(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(snapshot) = &self.snapshot else {
+            return div().into_any_element();
+        };
+        let Some(drives) = &snapshot.drives else {
+            return div().into_any_element();
+        };
+
+        let theme = &self.theme;
+        let mut occurrences = BTreeMap::new();
+        let mut items = div()
             .flex()
-            .flex_col()
-            .gap_2()
-            .p_3()
-            .bg(native_color(self.theme.surface_alt));
-        if let Some(snapshot) = &self.snapshot {
-            for (heading, folders) in [
-                ("Drives", &snapshot.drives),
-                ("Places", &snapshot.folders),
-                ("Bookmarks", &snapshot.bookmarks),
-            ] {
-                list = list.child(
-                    div()
-                        .text_sm()
-                        .text_color(native_color(self.theme.text_muted))
-                        .child(heading),
-                );
-                if let Some(folders) = folders {
-                    let mut occurrences = BTreeMap::new();
-                    for (i, folder) in folders.iter().enumerate() {
-                        let key = if heading == "Drives" {
-                            char::from_digit((i + 1) as u32, 10).unwrap_or(' ')
-                        } else {
-                            folder.shortcut
-                        };
-                        let label = format!("{}  {}", key, folder.label);
-                        let path = folder.path.clone();
-                        let kind = match heading {
-                            "Drives" => PlaceKind::Drive,
-                            "Places" => PlaceKind::Common,
-                            _ => PlaceKind::Bookmark,
-                        };
-                        let ax_kind = match kind {
-                            PlaceKind::Drive => {
-                                crate::platform::accessibility::model::PlaceKind::Drive
-                            }
-                            PlaceKind::Common => {
-                                crate::platform::accessibility::model::PlaceKind::Common
-                            }
-                            PlaceKind::Bookmark => {
-                                crate::platform::accessibility::model::PlaceKind::Bookmark
-                            }
-                        };
-                        let count = occurrences
-                            .entry((folder.path.clone(), folder.shortcut))
-                            .or_insert(0usize);
-                        let occurrence = *count;
-                        *count += 1;
-                        let ax_target = AxTarget::Place {
-                            kind: ax_kind,
-                            path: PathBuf::from(&path),
-                            shortcut: folder.shortcut,
-                            occurrence,
-                        };
-                        let handle = self
-                            .place_focus
-                            .entry(ax_target.clone())
-                            .or_insert_with(|| cx.focus_handle())
-                            .clone();
-                        let shortcut = folder.shortcut;
-                        list = list.child(
-                            self.accessibility.measured(
-                                div()
-                                    .id((heading, i))
-                                    .track_focus(&handle)
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .cursor_pointer()
-                                    .child(label)
-                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                        this.runtime.enqueue(
-                                            Command::PlaceExact {
-                                                kind,
-                                                path: path.clone(),
-                                                shortcut,
-                                                occurrence,
-                                            },
-                                            None,
-                                        );
-                                        cx.notify();
-                                    })),
-                                ax_target,
-                                Some(AxRole::Button),
-                                Some(AxCapability::Activate),
-                            ),
-                        );
-                    }
+            .items_center()
+            .gap(px(10.))
+            .overflow_x_hidden()
+            .flex_1()
+            .min_w_0();
+
+        for (i, drive) in drives.iter().enumerate() {
+            let key = if drive.shortcut.is_ascii_alphanumeric() {
+                drive.shortcut.to_string()
+            } else {
+                (i + 1).to_string()
+            };
+            let (glyph, _) = ira_core::theme::icons::icon_for(
+                &ira_core::services::list_files::FEntry {
+                    path: drive.path.clone(),
+                    label: drive.label.clone(),
+                    is_dir: true,
+                    size: 0,
+                    modified: None,
+                },
+                snapshot.icons,
+            );
+            let space_str = if let Some(space) = drive.space {
+                match space.available {
+                    Some(avail) => format!(
+                        " {} free / {}",
+                        ira_core::services::file_info::human(avail),
+                        ira_core::services::file_info::human(space.total)
+                    ),
+                    None => format!(" {}", ira_core::services::file_info::human(space.total)),
                 }
+            } else {
+                String::new()
+            };
+
+            let count = occurrences
+                .entry((drive.path.clone(), drive.shortcut))
+                .or_insert(0usize);
+            let occurrence = *count;
+            *count += 1;
+            let ax_target = AxTarget::Place {
+                kind: crate::platform::accessibility::model::PlaceKind::Drive,
+                path: PathBuf::from(&drive.path),
+                shortcut: drive.shortcut,
+                occurrence,
+            };
+            let handle = self
+                .place_focus
+                .entry(ax_target.clone())
+                .or_insert_with(|| cx.focus_handle())
+                .clone();
+            let path = drive.path.clone();
+            let shortcut = drive.shortcut;
+
+            let drive_element = div()
+                .id(("drive-item", i))
+                .track_focus(&handle)
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .px(px(5.))
+                .py(px(2.))
+                .rounded(px(4.))
+                .hover(|s| s.bg(chrome::to_gpui_color(theme.selection)))
+                .cursor_pointer()
+                .child(chrome::key_pill(&key, theme))
+                .child(
+                    div()
+                        .text_color(chrome::to_gpui_color(theme.dir))
+                        .child(glyph),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(chrome::to_gpui_color(theme.text))
+                        .child(drive.label.clone()),
+                )
+                .children((!space_str.is_empty()).then(|| {
+                    div()
+                        .text_size(px(11.))
+                        .text_color(chrome::to_gpui_color(theme.text_muted))
+                        .child(space_str)
+                }))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.runtime.enqueue(
+                        Command::PlaceExact {
+                            kind: PlaceKind::Drive,
+                            path: path.clone(),
+                            shortcut,
+                            occurrence,
+                        },
+                        None,
+                    );
+                    cx.notify();
+                }));
+
+            items = items.child(self.accessibility.measured(
+                drive_element,
+                ax_target,
+                Some(AxRole::Button),
+                Some(AxCapability::Activate),
+            ));
+        }
+
+        let title_left = div()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .child(
+                div()
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_size(px(12.))
+                    .text_color(chrome::to_gpui_color(theme.text))
+                    .child("Drives"),
+            )
+            .child(chrome::key_pill("-", theme))
+            .child(
+                div()
+                    .id("unmount-drive-btn")
+                    .px(px(4.))
+                    .py(px(1.))
+                    .rounded(px(3.))
+                    .hover(|s| s.bg(chrome::to_gpui_color(theme.selection)))
+                    .text_size(px(11.))
+                    .text_color(chrome::to_gpui_color(theme.text_muted))
+                    .cursor_pointer()
+                    .child("unmount the current drive")
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.dispatch(KeyCode::Char('-'), cx);
+                    })),
+            );
+
+        chrome::panel_block(title_left, None::<gpui::Div>, true, theme)
+            .id("ira-drives-row")
+            .debug_selector(|| "ira-drives-row".into())
+            .w_full()
+            .px(px(8.))
+            .py(px(4.))
+            .child(items)
+            .into_any_element()
+    }
+
+    fn render_common_folders_row(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(snapshot) = &self.snapshot else {
+            return div().into_any_element();
+        };
+        let Some(folders) = &snapshot.folders else {
+            return div().into_any_element();
+        };
+
+        let theme = &self.theme;
+        let mut occurrences = BTreeMap::new();
+        let mut items = div()
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .overflow_x_hidden()
+            .flex_1()
+            .min_w_0();
+
+        for (i, folder) in folders.iter().enumerate() {
+            let key = folder.shortcut.to_string();
+            let (glyph, _) = ira_core::theme::icons::icon_for(
+                &ira_core::services::list_files::FEntry {
+                    path: folder.path.clone(),
+                    label: folder.label.clone(),
+                    is_dir: true,
+                    size: 0,
+                    modified: None,
+                },
+                snapshot.icons,
+            );
+
+            let count = occurrences
+                .entry((folder.path.clone(), folder.shortcut))
+                .or_insert(0usize);
+            let occurrence = *count;
+            *count += 1;
+            let ax_target = AxTarget::Place {
+                kind: crate::platform::accessibility::model::PlaceKind::Common,
+                path: PathBuf::from(&folder.path),
+                shortcut: folder.shortcut,
+                occurrence,
+            };
+            let handle = self
+                .place_focus
+                .entry(ax_target.clone())
+                .or_insert_with(|| cx.focus_handle())
+                .clone();
+            let path = folder.path.clone();
+            let shortcut = folder.shortcut;
+
+            let folder_element = div()
+                .id(("common-folder", i))
+                .track_focus(&handle)
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .px(px(5.))
+                .py(px(2.))
+                .rounded(px(4.))
+                .hover(|s| s.bg(chrome::to_gpui_color(theme.selection)))
+                .cursor_pointer()
+                .child(chrome::key_pill(&key, theme))
+                .child(
+                    div()
+                        .text_color(chrome::to_gpui_color(theme.dir))
+                        .child(glyph),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(chrome::to_gpui_color(theme.text))
+                        .child(folder.label.clone()),
+                )
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.runtime.enqueue(
+                        Command::PlaceExact {
+                            kind: PlaceKind::Common,
+                            path: path.clone(),
+                            shortcut,
+                            occurrence,
+                        },
+                        None,
+                    );
+                    cx.notify();
+                }));
+
+            items = items.child(self.accessibility.measured(
+                folder_element,
+                ax_target,
+                Some(AxRole::Button),
+                Some(AxCapability::Activate),
+            ));
+        }
+
+        let title = div()
+            .font_weight(gpui::FontWeight::BOLD)
+            .text_size(px(12.))
+            .text_color(chrome::to_gpui_color(theme.text))
+            .child("Common folders");
+
+        chrome::panel_block(title, None::<gpui::Div>, true, theme)
+            .id("ira-common-folders-row")
+            .debug_selector(|| "ira-common-folders-row".into())
+            .w_full()
+            .px(px(8.))
+            .py(px(4.))
+            .child(items)
+            .into_any_element()
+    }
+
+    fn render_bookmarks_and_actions_row(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(snapshot) = &self.snapshot else {
+            return div().into_any_element();
+        };
+
+        let theme = &self.theme;
+        let mut occurrences = BTreeMap::new();
+        let mut bookmark_items = div()
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .overflow_x_hidden()
+            .flex_1()
+            .min_w_0();
+
+        if let Some(bookmarks) = &snapshot.bookmarks
+            && !bookmarks.is_empty()
+        {
+            for (i, bookmark) in bookmarks.iter().enumerate() {
+                let key = bookmark.shortcut.to_string();
+                let count = occurrences
+                    .entry((bookmark.path.clone(), bookmark.shortcut))
+                    .or_insert(0usize);
+                let occurrence = *count;
+                *count += 1;
+                let ax_target = AxTarget::Place {
+                    kind: crate::platform::accessibility::model::PlaceKind::Bookmark,
+                    path: PathBuf::from(&bookmark.path),
+                    shortcut: bookmark.shortcut,
+                    occurrence,
+                };
+                let handle = self
+                    .place_focus
+                    .entry(ax_target.clone())
+                    .or_insert_with(|| cx.focus_handle())
+                    .clone();
+                let path = bookmark.path.clone();
+                let shortcut = bookmark.shortcut;
+
+                let bm_element = div()
+                    .id(("bookmark-item", i))
+                    .track_focus(&handle)
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .px(px(5.))
+                    .py(px(2.))
+                    .rounded(px(4.))
+                    .hover(|s| s.bg(chrome::to_gpui_color(theme.selection)))
+                    .cursor_pointer()
+                    .child(chrome::key_pill(&key, theme))
+                    .child(
+                        div()
+                            .text_color(chrome::to_gpui_color(theme.accent))
+                            .child("★"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(chrome::to_gpui_color(theme.text))
+                            .child(bookmark.label.clone()),
+                    )
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.runtime.enqueue(
+                            Command::PlaceExact {
+                                kind: PlaceKind::Bookmark,
+                                path: path.clone(),
+                                shortcut,
+                                occurrence,
+                            },
+                            None,
+                        );
+                        cx.notify();
+                    }));
+
+                bookmark_items = bookmark_items.child(self.accessibility.measured(
+                    bm_element,
+                    ax_target,
+                    Some(AxRole::Button),
+                    Some(AxCapability::Activate),
+                ));
+            }
+        } else {
+            bookmark_items = bookmark_items.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(chrome::to_gpui_color(theme.text_muted))
+                    .child("No bookmarks (press b to bookmark)"),
+            );
+        }
+
+        let bm_title = div()
+            .font_weight(gpui::FontWeight::BOLD)
+            .text_size(px(12.))
+            .text_color(chrome::to_gpui_color(theme.text))
+            .child("Bookmarks");
+
+        let bookmarks_panel = chrome::panel_block(bm_title, None::<gpui::Div>, true, theme)
+            .flex_1()
+            .min_w_0()
+            .px(px(8.))
+            .py(px(4.))
+            .child(bookmark_items);
+
+        let actions_title = div()
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .child(
+                div()
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_size(px(12.))
+                    .text_color(chrome::to_gpui_color(theme.text))
+                    .child("Actions"),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(chrome::to_gpui_color(theme.text_muted))
+                    .child(format!("· {}", snapshot.theme_preset.label())),
+            );
+
+        let action_chips = div()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .child(chrome::key_hint(
+                "action-split",
+                "+",
+                "Split Pane",
+                theme,
+                cx.listener(|this, _: &ClickEvent, _, cx| this.dispatch(KeyCode::Char('+'), cx)),
+            ))
+            .child(chrome::key_hint(
+                "action-copyboard",
+                "`",
+                "Copy Board",
+                theme,
+                cx.listener(|this, _: &ClickEvent, _, cx| this.dispatch(KeyCode::Char('`'), cx)),
+            ))
+            .child(chrome::key_hint(
+                "action-terminal",
+                "0",
+                "Terminal",
+                theme,
+                cx.listener(|this, _: &ClickEvent, _, cx| this.dispatch(KeyCode::Char('0'), cx)),
+            ))
+            .child(chrome::key_hint(
+                "action-theme",
+                "\\",
+                "Theme",
+                theme,
+                cx.listener(|this, _: &ClickEvent, _, cx| this.dispatch(KeyCode::Char('\\'), cx)),
+            ));
+
+        let actions_panel = chrome::panel_block(actions_title, None::<gpui::Div>, true, theme)
+            .flex_shrink_0()
+            .px(px(8.))
+            .py(px(4.))
+            .child(action_chips);
+
+        div()
+            .id("ira-bookmarks-and-actions-row")
+            .debug_selector(|| "ira-bookmarks-and-actions-row".into())
+            .flex()
+            .w_full()
+            .gap(px(8.))
+            .child(bookmarks_panel)
+            .child(actions_panel)
+            .into_any_element()
+    }
+
+    fn contextual_hints(&self) -> Vec<(&'static str, &'static str)> {
+        let Some(snapshot) = &self.snapshot else {
+            return Vec::new();
+        };
+        if snapshot.hint_bar_blocked || snapshot.status.is_some() {
+            return Vec::new();
+        }
+        if snapshot
+            .panes
+            .get(snapshot.active_pane)
+            .is_some_and(|p| p.preview_mode == ira_core::model::PreviewMode::Grid)
+        {
+            vec![
+                ("arrows", "navigate"),
+                ("Enter", "open"),
+                ("F2", "rename"),
+                ("c", "copy"),
+                ("m", "move"),
+                (".", "hidden"),
+                (",", "sort"),
+                ("v", "preview"),
+                ("b", "bookmark"),
+                ("n", "new"),
+                ("/", "search"),
+            ]
+        } else {
+            vec![
+                ("↑/↓", "move"),
+                ("←/→", "open/leave"),
+                ("c", "copy"),
+                ("m", "move"),
+                (".", "hidden"),
+                (",", "sort"),
+                ("v", "preview"),
+                ("b", "bookmark"),
+                ("n", "new"),
+                ("/", "search"),
+            ]
+        }
+    }
+
+    fn render_bottom_bar(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = &self.theme;
+        let Some(snapshot) = &self.snapshot else {
+            return div().into_any_element();
+        };
+
+        let mut left_area = div()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .overflow_x_hidden()
+            .flex_1()
+            .min_w_0();
+
+        if let Some(feedback) = &self.feedback {
+            left_area = left_area
+                .child(
+                    div()
+                        .text_color(chrome::to_gpui_color(theme.accent))
+                        .text_size(px(13.))
+                        .child("●"),
+                )
+                .child(
+                    div()
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_size(px(12.))
+                        .text_color(chrome::to_gpui_color(theme.text))
+                        .child(feedback.clone()),
+                );
+        } else if let Some(status) = &snapshot.status {
+            let dot_color = if status.is_error {
+                theme.error
+            } else {
+                theme.accent
+            };
+            left_area = left_area
+                .child(
+                    div()
+                        .text_color(chrome::to_gpui_color(dot_color))
+                        .text_size(px(13.))
+                        .child("●"),
+                )
+                .child(
+                    div()
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_size(px(12.))
+                        .text_color(chrome::to_gpui_color(theme.text))
+                        .child(status.text.clone()),
+                );
+        } else if !snapshot.hint_bar_blocked {
+            for (key, label) in self.contextual_hints() {
+                left_area = left_area.child(chrome::hint_pill(key, label, theme));
             }
         }
-        self.place_focus.retain(|target, _| {
-            self.accessibility
-                .id(target, Some(AxRole::Button), Some(AxCapability::Focus))
-                .is_some()
-        });
-        list.into_any_element()
+
+        let mut bar = div()
+            .id("ira-status-footer")
+            .debug_selector(|| "ira-status-footer".into())
+            .flex()
+            .items_center()
+            .justify_between()
+            .w_full()
+            .px(px(8.))
+            .py(px(4.))
+            .bg(native_color(theme.surface_alt))
+            .border_1()
+            .border_color(chrome::to_gpui_color(theme.border))
+            .child(left_area);
+
+        if !snapshot.hint_bar_blocked {
+            let keybindings_btn = div()
+                .id("keybindings-btn")
+                .debug_selector(|| "keybindings-btn".into())
+                .cursor_pointer()
+                .flex_shrink_0()
+                .child(chrome::key_pill("* Keybindings", theme))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.dispatch(KeyCode::Char('*'), cx);
+                }));
+            bar = bar.child(keybindings_btn);
+        }
+
+        self.accessibility.measured(
+            bar,
+            AxTarget::Window,
+            Some(AxRole::Status),
+            None,
+        )
     }
     fn modal(&self, height: gpui::Pixels, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let snapshot = self.snapshot.as_ref()?;
@@ -1158,7 +2029,13 @@ impl Desktop {
             .flex_col()
             .gap_3();
         if let Some(input) = &self.input {
-            if self.input_mode == Some(InputMode::Search) {
+            if self.input_mode == Some(InputMode::Search)
+                || (self.input_mode == Some(InputMode::Editor)
+                    && snapshot
+                        .panes
+                        .get(snapshot.active_pane)
+                        .is_some_and(|p| p.preview_mode == ira_core::model::PreviewMode::Column))
+            {
                 return None;
             }
             let label = match self.input_mode {
@@ -1168,58 +2045,349 @@ impl Desktop {
                 Some(InputMode::Editor) => "Text editor",
                 _ => "Input",
             };
+            modal = modal
+                .child(chrome::dialog_header(
+                    label,
+                    chrome::DialogKind::Input,
+                    &self.theme,
+                ))
+                .child(self.accessibility.measured(
+                    div()
+                        .p_2()
+                        .rounded(px(4.))
+                        .border_1()
+                        .border_color(chrome::to_gpui_color(self.theme.border_active))
+                        .bg(native_color(self.theme.surface_alt))
+                        .child(input.clone()),
+                    AxTarget::Text {
+                        document: snapshot.document_generation,
+                    },
+                    None,
+                    None,
+                ));
+            if self.input_mode == Some(InputMode::Create) {
+                modal = modal.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(chrome::to_gpui_color(self.theme.accent))
+                        .child(rows::new_entry_kind_label(
+                            snapshot.new_entry.as_ref().map_or("", |p| p.text.as_str()),
+                        )),
+                );
+            }
+            modal = modal.child(chrome::hint_row(
+                &[("Enter", "confirm"), ("Esc", "cancel")],
+                &self.theme,
+            ));
             return Some(
-                modal
-                    .child(label)
-                    .child(self.accessibility.measured(
-                        div().child(input.clone()),
-                        AxTarget::Text {
-                            document: snapshot.document_generation,
-                        },
-                        None,
-                        None,
-                    ))
-                    .child("Enter to confirm · Esc to cancel")
-                    .into_any_element(),
+                self.accessibility
+                    .measured(modal, AxTarget::Modal, Some(AxRole::Dialog), None),
             );
         }
         if let Some(confirm) = &snapshot.confirming {
+            let verb = match confirm.action {
+                ira_core::model::ConfirmAction::Delete => "Delete",
+                ira_core::model::ConfirmAction::Copy => "Copy",
+                ira_core::model::ConfirmAction::Move => "Move",
+            };
+            let prompt = match &confirm.dest_dir {
+                Some(dest) => {
+                    let dest_name = dest
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| dest.display().to_string());
+                    format!("{verb} {} → {dest_name}?", confirm.label)
+                }
+                None => format!("{verb} {}?", confirm.label),
+            };
+            let policy_btn_label = match confirm.policy {
+                ira_core::services::transfer::OverwritePolicy::AutoRename => "o: auto-rename",
+                ira_core::services::transfer::OverwritePolicy::Overwrite => "o: overwrite",
+                ira_core::services::transfer::OverwritePolicy::SkipExisting => "o: skip",
+            };
+
+            let mut buttons = div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .child(self.button("y: Yes", KeyCode::Char('y'), cx))
+                .child(self.button("n: No", KeyCode::Char('n'), cx));
+
+            if !matches!(confirm.action, ira_core::model::ConfirmAction::Delete) {
+                buttons = buttons.child(self.button(
+                    policy_btn_label,
+                    KeyCode::Char('o'),
+                    cx,
+                ));
+            }
+
             modal = modal
-                .child(format!("{:?} {}", confirm.action, confirm.label))
-                .child(format!("Collision policy: {:?}", confirm.policy))
+                .child(chrome::dialog_header(
+                    "Confirm",
+                    if matches!(confirm.action, ira_core::model::ConfirmAction::Delete) {
+                        chrome::DialogKind::Danger
+                    } else {
+                        chrome::DialogKind::Confirm
+                    },
+                    &self.theme,
+                ))
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .text_color(chrome::to_gpui_color(self.theme.text))
+                        .child(prompt),
+                )
+                .child(buttons);
+        } else if let Some(status) = snapshot.status.as_ref().filter(|s| s.is_error) {
+            modal = modal
+                .child(chrome::dialog_header(
+                    "Error",
+                    chrome::DialogKind::Error,
+                    &self.theme,
+                ))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(chrome::to_gpui_color(self.theme.text))
+                        .child(status.text.clone()),
+                )
+                .child(chrome::hint_row(&[("any key", "dismiss")], &self.theme));
+        } else if let Some(info) = &snapshot.info {
+            let mut list = div()
+                .id("info-scroll")
+                .max_h(px((f32::from(height) - 200.).max(60.)))
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap_1();
+            for line in &info.lines {
+                if let Some((label, value, is_partial)) = rows::split_info_line(line) {
+                    list = list.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .text_size(px(12.))
+                            .child(
+                                div()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(chrome::to_gpui_color(self.theme.text_muted))
+                                    .child(format!("{label}:")),
+                            )
+                            .child(
+                                div()
+                                    .text_color(chrome::to_gpui_color(if is_partial {
+                                        self.theme.accent
+                                    } else {
+                                        self.theme.text
+                                    }))
+                                    .child(value.to_string()),
+                            ),
+                    );
+                } else {
+                    list = list.child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(chrome::to_gpui_color(self.theme.text))
+                            .child(line.clone()),
+                    );
+                }
+            }
+            if !info.lines.iter().any(|l| l.starts_with("Size:")) {
+                let cached = snapshot
+                    .sizes
+                    .iter()
+                    .find(|(p, _)| p == &info.path)
+                    .map(|(_, s)| s);
+                let spinner = ira_core::services::file_info::spinner_char(info.started);
+                let dynamic_size = match (info.pending, cached) {
+                    (true, Some(si)) => {
+                        Some(ira_core::services::file_info::size_line_partial(si, spinner))
+                    }
+                    (true, None) => {
+                        Some(ira_core::services::file_info::size_line_started(spinner))
+                    }
+                    (false, Some(si)) if !si.complete => {
+                        Some(ira_core::services::file_info::size_line_cancelled(si))
+                    }
+                    (false, Some(si)) => {
+                        Some(ira_core::services::file_info::size_line_final(si))
+                    }
+                    (false, None) => None,
+                };
+                if let Some(size_line) = dynamic_size {
+                    list = list.child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(chrome::to_gpui_color(self.theme.accent))
+                            .child(size_line),
+                    );
+                }
+            }
+            modal = modal
+                .child(chrome::dialog_header(
+                    "Entry info",
+                    chrome::DialogKind::Info,
+                    &self.theme,
+                ))
+                .child(list)
                 .child(
                     div()
                         .flex()
+                        .items_center()
                         .gap_3()
-                        .child(self.button("Confirm", KeyCode::Enter, cx))
-                        .child(self.button("Cancel", KeyCode::Esc, cx))
-                        .child(self.button("Policy", KeyCode::Char('o'), cx)),
-                );
-        } else if let Some(status) = snapshot.status.as_ref().filter(|s| s.is_error) {
-            modal = modal.child(status.text.clone()).child("Any key dismisses");
-        } else if let Some(info) = &snapshot.info {
+                        .child(self.button("r: Recalculate", KeyCode::Char('r'), cx))
+                        .child(self.button("x: Cancel walk", KeyCode::Char('x'), cx))
+                        .child(self.button("Esc: Close", KeyCode::Esc, cx)),
+                )
+                .child(chrome::hint_row(&[("any key", "close")], &self.theme));
+        } else if let Some(info) = &snapshot.multi_info {
+            let (sel_line, size_line) = rows::format_multi_info(
+                info.folders,
+                info.files,
+                info.aggregate,
+                chrome::spinner_char(info.started),
+            );
             modal = modal
+                .child(chrome::dialog_header(
+                    "Selection info",
+                    chrome::DialogKind::Info,
+                    &self.theme,
+                ))
                 .child(
                     div()
-                        .id("info-scroll")
-                        .max_h(px((f32::from(height) - 200.).max(60.)))
-                        .overflow_y_scroll()
-                        .children(info.lines.clone()),
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_size(px(13.))
+                        .text_color(chrome::to_gpui_color(self.theme.text))
+                        .child(sel_line),
                 )
-                .child("x: stop · r: recalculate · any other key: close");
-        } else if let Some(info) = &snapshot.multi_info {
-            modal = modal
-                .child(format!(
-                    "{} folders · {} files · {} bytes",
-                    info.folders, info.files, info.aggregate.1
-                ))
-                .child("Any key closes");
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(chrome::to_gpui_color(self.theme.text))
+                        .child(size_line),
+                )
+                .child(chrome::hint_row(&[("any key", "close")], &self.theme));
         } else if let Some(deletion) = snapshot.deletion.as_ref().filter(|d| !d.hidden) {
+            let frac = if deletion.total > 0 {
+                deletion.done as f32 / deletion.total as f32
+            } else {
+                0.0
+            };
             modal = modal
-                .child(format!("Deleting {} / {}", deletion.done, deletion.total))
-                .child("Any key hides; deletion continues");
+                .child(chrome::dialog_header(
+                    "Deleting",
+                    chrome::DialogKind::Progress,
+                    &self.theme,
+                ))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(chrome::to_gpui_color(self.theme.text))
+                        .child(format!("Deleting {} / {}", deletion.done, deletion.total)),
+                );
+            if let Some(current) = &deletion.current {
+                let name = current
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| current.display().to_string());
+                modal = modal.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(chrome::to_gpui_color(self.theme.text_muted))
+                        .child(name),
+                );
+            }
+            modal = modal
+                .child(chrome::progress_bar(
+                    frac,
+                    320.,
+                    chrome::to_gpui_color(self.theme.info),
+                    chrome::to_gpui_color(self.theme.border),
+                ))
+                .child(chrome::hint_row(
+                    &[("any key", "hide (deletion continues)")],
+                    &self.theme,
+                ));
         } else if snapshot.keybindings_visible {
-            modal=modal.child("Arrows: navigate · Enter: rename · Space: select · /: search · c/m: copy/move · +: split · Tab: focus · `: jobs · q: quit").child("Any key closes");
+            let theme = &self.theme;
+            let bind_rows: &[(&str, &str, &str, &str)] = &[
+                (
+                    "Arrows",
+                    "navigate; ←/→ open/leave",
+                    "z / x",
+                    "top / bottom",
+                ),
+                ("Space", "multi-select entry", "c", "copy to other pane"),
+                (
+                    "m",
+                    "move to other pane",
+                    "Enter / F2",
+                    "rename entry (open/rename in grid)",
+                ),
+                ("Del", "delete (with confirm)", "n", "new folder / file"),
+                (".", "toggle hidden files", ",", "cycle sort mode"),
+                ("v", "cycle image preview", "Tab", "switch pane"),
+                ("Ctrl+A", "select / clear all", "Alt+I", "invert selection"),
+                ("+", "split pane", "`", "copy board"),
+                ("b", "bookmark this folder", "/", "fuzzy search"),
+                ("Esc", "clear search filter", "?", "entry info"),
+                ("[", "go to path", "]", "copy folder path"),
+                (
+                    "0 / -",
+                    "terminal here / file browser",
+                    "Ctrl+-",
+                    "eject drive",
+                ),
+                ("*", "this help", "q", "quit"),
+            ];
+
+            let mut table = div().flex().flex_col().gap_1();
+            for (k1, v1, k2, v2) in bind_rows {
+                let row = div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .w(px(270.))
+                            .child(chrome::key_pill(k1, theme))
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(chrome::to_gpui_color(theme.text))
+                                    .child(*v1),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .w(px(270.))
+                            .child(chrome::key_pill(k2, theme))
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(chrome::to_gpui_color(theme.text))
+                                    .child(*v2),
+                            ),
+                    );
+                table = table.child(row);
+            }
+
+            modal = modal
+                .child(chrome::dialog_header(
+                    "Keybindings",
+                    chrome::DialogKind::Info,
+                    theme,
+                ))
+                .child(table)
+                .child(chrome::hint_row(&[("any key", "close")], theme));
         } else {
             return None;
         }
@@ -1241,7 +2409,7 @@ impl Render for Desktop {
         } else {
             1.0
         };
-        let columns = (((f32::from(window.bounds().size.width) - 190.).max(1.) / visible_panes)
+        let columns = ((f32::from(window.bounds().size.width) / visible_panes)
             / 180.)
             .floor()
             .max(1.) as usize;
@@ -1276,87 +2444,94 @@ impl Render for Desktop {
             self.accessibility
                 .begin_prepared(snapshot.clone(), text, self.rendered_footer());
         }
-        let mut panes = div().flex().flex_1().min_h_0().child(self.pane(0, cx));
-        if self.snapshot.as_ref().is_some_and(|s| s.split) {
-            panes = panes.child(self.pane(1, cx));
-        }
-        let mut content = div().flex().flex_col().flex_1().min_w_0().h_full();
-        if self.input_mode == Some(InputMode::Search)
-            && let Some(input) = &self.input
-        {
-            content = content.child(self.accessibility.measured(
-                div().px_3().py_2().child(input.clone()),
-                AxTarget::Text {
-                    document: self.snapshot.as_ref().map_or(0, |s| s.document_generation),
-                },
-                None,
-                None,
-            ));
-        }
-        for index in 0..if self.snapshot.as_ref().is_some_and(|s| s.split) {
-            2
-        } else {
-            1
-        } {
-            if let Some(key) = self
-                .snapshot
-                .as_ref()
-                .and_then(|s| preview::Host::key(s, index))
-            {
-                let mut column = div()
-                    .w(px(260.))
-                    .h_full()
-                    .min_h_0()
-                    .p_3()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .bg(native_color(self.theme.surface_alt))
-                    .child(format!("Preview · pane {}", index + 1));
-                column = match self.preview.content(&key) {
-                    Some(preview::Content::Image(image)) => column.child(
-                        gpui::img(image.clone())
-                            .w_full()
-                            .max_h(px(500.))
-                            .object_fit(gpui::ObjectFit::Contain),
-                    ),
-                    Some(preview::Content::Text(text)) => column.child(
-                        div()
-                            .id(("preview-text", index))
-                            .overflow_y_scroll()
-                            .flex_1()
-                            .min_h_0()
-                            .child(text.clone()),
-                    ),
-                    Some(preview::Content::Error(error)) => column.child(
-                        div()
-                            .text_color(native_color(self.theme.text_muted))
-                            .child(error.clone()),
-                    ),
-                    None => column.child("Loading preview…"),
-                };
-                panes = panes.child(column);
+        let mut panes = div().flex().flex_1().min_h_0().gap(px(8.));
+        let p0_text = self.snapshot.as_ref().is_some_and(|s| s.pane_shows_text_preview[0]);
+        let p1_text = self.snapshot.as_ref().is_some_and(|s| s.pane_shows_text_preview[1]);
+        let is_split = self.snapshot.as_ref().is_some_and(|s| s.split);
+
+        if is_split {
+            if p0_text && !p1_text {
+                panes = panes
+                    .child(div().flex_basis(gpui::relative(0.66)).h_full().child(self.pane(0, cx)))
+                    .child(div().flex_basis(gpui::relative(0.34)).h_full().child(self.pane(1, cx)));
+            } else if p1_text && !p0_text {
+                panes = panes
+                    .child(div().flex_basis(gpui::relative(0.34)).h_full().child(self.pane(0, cx)))
+                    .child(div().flex_basis(gpui::relative(0.66)).h_full().child(self.pane(1, cx)));
+            } else {
+                panes = panes
+                    .child(div().flex_1().h_full().child(self.pane(0, cx)))
+                    .child(div().flex_1().h_full().child(self.pane(1, cx)));
             }
+        } else {
+            panes = panes.child(div().flex_1().h_full().child(self.pane(0, cx)));
         }
-        content = content.child(panes);
+
+        let mut files_area = div().flex().flex_1().min_h_0().min_w_0();
+        files_area = files_area.child(panes);
+
         if let Some(snapshot) = &self.snapshot
             && snapshot.copy_board
         {
             let mut board = div()
                 .id("ira-copy-board")
                 .debug_selector(|| "ira-copy-board".into())
+                .w(px(360.))
                 .max_h(px(240.))
-                .overflow_y_scroll()
                 .flex_shrink_0()
+                .overflow_y_scroll()
                 .p_3()
+                .border_1()
+                .border_color(chrome::to_gpui_color(if snapshot.board_focused {
+                    self.theme.border_active
+                } else {
+                    self.theme.border
+                }))
                 .bg(native_color(self.theme.surface_alt))
-                .child("Copy Board");
+                .child(chrome::dialog_header(
+                    "Copy Board",
+                    chrome::DialogKind::Info,
+                    &self.theme,
+                ));
+
+            if snapshot.jobs.is_empty() {
+                board = board.child(
+                    div()
+                        .p_2()
+                        .text_sm()
+                        .text_color(chrome::to_gpui_color(self.theme.text_muted))
+                        .child("No copy/move jobs yet (press c to copy)"),
+                );
+            }
+
             for (index, job) in snapshot.jobs.iter().enumerate() {
                 let id = job.id;
-                let lifecycle = match &job.status {
-                    ira_core::services::transfer::JobStatus::Failed(_) => "Failed".to_string(),
-                    status => format!("{status:?}"),
+                let (status_icon, status_color, lifecycle_str) = match &job.status {
+                    ira_core::services::transfer::JobStatus::Running => {
+                        ("▶", self.theme.accent, "Running")
+                    }
+                    ira_core::services::transfer::JobStatus::Paused => {
+                        ("⏸", self.theme.warning, "Paused")
+                    }
+                    ira_core::services::transfer::JobStatus::Done => {
+                        ("✓", self.theme.success, "Done")
+                    }
+                    ira_core::services::transfer::JobStatus::Failed(_) => {
+                        ("!", self.theme.error, "Failed")
+                    }
+                    ira_core::services::transfer::JobStatus::Cancelled => {
+                        ("✕", self.theme.text_muted, "Cancelled")
+                    }
+                    ira_core::services::transfer::JobStatus::Queued => {
+                        ("·", self.theme.text_muted, "Queued")
+                    }
                 };
+                let kind_str = match job.kind {
+                    ira_core::services::transfer::JobKind::Copy => "COPY",
+                    ira_core::services::transfer::JobKind::Move => "MOVE",
+                };
+                let (fraction, pct, bytes_text) =
+                    rows::format_transfer_bytes(job.copied_bytes, job.total_bytes);
                 let mut row = div()
                     .id(("job", index))
                     .p_2()
@@ -1374,11 +2549,14 @@ impl Render for Desktop {
                         },
                     ))
                     .child(format!(
-                        "{} · {} · {} / {} B",
-                        job.label,
-                        lifecycle,
-                        job.copied_bytes,
-                        job.total_bytes.unwrap_or(0)
+                        "[{status_icon}] {kind_str} · {} · {lifecycle_str} · {pct}% ({bytes_text})",
+                        job.label
+                    ))
+                    .child(chrome::progress_bar(
+                        fraction,
+                        310.,
+                        chrome::to_gpui_color(status_color),
+                        chrome::to_gpui_color(self.theme.border),
                     ))
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         window.focus(&this.focus);
@@ -1397,6 +2575,7 @@ impl Render for Desktop {
                             .w_full()
                             .whitespace_normal()
                             .text_sm()
+                            .text_color(chrome::to_gpui_color(self.theme.error))
                             .child(error.clone()),
                     );
                 }
@@ -1409,6 +2588,13 @@ impl Render for Desktop {
                             div()
                                 .id((label, index))
                                 .px_2()
+                                .py(px(1.))
+                                .rounded(px(3.))
+                                .border_1()
+                                .border_color(chrome::to_gpui_color(self.theme.border))
+                                .bg(native_color(self.theme.surface))
+                                .hover(|s| s.bg(chrome::to_gpui_color(self.theme.selection)))
+                                .text_size(px(11.))
                                 .cursor_pointer()
                                 .child(label)
                                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
@@ -1434,9 +2620,41 @@ impl Render for Desktop {
                     None,
                 ));
             }
-            content = content.child(board);
+
+            let footer_hints: &[(&str, &str)] = if snapshot.board_focused {
+                &[("p/Space", "pause"), ("x", "cancel"), ("Esc", "close")]
+            } else {
+                &[("Tab", "focus board")]
+            };
+            board = board.child(
+                div()
+                    .mt_auto()
+                    .pt_2()
+                    .child(chrome::hint_row(footer_hints, &self.theme)),
+            );
+
+            files_area = files_area.child(board);
         }
-        let status = self.rendered_footer();
+
+        let mut content = div()
+            .id("ira-files-area")
+            .debug_selector(|| "ira-files-area".into())
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0();
+        content = content.child(files_area);
+
+        let drives_row = self.render_drives_row(cx);
+        let common_row = self.render_common_folders_row(cx);
+        let bookmarks_and_actions_row = self.render_bookmarks_and_actions_row(cx);
+        self.place_focus.retain(|target, _| {
+            self.accessibility
+                .id(target, Some(AxRole::Button), Some(AxCapability::Focus))
+                .is_some()
+        });
+        let footer_row = self.render_bottom_bar(cx);
+
         let mut root = div()
             .id("ira-root")
             .key_context("IraDesktop")
@@ -1445,6 +2663,8 @@ impl Render for Desktop {
             .size_full()
             .flex()
             .flex_col()
+            .p(px(6.))
+            .gap(px(6.))
             .bg(native_color(self.theme.bg))
             .text_color(native_color(self.theme.text))
             .on_key_down(cx.listener(Self::key))
@@ -1506,51 +2726,11 @@ impl Render for Desktop {
             .on_action(
                 cx.listener(|this, _: &actions::FocusNext, _, cx| this.dispatch(KeyCode::Tab, cx)),
             )
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .p_2()
-                    .flex_wrap()
-                    .child(div().id("browse-file").child("Browse file…").on_click(
-                        |_, window, cx| window.dispatch_action(Box::new(actions::BrowseFile), cx),
-                    ))
-                    .child(div().id("browse-folder").child("Browse folder…").on_click(
-                        |_, window, cx| window.dispatch_action(Box::new(actions::BrowseFolder), cx),
-                    ))
-                    .child(self.button("Parent", KeyCode::Left, cx))
-                    .child(self.button("Rename", KeyCode::Enter, cx))
-                    .child(self.button("New", KeyCode::Char('n'), cx))
-                    .child(self.button("Search", KeyCode::Char('/'), cx))
-                    .child(self.button("Copy", KeyCode::Char('c'), cx))
-                    .child(self.button("Move", KeyCode::Char('m'), cx))
-                    .child(self.button("Delete", KeyCode::Delete, cx))
-                    .child(self.button("Split", KeyCode::Char('+'), cx))
-                    .child(self.button("Sort", KeyCode::Char(','), cx))
-                    .child(self.button("Hidden", KeyCode::Char('.'), cx))
-                    .child(self.button("Jobs", KeyCode::Char('`'), cx)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_h_0()
-                    .child(self.places(cx))
-                    .child(content),
-            )
-            .child(
-                self.accessibility.measured(
-                    div()
-                        .debug_selector(|| "ira-status-footer".into())
-                        .p_2()
-                        .text_sm()
-                        .bg(native_color(self.theme.surface_alt))
-                        .child(status.to_string()),
-                    AxTarget::Window,
-                    Some(AxRole::Status),
-                    None,
-                ),
-            );
+            .child(drives_row)
+            .child(common_row)
+            .child(bookmarks_and_actions_row)
+            .child(content)
+            .child(footer_row);
         if let Some(family) = &self.font_family {
             root = root.font_family(family.clone());
         }
@@ -2774,6 +3954,73 @@ mod crossing_tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert!(cx.debug_bounds("ira-status-footer").unwrap().size.height > px(0.));
+        view.update_in(cx, |view, _, _| {
+            view.runtime.stop(&view.controls);
+            view.close();
+        });
+    }
+
+    #[gpui::test]
+    fn tui_parity_layout_and_keybindings_modal_renders(cx: &mut TestAppContext) {
+        let _fixture_scope = crate::test_support::enter();
+        let mut app = App::default();
+        app.window_generation = 12;
+        app.drives = Some(vec![Folder::new("Macintosh HD".into(), "/".into(), '1')]);
+        app.folders = Some(vec![Folder::new("Home".into(), "/Users/test".into(), 'h')]);
+        app.bookmarks = Some(vec![Folder::new("Work".into(), "/Users/test/work".into(), 'w')]);
+
+        let runtime = Runtime::with_factory(12, move || app);
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        let publication = loop {
+            if let Some(p) = runtime.try_snapshot() {
+                break p;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            let mut view = Desktop::new(runtime, crate::platform::geometry::Writer::new(None), cx);
+            view.accessibility = accessibility::Host::headless();
+            view.snapshot = Some(publication.snapshot);
+            view
+        });
+
+        // Verify the 5-row panels are painted with valid bounds
+        assert!(cx.debug_bounds("ira-drives-row").is_some(), "Row 1 (drives shortcuts) must be painted");
+        assert!(cx.debug_bounds("ira-common-folders-row").is_some(), "Row 2 (common folders) must be painted");
+        assert!(cx.debug_bounds("ira-bookmarks-and-actions-row").is_some(), "Row 3 (bookmarks & actions) must be painted");
+        assert!(cx.debug_bounds("ira-files-area").is_some(), "Row 4 (panes & copy board files area) must be painted");
+        assert!(cx.debug_bounds("ira-status-footer").is_some(), "Row 5 (status / shortcuts marquee footer) must be painted");
+        assert!(cx.debug_bounds("keybindings-btn").is_some(), "* Keybindings button must be painted in footer");
+
+        // Verify accessibility tree contains the 3 place kinds
+        view.update_in(cx, |view, _, _| {
+            let tree = view.accessibility.tree.as_ref().unwrap();
+            assert!(tree.nodes.values().any(|n| matches!(&n.target, Target::Place { kind: crate::platform::accessibility::model::PlaceKind::Drive, .. })));
+            assert!(tree.nodes.values().any(|n| matches!(&n.target, Target::Place { kind: crate::platform::accessibility::model::PlaceKind::Common, .. })));
+            assert!(tree.nodes.values().any(|n| matches!(&n.target, Target::Place { kind: crate::platform::accessibility::model::PlaceKind::Bookmark, .. })));
+        });
+
+        // Open Keybindings modal via '*' keypress
+        view.update_in(cx, |view, _, cx| {
+            view.dispatch(KeyCode::Char('*'), cx);
+        });
+
+        loop {
+            let ready = view.update_in(cx, |view, _, cx| {
+                view.poll(cx);
+                view.snapshot.as_ref().is_some_and(|s| s.keybindings_visible)
+            });
+            if ready {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(cx.debug_bounds("ira-modal").is_some(), "13-row keybindings modal must be painted when active");
+
         view.update_in(cx, |view, _, _| {
             view.runtime.stop(&view.controls);
             view.close();

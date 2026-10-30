@@ -1,9 +1,55 @@
 use std::io::Result as IOResult;
 
+#[cfg(unix)]
+use crate::domain::data::DiskSpace;
 use crate::domain::data::Folder;
+
+#[cfg(unix)]
+fn disk_space(path: &str) -> Option<DiskSpace> {
+    let stat = rustix::fs::statvfs(path).ok()?;
+    let total = (stat.f_blocks as u64).saturating_mul(stat.f_bsize as u64);
+    if total == 0 {
+        return None;
+    }
+    let available = (stat.f_bavail as u64).saturating_mul(stat.f_bsize as u64).min(total);
+    Some(DiskSpace {
+        total,
+        available: Some(available),
+    })
+}
+
+/// Fills in free/total space for mounted drives. This issues `statvfs`-style
+/// calls that can block on stale network mounts, so it must only run on a
+/// background thread (the drive poller), never on the UI thread. Drives whose
+/// space cannot be read keep whatever `list_drives` reported.
+pub fn fill_space(drives: &mut [Folder]) {
+    for d in drives.iter_mut() {
+        if d.path.is_empty() {
+            continue;
+        }
+        #[cfg(unix)]
+        if let Some(space) = disk_space(&d.path) {
+            d.space = Some(space);
+        }
+    }
+}
 
 #[cfg(target_os = "macos")]
 use std::fs::read_dir;
+
+#[cfg(target_os = "macos")]
+const ICLOUD_REL_PATH: &str = "Library/Mobile Documents/com~apple~CloudDocs";
+
+#[cfg(target_os = "macos")]
+const ICLOUD_SHORTCUT: char = '9';
+
+#[cfg(target_os = "macos")]
+fn icloud_dir_exists(path: &std::path::Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(m) => m.is_dir(),
+        Err(e) => e.kind() == std::io::ErrorKind::PermissionDenied,
+    }
+}
 
 #[cfg(target_os = "macos")]
 pub fn list_drives() -> IOResult<Vec<Folder>> {
@@ -11,19 +57,39 @@ pub fn list_drives() -> IOResult<Vec<Folder>> {
     let mut drives: Vec<Folder> = Vec::new();
 
     if let Ok(entries) = read_dir(VOLUMES) {
-        for (i, entry) in entries.enumerate() {
-            if let Ok(entry) = entry {
-                if let Ok(file_name) = entry.file_name().into_string() {
-                    drives.push(Folder {
-                        path: format!("{}/{}", VOLUMES, file_name),
-                        label: file_name,
-                        shortcut: (i + 1) as u8 as char,
-                        device: None,
-                    });
-                }
+        for entry in entries.flatten() {
+            if let Ok(file_name) = entry.file_name().into_string() {
+                let n = drives.len() + 1;
+                let shortcut = if n < 9 {
+                    char::from_digit(n as u32, 10).unwrap_or('#')
+                } else {
+                    '#'
+                };
+                drives.push(Folder {
+                    path: format!("{}/{}", VOLUMES, file_name),
+                    label: file_name,
+                    shortcut,
+                    device: None,
+                    space: None,
+                });
             }
         }
     }
+
+    if let Some(icloud) = dirs_next::home_dir().map(|h| h.join(ICLOUD_REL_PATH)) {
+        if icloud_dir_exists(&icloud) {
+            if let Some(path_str) = icloud.to_str() {
+                drives.push(Folder {
+                    path: path_str.to_string(),
+                    label: "iCloud".to_string(),
+                    shortcut: ICLOUD_SHORTCUT,
+                    device: None,
+                    space: None,
+                });
+            }
+        }
+    }
+
     Ok(drives)
 }
 
@@ -51,8 +117,9 @@ pub fn list_drives_with_labels(provider: &impl VolumeLabelProvider) -> IOResult<
                                 maybe_drive.clone()
                             }
                         },
-                        shortcut: i as u8 as char,
+                        shortcut: char::from_digit(i as u32, 10).unwrap_or('#'),
                         device: None,
+                        space: None,
                     })
                 } else {
                     None

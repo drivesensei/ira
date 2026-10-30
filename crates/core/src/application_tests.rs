@@ -1283,3 +1283,128 @@ fn async_prompt_completion_advances_revision_without_input_even_when_context_is_
     assert!(after.revision > before.revision);
     assert_eq!(after.ack_sequence, 0);
 }
+
+#[test]
+fn icloud_drive_shortcut_nine_resolution_works_with_few_drives() {
+    let mut app = fixture();
+    app.drives = Some(vec![
+        Folder::new("Macintosh HD".into(), "/Volumes/Macintosh HD".into(), '1'),
+        Folder::new("iCloud".into(), "/Users/test/Library/Mobile Documents/com~apple~CloudDocs".into(), '9'),
+    ]);
+    let input = crate::input::Input::Key(crate::input::KeyEvent::new(
+        crate::input::KeyCode::Char('9'),
+        crate::input::KeyModifiers::NONE,
+    ));
+    app.dispatch(input).unwrap();
+    // Blocking operations execute on the worker thread; tick() drains the operation result
+    for _ in 0..10 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        app.tick();
+        if app.panes[app.active_pane].folder.as_ref().map(|f| f.label.as_str()) == Some("iCloud") {
+            break;
+        }
+    }
+    assert_eq!(app.panes[app.active_pane].folder.as_ref().map(|f| f.label.as_str()), Some("iCloud"));
+}
+
+#[test]
+fn f2_starts_rename_in_list_and_grid_mode() {
+    let mut app = fixture();
+    app.panes[0].files = vec![
+        FEntry {
+            path: "/tmp/test.txt".into(),
+            label: "test.txt".into(),
+            is_dir: false,
+            size: 10,
+            modified: None,
+        }
+    ];
+    app.panes[0].state.select(Some(0));
+
+    // Test list mode F2
+    app.panes[0].preview_mode = PreviewMode::Details;
+    let input = crate::input::Input::Key(crate::input::KeyEvent::new(
+        crate::input::KeyCode::F(2),
+        crate::input::KeyModifiers::NONE,
+    ));
+    app.dispatch(input).unwrap();
+    assert!(app.renaming.is_some());
+    app.cancel_rename();
+
+    // Test grid mode F2
+    app.panes[0].preview_mode = PreviewMode::Grid;
+    let input = crate::input::Input::Key(crate::input::KeyEvent::new(
+        crate::input::KeyCode::F(2),
+        crate::input::KeyModifiers::NONE,
+    ));
+    app.dispatch(input).unwrap();
+    assert!(app.renaming.is_some());
+}
+
+#[test]
+fn grid_mode_navigation_and_page_up_down() {
+    let mut app = fixture();
+    app.panes[0].preview_mode = PreviewMode::Grid;
+    app.panes[0].grid_cols = 2;
+    app.panes[0].grid_rows = 2;
+    app.panes[0].files = (0..6).map(|i| FEntry {
+        path: format!("/tmp/file_{i}"),
+        label: format!("file_{i}"),
+        is_dir: false,
+        size: 10,
+        modified: None,
+    }).collect();
+    app.panes[0].state.select(Some(0));
+
+    // Right moves to 1
+    app.dispatch(crate::input::Input::Key(crate::input::KeyEvent::new(
+        crate::input::KeyCode::Right,
+        crate::input::KeyModifiers::NONE,
+    ))).unwrap();
+    assert_eq!(app.panes[0].state.selected(), Some(1));
+
+    // Down moves by grid_cols (2) to 3
+    app.dispatch(crate::input::Input::Key(crate::input::KeyEvent::new(
+        crate::input::KeyCode::Down,
+        crate::input::KeyModifiers::NONE,
+    ))).unwrap();
+    assert_eq!(app.panes[0].state.selected(), Some(3));
+
+    // Up moves by grid_cols (2) back to 1
+    app.dispatch(crate::input::Input::Key(crate::input::KeyEvent::new(
+        crate::input::KeyCode::Up,
+        crate::input::KeyModifiers::NONE,
+    ))).unwrap();
+    assert_eq!(app.panes[0].state.selected(), Some(1));
+
+    // Left moves back to 0
+    app.dispatch(crate::input::Input::Key(crate::input::KeyEvent::new(
+        crate::input::KeyCode::Left,
+        crate::input::KeyModifiers::NONE,
+    ))).unwrap();
+    assert_eq!(app.panes[0].state.selected(), Some(0));
+
+    // PageDown moves by cols * rows (4) -> 4
+    app.dispatch(crate::input::Input::Key(crate::input::KeyEvent::new(
+        crate::input::KeyCode::PageDown,
+        crate::input::KeyModifiers::NONE,
+    ))).unwrap();
+    assert_eq!(app.panes[0].state.selected(), Some(4));
+
+    // PageUp moves by cols * rows (4) -> 0
+    app.dispatch(crate::input::Input::Key(crate::input::KeyEvent::new(
+        crate::input::KeyCode::PageUp,
+        crate::input::KeyModifiers::NONE,
+    ))).unwrap();
+    assert_eq!(app.panes[0].state.selected(), Some(0));
+}
+
+#[test]
+fn snapshot_observable_parity_fields() {
+    let mut app = fixture();
+    app.hint_offset = 42;
+    let snapshot = app.snapshot();
+    assert_eq!(snapshot.hint_offset, 42);
+    assert!(!snapshot.hint_bar_blocked);
+    assert_eq!(snapshot.pane_shows_text_preview, [false, false]);
+}
