@@ -1,0 +1,3 @@
+# Oracle traces are compared byte-for-byte and edited with "\n" in tests;
+# keep LF on every platform (Windows checkouts would otherwise get CRLF).
+migration/oracle/traces/**/*.toml text eol=lf
