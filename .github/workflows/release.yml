@@ -31,9 +31,9 @@ jobs:
             # rustup's self-contained musl linking covers x86_64 but not aarch64:
             # point the linker at the bundled rust-lld.
             rustflags: "-C linker=rust-lld"
-          - os: macos-14
+          - os: macos-15
             target: x86_64-apple-darwin
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -86,7 +86,7 @@ jobs:
   macos-universal:
     name: macos universal
     needs: build
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/download-artifact@v4
         with:
