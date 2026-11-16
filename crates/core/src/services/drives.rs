@@ -5,22 +5,101 @@ use crate::domain::data::Folder;
 #[cfg(target_os = "macos")]
 use std::fs::read_dir;
 
+/// Mount points of attached disk images (mounted `.dmg` apps, simulator
+/// runtimes), read from `hdiutil info` in one fast call.
+#[cfg(target_os = "macos")]
+fn disk_image_mounts() -> Vec<String> {
+    std::process::Command::new("/usr/bin/hdiutil")
+        .args(["info", "-plist"])
+        .output()
+        .map(|o| parse_image_mounts(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_default()
+}
+
+/// Extracts every `mount-point` value from `hdiutil info -plist` output.
+#[cfg(target_os = "macos")]
+fn parse_image_mounts(plist: &str) -> Vec<String> {
+    let mut mounts = Vec::new();
+    let mut lines = plist.lines().map(str::trim);
+    while let Some(line) = lines.next() {
+        if line != "<key>mount-point</key>" {
+            continue;
+        }
+        let value = lines
+            .next()
+            .and_then(|l| l.strip_prefix("<string>"))
+            .and_then(|l| l.strip_suffix("</string>"));
+        if let Some(v) = value {
+            mounts.push(
+                v.replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                    .replace("&amp;", "&"),
+            );
+        }
+    }
+    mounts
+}
+
+/// Parses one `mount` line (`<dev> on <path> (<fs>, <flag>, ...)`) and keeps
+/// physical storage: local, shown by Finder (`nobrowse` unset) and not a
+/// disk image. Returns the mount point when kept.
+#[cfg(target_os = "macos")]
+fn storage_mount_point(line: &str, image_mounts: &[String]) -> Option<String> {
+    let (_, rest) = line.split_once(" on ")?;
+    let (mount_point, flags) = rest.rsplit_once(" (")?;
+    let flags: Vec<&str> = flags.trim_end_matches(')').split(", ").collect();
+    let keep = flags.contains(&"local")
+        && !flags.contains(&"nobrowse")
+        && !image_mounts.iter().any(|m| m == mount_point);
+    keep.then(|| mount_point.to_string())
+}
+
+/// Mount points of physical storage volumes. `mount` reads the kernel's
+/// cached table (`MNT_NOWAIT`), so a hung network share cannot block. `None`
+/// when it cannot run, so the caller shows every volume instead of none.
+#[cfg(target_os = "macos")]
+fn storage_mounts() -> Option<Vec<String>> {
+    let out = std::process::Command::new("/sbin/mount").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let images = disk_image_mounts();
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| storage_mount_point(l, &images))
+            .collect(),
+    )
+}
+
 #[cfg(target_os = "macos")]
 pub fn list_drives() -> IOResult<Vec<Folder>> {
     const VOLUMES: &str = "/Volumes";
     let mut drives: Vec<Folder> = Vec::new();
 
+    let storage = storage_mounts();
+
     if let Ok(entries) = read_dir(VOLUMES) {
-        for (i, entry) in entries.enumerate() {
-            if let Ok(entry) = entry {
-                if let Ok(file_name) = entry.file_name().into_string() {
-                    drives.push(Folder {
-                        path: format!("{}/{}", VOLUMES, file_name),
-                        label: file_name,
-                        shortcut: (i + 1) as u8 as char,
-                        device: None,
-                    });
-                }
+        for entry in entries.flatten() {
+            // "Macintosh HD" is a symlink to "/"; match the mount it points at.
+            let mut target = entry.path();
+            if entry.file_type().is_ok_and(|t| t.is_symlink()) {
+                target = std::fs::read_link(&target).unwrap_or(target);
+            }
+            let hidden = storage
+                .as_ref()
+                .is_some_and(|mounts| !mounts.iter().any(|m| std::path::Path::new(m) == target));
+            if hidden {
+                continue;
+            }
+            if let Ok(file_name) = entry.file_name().into_string() {
+                drives.push(Folder {
+                    path: format!("{}/{}", VOLUMES, file_name),
+                    label: file_name,
+                    // Count kept drives so hidden volumes leave no shortcut gaps.
+                    shortcut: (drives.len() + 1) as u8 as char,
+                    device: None,
+                });
             }
         }
     }
@@ -302,3 +381,7 @@ pub fn eject_drive(_device: &str) -> IOResult<()> {
 #[cfg(all(test, target_os = "linux"))]
 #[path = "drives_tests.rs"]
 mod tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "drives_macos_tests.rs"]
+mod macos_tests;
