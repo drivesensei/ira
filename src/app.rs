@@ -5746,13 +5746,13 @@ mod preview_tests {
     #[test]
     fn read_only_files_open_without_save() {
         use std::fs;
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join("ira_preview_tests");
         let path = dir.join("locked.txt");
         fs::create_dir_all(&dir).unwrap();
         fs::write(&path, "readonly\n").unwrap();
         let mut perms = fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(perms.mode() & !0o200);
+        // `readonly` is what the app checks, and it works on Unix and Windows.
+        perms.set_readonly(true);
         fs::set_permissions(&path, perms.clone()).unwrap();
 
         let mut app = App::default();
@@ -5776,7 +5776,8 @@ mod preview_tests {
         assert!(app.status.as_ref().is_some_and(|s| s.is_error));
 
         // Restore permissions so the temp dir stays reusable.
-        perms.set_mode(perms.mode() | 0o200);
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
         fs::set_permissions(&path, perms).unwrap();
     }
 

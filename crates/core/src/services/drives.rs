@@ -352,6 +352,7 @@ fn drives_from_lsblk(output: &str) -> Vec<Folder> {
             path: mountpoint.to_string(),
             shortcut: i as u8 as char,
             device: Some(device),
+            space: None,
         });
     }
 
