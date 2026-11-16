@@ -4,18 +4,27 @@ use std::io::Result as IOResult;
 use crate::domain::data::DiskSpace;
 use crate::domain::data::Folder;
 
+/// Turns raw block counts into a `DiskSpace`. Counts are in fragment units
+/// (`f_frsize`); macOS reports a 1 MiB `f_bsize` beside a 4 KiB fragment, so
+/// using `f_bsize` inflated sizes 256x. A zero fragment size (some FUSE
+/// filesystems) falls back to `bsize`; a zero total means "unknown" (`None`).
 #[cfg(unix)]
-fn disk_space(path: &str) -> Option<DiskSpace> {
-    let stat = rustix::fs::statvfs(path).ok()?;
-    let total = (stat.f_blocks as u64).saturating_mul(stat.f_bsize as u64);
+fn space_from_counts(blocks: u64, bavail: u64, frsize: u64, bsize: u64) -> Option<DiskSpace> {
+    let unit = if frsize == 0 { bsize } else { frsize };
+    let total = blocks.saturating_mul(unit);
     if total == 0 {
         return None;
     }
-    let available = (stat.f_bavail as u64).saturating_mul(stat.f_bsize as u64).min(total);
     Some(DiskSpace {
         total,
-        available: Some(available),
+        available: Some(bavail.saturating_mul(unit).min(total)),
     })
+}
+
+#[cfg(unix)]
+fn disk_space(path: &str) -> Option<DiskSpace> {
+    let stat = rustix::fs::statvfs(path).ok()?;
+    space_from_counts(stat.f_blocks, stat.f_bavail, stat.f_frsize, stat.f_bsize)
 }
 
 /// Fills in free/total space for mounted drives. This issues `statvfs`-style
@@ -51,13 +60,92 @@ fn icloud_dir_exists(path: &std::path::Path) -> bool {
     }
 }
 
+/// Mount points of attached disk images (mounted `.dmg` apps, simulator
+/// runtimes), read from `hdiutil info` in one fast call.
+#[cfg(target_os = "macos")]
+fn disk_image_mounts() -> Vec<String> {
+    std::process::Command::new("/usr/bin/hdiutil")
+        .args(["info", "-plist"])
+        .output()
+        .map(|o| parse_image_mounts(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_default()
+}
+
+/// Extracts every `mount-point` value from `hdiutil info -plist` output.
+#[cfg(target_os = "macos")]
+fn parse_image_mounts(plist: &str) -> Vec<String> {
+    let mut mounts = Vec::new();
+    let mut lines = plist.lines().map(str::trim);
+    while let Some(line) = lines.next() {
+        if line != "<key>mount-point</key>" {
+            continue;
+        }
+        let value = lines
+            .next()
+            .and_then(|l| l.strip_prefix("<string>"))
+            .and_then(|l| l.strip_suffix("</string>"));
+        if let Some(v) = value {
+            mounts.push(
+                v.replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                    .replace("&amp;", "&"),
+            );
+        }
+    }
+    mounts
+}
+
+/// Parses one `mount` line (`<dev> on <path> (<fs>, <flag>, ...)`) and keeps
+/// physical storage: local, shown by Finder (`nobrowse` unset) and not a
+/// disk image. Returns the mount point when kept.
+#[cfg(target_os = "macos")]
+fn storage_mount_point(line: &str, image_mounts: &[String]) -> Option<String> {
+    let (_, rest) = line.split_once(" on ")?;
+    let (mount_point, flags) = rest.rsplit_once(" (")?;
+    let flags: Vec<&str> = flags.trim_end_matches(')').split(", ").collect();
+    let keep = flags.contains(&"local")
+        && !flags.contains(&"nobrowse")
+        && !image_mounts.iter().any(|m| m == mount_point);
+    keep.then(|| mount_point.to_string())
+}
+
+/// Mount points of physical storage volumes. `mount` reads the kernel's
+/// cached table (`MNT_NOWAIT`), so a hung network share cannot block. `None`
+/// when it cannot run, so the caller shows every volume instead of none.
+#[cfg(target_os = "macos")]
+fn storage_mounts() -> Option<Vec<String>> {
+    let out = std::process::Command::new("/sbin/mount").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let images = disk_image_mounts();
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| storage_mount_point(l, &images))
+            .collect(),
+    )
+}
+
 #[cfg(target_os = "macos")]
 pub fn list_drives() -> IOResult<Vec<Folder>> {
     const VOLUMES: &str = "/Volumes";
     let mut drives: Vec<Folder> = Vec::new();
+    let storage = storage_mounts();
 
     if let Ok(entries) = read_dir(VOLUMES) {
         for entry in entries.flatten() {
+            // "Macintosh HD" is a symlink to "/"; match the mount it points at.
+            let mut target = entry.path();
+            if entry.file_type().is_ok_and(|t| t.is_symlink()) {
+                target = std::fs::read_link(&target).unwrap_or(target);
+            }
+            let hidden = storage
+                .as_ref()
+                .is_some_and(|mounts| !mounts.iter().any(|m| std::path::Path::new(m) == target));
+            if hidden {
+                continue;
+            }
             if let Ok(file_name) = entry.file_name().into_string() {
                 let n = drives.len() + 1;
                 let shortcut = if n < 9 {
@@ -369,3 +457,7 @@ pub fn eject_drive(_device: &str) -> IOResult<()> {
 #[cfg(all(test, target_os = "linux"))]
 #[path = "drives_tests.rs"]
 mod tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "drives_macos_tests.rs"]
+mod macos_tests;
