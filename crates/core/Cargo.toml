@@ -6,3 +6,20 @@ publish = false
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+dirs-next = "=2.0.0"
+parking_lot = "=0.12.5"
+serde = { version = "=1.0.229", features = ["derive"] }
+toml = "=0.8.23"
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
+
+[dev-dependencies]
+unicode-width = "=0.2.2"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "=1.1.4", features = ["fs"] }
+
+# D-006: source-inclusion tests exercise the existing terminal Windows host wrapper.
+[target.'cfg(windows)'.dev-dependencies]
+winapi = { version = "=0.3.9", features = ["fileapi", "winbase", "errhandlingapi"] }

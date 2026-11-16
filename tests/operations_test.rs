@@ -2416,6 +2416,7 @@ fn grid_mode_key_events_navigate_2d_and_open_or_rename() {
         app.renaming.is_none(),
         "Enter in grid mode does not start rename"
     );
+    app.clear_status();
 
     // F2 in grid mode starts rename
     handle_key_events(key(KeyCode::F(2)), &mut app).unwrap();

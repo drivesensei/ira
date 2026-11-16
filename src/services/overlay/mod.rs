@@ -837,11 +837,11 @@ fn geom_tracker_loop() {
 fn query_front_window() -> Option<WindowGeom> {
     #[cfg(target_os = "macos")]
     {
-        return macos::query_front_window();
+        macos::query_front_window()
     }
     #[cfg(windows)]
     {
-        return windows::query_front_window();
+        windows::query_front_window()
     }
 }
 
@@ -869,7 +869,7 @@ pub fn front_window() -> FrontWindow {
 pub fn backing_scale() -> u16 {
     #[cfg(target_os = "macos")]
     {
-        return macos::backing_scale();
+        macos::backing_scale()
     }
     #[cfg(not(target_os = "macos"))]
     {

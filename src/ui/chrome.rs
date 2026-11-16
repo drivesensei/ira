@@ -219,6 +219,26 @@ pub fn dialog_area(content_w: u16, content_h: u16, frame: Rect) -> Rect {
     centered_rect(w, h, frame)
 }
 
+/// Measure Info text using the same reflow as `render_dialog`, after the
+/// dialog width has been clamped to the viewport. Width is independent of
+/// height, so the second area calculation has the same content width.
+/// Content taller than the available viewport remains clipped, as before.
+pub(super) fn wrapped_info_area(lines: &[Line<'_>], frame: Rect) -> Rect {
+    let content_w = lines
+        .iter()
+        .map(Line::width)
+        .max()
+        .unwrap_or(10)
+        .max(10)
+        .min(u16::MAX as usize) as u16;
+    let width_area = dialog_area(content_w, 0, frame);
+    let wrapped_h = Paragraph::new(lines.to_vec())
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .line_count(width_area.width.saturating_sub(DIALOG_CHROME))
+        .min(u16::MAX as usize) as u16;
+    dialog_area(content_w, wrapped_h, frame)
+}
+
 /// Glass dialog: dim the backdrop, drop a 1-cell shadow, keep a frost
 /// ring of muted underlying cells, paint a tinted surface, rounded border.
 pub fn render_dialog(
